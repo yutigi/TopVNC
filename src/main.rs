@@ -1,17 +1,22 @@
 use minifb::{InputCallback, Key, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-    mpsc,
-};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
-use topvnc::{Framebuffer, Session};
+use topvnc::{Encoding, Framebuffer, Session};
 
+mod settings;
 mod ui;
-use ui::{Box2, Canvas, Config, Field, Quality, UiState, WindowMode};
+use ui::{Box2, Canvas, Compression, Config, Field, Quality, UiState, WindowMode};
+
+impl From<Compression> for Encoding {
+    fn from(value: Compression) -> Self {
+        match value {
+            Compression::Raw => Encoding::Raw,
+            Compression::Zlib => Encoding::Zlib,
+        }
+    }
+}
 
 const USAGE: &str = "usage: topvnc [HOST:PORT] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--input-debug]";
 
@@ -471,6 +476,7 @@ fn translated_key_event(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut config = Config::default();
+    settings::load(&mut config);
     let mut input_debug = false;
     let mut address = None;
     let mut args = std::env::args().skip(1);
@@ -511,7 +517,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         if let Some(error) = &connection_error {
             eprintln!("Session ended: {error}");
         }
-        config.password.clear();
     }
 }
 
@@ -547,7 +552,12 @@ fn show_landing(
         if let Ok(result) = result_rx.try_recv() {
             connecting = false;
             match result {
-                Ok(session) => return Ok(Some((config, session))),
+                Ok(session) => {
+                    if let Err(error) = settings::save(&config) {
+                        eprintln!("Could not remember the last session: {error}");
+                    }
+                    return Ok(Some((config, session)));
+                }
                 Err(error) => state.error = Some(error),
             }
         }
@@ -574,7 +584,6 @@ fn show_landing(
             for (area, field) in [
                 (ui::HOST, Field::Host),
                 (ui::PORT, Field::Port),
-                (ui::USERNAME, Field::Username),
                 (ui::PASSWORD, Field::Password),
                 (ui::SIZE, Field::WindowSize),
             ] {
@@ -584,6 +593,12 @@ fn show_landing(
             }
             if ui::INSECURE.contains(x, y) {
                 config.allow_insecure = !config.allow_insecure;
+            }
+            if ui::RAW.contains(x, y) {
+                config.compression = Compression::Raw;
+            }
+            if ui::ZLIB.contains(x, y) {
+                config.compression = Compression::Zlib;
             }
             if ui::FIT.contains(x, y) {
                 config.window_mode = WindowMode::Fit;
@@ -619,12 +634,17 @@ fn show_landing(
                     state.error = None;
                     connecting = true;
                     let sender = result_tx.clone();
-                    let password = std::mem::take(&mut config.password);
+                    let password = config.password.clone();
                     let allow_insecure = config.allow_insecure;
+                    let compression = config.compression;
                     thread::spawn(move || {
-                        let result =
-                            Session::connect(&address, allow_insecure, || Ok(password.clone()))
-                                .map_err(|error| error.to_string());
+                        let result = Session::connect_with_encoding(
+                            &address,
+                            allow_insecure,
+                            compression.into(),
+                            || Ok(password.clone()),
+                        )
+                        .map_err(|error| error.to_string());
                         let _ = sender.send(result);
                     });
                 }
@@ -705,15 +725,12 @@ fn run_session_inner(
     }));
     let worker_framebuffer = Arc::clone(&framebuffer);
     let worker_writer = writer.clone();
-    let update_rate = Arc::new(AtomicUsize::new(config.fps));
-    let worker_rate = Arc::clone(&update_rate);
     let (error_tx, error_rx) = mpsc::channel();
     thread::spawn(move || {
         let result: std::io::Result<()> = (|| {
             let mut scratch = Vec::new();
             let mut incremental = false;
             loop {
-                let started = Instant::now();
                 worker_writer.request_update(incremental, info.width, info.height)?;
                 session.read_update_with(&mut scratch, |x, y, width, height, bytes| {
                     let mut frame = worker_framebuffer.lock().unwrap();
@@ -728,11 +745,6 @@ fn run_session_inner(
                     Ok(())
                 })?;
                 incremental = true;
-                let fps = worker_rate.load(Ordering::Relaxed).max(1);
-                let interval = Duration::from_secs_f64(1.0 / fps as f64);
-                if let Some(remaining) = interval.checked_sub(started.elapsed()) {
-                    thread::sleep(remaining);
-                }
             }
         })();
         let _ = error_tx.send(result);
@@ -767,6 +779,7 @@ fn run_session_inner(
     let mut last_pointer = None;
     let mut ui_state = UiState::default();
     let mut settings_open = false;
+    let mut dragging_ui_scale = false;
     let mut ui_captured_mouse = false;
     let mut redraw = false;
     while window.is_open() {
@@ -805,14 +818,9 @@ fn run_session_inner(
             }
         }
         let area = if settings_open {
-            Box2 {
-                x: 8,
-                y: 8,
-                w: 432,
-                h: 462,
-            }
+            ui::SETTINGS_PANEL
         } else {
-            ui::OPEN_SETTINGS
+            ui::open_settings_box(config.ui_scale)
         };
         let backup = backup_region(&scaled.pixels, size.0, size.1, area);
         ui::overlay(
@@ -827,6 +835,7 @@ fn run_session_inner(
         for event in input_rx.try_iter() {
             if let InputEvent::Key(Key::F8, true) = event {
                 settings_open = !settings_open;
+                dragging_ui_scale = false;
                 ui_captured_mouse = true;
                 for (_, symbol) in pressed_keys.drain() {
                     writer.key(symbol, false)?;
@@ -861,7 +870,7 @@ fn run_session_inner(
         let (mx, my) = (mouse.0 as usize, mouse.1 as usize);
         let was_settings_open = settings_open;
         if click {
-            if !settings_open && ui::OPEN_SETTINGS.contains(mx, my) {
+            if !settings_open && ui::open_settings_box(config.ui_scale).contains(mx, my) {
                 settings_open = true;
                 ui_captured_mouse = true;
                 for (_, symbol) in pressed_keys.drain() {
@@ -874,6 +883,7 @@ fn run_session_inner(
                 ui_captured_mouse = true;
                 if ui::CLOSE_SETTINGS.contains(mx, my) {
                     settings_open = false;
+                    dragging_ui_scale = false;
                 } else if ui::LIVE_FIT.contains(mx, my) {
                     config.window_mode = WindowMode::Fit;
                 } else if ui::LIVE_NATIVE.contains(mx, my) {
@@ -888,18 +898,27 @@ fn run_session_inner(
                     config.quality = Quality::Smooth;
                 } else if ui::LIVE_SHARP.contains(mx, my) {
                     config.quality = Quality::Sharp;
+                } else if ui::SCALE_SLIDER.contains(mx, my) {
+                    dragging_ui_scale = true;
+                    config.ui_scale = ui::scale_from_slider_x(mx);
                 } else if ui::DISCONNECT.contains(mx, my) {
                     writer.shutdown()?;
                     return Ok(None);
                 }
-                update_rate.store(config.fps, Ordering::Relaxed);
                 window.set_target_fps(config.fps);
+            }
+        }
+        if dragging_ui_scale {
+            if window.get_mouse_down(MouseButton::Left) && settings_open {
+                config.ui_scale = ui::scale_from_slider_x(mx);
+            } else {
+                dragging_ui_scale = false;
             }
         }
         let suppress_pointer = was_settings_open
             || settings_open
             || ui_captured_mouse
-            || ui::OPEN_SETTINGS.contains(mx, my);
+            || ui::open_settings_box(config.ui_scale).contains(mx, my);
         if !window.get_mouse_down(MouseButton::Left) {
             ui_captured_mouse = false;
         }

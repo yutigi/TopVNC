@@ -22,17 +22,24 @@ pub enum Quality {
     Sharp,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Compression {
+    Raw,
+    Zlib,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub host: String,
     pub port: String,
-    pub username: String,
     pub password: String,
     pub allow_insecure: bool,
     pub window_mode: WindowMode,
     pub window_size: String,
     pub fps: usize,
     pub quality: Quality,
+    pub compression: Compression,
+    pub ui_scale: f32,
 }
 
 impl Default for Config {
@@ -40,13 +47,14 @@ impl Default for Config {
         Self {
             host: String::new(),
             port: "5900".into(),
-            username: String::new(),
             password: String::new(),
             allow_insecure: false,
             window_mode: WindowMode::Fit,
             window_size: "1280x720".into(),
             fps: 60,
             quality: Quality::Smooth,
+            compression: Compression::Raw,
+            ui_scale: 1.0,
         }
     }
 }
@@ -91,7 +99,6 @@ impl Config {
 pub enum Field {
     Host,
     Port,
-    Username,
     Password,
     WindowSize,
 }
@@ -116,8 +123,7 @@ impl UiState {
                 self.focus = Some(match self.focus {
                     None => Field::Host,
                     Some(Field::Host) => Field::Port,
-                    Some(Field::Port) => Field::Username,
-                    Some(Field::Username) => Field::Password,
+                    Some(Field::Port) => Field::Password,
                     Some(Field::Password) => Field::WindowSize,
                     Some(Field::WindowSize) => Field::Host,
                 });
@@ -148,7 +154,6 @@ impl UiState {
         match self.focus? {
             Field::Host => Some(&mut config.host),
             Field::Port => Some(&mut config.port),
-            Field::Username => Some(&mut config.username),
             Field::Password => Some(&mut config.password),
             Field::WindowSize => Some(&mut config.window_size),
         }
@@ -318,17 +323,23 @@ pub const PORT: Box2 = Box2 {
     w: 210,
     h: 40,
 };
-pub const USERNAME: Box2 = Box2 {
+pub const PASSWORD: Box2 = Box2 {
     x: 40,
     y: 215,
-    w: 345,
+    w: 718,
     h: 40,
 };
-pub const PASSWORD: Box2 = Box2 {
-    x: 403,
-    y: 215,
-    w: 355,
-    h: 40,
+pub const RAW: Box2 = Box2 {
+    x: 542,
+    y: 280,
+    w: 95,
+    h: 36,
+};
+pub const ZLIB: Box2 = Box2 {
+    x: 649,
+    y: 280,
+    w: 109,
+    h: 36,
 };
 pub const INSECURE: Box2 = Box2 {
     x: 40,
@@ -434,15 +445,7 @@ pub fn landing(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
         state.focus == Some(Field::Port),
         false,
     );
-    canvas.label(40, 192, "USERNAME (UNSUPPORTED)");
-    canvas.label(403, 192, "VNC PASSWORD");
-    canvas.field(
-        USERNAME,
-        &config.username,
-        "NOT SENT TO SERVER",
-        state.focus == Some(Field::Username),
-        false,
-    );
+    canvas.label(40, 192, "VNC PASSWORD");
     canvas.field(
         PASSWORD,
         &config.password,
@@ -456,6 +459,9 @@ pub fn landing(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
         canvas.text(45, 296, "X", BG, 2);
     }
     canvas.text(76, 296, "ALLOW NONE AUTHENTICATION", TEXT, 2);
+    canvas.label(420, 258, "COMPRESSION");
+    canvas.button(RAW, "RAW", config.compression == Compression::Raw);
+    canvas.button(ZLIB, "ZLIB", config.compression == Compression::Zlib);
     canvas.text(
         40,
         331,
@@ -485,7 +491,7 @@ pub fn landing(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
         let short: String = error.chars().take(62).collect();
         canvas.text(40, 537, &short, ERROR, 2);
     } else {
-        canvas.text(40, 537, "RAW ENCODING  /  TCP TRANSPORT", MUTED, 2);
+        canvas.text(40, 537, "TCP TRANSPORT  /  UNENCRYPTED", MUTED, 2);
     }
     canvas.button(
         CONNECT,
@@ -498,12 +504,15 @@ pub fn landing(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
     );
 }
 
-pub const OPEN_SETTINGS: Box2 = Box2 {
-    x: 12,
-    y: 12,
-    w: 138,
-    h: 32,
-};
+pub fn open_settings_box(scale: f32) -> Box2 {
+    let scale = scale.clamp(0.5, 2.0);
+    Box2 {
+        x: 12,
+        y: 12,
+        w: (150.0 * scale).round() as usize,
+        h: (36.0 * scale).round() as usize,
+    }
+}
 pub const CLOSE_SETTINGS: Box2 = Box2 {
     x: 362,
     y: 20,
@@ -554,34 +563,55 @@ pub const LIVE_SHARP: Box2 = Box2 {
 };
 pub const DISCONNECT: Box2 = Box2 {
     x: 24,
-    y: 413,
+    y: 493,
     w: 392,
     h: 42,
+};
+pub const SCALE_SLIDER: Box2 = Box2 {
+    x: 24,
+    y: 399,
+    w: 392,
+    h: 48,
+};
+const SLIDER_LEFT: usize = 36;
+const SLIDER_RIGHT: usize = 404;
+
+pub fn scale_from_slider_x(x: usize) -> f32 {
+    let fraction = (x.saturating_sub(SLIDER_LEFT) as f32 / (SLIDER_RIGHT - SLIDER_LEFT) as f32)
+        .clamp(0.0, 1.0);
+    0.5 + fraction * 1.5
+}
+
+fn slider_x(scale: f32) -> usize {
+    SLIDER_LEFT
+        + (((scale.clamp(0.5, 2.0) - 0.5) / 1.5) * (SLIDER_RIGHT - SLIDER_LEFT) as f32).round()
+            as usize
+}
+pub const SETTINGS_PANEL: Box2 = Box2 {
+    x: 8,
+    y: 8,
+    w: 432,
+    h: 542,
 };
 
 pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     if !open {
-        canvas.button(OPEN_SETTINGS, "F8 SETTINGS", false);
+        let area = open_settings_box(config.ui_scale);
+        let text_scale = (2.0 * config.ui_scale).round().clamp(1.0, 4.0) as usize;
+        let text_width = 11 * 6 * text_scale;
+        canvas.fill(area, PANEL);
+        canvas.frame(area, BORDER);
+        canvas.text(
+            area.x + area.w.saturating_sub(text_width) / 2,
+            area.y + area.h.saturating_sub(7 * text_scale) / 2,
+            "F8 SETTINGS",
+            TEXT,
+            text_scale,
+        );
         return;
     }
-    canvas.fill(
-        Box2 {
-            x: 8,
-            y: 8,
-            w: 432,
-            h: 462,
-        },
-        BG,
-    );
-    canvas.frame(
-        Box2 {
-            x: 8,
-            y: 8,
-            w: 432,
-            h: 462,
-        },
-        ACCENT,
-    );
+    canvas.fill(SETTINGS_PANEL, BG);
+    canvas.frame(SETTINGS_PANEL, ACCENT);
     canvas.text(24, 28, "SESSION SETTINGS", TEXT, 3);
     canvas.button(CLOSE_SETTINGS, "CLOSE", false);
     canvas.text(24, 83, "WINDOW", ACCENT, 2);
@@ -603,7 +633,39 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     canvas.text(24, 285, "SCALING", ACCENT, 2);
     canvas.button(LIVE_SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(LIVE_SHARP, "SHARP", config.quality == Quality::Sharp);
-    canvas.text(24, 376, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
+    canvas.text(24, 376, "F8 BUTTON SIZE", ACCENT, 2);
+    canvas.text(330, 376, &format!("{:.2}X", config.ui_scale), TEXT, 2);
+    canvas.fill(
+        Box2 {
+            x: SLIDER_LEFT,
+            y: 418,
+            w: SLIDER_RIGHT - SLIDER_LEFT,
+            h: 6,
+        },
+        BORDER,
+    );
+    let thumb = slider_x(config.ui_scale);
+    canvas.fill(
+        Box2 {
+            x: SLIDER_LEFT,
+            y: 418,
+            w: thumb - SLIDER_LEFT,
+            h: 6,
+        },
+        ACCENT,
+    );
+    canvas.fill(
+        Box2 {
+            x: thumb.saturating_sub(6),
+            y: 408,
+            w: 12,
+            h: 26,
+        },
+        ACCENT,
+    );
+    canvas.text(24, 444, "0.5X", MUTED, 1);
+    canvas.text(384, 444, "2X", MUTED, 1);
+    canvas.text(24, 466, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
     canvas.button(DISCONNECT, "DISCONNECT", false);
 }
 
@@ -684,5 +746,23 @@ mod tests {
         assert!(config.address().is_err());
         config.window_size = "8192x8192".into();
         assert!(config.address().is_err());
+    }
+
+    #[test]
+    fn tab_skips_removed_username_and_f8_hitbox_scales() {
+        let mut state = UiState::default();
+        let mut config = Config::default();
+        for expected in [Field::Host, Field::Port, Field::Password, Field::WindowSize] {
+            state.key(&mut config, Key::Tab);
+            assert!(state.focus == Some(expected));
+        }
+        let small = open_settings_box(0.5);
+        let large = open_settings_box(2.0);
+        assert!(large.w > small.w && large.h > small.h);
+        assert!(!small.contains(large.x + large.w - 1, large.y + large.h - 1));
+        assert!(large.contains(large.x + large.w - 1, large.y + large.h - 1));
+        assert_eq!(scale_from_slider_x(0), 0.5);
+        assert_eq!(scale_from_slider_x(usize::MAX), 2.0);
+        assert!((scale_from_slider_x((SLIDER_LEFT + SLIDER_RIGHT) / 2) - 1.25).abs() < 0.01);
     }
 }
