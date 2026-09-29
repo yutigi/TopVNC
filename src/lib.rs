@@ -4,6 +4,7 @@
 
 use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+use flate2::{Decompress, FlushDecompress};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
@@ -138,6 +139,12 @@ pub enum Security {
     VncPassword,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    Raw,
+    Zlib,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Version {
     V3_3,
@@ -175,6 +182,15 @@ fn vnc_response(challenge: &[u8; 16], password: &str) -> [u8; 16] {
 pub fn negotiate(
     stream: &mut (impl Read + Write),
     allow_insecure: bool,
+    password_prompt: impl FnMut() -> io::Result<String>,
+) -> io::Result<ServerInfo> {
+    negotiate_with_encoding(stream, allow_insecure, Encoding::Raw, password_prompt)
+}
+
+pub fn negotiate_with_encoding(
+    stream: &mut (impl Read + Write),
+    allow_insecure: bool,
+    encoding: Encoding,
     mut password_prompt: impl FnMut() -> io::Result<String>,
 ) -> io::Result<ServerInfo> {
     let mut version = [0; 12];
@@ -288,8 +304,12 @@ pub fn negotiate(
     stream.write_all(&[
         0, 0, 0, 0, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0,
     ])?;
-    // Raw is the only advertised encoding.
-    stream.write_all(&[2, 0, 0, 1, 0, 0, 0, 0])?;
+    let encoding_id: i32 = match encoding {
+        Encoding::Raw => 0,
+        Encoding::Zlib => 6,
+    };
+    stream.write_all(&[2, 0, 0, 1])?;
+    stream.write_all(&encoding_id.to_be_bytes())?;
     Ok(ServerInfo {
         width,
         height,
@@ -371,6 +391,26 @@ pub fn read_update_with(
     frame_width: u16,
     frame_height: u16,
     scratch: &mut Vec<u8>,
+    apply: impl FnMut(u16, u16, u16, u16, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    read_update_with_encoding(
+        reader,
+        frame_width,
+        frame_height,
+        scratch,
+        Encoding::Raw,
+        &mut Decompress::new(true),
+        apply,
+    )
+}
+
+pub fn read_update_with_encoding(
+    reader: &mut impl Read,
+    frame_width: u16,
+    frame_height: u16,
+    scratch: &mut Vec<u8>,
+    selected_encoding: Encoding,
+    decoder: &mut Decompress,
     mut apply: impl FnMut(u16, u16, u16, u16, &[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
     loop {
@@ -388,8 +428,10 @@ pub fn read_update_with(
                     let y = u16::from_be_bytes([rect[2], rect[3]]);
                     let width = u16::from_be_bytes([rect[4], rect[5]]);
                     let height = u16::from_be_bytes([rect[6], rect[7]]);
-                    let encoding = i32::from_be_bytes(rect[8..12].try_into().unwrap());
-                    if encoding != 0 {
+                    let wire_encoding = i32::from_be_bytes(rect[8..12].try_into().unwrap());
+                    if wire_encoding != 0
+                        && !(wire_encoding == 6 && selected_encoding == Encoding::Zlib)
+                    {
                         return Err(invalid("server sent an unsupported encoding"));
                     }
                     if width == 0
@@ -401,7 +443,28 @@ pub fn read_update_with(
                     }
                     let length = usize::from(width) * usize::from(height) * 4;
                     scratch.resize(length, 0);
-                    reader.read_exact(scratch)?;
+                    if wire_encoding == 0 {
+                        reader.read_exact(scratch)?;
+                    } else {
+                        let compressed_length = read_u32(reader)? as usize;
+                        // A zlib block may expand slightly; cap it before allocating.
+                        let limit = length + length / 1000 + 65_536;
+                        if compressed_length > limit {
+                            return Err(invalid("compressed rectangle exceeds size limit"));
+                        }
+                        let mut compressed = vec![0; compressed_length];
+                        reader.read_exact(&mut compressed)?;
+                        let input_before = decoder.total_in();
+                        let output_before = decoder.total_out();
+                        decoder
+                            .decompress(&compressed, scratch, FlushDecompress::Sync)
+                            .map_err(|_| invalid("invalid zlib rectangle"))?;
+                        if decoder.total_in() - input_before != compressed_length as u64
+                            || decoder.total_out() - output_before != length as u64
+                        {
+                            return Err(invalid("zlib rectangle has incorrect decoded length"));
+                        }
+                    }
                     apply(x, y, width, height, scratch)?;
                 }
                 return Ok(());
@@ -489,6 +552,8 @@ pub struct Session {
     pub info: ServerInfo,
     reader: TcpStream,
     writer: InputWriter,
+    encoding: Encoding,
+    decoder: Decompress,
 }
 
 impl Session {
@@ -497,27 +562,55 @@ impl Session {
         allow_insecure: bool,
         password_prompt: impl FnMut() -> io::Result<String>,
     ) -> io::Result<Self> {
-        Self::from_stream(
+        Self::connect_with_encoding(address, allow_insecure, Encoding::Raw, password_prompt)
+    }
+
+    pub fn connect_with_encoding(
+        address: &str,
+        allow_insecure: bool,
+        encoding: Encoding,
+        password_prompt: impl FnMut() -> io::Result<String>,
+    ) -> io::Result<Self> {
+        Self::from_stream_with_encoding(
             connect_tcp(address)?,
             allow_insecure,
+            encoding,
             password_prompt,
             CONNECT_TIMEOUT,
         )
     }
 
+    #[cfg(test)]
     fn from_stream(
-        mut stream: TcpStream,
+        stream: TcpStream,
         allow_insecure: bool,
         password_prompt: impl FnMut() -> io::Result<String>,
         timeout: Duration,
     ) -> io::Result<Self> {
+        Self::from_stream_with_encoding(
+            stream,
+            allow_insecure,
+            Encoding::Raw,
+            password_prompt,
+            timeout,
+        )
+    }
+
+    fn from_stream_with_encoding(
+        mut stream: TcpStream,
+        allow_insecure: bool,
+        encoding: Encoding,
+        password_prompt: impl FnMut() -> io::Result<String>,
+        timeout: Duration,
+    ) -> io::Result<Self> {
         stream.set_nodelay(true)?;
-        let info = negotiate(
+        let info = negotiate_with_encoding(
             &mut HandshakeStream {
                 stream: &mut stream,
                 deadline: Instant::now() + timeout,
             },
             allow_insecure,
+            encoding,
             password_prompt,
         )
         .map_err(|error| {
@@ -537,6 +630,8 @@ impl Session {
             info,
             reader,
             writer: InputWriter(Arc::new(Mutex::new(stream))),
+            encoding,
+            decoder: Decompress::new(true),
         })
     }
 
@@ -566,11 +661,13 @@ impl Session {
             refresh: || writer.request_update(false, width, height),
             requested: false,
         };
-        read_update_with(
+        read_update_with_encoding(
             &mut reader,
             self.info.width,
             self.info.height,
             scratch,
+            self.encoding,
+            &mut self.decoder,
             apply,
         )
     }
@@ -579,6 +676,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compress, Compression as ZlibLevel, FlushCompress};
     use std::io::Cursor;
 
     struct PausedReader {
@@ -779,6 +877,107 @@ mod tests {
         assert_eq!(&server.output[18..22], &[32, 24, 0, 1]);
         assert_eq!(&server.output[34..], &[2, 0, 0, 1, 0, 0, 0, 0]);
         assert_eq!(info.security, Security::None);
+    }
+
+    #[test]
+    fn handshake_advertises_zlib_only_when_selected() {
+        let mut server = mock_server();
+        negotiate_with_encoding(&mut server, true, Encoding::Zlib, || unreachable!()).unwrap();
+        assert_eq!(&server.output[34..], &[2, 0, 0, 1, 0, 0, 0, 6]);
+    }
+
+    #[test]
+    fn zlib_rectangles_share_a_stream_across_updates() {
+        let mut compressor = Compress::new(ZlibLevel::default(), true);
+        let mut decoder = Decompress::new(true);
+        let mut scratch = Vec::new();
+        let mut frame = Framebuffer::new(2, 1).unwrap();
+        for pixel in [[1, 2, 3, 0], [4, 5, 6, 0]] {
+            let mut compressed = [0; 128];
+            let input_before = compressor.total_in();
+            let output_before = compressor.total_out();
+            compressor
+                .compress(&pixel, &mut compressed, FlushCompress::Sync)
+                .unwrap();
+            assert_eq!(compressor.total_in() - input_before, 4);
+            let length = (compressor.total_out() - output_before) as usize;
+            let mut update = vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1];
+            update.extend_from_slice(&6i32.to_be_bytes());
+            update.extend_from_slice(&(length as u32).to_be_bytes());
+            update.extend_from_slice(&compressed[..length]);
+            read_update_with_encoding(
+                &mut Cursor::new(update),
+                2,
+                1,
+                &mut scratch,
+                Encoding::Zlib,
+                &mut decoder,
+                |x, y, width, height, bytes| frame.apply_raw(x, y, width, height, bytes),
+            )
+            .unwrap();
+            assert_eq!(
+                frame.pixels()[0],
+                (u32::from(pixel[2]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[0])
+            );
+        }
+    }
+
+    #[test]
+    fn raw_mode_rejects_unadvertised_zlib() {
+        let update = [0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 6];
+        let mut scratch = Vec::new();
+        assert_eq!(
+            read_update_with(
+                &mut Cursor::new(update),
+                2,
+                1,
+                &mut scratch,
+                |_, _, _, _, _| Ok(())
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn zlib_rejects_oversized_and_corrupt_rectangles() {
+        let mut header = vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1];
+        header.extend_from_slice(&6i32.to_be_bytes());
+        let mut oversized = header.clone();
+        oversized.extend_from_slice(&65_541u32.to_be_bytes());
+        let mut scratch = Vec::new();
+        let mut decoder = Decompress::new(true);
+        assert_eq!(
+            read_update_with_encoding(
+                &mut Cursor::new(oversized),
+                2,
+                1,
+                &mut scratch,
+                Encoding::Zlib,
+                &mut decoder,
+                |_, _, _, _, _| Ok(())
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+        header.extend_from_slice(&4u32.to_be_bytes());
+        header.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(
+            read_update_with_encoding(
+                &mut Cursor::new(header),
+                2,
+                1,
+                &mut scratch,
+                Encoding::Zlib,
+                &mut decoder,
+                |_, _, _, _, _| Ok(())
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     fn server_init(input: &mut Vec<u8>) {
