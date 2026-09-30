@@ -953,8 +953,11 @@ dependencies = [
  "des",
  "display-info",
  "flate2",
+ "getrandom",
  "minifb",
  "rpassword",
+ "windows",
+ "windows-sys",
 ]
 
 [[package]]

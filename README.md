@@ -2,11 +2,13 @@
 
 A VNC viewer written in Rust, built toward responsive remote gaming with low input latency and smooth frame presentation.
 
+TopVNC can also serve the primary Windows desktop over RFB 3.8. The reusable server protocol is in the library; the Windows executable captures the desktop and injects remote keyboard and mouse input. Other server host platforms and capture of additional monitors are not implemented yet. See [`specs/004-vnc-server/spec.md`](specs/004-vnc-server/spec.md) for protocol and platform limits.
+
 ![TopVNC connection screen with server, authentication, encoding, window size, frame rate, and scaling controls](docs/images/topvnc-connection.png)
 
 *TopVNC running on Windows, with connection and display settings in one window.*
 
-**Early development:** the native client has been compiled and tested on Windows and connected to a live macOS VNC server. Full remote control and macOS unlocking remain under live validation. macOS and Linux client builds are untested; a browser client is planned. Performance goals have not yet been established by end-to-end benchmarks.
+**Early development:** the native client has been compiled and tested on Windows and connected to a live macOS VNC server. The Windows server mode compiles, but desktop capture has not passed a live startup check in this environment (GDI `BitBlt` failed, and Desktop Duplication was denied with `0x80070005`). Full remote control and macOS unlocking remain under live validation. macOS and Linux client builds are untested; other server host platforms are not implemented. Performance goals have not yet been established by end-to-end benchmarks.
 
 [Quick start](#quick-start) · [Controls](#controls-and-display-settings) · [Security](#security-and-saved-settings) · [Development](#development) · [Roadmap](#roadmap)
 
@@ -18,6 +20,7 @@ A VNC viewer written in Rust, built toward responsive remote gaming with low inp
 - **Adjustable display** with fit-to-window or native pixels, smooth or sharp scaling, and 30, 60, or 120 FPS presentation limits.
 - **In-session settings** accessible through **F8**, including disconnect and a resizable on-screen settings button.
 - **Saved connection details** with platform-specific password storage.
+- **Experimental Windows server mode** with primary display capture, remote keyboard/mouse input, and password authentication; live capture validation is pending.
 
 The protocol implementation handles RFB 3.3, 3.7, and 3.8. Apple's `RFB 003.889` banner is handled through a standard RFB 3.8 fallback; Apple-specific authentication is not implemented.
 
@@ -57,6 +60,17 @@ cargo run --release -- 127.0.0.1:5900 --window 1280x720
 | `--input-debug` | Log outgoing key and pointer events for troubleshooting. |
 
 Do not use `--input-debug` while typing passwords: it logs key events.
+
+### Serve this Windows desktop
+
+Run the server as a separate mode. It binds to localhost by default and prompts for a VNC password:
+
+```sh
+cargo run --release -- --serve
+cargo run --release -- --serve 0.0.0.0:5900
+```
+
+The second command listens on all network interfaces. Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers. The server currently shares the primary display only. Windows secure desktop prompts and other monitors are not captured.
 
 ## Controls and display settings
 
@@ -119,6 +133,8 @@ cargo run
 | [`src/main.rs`](src/main.rs) | Native application, session worker, input handling, and software presentation. |
 | [`src/ui.rs`](src/ui.rs) | Connection form and in-session settings UI. |
 | [`src/settings.rs`](src/settings.rs) | Saved connection details and platform-specific password storage. |
+| [`src/windows_server.rs`](src/windows_server.rs) | Windows Desktop Duplication capture and remote keyboard/mouse injection for server mode. |
+| [`specs/004-vnc-server/spec.md`](specs/004-vnc-server/spec.md) | Server scope, security behavior, and limitations. |
 | [`specs/`](specs/) | Feature scope and acceptance criteria. |
 
 The native frontend uses TCP and a software window. Protocol and framebuffer code are kept separate from the UI so future frontends can reuse them. A browser frontend will need a browser-compatible transport and gateway because web pages cannot open raw VNC TCP sockets.
