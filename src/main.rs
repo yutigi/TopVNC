@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use topvnc::{Encoding, Framebuffer, Session};
 
+#[cfg(windows)]
+mod windows_server;
+
 mod settings;
 mod ui;
 use ui::{Box2, Canvas, Compression, Config, Field, Quality, UiState, WindowMode};
@@ -475,11 +478,18 @@ fn translated_key_event(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--serve")
+    {
+        return run_server(&arguments[1..]);
+    }
     let mut config = Config::default();
     settings::load(&mut config);
     let mut input_debug = false;
     let mut address = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = arguments.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--allow-insecure" => config.allow_insecure = true,
@@ -518,6 +528,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("Session ended: {error}");
         }
     }
+}
+
+#[cfg(windows)]
+fn run_server(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    windows_server::run(arguments)
+}
+
+#[cfg(not(windows))]
+fn run_server(_arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    Err(
+        "the desktop capture and input server backend is currently available on Windows only"
+            .into(),
+    )
 }
 
 fn show_landing(
