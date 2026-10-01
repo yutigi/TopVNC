@@ -8,7 +8,7 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 
 *TopVNC running on Windows, with connection and display settings in one window.*
 
-**Early development:** the native client has been compiled and tested on Windows and connected to a live macOS VNC server. The Windows server mode compiles and links, and its platform-neutral logic is tested, but live desktop capture and input injection have not yet been verified on Windows (an earlier attempt outside an interactive desktop was denied with `0x80070005`). The macOS server mode builds and its platform-neutral logic is tested on macOS, but live capture and input injection have not yet been validated. Full remote control and macOS unlocking remain under live validation. macOS and Linux client builds are untested; Linux hosting is not implemented. Performance goals have not yet been established by end-to-end benchmarks.
+**Early development:** the native client has been compiled and tested on Windows, where it connected to a live macOS VNC server, and on macOS, where it connected to a live server over the local network. The Windows server mode compiles and links, and its platform-neutral logic is tested, but live desktop capture and input injection have not yet been verified on Windows (an earlier attempt outside an interactive desktop was denied with `0x80070005`). The macOS server mode builds and its platform-neutral logic is tested on macOS, but live capture and input injection have not yet been validated. Full remote control and macOS unlocking remain under live validation. The Linux client build is untested; Linux hosting is not implemented. Performance goals have not yet been established by end-to-end benchmarks.
 
 [Quick start](#quick-start) · [Controls](#controls-and-display-settings) · [Security](#security-and-saved-settings) · [Development](#development) · [Roadmap](#roadmap)
 
@@ -26,7 +26,7 @@ The protocol implementation handles RFB 3.3, 3.7, and 3.8. Apple's `RFB 003.889`
 
 ## Quick start
 
-You need a stable Rust toolchain with Cargo and native build tools for your platform. Windows is the currently tested client platform. To connect, you also need a reachable VNC server configured for standard VNC password authentication.
+You need a stable Rust toolchain with Cargo and native build tools for your platform. Windows and macOS are the currently tested client platforms. To connect, you also need a reachable VNC server configured for standard VNC password authentication.
 
 ```sh
 git clone https://github.com/yutigi/TopVNC.git
@@ -112,7 +112,7 @@ The last successfully connected address and port are restored on the next launch
 | --- | --- | --- |
 | Windows | Protected with the current user's DPAPI key. | Client compiled and tested. |
 | Linux | Stored through Secret Service using `secret-tool`, when available. | Client untested. |
-| macOS | Password is not saved; only the address and port are retained. | Client untested. |
+| macOS | Password is not saved; only the address and port are retained. | Client compiled and tested. |
 
 ## Troubleshooting
 
