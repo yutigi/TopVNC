@@ -1,16 +1,26 @@
 use minifb::{InputCallback, Key, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use topvnc::{Encoding, Framebuffer, Session};
 
+// Each host backend uses part of the shared logic; tests cover all of it.
+#[allow(dead_code)]
+mod desktop_host;
+#[cfg(target_os = "macos")]
+mod macos_server;
 #[cfg(windows)]
 mod windows_server;
 
 mod settings;
 mod ui;
-use ui::{Box2, Canvas, Compression, Config, Field, Quality, UiState, WindowMode};
+use desktop_host::{HostPermissions, ServeOptions, ServerNotice};
+use ui::{
+    Box2, Canvas, Compression, Config, Field, Quality, ServeRequest, ServerPhase, ServerView, Tab,
+    UiState, WindowMode,
+};
 
 impl From<Compression> for Encoding {
     fn from(value: Compression) -> Self {
@@ -515,8 +525,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut connection_error = None;
+    // Lives across viewer sessions; dropping it stops the server.
+    let mut server = HostedServer::default();
     loop {
-        let Some((next_config, session)) = show_landing(config, connection_error.take())? else {
+        let Some((next_config, session)) =
+            show_landing(config, connection_error.take(), &mut server)?
+        else {
             return Ok(());
         };
         config = next_config;
@@ -530,25 +544,228 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+#[cfg(not(any(windows, target_os = "macos")))]
+const SERVER_UNAVAILABLE: &str =
+    "the desktop capture and input server backend is available on Windows and macOS only";
+
 #[cfg(windows)]
 fn run_server(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     windows_server::run(arguments)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn run_server(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    macos_server::run(arguments)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn run_server(_arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    Err(
-        "the desktop capture and input server backend is currently available on Windows only"
-            .into(),
-    )
+    Err(SERVER_UNAVAILABLE.into())
+}
+
+#[cfg(windows)]
+fn serve_desktop(
+    options: ServeOptions,
+    password: Option<String>,
+    shutdown: &AtomicBool,
+    report: &(dyn Fn(ServerNotice) + Sync),
+) -> Result<(), String> {
+    windows_server::serve(options, password, shutdown, report).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn serve_desktop(
+    options: ServeOptions,
+    password: Option<String>,
+    shutdown: &AtomicBool,
+    report: &(dyn Fn(ServerNotice) + Sync),
+) -> Result<(), String> {
+    macos_server::serve(options, password, shutdown, report).map_err(|error| error.to_string())
+}
+
+/// Permission state the Server tab shows while stopped, on hosts that need it.
+#[cfg(target_os = "macos")]
+fn host_permissions() -> Option<HostPermissions> {
+    Some(macos_server::permissions())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_permissions() -> Option<HostPermissions> {
+    None
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn serve_desktop(
+    _options: ServeOptions,
+    _password: Option<String>,
+    _shutdown: &AtomicBool,
+    _report: &(dyn Fn(ServerNotice) + Sync),
+) -> Result<(), String> {
+    Err(SERVER_UNAVAILABLE.into())
+}
+
+enum HostEvent {
+    Notice(ServerNotice),
+    Stopped(Result<(), String>),
+}
+
+/// The desktop server started from the Server tab. It runs on a background
+/// thread so the UI and viewer sessions stay responsive.
+#[derive(Default)]
+struct HostedServer {
+    view: ServerView,
+    running: Option<(
+        Arc<AtomicBool>,
+        mpsc::Receiver<HostEvent>,
+        thread::JoinHandle<()>,
+    )>,
+    authenticated: bool,
+}
+
+impl HostedServer {
+    fn start(&mut self, request: ServeRequest) {
+        if self.running.is_some() {
+            return;
+        }
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (events, receiver) = mpsc::channel();
+        let options = ServeOptions {
+            address: request.address,
+            display: request.display,
+            allow_insecure: request.allow_insecure,
+        };
+        self.authenticated = request.password.is_some();
+        let password = request.password;
+        let thread_shutdown = Arc::clone(&shutdown);
+        let spawned = thread::Builder::new()
+            .name("topvnc-server".into())
+            .spawn(move || {
+                // `mpsc::Sender` is not `Sync`; the capture and input threads
+                // share this one through the lock.
+                let notices = Mutex::new(events.clone());
+                let report = |notice: ServerNotice| {
+                    if let Ok(notices) = notices.lock() {
+                        let _ = notices.send(HostEvent::Notice(notice));
+                    }
+                };
+                let result = serve_desktop(options, password, &thread_shutdown, &report);
+                let _ = events.send(HostEvent::Stopped(result));
+            });
+        match spawned {
+            Ok(thread) => {
+                self.view = ServerView {
+                    phase: ServerPhase::Starting,
+                    message: None,
+                    permissions: self.view.permissions,
+                };
+                self.running = Some((shutdown, receiver, thread));
+            }
+            Err(error) => {
+                self.view.message = Some(format!("Could not start the server: {error}"));
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some((shutdown, ..)) = &self.running {
+            shutdown.store(true, Ordering::Release);
+            self.view.phase = ServerPhase::Stopping;
+        }
+    }
+
+    /// Apply status from the server thread. Returns the error that ended it.
+    fn poll(&mut self) -> Option<String> {
+        let (_, receiver, _) = self.running.as_ref()?;
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        let mut failure = None;
+        let mut stopped = false;
+        for event in events {
+            match event {
+                HostEvent::Notice(notice) => {
+                    eprintln!("Server: {notice}");
+                    self.apply(notice);
+                }
+                HostEvent::Stopped(result) => {
+                    stopped = true;
+                    if let Err(error) = result {
+                        eprintln!("Server stopped: {error}");
+                        failure = Some(error);
+                    }
+                }
+            }
+        }
+        if stopped {
+            if let Some((_, _, thread)) = self.running.take() {
+                let _ = thread.join();
+            }
+            self.view = ServerView {
+                phase: ServerPhase::Stopped,
+                message: failure.is_none().then(|| "Server stopped.".into()),
+                permissions: self.view.permissions,
+            };
+        }
+        failure
+    }
+
+    fn apply(&mut self, notice: ServerNotice) {
+        match (notice, &mut self.view.phase) {
+            (
+                ServerNotice::Serving {
+                    address,
+                    width,
+                    height,
+                    ..
+                },
+                ServerPhase::Starting,
+            ) => {
+                self.view.phase = ServerPhase::Serving {
+                    address: address.to_string(),
+                    width,
+                    height,
+                    connections: 0,
+                    authenticated: self.authenticated,
+                    view_only: false,
+                };
+            }
+            (
+                ServerNotice::Resized { width, height },
+                ServerPhase::Serving {
+                    width: served_width,
+                    height: served_height,
+                    ..
+                },
+            ) => {
+                (*served_width, *served_height) = (width, height);
+            }
+            (ServerNotice::Connections(count), ServerPhase::Serving { connections, .. }) => {
+                *connections = count;
+            }
+            (ServerNotice::ViewOnly(state), ServerPhase::Serving { view_only, .. }) => {
+                *view_only = state;
+            }
+            (ServerNotice::Message(message), _) => self.view.message = Some(message),
+            _ => {}
+        }
+    }
+}
+
+impl Drop for HostedServer {
+    fn drop(&mut self) {
+        // Joining lets the server release every remotely held key and button.
+        if let Some((shutdown, _, thread)) = self.running.take() {
+            shutdown.store(true, Ordering::Release);
+            let _ = thread.join();
+        }
+    }
 }
 
 fn show_landing(
     mut config: Config,
     error: Option<String>,
+    server: &mut HostedServer,
 ) -> Result<Option<(Config, Session)>, Box<dyn Error>> {
     let mut window = Window::new(
-        "TopVNC — Connect",
+        "TopVNC",
         800,
         640,
         WindowOptions {
@@ -564,12 +781,25 @@ fn show_landing(
     window.set_input_callback(Box::new(KeyEvents(input_tx)));
     let (result_tx, result_rx) = mpsc::channel::<Result<Session, String>>();
     let mut connecting = false;
+    let mut permissions_checked: Option<std::time::Instant> = None;
     while window.is_open() {
+        // Permissions can change in System Settings while the window is open.
+        if server.view.phase == ServerPhase::Stopped
+            && permissions_checked.is_none_or(|checked| checked.elapsed().as_secs() >= 1)
+        {
+            server.view.permissions = host_permissions();
+            permissions_checked = Some(std::time::Instant::now());
+        }
+        if let Some(error) = server.poll() {
+            state.switch_tab(Tab::Server);
+            state.error = Some(error);
+        }
         ui::landing(
             &mut Canvas::new(&mut pixels, 800, 640),
             &config,
             &state,
             connecting,
+            &server.view,
         );
         window.update_with_buffer(&pixels, 800, 640)?;
         if let Ok(result) = result_rx.try_recv() {
@@ -585,12 +815,19 @@ fn show_landing(
             }
         }
         let mut connect_clicked = false;
+        let mut server_clicked = false;
         for event in input_rx.try_iter() {
             match event {
                 InputEvent::Character(character) if !connecting => {
                     state.character(&mut config, character)
                 }
-                InputEvent::Key(Key::Enter, true) if !connecting => connect_clicked = true,
+                InputEvent::Key(Key::Enter, true) if !connecting => match state.tab {
+                    Tab::Connect => connect_clicked = true,
+                    // Enter only starts the server; stopping takes a click.
+                    Tab::Server => {
+                        server_clicked = server.view.phase == ServerPhase::Stopped;
+                    }
+                },
                 InputEvent::Key(Key::Escape, true) => return Ok(None),
                 InputEvent::Key(key, true) if !connecting => {
                     state.key(&mut config, key);
@@ -601,8 +838,40 @@ fn show_landing(
         let (mx, my) = window
             .get_unscaled_mouse_pos(MouseMode::Clamp)
             .unwrap_or((-1.0, -1.0));
-        if state.click(window.get_mouse_down(MouseButton::Left)) && !connecting {
-            let (x, y) = (mx as usize, my as usize);
+        let click = state.click(window.get_mouse_down(MouseButton::Left)) && !connecting;
+        let (x, y) = (mx as usize, my as usize);
+        if click && ui::TAB_CONNECT.contains(x, y) {
+            state.switch_tab(Tab::Connect);
+        } else if click && ui::TAB_SERVER.contains(x, y) {
+            state.switch_tab(Tab::Server);
+        } else if click && state.tab == Tab::Server {
+            // The form describes the next start, so it is locked while serving.
+            let editable = server.view.phase == ServerPhase::Stopped;
+            state.focus = None;
+            for (area, field) in [
+                (ui::HOST, Field::ServeHost),
+                (ui::PORT, Field::ServePort),
+                (ui::PASSWORD, Field::ServePassword),
+                (ui::SERVE_DISPLAY, Field::ServeDisplay),
+            ] {
+                if editable && area.contains(x, y) {
+                    state.focus = Some(field);
+                }
+            }
+            let serve = &mut config.serve;
+            if editable && ui::INSECURE.contains(x, y) {
+                serve.allow_insecure = !serve.allow_insecure;
+            }
+            if editable && ui::LOCAL_ONLY.contains(x, y) {
+                serve.host = ui::LOCAL_ONLY_HOST.into();
+            }
+            if editable && ui::ALL_NETWORKS.contains(x, y) {
+                serve.host = ui::ALL_NETWORKS_HOST.into();
+            }
+            if ui::CONNECT.contains(x, y) {
+                server_clicked = true;
+            }
+        } else if click {
             state.focus = None;
             for (area, field) in [
                 (ui::HOST, Field::Host),
@@ -649,6 +918,20 @@ fn show_landing(
             }
             if ui::CONNECT.contains(x, y) {
                 connect_clicked = true;
+            }
+        }
+        if server_clicked {
+            match server.view.phase {
+                ServerPhase::Stopped => match config.serve.request() {
+                    Ok(request) => {
+                        state.error = None;
+                        state.focus = None;
+                        server.start(request);
+                    }
+                    Err(error) => state.error = Some(error),
+                },
+                ServerPhase::Serving { .. } => server.stop(),
+                ServerPhase::Starting | ServerPhase::Stopping => {}
             }
         }
         if connect_clicked && !connecting {
@@ -1138,6 +1421,78 @@ mod tests {
         assert_eq!(&scaled.pixels[..4], &[0; 4]);
         assert_eq!(&scaled.pixels[12..], &[0; 4]);
         assert_eq!(&scaled.pixels[4..8], &[0xffffff; 4]);
+    }
+
+    #[test]
+    fn hosted_server_status_follows_notices_in_order() {
+        let mut server = HostedServer::default();
+        let address = "0.0.0.0:5900".parse().unwrap();
+        let serving = |width, height| ServerNotice::Serving {
+            address,
+            display: "DISPLAY1".into(),
+            width,
+            height,
+        };
+        // Notices for a server that is not starting are ignored.
+        server.apply(serving(1920, 1080));
+        assert_eq!(server.view.phase, ServerPhase::Stopped);
+        server.view.phase = ServerPhase::Starting;
+        server.authenticated = true;
+        server.apply(serving(1920, 1080));
+        server.apply(ServerNotice::Connections(2));
+        server.apply(ServerNotice::Resized {
+            width: 1280,
+            height: 720,
+        });
+        server.apply(ServerNotice::ViewOnly(true));
+        server.apply(ServerNotice::Message("Desktop capture resumed.".into()));
+        assert_eq!(
+            server.view.phase,
+            ServerPhase::Serving {
+                address: "0.0.0.0:5900".into(),
+                width: 1280,
+                height: 720,
+                connections: 2,
+                authenticated: true,
+                view_only: true,
+            }
+        );
+        assert_eq!(
+            server.view.message.as_deref(),
+            Some("Desktop capture resumed.")
+        );
+        server.apply(ServerNotice::ViewOnly(false));
+        assert!(matches!(
+            server.view.phase,
+            ServerPhase::Serving {
+                view_only: false,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn hosted_server_reports_unsupported_platforms_and_stops() {
+        let mut server = HostedServer::default();
+        server.start(ServeRequest {
+            address: "127.0.0.1:0".into(),
+            display: None,
+            password: Some("secret".into()),
+            allow_insecure: false,
+        });
+        assert_eq!(server.view.phase, ServerPhase::Starting);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let error = loop {
+            if let Some(error) = server.poll() {
+                break error;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        };
+        assert_eq!(error, SERVER_UNAVAILABLE);
+        assert_eq!(server.view.phase, ServerPhase::Stopped);
+        assert!(server.running.is_none());
     }
 
     #[test]

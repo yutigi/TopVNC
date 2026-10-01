@@ -7,6 +7,8 @@ use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use flate2::{Decompress, FlushDecompress};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,6 +18,13 @@ const MAX_NAME_BYTES: usize = 4096;
 const MAX_CLIENT_CLIPBOARD_BYTES: usize = 1_048_576;
 const SERVER_TILE_SIZE: usize = 64;
 const SERVER_EVENT_QUEUE_CAPACITY: usize = 64;
+const SERVER_SESSION_QUEUE_CAPACITY: usize = 64;
+/// How long an incremental request without changes waits before it is
+/// answered with an empty update. A change answers it immediately.
+const SERVER_EMPTY_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
+const SERVER_IDLE_WAKE_INTERVAL: Duration = Duration::from_secs(1);
+const SERVER_WRITE_CHUNK_BYTES: usize = 64 * 1024;
+const DESKTOP_SIZE_ENCODING: i32 = -223;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -168,6 +177,15 @@ pub enum ClientEvent {
     ClientDisconnected { client_id: u64 },
 }
 
+/// A framebuffer region the host changed, in framebuffer pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
 /// Configuration for the embedded RFB server. Password authentication is the
 /// default; `None` security must be selected explicitly.
 #[derive(Clone)]
@@ -188,7 +206,8 @@ impl Default for ServerConfig {
 }
 
 /// A small RFB 3.8 server for applications that provide a framebuffer and
-/// consume remote input events. It serves Raw rectangles to concurrent clients.
+/// consume remote input events. It serves Raw rectangles to concurrent clients
+/// and announces size changes with the DesktopSize pseudo-encoding.
 /// The caller owns display capture and OS input injection.
 pub struct VncServer {
     listener: std::net::TcpListener,
@@ -209,13 +228,54 @@ struct ServerClipboard {
     text: Option<Vec<u8>>,
 }
 
+/// Messages delivered to one client's update writer.
+enum SessionInput {
+    PixelFormat(ServerPixelFormat),
+    Encodings {
+        desktop_size: bool,
+    },
+    UpdateRequest(UpdateRequest),
+    /// The framebuffer or clipboard changed.
+    Wake,
+    /// The client's reader stopped; the session ends with this error.
+    Closed(io::Error),
+}
+
+/// Wakes an idle update writer. At most one wake is queued at a time so a
+/// fast-changing framebuffer cannot fill the session queue.
+struct SessionWaker {
+    sender: SyncSender<SessionInput>,
+    queued: Arc<AtomicBool>,
+}
+
+impl SessionWaker {
+    fn wake(&self) {
+        if !self.queued.swap(true, Ordering::AcqRel)
+            && self.sender.try_send(SessionInput::Wake).is_err()
+        {
+            self.queued.store(false, Ordering::Release);
+        }
+    }
+}
+
 #[derive(Default)]
 struct ServerSessions {
     streams: std::collections::HashMap<u64, TcpStream>,
+    wakers: std::collections::HashMap<u64, SessionWaker>,
     exclusive_client: Option<u64>,
 }
 
 impl ServerSessions {
+    fn watch(&mut self, client_id: u64, waker: SessionWaker) {
+        self.wakers.insert(client_id, waker);
+    }
+
+    fn wake_all(&self) {
+        for waker in self.wakers.values() {
+            waker.wake();
+        }
+    }
+
     fn register(&mut self, client_id: u64, stream: TcpStream) -> io::Result<()> {
         if self.exclusive_client.is_some() {
             return Err(io::Error::new(
@@ -262,6 +322,7 @@ impl ServerSessions {
 
     fn remove(&mut self, client_id: u64) {
         self.streams.remove(&client_id);
+        self.wakers.remove(&client_id);
         if self.exclusive_client == Some(client_id) {
             self.exclusive_client = None;
         }
@@ -279,6 +340,8 @@ struct ServerFramebuffer {
     tile_revisions: Vec<u64>,
     revision: u64,
     tile_columns: usize,
+    /// Incremented whenever the framebuffer dimensions change.
+    generation: u64,
 }
 
 impl ServerFramebuffer {
@@ -290,6 +353,41 @@ impl ServerFramebuffer {
             tile_revisions: vec![0; tile_columns * tile_rows],
             revision: 0,
             tile_columns,
+            generation: 0,
+        }
+    }
+
+    fn resize(&mut self, framebuffer: Framebuffer) {
+        let generation = self.generation.wrapping_add(1);
+        *self = Self::new(framebuffer);
+        self.generation = generation;
+    }
+
+    fn next_revision(&mut self) -> u64 {
+        if self.revision == u64::MAX {
+            self.revision = 0;
+            self.tile_revisions.fill(0);
+        }
+        self.revision += 1;
+        self.revision
+    }
+
+    /// Copy one tile from `source` and bump its revision if any pixel changed.
+    fn sync_tile(&mut self, index: usize, source: &Framebuffer) {
+        let (x, y, width, height) = self.tile_rect(index);
+        let stride = self.framebuffer.width();
+        let mut changed = false;
+        for row in y..y + height {
+            let start = row * stride + x;
+            let end = start + width;
+            if self.framebuffer.pixels[start..end] != source.pixels[start..end] {
+                self.framebuffer.pixels[start..end].copy_from_slice(&source.pixels[start..end]);
+                changed = true;
+            }
+        }
+        if changed {
+            let revision = self.next_revision();
+            self.tile_revisions[index] = revision;
         }
     }
 
@@ -348,6 +446,12 @@ impl VncServer {
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
     }
+
+    /// Open client connections, including ones still authenticating.
+    pub fn active_connections(&self) -> usize {
+        self.active_clients
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
     pub fn try_event(&self) -> Result<ClientEvent, std::sync::mpsc::TryRecvError> {
         match self.event_receiver.lock() {
             Ok(receiver) => receiver.try_recv(),
@@ -365,10 +469,32 @@ impl VncServer {
         }
     }
 
-    /// Replace the current desktop image. Framebuffer dimensions cannot change
-    /// during a session; use a new server when the desktop size changes.
+    /// Replace the current desktop image. When the dimensions change, clients
+    /// that advertised the DesktopSize pseudo-encoding receive the new size;
+    /// other clients are disconnected because they cannot follow the change.
     pub fn update_framebuffer(&self, framebuffer: &Framebuffer) -> io::Result<()> {
-        update_server_framebuffer(&self.framebuffer, framebuffer)
+        update_server_framebuffer(&self.framebuffer, framebuffer)?;
+        self.wake_sessions();
+        Ok(())
+    }
+
+    /// Like [`VncServer::update_framebuffer`], but only compares the damaged
+    /// regions; pixels outside them must be unchanged since the last update.
+    /// A dimension change replaces the whole framebuffer regardless of damage.
+    pub fn update_framebuffer_regions(
+        &self,
+        framebuffer: &Framebuffer,
+        damage: &[DamageRect],
+    ) -> io::Result<()> {
+        update_server_framebuffer_regions(&self.framebuffer, framebuffer, damage)?;
+        self.wake_sessions();
+        Ok(())
+    }
+
+    fn wake_sessions(&self) {
+        if let Ok(sessions) = self.sessions.lock() {
+            sessions.wake_all();
+        }
     }
 
     /// Send Latin-1 clipboard text to connected clients promptly, including idle clients.
@@ -386,6 +512,8 @@ impl VncServer {
             clipboard.revision = 1;
         }
         clipboard.text = Some(text.to_vec());
+        drop(clipboard);
+        self.wake_sessions();
         Ok(())
     }
 
@@ -496,34 +624,56 @@ fn update_server_framebuffer(
     shared: &Arc<Mutex<ServerFramebuffer>>,
     framebuffer: &Framebuffer,
 ) -> io::Result<()> {
+    update_server_framebuffer_regions(
+        shared,
+        framebuffer,
+        &[DamageRect {
+            x: 0,
+            y: 0,
+            width: framebuffer.width,
+            height: framebuffer.height,
+        }],
+    )
+}
+
+fn update_server_framebuffer_regions(
+    shared: &Arc<Mutex<ServerFramebuffer>>,
+    framebuffer: &Framebuffer,
+    damage: &[DamageRect],
+) -> io::Result<()> {
     let mut current = shared
         .lock()
         .map_err(|_| invalid("framebuffer lock is poisoned"))?;
     if current.framebuffer.width != framebuffer.width
         || current.framebuffer.height != framebuffer.height
     {
-        return Err(invalid("server framebuffer dimensions cannot change"));
+        current.resize(framebuffer.clone());
+        return Ok(());
     }
-    for index in 0..current.tile_revisions.len() {
-        let (x, y, width, height) = current.tile_rect(index);
-        let changed = (y..y + height).any(|row| {
-            let start = row * current.framebuffer.width() + x;
-            let end = start + width;
-            current.framebuffer.pixels[start..end] != framebuffer.pixels[start..end]
-        });
-        if changed {
-            if current.revision == u64::MAX {
-                current.revision = 0;
-                current.tile_revisions.fill(0);
+    if damage.iter().any(|rect| {
+        usize::from(rect.x) + usize::from(rect.width) > framebuffer.width()
+            || usize::from(rect.y) + usize::from(rect.height) > framebuffer.height()
+    }) {
+        return Err(invalid("damage rectangle is outside framebuffer"));
+    }
+    let mut visited = vec![false; current.tile_revisions.len()];
+    for rect in damage {
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+        let column_start = usize::from(rect.x) / SERVER_TILE_SIZE;
+        let column_end = (usize::from(rect.x) + usize::from(rect.width) - 1) / SERVER_TILE_SIZE;
+        let row_start = usize::from(rect.y) / SERVER_TILE_SIZE;
+        let row_end = (usize::from(rect.y) + usize::from(rect.height) - 1) / SERVER_TILE_SIZE;
+        for tile_row in row_start..=row_end {
+            for tile_column in column_start..=column_end {
+                let index = tile_row * current.tile_columns + tile_column;
+                if !std::mem::replace(&mut visited[index], true) {
+                    current.sync_tile(index, framebuffer);
+                }
             }
-            current.revision += 1;
-            current.tile_revisions[index] = current.revision;
         }
     }
-    current
-        .framebuffer
-        .pixels
-        .copy_from_slice(&framebuffer.pixels);
     Ok(())
 }
 
@@ -550,36 +700,10 @@ fn send_pending_clipboard(
     Ok(())
 }
 
-fn wait_for_client_message(stream: &mut TcpStream) -> io::Result<bool> {
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-    let mut byte = [0];
-    match stream.peek(&mut byte) {
-        Ok(0) => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "client disconnected",
-        )),
-        Ok(_) => {
-            // Once a message begins, allow time for the remaining bytes while
-            // keeping idle sessions alive and responsive to server clipboard changes.
-            stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-            Ok(true)
-        }
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 fn serve_client(
     stream: &mut TcpStream,
     framebuffer: &Arc<Mutex<ServerFramebuffer>>,
-    events: &std::sync::mpsc::SyncSender<ClientEvent>,
+    events: &SyncSender<ClientEvent>,
     config: &ServerConfig,
     sessions: &Arc<Mutex<ServerSessions>>,
     clipboard: &Arc<Mutex<ServerClipboard>>,
@@ -632,125 +756,302 @@ fn serve_client(
         .admit(client_id, shared[0] != 0)?;
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
-    let fb = framebuffer
-        .lock()
-        .map_err(|_| invalid("framebuffer lock is poisoned"))?;
-    stream.write_all(&fb.framebuffer.width.to_be_bytes())?;
-    stream.write_all(&fb.framebuffer.height.to_be_bytes())?;
-    stream.write_all(&[32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0])?;
     let name = config.name.as_bytes();
     if name.len() > MAX_NAME_BYTES {
         return Err(invalid("server name is too long"));
     }
-    stream.write_all(&(name.len() as u32).to_be_bytes())?;
-    stream.write_all(name)?;
-    drop(fb);
-    let tile_count = {
+    let (generation, tile_count) = {
         let fb = framebuffer
             .lock()
             .map_err(|_| invalid("framebuffer lock is poisoned"))?;
-        fb.tile_revisions.len()
+        stream.write_all(&fb.framebuffer.width.to_be_bytes())?;
+        stream.write_all(&fb.framebuffer.height.to_be_bytes())?;
+        (fb.generation, fb.tile_revisions.len())
     };
-    let mut seen_revisions = vec![u64::MAX; tile_count];
-    let mut format = [0; 19];
-    let mut pixel_format = ServerPixelFormat::DEFAULT;
-    let mut row_bytes = Vec::new();
-    let mut clipboard_revision = 0;
-    loop {
-        send_pending_clipboard(stream, clipboard, &mut clipboard_revision)?;
-        if !wait_for_client_message(stream)? {
-            continue;
-        }
-        let mut kind = [0];
-        stream.read_exact(&mut kind)?;
-        match kind[0] {
-            0 => {
-                stream.read_exact(&mut format)?;
-                pixel_format = ServerPixelFormat::parse(&format)?;
-            }
-            2 => {
-                let mut header = [0; 3];
-                stream.read_exact(&mut header)?;
-                validate_zero_padding(&header[..1], "invalid SetEncodings padding")?;
-                let count = usize::from(u16::from_be_bytes([header[1], header[2]]));
-                if count > 65_536 / 4 {
-                    return Err(invalid("encoding list too large"));
-                }
-                let mut discard = vec![0; count * 4];
-                stream.read_exact(&mut discard)?;
-            }
-            3 => {
-                let mut req = [0; 9];
-                stream.read_exact(&mut req)?;
-                let request = parse_update_request(req)?;
-                send_framebuffer_update(
-                    stream,
-                    framebuffer,
-                    &mut seen_revisions,
-                    &mut row_bytes,
-                    pixel_format,
-                    request,
-                )?;
-            }
-            4 => {
-                let mut data = [0; 7];
-                stream.read_exact(&mut data)?;
-                if data[0] > 1 {
-                    return Err(invalid("invalid key event state"));
-                }
-                validate_zero_padding(&data[1..3], "invalid KeyEvent padding")?;
-                events
-                    .send(ClientEvent::Key {
+    stream.write_all(&[32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0])?;
+    stream.write_all(&(name.len() as u32).to_be_bytes())?;
+    stream.write_all(name)?;
+
+    // Client messages are read on their own thread so that key and pointer
+    // events reach the host immediately, even while this thread is writing a
+    // large framebuffer update.
+    let (session_sender, session_receiver) =
+        std::sync::mpsc::sync_channel(SERVER_SESSION_QUEUE_CAPACITY);
+    let wake_queued = Arc::new(AtomicBool::new(false));
+    sessions
+        .lock()
+        .map_err(|_| invalid("session registry lock is poisoned"))?
+        .watch(
+            client_id,
+            SessionWaker {
+                sender: session_sender.clone(),
+                queued: Arc::clone(&wake_queued),
+            },
+        );
+    let resized = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let mut stream = stream.try_clone()?;
+        let framebuffer = Arc::clone(framebuffer);
+        let events = events.clone();
+        let resized = Arc::clone(&resized);
+        std::thread::Builder::new()
+            .name("topvnc-rfb-reader".into())
+            .spawn(move || {
+                let error = loop {
+                    if let Err(error) = read_client_message(
+                        &mut stream,
+                        &session_sender,
+                        &events,
+                        &framebuffer,
+                        &resized,
                         client_id,
-                        keysym: u32::from_be_bytes(data[3..7].try_into().unwrap()),
-                        down: data[0] != 0,
-                    })
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "input receiver closed")
-                    })?;
+                    ) {
+                        break error;
+                    }
+                };
+                let _ = session_sender.send(SessionInput::Closed(error));
+            })?
+    };
+    let result = write_client_updates(
+        stream,
+        framebuffer,
+        clipboard,
+        &session_receiver,
+        &wake_queued,
+        &resized,
+        generation,
+        tile_count,
+    );
+    // Unblock the reader, then wait for it so every input event from this
+    // client is queued before the caller reports the disconnect.
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    drop(session_receiver);
+    let _ = reader.join();
+    result
+}
+
+fn read_client_message(
+    stream: &mut TcpStream,
+    session: &SyncSender<SessionInput>,
+    events: &SyncSender<ClientEvent>,
+    framebuffer: &Arc<Mutex<ServerFramebuffer>>,
+    resized: &AtomicBool,
+    client_id: u64,
+) -> io::Result<()> {
+    let session_closed = || io::Error::new(io::ErrorKind::BrokenPipe, "session writer closed");
+    let input_closed = || io::Error::new(io::ErrorKind::BrokenPipe, "input receiver closed");
+    let mut kind = [0];
+    stream.read_exact(&mut kind)?;
+    match kind[0] {
+        0 => {
+            let mut format = [0; 19];
+            stream.read_exact(&mut format)?;
+            session
+                .send(SessionInput::PixelFormat(ServerPixelFormat::parse(
+                    &format,
+                )?))
+                .map_err(|_| session_closed())?;
+        }
+        2 => {
+            let mut header = [0; 3];
+            stream.read_exact(&mut header)?;
+            validate_zero_padding(&header[..1], "invalid SetEncodings padding")?;
+            let count = usize::from(u16::from_be_bytes([header[1], header[2]]));
+            if count > 65_536 / 4 {
+                return Err(invalid("encoding list too large"));
             }
-            5 => {
-                let mut data = [0; 5];
-                stream.read_exact(&mut data)?;
-                let x = u16::from_be_bytes([data[1], data[2]]);
-                let y = u16::from_be_bytes([data[3], data[4]]);
+            let mut encodings = vec![0; count * 4];
+            stream.read_exact(&mut encodings)?;
+            let desktop_size = encodings.chunks_exact(4).any(|encoding| {
+                i32::from_be_bytes(encoding.try_into().unwrap()) == DESKTOP_SIZE_ENCODING
+            });
+            session
+                .send(SessionInput::Encodings { desktop_size })
+                .map_err(|_| session_closed())?;
+        }
+        3 => {
+            let mut request = [0; 9];
+            stream.read_exact(&mut request)?;
+            session
+                .send(SessionInput::UpdateRequest(parse_update_request(request)?))
+                .map_err(|_| session_closed())?;
+        }
+        4 => {
+            let mut data = [0; 7];
+            stream.read_exact(&mut data)?;
+            if data[0] > 1 {
+                return Err(invalid("invalid key event state"));
+            }
+            validate_zero_padding(&data[1..3], "invalid KeyEvent padding")?;
+            events
+                .send(ClientEvent::Key {
+                    client_id,
+                    keysym: u32::from_be_bytes(data[3..7].try_into().unwrap()),
+                    down: data[0] != 0,
+                })
+                .map_err(|_| input_closed())?;
+        }
+        5 => {
+            let mut data = [0; 5];
+            stream.read_exact(&mut data)?;
+            let x = u16::from_be_bytes([data[1], data[2]]);
+            let y = u16::from_be_bytes([data[3], data[4]]);
+            let in_bounds = {
                 let fb = framebuffer
                     .lock()
                     .map_err(|_| invalid("framebuffer lock is poisoned"))?;
-                if x >= fb.framebuffer.width || y >= fb.framebuffer.height {
-                    return Err(invalid("pointer outside framebuffer"));
+                x < fb.framebuffer.width && y < fb.framebuffer.height
+            };
+            if !in_bounds {
+                // After a resize, pointer events sent for the old size may
+                // still be in flight; drop them instead of ending the session.
+                if resized.load(Ordering::Acquire) {
+                    return Ok(());
                 }
-                drop(fb);
-                events
-                    .send(ClientEvent::Pointer {
-                        client_id,
-                        buttons: data[0],
-                        x,
-                        y,
-                    })
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "input receiver closed")
-                    })?;
+                return Err(invalid("pointer outside framebuffer"));
             }
-            6 => {
-                let mut header = [0; 7];
-                stream.read_exact(&mut header)?;
-                validate_zero_padding(&header[..3], "invalid ClientCutText padding")?;
-                let len = u32::from_be_bytes(header[3..7].try_into().unwrap()) as usize;
-                if len > MAX_CLIENT_CLIPBOARD_BYTES {
-                    return Err(invalid("client clipboard text too large"));
-                }
-                let mut text = vec![0; len];
-                stream.read_exact(&mut text)?;
-                events
-                    .send(ClientEvent::ClipboardText { client_id, text })
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "input receiver closed")
-                    })?;
+            events
+                .send(ClientEvent::Pointer {
+                    client_id,
+                    buttons: data[0],
+                    x,
+                    y,
+                })
+                .map_err(|_| input_closed())?;
+        }
+        6 => {
+            let mut header = [0; 7];
+            stream.read_exact(&mut header)?;
+            validate_zero_padding(&header[..3], "invalid ClientCutText padding")?;
+            let len = u32::from_be_bytes(header[3..7].try_into().unwrap()) as usize;
+            if len > MAX_CLIENT_CLIPBOARD_BYTES {
+                return Err(invalid("client clipboard text too large"));
             }
-            _ => return Err(invalid("unknown client message")),
+            let mut text = vec![0; len];
+            stream.read_exact(&mut text)?;
+            events
+                .send(ClientEvent::ClipboardText { client_id, text })
+                .map_err(|_| input_closed())?;
+        }
+        _ => return Err(invalid("unknown client message")),
+    }
+    Ok(())
+}
+
+struct PendingRequest {
+    request: UpdateRequest,
+    /// When an unchanged incremental request is answered with an empty update.
+    deadline: Instant,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_client_updates(
+    stream: &mut TcpStream,
+    shared: &Arc<Mutex<ServerFramebuffer>>,
+    clipboard: &Arc<Mutex<ServerClipboard>>,
+    receiver: &std::sync::mpsc::Receiver<SessionInput>,
+    wake_queued: &AtomicBool,
+    resized: &AtomicBool,
+    mut generation: u64,
+    tile_count: usize,
+) -> io::Result<()> {
+    let mut seen_revisions = vec![u64::MAX; tile_count];
+    let mut pixel_format = ServerPixelFormat::DEFAULT;
+    let mut desktop_size = false;
+    let mut output = Vec::new();
+    let mut clipboard_revision = 0;
+    let mut pending: Option<PendingRequest> = None;
+    loop {
+        send_pending_clipboard(stream, clipboard, &mut clipboard_revision)?;
+        let (current_generation, width, height) = {
+            let fb = shared
+                .lock()
+                .map_err(|_| invalid("framebuffer lock is poisoned"))?;
+            (fb.generation, fb.framebuffer.width, fb.framebuffer.height)
+        };
+        if current_generation != generation {
+            if !desktop_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "desktop size changed and the client does not support DesktopSize",
+                ));
+            }
+            resized.store(true, Ordering::Release);
+            // Answer the next request with the new size; the client then
+            // requests pixels for the new framebuffer.
+            if pending.take().is_some() {
+                write_desktop_size(stream, width, height)?;
+                generation = current_generation;
+                let tiles = usize::from(width).div_ceil(SERVER_TILE_SIZE)
+                    * usize::from(height).div_ceil(SERVER_TILE_SIZE);
+                seen_revisions = vec![u64::MAX; tiles];
+                continue;
+            }
+        } else if let Some(waiting) = &pending {
+            let update = prepare_update(
+                shared,
+                &seen_revisions,
+                waiting.request,
+                resized.load(Ordering::Acquire),
+                generation,
+            )?;
+            if let Some(update) = update
+                && (!update.rectangles.is_empty() || Instant::now() >= waiting.deadline)
+            {
+                write_update(
+                    stream,
+                    shared,
+                    &mut seen_revisions,
+                    &mut output,
+                    pixel_format,
+                    update,
+                    generation,
+                )?;
+                pending = None;
+            }
+        }
+        let timeout = match &pending {
+            Some(waiting) if current_generation == generation => waiting
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1)),
+            _ => SERVER_IDLE_WAKE_INTERVAL,
+        };
+        match receiver.recv_timeout(timeout) {
+            Ok(SessionInput::PixelFormat(format)) => pixel_format = format,
+            Ok(SessionInput::Encodings {
+                desktop_size: supported,
+            }) => desktop_size = supported,
+            Ok(SessionInput::UpdateRequest(request)) => {
+                pending = Some(PendingRequest {
+                    request,
+                    deadline: if request.incremental {
+                        Instant::now() + SERVER_EMPTY_UPDATE_INTERVAL
+                    } else {
+                        Instant::now()
+                    },
+                });
+            }
+            Ok(SessionInput::Wake) => wake_queued.store(false, Ordering::Release),
+            Ok(SessionInput::Closed(error)) => return Err(error),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client reader stopped",
+                ));
+            }
         }
     }
+}
+
+fn write_desktop_size(stream: &mut TcpStream, width: u16, height: u16) -> io::Result<()> {
+    let mut message = [0; 16];
+    message[3] = 1;
+    message[8..10].copy_from_slice(&width.to_be_bytes());
+    message[10..12].copy_from_slice(&height.to_be_bytes());
+    message[12..16].copy_from_slice(&DESKTOP_SIZE_ENCODING.to_be_bytes());
+    stream.write_all(&message)
 }
 
 #[derive(Clone, Copy)]
@@ -846,6 +1147,20 @@ impl ServerPixelFormat {
         usize::from(self.bits_per_pixel / 8)
     }
 
+    fn encode_row(self, pixels: &[u32], output: &mut Vec<u8>) {
+        if self == Self::DEFAULT {
+            // The framebuffer already stores 0x00RRGGBB, the default wire layout.
+            output.reserve(pixels.len() * 4);
+            for pixel in pixels {
+                output.extend_from_slice(&pixel.to_le_bytes());
+            }
+        } else {
+            for pixel in pixels {
+                self.encode(*pixel, output);
+            }
+        }
+    }
+
     fn encode(self, rgb: u32, output: &mut Vec<u8>) {
         let red = (rgb >> 16) & 0xff;
         let green = (rgb >> 8) & 0xff;
@@ -895,14 +1210,20 @@ fn validate_zero_padding(bytes: &[u8], message: &'static str) -> io::Result<()> 
     Ok(())
 }
 
-fn send_framebuffer_update(
-    stream: &mut TcpStream,
+struct PreparedUpdate {
+    rectangles: Vec<ServerRect>,
+    acknowledged: Vec<(usize, u64)>,
+}
+
+/// Select the rectangles that answer `request`. Returns `None` when the
+/// framebuffer no longer has the dimensions the client was told about.
+fn prepare_update(
     shared: &Arc<Mutex<ServerFramebuffer>>,
-    seen_revisions: &mut [u64],
-    row_bytes: &mut Vec<u8>,
-    pixel_format: ServerPixelFormat,
+    seen_revisions: &[u64],
     request: UpdateRequest,
-) -> io::Result<()> {
+    clip_to_framebuffer: bool,
+    generation: u64,
+) -> io::Result<Option<PreparedUpdate>> {
     let UpdateRequest {
         incremental,
         x,
@@ -910,104 +1231,127 @@ fn send_framebuffer_update(
         width,
         height,
     } = request;
-    let (rectangles, acknowledged) = {
-        let fb = shared
-            .lock()
-            .map_err(|_| invalid("framebuffer lock is poisoned"))?;
-        if usize::from(x) + usize::from(width) > fb.framebuffer.width()
-            || usize::from(y) + usize::from(height) > fb.framebuffer.height()
-        {
+    let fb = shared
+        .lock()
+        .map_err(|_| invalid("framebuffer lock is poisoned"))?;
+    if fb.generation != generation || seen_revisions.len() != fb.tile_revisions.len() {
+        return Ok(None);
+    }
+    let request_x0 = usize::from(x);
+    let request_y0 = usize::from(y);
+    let mut request_x1 = request_x0 + usize::from(width);
+    let mut request_y1 = request_y0 + usize::from(height);
+    if request_x1 > fb.framebuffer.width() || request_y1 > fb.framebuffer.height() {
+        // Requests sized for a previous framebuffer may still be in flight
+        // after a resize; clip those instead of ending the session.
+        if !clip_to_framebuffer {
             return Err(invalid("client requested pixels outside framebuffer"));
         }
+        request_x1 = request_x1.min(fb.framebuffer.width());
+        request_y1 = request_y1.min(fb.framebuffer.height());
+    }
 
-        let request_x0 = usize::from(x);
-        let request_y0 = usize::from(y);
-        let request_x1 = request_x0 + usize::from(width);
-        let request_y1 = request_y0 + usize::from(height);
-        let mut rectangles = Vec::new();
-        let mut acknowledged = Vec::new();
-        if !incremental && width != 0 && height != 0 {
+    let mut rectangles = Vec::new();
+    let mut acknowledged = Vec::new();
+    if !incremental && request_x0 < request_x1 && request_y0 < request_y1 {
+        rectangles.push(ServerRect {
+            x,
+            y,
+            width: (request_x1 - request_x0) as u16,
+            height: (request_y1 - request_y0) as u16,
+            tile_index: None,
+            revision: 0,
+        });
+    }
+    for (index, seen_revision) in seen_revisions.iter().enumerate() {
+        let revision = fb.tile_revisions[index];
+        let (tile_x, tile_y, tile_width, tile_height) = fb.tile_rect(index);
+        let tile_x1 = tile_x + tile_width;
+        let tile_y1 = tile_y + tile_height;
+        let overlap_x0 = tile_x.max(request_x0);
+        let overlap_y0 = tile_y.max(request_y0);
+        let overlap_x1 = tile_x1.min(request_x1);
+        let overlap_y1 = tile_y1.min(request_y1);
+        if overlap_x0 >= overlap_x1 || overlap_y0 >= overlap_y1 {
+            continue;
+        }
+        let covers_tile = overlap_x0 == tile_x
+            && overlap_y0 == tile_y
+            && overlap_x1 == tile_x1
+            && overlap_y1 == tile_y1;
+        if covers_tile {
+            acknowledged.push((index, revision));
+        }
+        // Keep a partially requested tile pending so a later request for
+        // the rest of that tile also receives the outstanding changes.
+        if incremental && *seen_revision != revision {
             rectangles.push(ServerRect {
-                x,
-                y,
-                width,
-                height,
-                tile_index: None,
-                revision: 0,
+                x: overlap_x0 as u16,
+                y: overlap_y0 as u16,
+                width: (overlap_x1 - overlap_x0) as u16,
+                height: (overlap_y1 - overlap_y0) as u16,
+                tile_index: covers_tile.then_some(index),
+                revision,
             });
         }
-        for (index, seen_revision) in seen_revisions.iter().enumerate() {
-            let revision = fb.tile_revisions[index];
-            let (tile_x, tile_y, tile_width, tile_height) = fb.tile_rect(index);
-            let tile_x1 = tile_x + tile_width;
-            let tile_y1 = tile_y + tile_height;
-            let overlap_x0 = tile_x.max(request_x0);
-            let overlap_y0 = tile_y.max(request_y0);
-            let overlap_x1 = tile_x1.min(request_x1);
-            let overlap_y1 = tile_y1.min(request_y1);
-            if overlap_x0 >= overlap_x1 || overlap_y0 >= overlap_y1 {
-                continue;
-            }
-            let covers_tile = overlap_x0 == tile_x
-                && overlap_y0 == tile_y
-                && overlap_x1 == tile_x1
-                && overlap_y1 == tile_y1;
-            if covers_tile {
-                acknowledged.push((index, revision));
-            }
-            // Keep a partially requested tile pending so a later request for
-            // the rest of that tile also receives the outstanding changes.
-            if incremental && *seen_revision != revision {
-                rectangles.push(ServerRect {
-                    x: overlap_x0 as u16,
-                    y: overlap_y0 as u16,
-                    width: (overlap_x1 - overlap_x0) as u16,
-                    height: (overlap_y1 - overlap_y0) as u16,
-                    tile_index: covers_tile.then_some(index),
-                    revision,
-                });
-            }
-        }
-        if rectangles.len() > usize::from(u16::MAX) {
-            return Err(invalid("too many changed framebuffer rectangles"));
-        }
-        (rectangles, acknowledged)
-    };
-
-    if incremental && rectangles.is_empty() {
-        // Avoid a tight empty-update loop for clients that immediately request
-        // another incremental frame. This also gives the host time to capture.
-        std::thread::sleep(Duration::from_millis(12));
     }
-    stream.write_all(&[0, 0])?;
-    stream.write_all(&(rectangles.len() as u16).to_be_bytes())?;
-    for rect in &rectangles {
-        stream.write_all(&rect.x.to_be_bytes())?;
-        stream.write_all(&rect.y.to_be_bytes())?;
-        stream.write_all(&rect.width.to_be_bytes())?;
-        stream.write_all(&rect.height.to_be_bytes())?;
-        stream.write_all(&0i32.to_be_bytes())?;
-        row_bytes.clear();
-        row_bytes.reserve(usize::from(rect.width).saturating_mul(pixel_format.bytes_per_pixel()));
+    if rectangles.len() > usize::from(u16::MAX) {
+        return Err(invalid("too many changed framebuffer rectangles"));
+    }
+    Ok(Some(PreparedUpdate {
+        rectangles,
+        acknowledged,
+    }))
+}
+
+/// Write a prepared update. The framebuffer lock is taken per row so capture
+/// is never blocked on the network. If the framebuffer is resized while the
+/// update is being written, the remaining rows are sent black; the client
+/// receives the new size in its next update.
+fn write_update(
+    stream: &mut TcpStream,
+    shared: &Arc<Mutex<ServerFramebuffer>>,
+    seen_revisions: &mut [u64],
+    output: &mut Vec<u8>,
+    pixel_format: ServerPixelFormat,
+    update: PreparedUpdate,
+    generation: u64,
+) -> io::Result<()> {
+    output.clear();
+    output.extend_from_slice(&[0, 0]);
+    output.extend_from_slice(&(update.rectangles.len() as u16).to_be_bytes());
+    for rect in &update.rectangles {
+        output.extend_from_slice(&rect.x.to_be_bytes());
+        output.extend_from_slice(&rect.y.to_be_bytes());
+        output.extend_from_slice(&rect.width.to_be_bytes());
+        output.extend_from_slice(&rect.height.to_be_bytes());
+        output.extend_from_slice(&0i32.to_be_bytes());
+        let row_len = usize::from(rect.width) * pixel_format.bytes_per_pixel();
         for row in usize::from(rect.y)..usize::from(rect.y) + usize::from(rect.height) {
             {
                 let fb = shared
                     .lock()
                     .map_err(|_| invalid("framebuffer lock is poisoned"))?;
-                let start = row * fb.framebuffer.width() + usize::from(rect.x);
-                let end = start + usize::from(rect.width);
-                for pixel in &fb.framebuffer.pixels[start..end] {
-                    pixel_format.encode(*pixel, row_bytes);
+                if fb.generation == generation {
+                    let start = row * fb.framebuffer.width() + usize::from(rect.x);
+                    let end = start + usize::from(rect.width);
+                    pixel_format.encode_row(&fb.framebuffer.pixels[start..end], output);
+                } else {
+                    output.resize(output.len() + row_len, 0);
                 }
             }
-            stream.write_all(row_bytes)?;
-            row_bytes.clear();
+            if output.len() >= SERVER_WRITE_CHUNK_BYTES {
+                stream.write_all(output)?;
+                output.clear();
+            }
         }
         if let Some(index) = rect.tile_index {
             seen_revisions[index] = rect.revision;
         }
     }
-    for (index, revision) in acknowledged {
+    stream.write_all(output)?;
+    output.clear();
+    for (index, revision) in update.acknowledged {
         seen_revisions[index] = revision;
     }
     Ok(())
@@ -1218,8 +1562,15 @@ impl Framebuffer {
         })
     }
 
+    /// Pixels as 0x00RRGGBB, row-major.
     pub fn pixels(&self) -> &[u32] {
         &self.pixels
+    }
+
+    /// Mutable 0x00RRGGBB pixels for hosts that render or capture directly.
+    /// The buffer length is fixed by the framebuffer dimensions.
+    pub fn pixels_mut(&mut self) -> &mut [u32] {
+        &mut self.pixels
     }
     pub fn width(&self) -> usize {
         usize::from(self.width)
@@ -1554,6 +1905,27 @@ mod tests {
     use flate2::{Compress, Compression as ZlibLevel, FlushCompress};
     use std::io::Cursor;
 
+    fn send_framebuffer_update(
+        stream: &mut TcpStream,
+        shared: &Arc<Mutex<ServerFramebuffer>>,
+        seen_revisions: &mut [u64],
+        output: &mut Vec<u8>,
+        pixel_format: ServerPixelFormat,
+        request: UpdateRequest,
+    ) -> io::Result<()> {
+        let generation = shared.lock().unwrap().generation;
+        let update = prepare_update(shared, seen_revisions, request, false, generation)?.unwrap();
+        write_update(
+            stream,
+            shared,
+            seen_revisions,
+            output,
+            pixel_format,
+            update,
+            generation,
+        )
+    }
+
     fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -1751,6 +2123,216 @@ mod tests {
         let mut empty = [0; 4];
         client_stream.read_exact(&mut empty).unwrap();
         assert_eq!(empty, [0, 0, 0, 0]);
+    }
+
+    fn start_insecure_server(framebuffer: Framebuffer) -> (Arc<VncServer>, std::net::SocketAddr) {
+        let server = Arc::new(
+            VncServer::bind(
+                "127.0.0.1:0",
+                framebuffer,
+                ServerConfig {
+                    allow_insecure: true,
+                    ..ServerConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let address = server.local_addr().unwrap();
+        let runner = Arc::clone(&server);
+        std::thread::spawn(move || runner.run());
+        (server, address)
+    }
+
+    /// Complete an RFB 3.8 None-security handshake and advertise `encodings`.
+    fn raw_client(address: std::net::SocketAddr, encodings: &[i32]) -> (TcpStream, u16, u16) {
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut banner = [0; 12];
+        client.read_exact(&mut banner).unwrap();
+        client.write_all(&banner).unwrap();
+        let mut security = [0; 2];
+        client.read_exact(&mut security).unwrap();
+        client.write_all(&[1]).unwrap();
+        let mut security_result = [0; 4];
+        client.read_exact(&mut security_result).unwrap();
+        client.write_all(&[1]).unwrap();
+        let mut server_init = [0; 24];
+        client.read_exact(&mut server_init).unwrap();
+        let name_len = u32::from_be_bytes(server_init[20..24].try_into().unwrap()) as usize;
+        client.read_exact(&mut vec![0; name_len]).unwrap();
+        let mut message = vec![2, 0];
+        message.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
+        for encoding in encodings {
+            message.extend_from_slice(&encoding.to_be_bytes());
+        }
+        client.write_all(&message).unwrap();
+        (
+            client,
+            u16::from_be_bytes([server_init[0], server_init[1]]),
+            u16::from_be_bytes([server_init[2], server_init[3]]),
+        )
+    }
+
+    fn request(client: &mut TcpStream, incremental: bool, width: u16, height: u16) {
+        let mut message = [3, u8::from(incremental), 0, 0, 0, 0, 0, 0, 0, 0];
+        message[6..8].copy_from_slice(&width.to_be_bytes());
+        message[8..10].copy_from_slice(&height.to_be_bytes());
+        client.write_all(&message).unwrap();
+    }
+
+    /// Read one FramebufferUpdate of 32-bit Raw or DesktopSize rectangles.
+    fn read_rectangles(client: &mut TcpStream) -> Vec<(u16, u16, u16, u16, i32, Vec<u8>)> {
+        let mut header = [0; 4];
+        client.read_exact(&mut header).unwrap();
+        assert_eq!(header[0], 0);
+        let count = u16::from_be_bytes([header[2], header[3]]);
+        (0..count)
+            .map(|_| {
+                let mut rect = [0; 12];
+                client.read_exact(&mut rect).unwrap();
+                let field = |index: usize| u16::from_be_bytes([rect[index], rect[index + 1]]);
+                let encoding = i32::from_be_bytes(rect[8..12].try_into().unwrap());
+                let mut pixels = Vec::new();
+                if encoding == 0 {
+                    pixels = vec![0; usize::from(field(4)) * usize::from(field(6)) * 4];
+                    client.read_exact(&mut pixels).unwrap();
+                }
+                (field(0), field(2), field(4), field(6), encoding, pixels)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn desktop_size_clients_follow_a_framebuffer_resize() {
+        let (server, address) = start_insecure_server(Framebuffer::new(2, 1).unwrap());
+        let (mut client, width, height) = raw_client(address, &[0, DESKTOP_SIZE_ENCODING]);
+        assert_eq!((width, height), (2, 1));
+        request(&mut client, false, 2, 1);
+        assert_eq!(read_rectangles(&mut client).len(), 1);
+
+        let mut resized = Framebuffer::new(3, 2).unwrap();
+        resized.pixels_mut()[5] = 0x00ff_0000;
+        server.update_framebuffer(&resized).unwrap();
+        // A request sized for the old framebuffer is answered with the new size.
+        request(&mut client, true, 2, 1);
+        assert_eq!(
+            read_rectangles(&mut client),
+            [(0, 0, 3, 2, DESKTOP_SIZE_ENCODING, Vec::new())]
+        );
+        // Pointer events for the old size that are still in flight are
+        // dropped rather than ending the session.
+        client.write_all(&[5, 0, 0, 9, 0, 9]).unwrap();
+        request(&mut client, false, 3, 2);
+        let update = read_rectangles(&mut client);
+        assert_eq!(update.len(), 1);
+        let (x, y, width, height, encoding, pixels) = &update[0];
+        assert_eq!((*x, *y, *width, *height, *encoding), (0, 0, 3, 2, 0));
+        assert_eq!(&pixels[5 * 4..5 * 4 + 4], &[0, 0, 0xff, 0]);
+
+        client.write_all(&[5, 0, 0, 2, 0, 1]).unwrap();
+        assert_eq!(
+            server.recv_event_timeout(Duration::from_secs(1)).unwrap(),
+            ClientEvent::Pointer {
+                client_id: 1,
+                buttons: 0,
+                x: 2,
+                y: 1,
+            }
+        );
+        server.stop();
+    }
+
+    #[test]
+    fn clients_without_desktop_size_are_disconnected_on_resize() {
+        let (server, address) = start_insecure_server(Framebuffer::new(2, 1).unwrap());
+        let (mut client, _, _) = raw_client(address, &[0]);
+        request(&mut client, false, 2, 1);
+        read_rectangles(&mut client);
+        server
+            .update_framebuffer(&Framebuffer::new(4, 4).unwrap())
+            .unwrap();
+        let mut byte = [0];
+        assert!(!matches!(client.read(&mut byte), Ok(1)));
+        assert_eq!(
+            server.recv_event_timeout(Duration::from_secs(1)).unwrap(),
+            ClientEvent::ClientDisconnected { client_id: 1 }
+        );
+        server.stop();
+    }
+
+    #[test]
+    fn pending_incremental_request_is_answered_by_the_next_change() {
+        let (server, address) = start_insecure_server(Framebuffer::new(2, 1).unwrap());
+        let (mut client, _, _) = raw_client(address, &[0]);
+        request(&mut client, false, 2, 1);
+        read_rectangles(&mut client);
+
+        request(&mut client, true, 2, 1);
+        // Input sent while the request waits is delivered immediately.
+        client.write_all(&[4, 1, 0, 0, 0, 0, 0, b'q']).unwrap();
+        assert!(matches!(
+            server.recv_event_timeout(Duration::from_secs(1)).unwrap(),
+            ClientEvent::Key { keysym: 0x71, .. }
+        ));
+        let mut changed = Framebuffer::new(2, 1).unwrap();
+        changed.pixels_mut()[1] = 0x0000_00ff;
+        server.update_framebuffer(&changed).unwrap();
+        let update = read_rectangles(&mut client);
+        assert_eq!(update.len(), 1);
+        assert_eq!(update[0].5, [0, 0, 0, 0, 0xff, 0, 0, 0]);
+
+        // Without changes, an incremental request gets a throttled empty update.
+        let started = Instant::now();
+        request(&mut client, true, 2, 1);
+        assert!(read_rectangles(&mut client).is_empty());
+        assert!(started.elapsed() >= SERVER_EMPTY_UPDATE_INTERVAL / 2);
+        server.stop();
+    }
+
+    #[test]
+    fn damage_regions_limit_which_tiles_are_compared() {
+        let shared = Arc::new(Mutex::new(ServerFramebuffer::new(
+            Framebuffer::new(130, 2).unwrap(),
+        )));
+        let mut changed = Framebuffer::new(130, 2).unwrap();
+        changed.pixels_mut()[0] = 1;
+        changed.pixels_mut()[129] = 2;
+        // Damage is compared per 64x64 tile: row 1 of the last tile also
+        // syncs its row 0, while the undamaged first tile is skipped.
+        let damage = DamageRect {
+            x: 128,
+            y: 1,
+            width: 2,
+            height: 1,
+        };
+        update_server_framebuffer_regions(&shared, &changed, &[damage]).unwrap();
+        {
+            let fb = shared.lock().unwrap();
+            assert_eq!(fb.tile_revisions, [0, 0, 1]);
+            assert_eq!(fb.framebuffer.pixels()[0], 0);
+            assert_eq!(fb.framebuffer.pixels()[129], 2);
+        }
+        let damage = DamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        update_server_framebuffer_regions(&shared, &changed, &[damage]).unwrap();
+        {
+            let fb = shared.lock().unwrap();
+            assert_eq!(fb.tile_revisions, [2, 0, 1]);
+            assert_eq!(fb.framebuffer.pixels()[0], 1);
+        }
+        let outside = DamageRect {
+            x: 129,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+        assert!(update_server_framebuffer_regions(&shared, &changed, &[outside]).is_err());
     }
 
     #[test]
