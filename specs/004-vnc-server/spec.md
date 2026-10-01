@@ -10,6 +10,7 @@ Provide a reusable RFB server endpoint and a usable Windows host mode that captu
 
 - The server binds a caller-selected TCP address and reports the actual bound address.
 - RFB 3.8 clients can authenticate with standard VNC password authentication, or use None security only when the host explicitly enables it.
+- A client must finish the handshake, through ClientInit, within 60 seconds in total, so a slow client cannot hold a connection slot. An accept error that affects only one connection (a client that reset before it was accepted) does not stop the listener.
 - The server announces a bounded framebuffer and name, serves requested in-bounds rectangles as 8-, 16-, or 32-bit Raw true-color pixels for valid client pixel formats, and rejects malformed or out-of-bounds client messages.
 - Incremental requests send changed 64×64 tiles clipped to the requested region. Tile revisions are acknowledged only when the request covers the whole tile; partial tile requests can repeat until a full tile is requested. An incremental request with no pending tile changes is held until the framebuffer changes and is otherwise answered with an empty update after 50 ms.
 - Each client's messages are read on a dedicated thread, so key and pointer events reach the host without waiting for framebuffer updates to be written. Update writes take the framebuffer lock per row and are sent in bounded chunks.
