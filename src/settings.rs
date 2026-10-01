@@ -1,6 +1,9 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use std::io::Write;
 use std::path::PathBuf;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
 use crate::ui::Config;

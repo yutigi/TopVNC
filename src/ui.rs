@@ -1,3 +1,4 @@
+use crate::desktop_host::HostPermissions;
 use minifb::Key;
 
 pub const BG: u32 = 0x0b1020;
@@ -40,6 +41,7 @@ pub struct Config {
     pub quality: Quality,
     pub compression: Compression,
     pub ui_scale: f32,
+    pub serve: ServeForm,
 }
 
 impl Default for Config {
@@ -55,27 +57,129 @@ impl Default for Config {
             quality: Quality::Smooth,
             compression: Compression::Raw,
             ui_scale: 1.0,
+            serve: ServeForm::default(),
         }
     }
 }
 
+/// Validate a host and port typed into a form and join them as `HOST:PORT`.
+fn socket_address(host: &str, port: &str, host_error: &str) -> Result<String, String> {
+    let host = host.trim();
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        return Err(host_error.into());
+    }
+    let port: u16 = port.parse().map_err(|_| "Port must be 1-65535.")?;
+    if port == 0 {
+        return Err("Port must be 1-65535.".into());
+    }
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Err("Use brackets around an IPv6 address.".into());
+    }
+    Ok(format!("{host}:{port}"))
+}
+
+pub const LOCAL_ONLY_HOST: &str = "127.0.0.1";
+pub const ALL_NETWORKS_HOST: &str = "0.0.0.0";
+
+/// The Server tab form. Like the client's security choices, it is never saved.
+#[derive(Clone, Debug)]
+pub struct ServeForm {
+    pub host: String,
+    pub port: String,
+    pub password: String,
+    pub display: String,
+    pub allow_insecure: bool,
+}
+
+impl Default for ServeForm {
+    fn default() -> Self {
+        Self {
+            host: LOCAL_ONLY_HOST.into(),
+            port: "5900".into(),
+            password: String::new(),
+            display: String::new(),
+            allow_insecure: false,
+        }
+    }
+}
+
+/// A validated request to start serving this desktop.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ServeRequest {
+    pub address: String,
+    /// 1-based display number; `None` serves the primary display.
+    pub display: Option<usize>,
+    /// `None` only when unauthenticated access was explicitly allowed.
+    pub password: Option<String>,
+    pub allow_insecure: bool,
+}
+
+impl ServeForm {
+    pub fn request(&self) -> Result<ServeRequest, String> {
+        let address = socket_address(&self.host, &self.port, "Enter a valid listen address.")?;
+        let display = match self.display.trim() {
+            "" => None,
+            number => Some(
+                number
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|number| *number > 0)
+                    .ok_or("Display must be a number from 1, or empty.")?,
+            ),
+        };
+        // A typed password always enables authentication; the checkbox only
+        // permits leaving it empty.
+        let password = if self.password.is_empty() {
+            if !self.allow_insecure {
+                return Err("Enter a password or allow none authentication.".into());
+            }
+            None
+        } else {
+            Some(self.password.clone())
+        };
+        Ok(ServeRequest {
+            address,
+            display,
+            password,
+            allow_insecure: self.allow_insecure,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ServerPhase {
+    #[default]
+    Stopped,
+    Starting,
+    Serving {
+        address: String,
+        width: u16,
+        height: u16,
+        connections: usize,
+        authenticated: bool,
+        /// Remote keyboard and pointer input is ignored for lack of permission.
+        view_only: bool,
+    },
+    Stopping,
+}
+
+/// What the Server tab shows about the desktop server.
+#[derive(Clone, Debug, Default)]
+pub struct ServerView {
+    pub phase: ServerPhase,
+    /// The latest status message from the server host.
+    pub message: Option<String>,
+    /// Host permission state, on platforms that require it.
+    pub permissions: Option<HostPermissions>,
+}
+
 impl Config {
     pub fn address(&self) -> Result<String, String> {
-        let host = self.host.trim();
-        if host.is_empty() || host.chars().any(char::is_whitespace) {
-            return Err("Enter a valid server address.".into());
-        }
-        let port: u16 = self.port.parse().map_err(|_| "Port must be 1-65535.")?;
-        if port == 0 {
-            return Err("Port must be 1-65535.".into());
-        }
-        if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
-            return Err("Use brackets around an IPv6 address.".into());
-        }
+        let address = socket_address(&self.host, &self.port, "Enter a valid server address.")?;
         if self.window_mode == WindowMode::Custom {
             self.custom_size()?;
         }
-        Ok(format!("{host}:{port}"))
+        Ok(address)
     }
 
     pub fn custom_size(&self) -> Result<(usize, usize), String> {
@@ -95,16 +199,43 @@ impl Config {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Field {
     Host,
     Port,
     Password,
     WindowSize,
+    ServeHost,
+    ServePort,
+    ServePassword,
+    ServeDisplay,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Tab {
+    #[default]
+    Connect,
+    Server,
+}
+
+impl Tab {
+    /// Text fields in Tab-key order.
+    fn fields(self) -> &'static [Field] {
+        match self {
+            Self::Connect => &[Field::Host, Field::Port, Field::Password, Field::WindowSize],
+            Self::Server => &[
+                Field::ServeHost,
+                Field::ServePort,
+                Field::ServePassword,
+                Field::ServeDisplay,
+            ],
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct UiState {
+    pub tab: Tab,
     pub focus: Option<Field>,
     pub error: Option<String>,
     mouse_was_down: bool,
@@ -120,13 +251,12 @@ impl UiState {
     pub fn key(&mut self, config: &mut Config, key: Key) -> bool {
         match key {
             Key::Tab => {
-                self.focus = Some(match self.focus {
-                    None => Field::Host,
-                    Some(Field::Host) => Field::Port,
-                    Some(Field::Port) => Field::Password,
-                    Some(Field::Password) => Field::WindowSize,
-                    Some(Field::WindowSize) => Field::Host,
-                });
+                let fields = self.tab.fields();
+                let next = self
+                    .focus
+                    .and_then(|focus| fields.iter().position(|field| *field == focus))
+                    .map_or(0, |index| (index + 1) % fields.len());
+                self.focus = Some(fields[next]);
                 true
             }
             Key::Backspace => {
@@ -136,6 +266,14 @@ impl UiState {
                 true
             }
             _ => false,
+        }
+    }
+
+    pub fn switch_tab(&mut self, tab: Tab) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.focus = None;
+            self.error = None;
         }
     }
 
@@ -156,6 +294,10 @@ impl UiState {
             Field::Port => Some(&mut config.port),
             Field::Password => Some(&mut config.password),
             Field::WindowSize => Some(&mut config.window_size),
+            Field::ServeHost => Some(&mut config.serve.host),
+            Field::ServePort => Some(&mut config.serve.port),
+            Field::ServePassword => Some(&mut config.serve.password),
+            Field::ServeDisplay => Some(&mut config.serve.display),
         }
     }
 }
@@ -408,7 +550,50 @@ pub const CONNECT: Box2 = Box2 {
     h: 48,
 };
 
-pub fn landing(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connecting: bool) {
+pub const TAB_CONNECT: Box2 = Box2 {
+    x: 528,
+    y: 34,
+    w: 110,
+    h: 36,
+};
+pub const TAB_SERVER: Box2 = Box2 {
+    x: 648,
+    y: 34,
+    w: 110,
+    h: 36,
+};
+pub const SERVE_DISPLAY: Box2 = Box2 {
+    x: 548,
+    y: 280,
+    w: 210,
+    h: 36,
+};
+pub const LOCAL_ONLY: Box2 = Box2 {
+    x: 40,
+    y: 386,
+    w: 220,
+    h: 36,
+};
+pub const ALL_NETWORKS: Box2 = Box2 {
+    x: 272,
+    y: 386,
+    w: 220,
+    h: 36,
+};
+const SERVER_STATUS: Box2 = Box2 {
+    x: 40,
+    y: 478,
+    w: 718,
+    h: 44,
+};
+
+pub fn landing(
+    canvas: &mut Canvas<'_>,
+    config: &Config,
+    state: &UiState,
+    connecting: bool,
+    server: &ServerView,
+) {
     canvas.fill(
         Box2 {
             x: 0,
@@ -428,6 +613,15 @@ pub fn landing(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
         ACCENT,
     );
     canvas.text(40, 36, "TOPVNC", TEXT, 4);
+    canvas.button(TAB_CONNECT, "CONNECT", state.tab == Tab::Connect);
+    canvas.button(TAB_SERVER, "SERVER", state.tab == Tab::Server);
+    match state.tab {
+        Tab::Connect => connect_tab(canvas, config, state, connecting),
+        Tab::Server => server_tab(canvas, &config.serve, state, server),
+    }
+}
+
+fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connecting: bool) {
     canvas.text(42, 76, "CONNECT TO A REMOTE DESKTOP", MUTED, 2);
     canvas.label(40, 108, "SERVER ADDRESS");
     canvas.label(548, 108, "PORT");
@@ -502,6 +696,230 @@ pub fn landing(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
         },
         true,
     );
+}
+
+fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server: &ServerView) {
+    canvas.text(42, 76, "SHARE THIS DESKTOP OVER VNC", MUTED, 2);
+    canvas.label(40, 108, "LISTEN ADDRESS");
+    canvas.label(548, 108, "PORT");
+    canvas.field(
+        HOST,
+        &form.host,
+        LOCAL_ONLY_HOST,
+        state.focus == Some(Field::ServeHost),
+        false,
+    );
+    canvas.field(
+        PORT,
+        &form.port,
+        "5900",
+        state.focus == Some(Field::ServePort),
+        false,
+    );
+    canvas.label(40, 192, "SERVER PASSWORD");
+    canvas.field(
+        PASSWORD,
+        &form.password,
+        if form.allow_insecure {
+            "NONE"
+        } else {
+            "REQUIRED"
+        },
+        state.focus == Some(Field::ServePassword),
+        true,
+    );
+    canvas.fill(INSECURE, if form.allow_insecure { ACCENT } else { FIELD });
+    canvas.frame(INSECURE, BORDER);
+    if form.allow_insecure {
+        canvas.text(45, 296, "X", BG, 2);
+    }
+    canvas.text(76, 296, "ALLOW NONE AUTHENTICATION", TEXT, 2);
+    canvas.label(548, 258, "DISPLAY");
+    canvas.field(
+        SERVE_DISPLAY,
+        &form.display,
+        "PRIMARY",
+        state.focus == Some(Field::ServeDisplay),
+        false,
+    );
+    canvas.text(
+        40,
+        331,
+        "ONLY 8 PASSWORD CHARACTERS ARE USED. TCP IS UNENCRYPTED.",
+        MUTED,
+        2,
+    );
+    canvas.label(40, 362, "LISTEN ON");
+    canvas.button(
+        LOCAL_ONLY,
+        "THIS PC ONLY",
+        form.host.trim() == LOCAL_ONLY_HOST,
+    );
+    canvas.button(
+        ALL_NETWORKS,
+        "ALL NETWORKS",
+        form.host.trim() == ALL_NETWORKS_HOST,
+    );
+
+    canvas.label(40, 456, "STATUS");
+    canvas.fill(SERVER_STATUS, PANEL);
+    canvas.frame(SERVER_STATUS, BORDER);
+    let serving = matches!(server.phase, ServerPhase::Serving { .. });
+    let view_only = matches!(
+        server.phase,
+        ServerPhase::Serving {
+            view_only: true,
+            ..
+        }
+    );
+    canvas.fill(
+        Box2 {
+            x: SERVER_STATUS.x + 14,
+            y: SERVER_STATUS.y + 17,
+            w: 10,
+            h: 10,
+        },
+        match (serving, view_only) {
+            (true, true) => ERROR,
+            (true, false) => ACCENT,
+            _ => MUTED,
+        },
+    );
+    let text_y = SERVER_STATUS.y + 15;
+    let status = match &server.phase {
+        ServerPhase::Stopped => stopped_status(server.permissions),
+        ServerPhase::Starting => "STARTING CAPTURE...".to_string(),
+        ServerPhase::Stopping => "STOPPING...".to_string(),
+        ServerPhase::Serving {
+            address,
+            width,
+            height,
+            connections,
+            view_only,
+            ..
+        } => {
+            let viewers = match connections {
+                1 => "1 VIEWER".to_string(),
+                count => format!("{count} VIEWERS"),
+            };
+            let right = SERVER_STATUS.x + SERVER_STATUS.w - 12;
+            canvas.text(right - viewers.len() * 12, text_y, &viewers, TEXT, 2);
+            let room = (SERVER_STATUS.w - 48) / 12 - viewers.len() - 2;
+            let mode = if *view_only { "VIEW ONLY" } else { "SERVING" };
+            let status = format!("{mode} {width}X{height} ON {address}");
+            status.chars().take(room).collect()
+        }
+    };
+    canvas.text(
+        SERVER_STATUS.x + 34,
+        text_y,
+        &status,
+        if serving { TEXT } else { MUTED },
+        2,
+    );
+
+    if let Some(error) = &state.error {
+        status_message(canvas, error, ERROR);
+    } else if let ServerPhase::Serving {
+        authenticated: false,
+        ..
+    } = server.phase
+    {
+        canvas.text(
+            40,
+            537,
+            "NO AUTHENTICATION: ANY VIEWER CAN CONTROL THIS PC",
+            ERROR,
+            2,
+        );
+    } else if view_only {
+        canvas.text(
+            40,
+            537,
+            "VIEW ONLY: ALLOW ACCESSIBILITY ACCESS FOR REMOTE INPUT",
+            ERROR,
+            2,
+        );
+    } else if let Some(message) = &server.message {
+        status_message(canvas, message, MUTED);
+    } else {
+        canvas.text(40, 537, "TCP TRANSPORT  /  UNENCRYPTED", MUTED, 2);
+    }
+    match server.phase {
+        ServerPhase::Stopped => canvas.button(CONNECT, "START SERVER", true),
+        ServerPhase::Starting => canvas.button(CONNECT, "STARTING...", true),
+        ServerPhase::Serving { .. } => canvas.button(CONNECT, "STOP SERVER", false),
+        ServerPhase::Stopping => canvas.button(CONNECT, "STOPPING...", false),
+    }
+}
+
+fn stopped_status(permissions: Option<HostPermissions>) -> String {
+    let answer = |allowed| if allowed { "YES" } else { "NO" };
+    match permissions {
+        Some(HostPermissions {
+            screen_recording,
+            accessibility,
+        }) => format!(
+            "STOPPED / SCREEN RECORDING: {} / ACCESSIBILITY: {}",
+            answer(screen_recording),
+            answer(accessibility)
+        ),
+        None if cfg!(any(windows, target_os = "macos")) => "STOPPED".into(),
+        None => "STOPPED  /  WINDOWS AND MACOS HOSTS ONLY".into(),
+    }
+}
+
+/// Characters per line of the message below the server status.
+const MESSAGE_LINE: usize = 60;
+
+/// Break `message` into lines of at most `width` characters, at spaces where
+/// possible.
+fn wrap(message: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in message.split_whitespace() {
+        let mut word = word.to_string();
+        while word.chars().count() > width {
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            let rest = word.split_off(
+                word.char_indices()
+                    .nth(width)
+                    .map_or(word.len(), |(at, _)| at),
+            );
+            lines.push(std::mem::replace(&mut word, rest));
+        }
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// The message below the server status: one large line, two when it does
+/// not fit, or small text for long instructions such as permission errors.
+fn status_message(canvas: &mut Canvas<'_>, message: &str, color: u32) {
+    let large = wrap(message, MESSAGE_LINE);
+    match large.as_slice() {
+        [line] => canvas.text(40, 537, line, color, 2),
+        [first, second] => {
+            canvas.text(40, 527, first, color, 2);
+            canvas.text(40, 546, second, color, 2);
+        }
+        _ => {
+            for (index, line) in wrap(message, MESSAGE_LINE * 2).iter().take(4).enumerate() {
+                canvas.text(40, 525 + index * 10, line, color, 1);
+            }
+        }
+    }
 }
 
 pub fn open_settings_box(scale: f32) -> Box2 {
@@ -723,6 +1141,11 @@ fn glyph(c: char) -> [u8; 7] {
         '=' => [0, 31, 0, 31, 0, 0, 0],
         ',' => [0, 0, 0, 0, 12, 12, 8],
         '+' => [0, 4, 4, 31, 4, 4, 0],
+        '&' => [12, 18, 20, 8, 21, 18, 13],
+        '\'' => [4, 4, 8, 0, 0, 0, 0],
+        '"' => [10, 10, 0, 0, 0, 0, 0],
+        '<' => [2, 4, 8, 16, 8, 4, 2],
+        '>' | '→' => [8, 4, 2, 1, 2, 4, 8],
         ' ' => [0; 7],
         _ => [31, 17, 21, 21, 21, 17, 31],
     }
@@ -764,5 +1187,82 @@ mod tests {
         assert_eq!(scale_from_slider_x(0), 0.5);
         assert_eq!(scale_from_slider_x(usize::MAX), 2.0);
         assert!((scale_from_slider_x((SLIDER_LEFT + SLIDER_RIGHT) / 2) - 1.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn server_tab_cycles_its_own_fields_and_switching_clears_focus() {
+        let mut state = UiState::default();
+        let mut config = Config::default();
+        state.key(&mut config, Key::Tab);
+        state.switch_tab(Tab::Server);
+        assert_eq!(state.focus, None);
+        for expected in [
+            Field::ServeHost,
+            Field::ServePort,
+            Field::ServePassword,
+            Field::ServeDisplay,
+            Field::ServeHost,
+        ] {
+            state.key(&mut config, Key::Tab);
+            assert_eq!(state.focus, Some(expected));
+        }
+        state.key(&mut config, Key::Tab);
+        state.character(&mut config, '7');
+        assert_eq!(config.serve.port, "59007");
+        assert_eq!(config.port, "5900");
+    }
+
+    #[test]
+    fn server_messages_wrap_at_spaces_and_split_long_words() {
+        assert_eq!(wrap("ONE TWO THREE", 7), ["ONE TWO", "THREE"]);
+        assert_eq!(wrap("  ", 7), Vec::<String>::new());
+        assert_eq!(wrap("ABCDEFGHIJ KL", 4), ["ABCD", "EFGH", "IJ", "KL"]);
+        assert_eq!(wrap("é😀é😀é", 2), ["é😀", "é😀", "é"]);
+        let message = "Screen Recording access is required. Allow TopVNC in System Settings → \
+                       Privacy & Security → Screen & System Audio Recording, then relaunch it";
+        assert!(wrap(message, MESSAGE_LINE * 2).len() <= 4);
+    }
+
+    #[test]
+    fn stopped_status_reports_host_permissions() {
+        let permissions = |screen_recording, accessibility| {
+            Some(HostPermissions {
+                screen_recording,
+                accessibility,
+            })
+        };
+        let status = stopped_status(permissions(true, false));
+        assert_eq!(
+            status,
+            "STOPPED / SCREEN RECORDING: YES / ACCESSIBILITY: NO"
+        );
+        // It fits the status panel next to the indicator.
+        assert!(status.len() <= (SERVER_STATUS.w - 46) / 12);
+        assert!(stopped_status(None).starts_with("STOPPED"));
+    }
+
+    #[test]
+    fn serve_form_requires_a_password_unless_none_is_explicit() {
+        let mut form = ServeForm::default();
+        assert!(form.request().is_err());
+        form.allow_insecure = true;
+        let request = form.request().unwrap();
+        assert_eq!(request.address, "127.0.0.1:5900");
+        assert_eq!((request.password, request.display), (None, None));
+        form.password = "secret".into();
+        assert_eq!(form.request().unwrap().password.as_deref(), Some("secret"));
+        form.display = "2".into();
+        assert_eq!(form.request().unwrap().display, Some(2));
+        for display in ["0", "-1", "two"] {
+            form.display = display.into();
+            assert!(form.request().is_err());
+        }
+        form.display.clear();
+        form.host = "::".into();
+        assert!(form.request().is_err());
+        form.host = "[::]".into();
+        assert_eq!(form.request().unwrap().address, "[::]:5900");
+        form.port = "0".into();
+        assert!(form.request().is_err());
     }
 }
