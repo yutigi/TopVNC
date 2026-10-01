@@ -224,7 +224,9 @@ pub fn serve(
         // A frame that cannot be used, such as one from just before a display
         // change, leaves the first image to the serving loop.
         if let Some((buffer, damage)) = capture.shared.frames.take_timeout(FRAME_WAIT) {
-            let _ = copy_frame(&buffer, &damage, &mut framebuffer);
+            if copy_frame(&buffer, &damage, &mut framebuffer).is_err() {
+                capture.request_full_frame();
+            }
             break;
         }
         if let Some(error) = capture.stopped_error() {
@@ -347,8 +349,8 @@ fn serve_desktop(
         ))),
     }
     let mut last_pasteboard_poll = Instant::now();
-    // Kept while capture is paused so the stream is recreated for the same
-    // display identity.
+    // `None` while capture is paused; it is recreated from the same display
+    // selection.
     let mut capture = Some(capture);
     let mut retry_delay = CAPTURE_RETRY_MIN;
     let mut next_retry = Instant::now();
@@ -474,13 +476,18 @@ fn serve_desktop(
                     server.update_framebuffer_regions(&framebuffer, &regions)?;
                 }
             }
-            Err(FrameError::SizeMismatch) => {
-                // The stream still delivers the old size; check the display now.
-                DISPLAY_RECONFIGURED.store(true, Ordering::Release);
+            Err(error) => {
+                // The skipped frame's damage is lost, and later frames carry
+                // only their own; copy the next one in full.
+                active.request_full_frame();
+                match error {
+                    // The stream still delivers the old size; check the display now.
+                    FrameError::SizeMismatch => DISPLAY_RECONFIGURED.store(true, Ordering::Release),
+                    FrameError::Invalid(error) => report(ServerNotice::Message(format!(
+                        "Skipped a desktop frame: {error}"
+                    ))),
+                }
             }
-            Err(FrameError::Invalid(error)) => report(ServerNotice::Message(format!(
-                "Skipped a desktop frame: {error}"
-            ))),
         }
     }
     Ok(())
@@ -891,6 +898,13 @@ impl DisplayCapture {
 
     fn stopped_error(&self) -> Option<String> {
         self.shared.stopped.lock().ok()?.clone()
+    }
+
+    /// Treat the next complete frame as fully damaged.
+    fn request_full_frame(&self) {
+        self.shared
+            .full_frame_pending
+            .store(true, Ordering::Release);
     }
 
     /// Why the stream no longer matches the display it should capture.

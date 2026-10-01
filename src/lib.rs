@@ -24,6 +24,9 @@ const SERVER_SESSION_QUEUE_CAPACITY: usize = 64;
 const SERVER_EMPTY_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
 const SERVER_IDLE_WAKE_INTERVAL: Duration = Duration::from_secs(1);
 const SERVER_WRITE_CHUNK_BYTES: usize = 64 * 1024;
+/// Total time a client has to finish the handshake, including typing its
+/// password, before its connection slot is released.
+const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const DESKTOP_SIZE_ENCODING: i32 = -223;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -424,10 +427,10 @@ impl VncServer {
                 "server requires a password unless allow_insecure is explicitly enabled",
             ));
         }
-        let listener = std::net::TcpListener::bind(address)?;
         if config.name.len() > MAX_NAME_BYTES {
             return Err(invalid("server name is too long"));
         }
+        let listener = std::net::TcpListener::bind(address)?;
         let (events, event_receiver) = std::sync::mpsc::sync_channel(SERVER_EVENT_QUEUE_CAPACITY);
         Ok(Self {
             listener,
@@ -536,9 +539,23 @@ impl VncServer {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
+                // A client that resets before it is accepted affects only
+                // that connection; keep listening for others.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
-            stream.set_nonblocking(false)?;
+            if stream.set_nonblocking(false).is_err() {
+                continue;
+            }
             if self
                 .active_clients
                 .fetch_update(
@@ -597,8 +614,6 @@ impl VncServer {
                     };
                     let mut stream = stream;
                     let _ = stream.set_nodelay(true);
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
                     let _ = serve_client(
                         &mut stream,
                         &framebuffer,
@@ -709,16 +724,22 @@ fn serve_client(
     clipboard: &Arc<Mutex<ServerClipboard>>,
     client_id: u64,
 ) -> io::Result<()> {
-    stream.write_all(b"RFB 003.008\n")?;
+    // Bound the whole handshake, not each read, so a client that trickles
+    // bytes cannot hold one of the few connection slots indefinitely.
+    let mut handshake = HandshakeStream {
+        stream: &mut *stream,
+        deadline: Instant::now() + SERVER_HANDSHAKE_TIMEOUT,
+    };
+    handshake.write_all(b"RFB 003.008\n")?;
     let mut version = [0; 12];
-    stream.read_exact(&mut version)?;
+    handshake.read_exact(&mut version)?;
     if &version != b"RFB 003.008\n" {
         return Err(invalid("unsupported RFB client version"));
     }
     let security = if config.password.is_some() { 2 } else { 1 };
-    stream.write_all(&[1, security])?;
+    handshake.write_all(&[1, security])?;
     let mut selected = [0];
-    stream.read_exact(&mut selected)?;
+    handshake.read_exact(&mut selected)?;
     if selected[0] != security {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -730,23 +751,23 @@ fn serve_client(
         // Per-connection unpredictable challenge.
         getrandom::fill(&mut challenge)
             .map_err(|_| io::Error::other("secure random challenge generation failed"))?;
-        stream.write_all(&challenge)?;
+        handshake.write_all(&challenge)?;
         let mut answer = [0; 16];
-        stream.read_exact(&mut answer)?;
+        handshake.read_exact(&mut answer)?;
         if !constant_time_equal(&answer, &vnc_response(&challenge, password)) {
             let reason = b"VNC authentication failed";
-            stream.write_all(&1u32.to_be_bytes())?;
-            stream.write_all(&(reason.len() as u32).to_be_bytes())?;
-            stream.write_all(reason)?;
+            handshake.write_all(&1u32.to_be_bytes())?;
+            handshake.write_all(&(reason.len() as u32).to_be_bytes())?;
+            handshake.write_all(reason)?;
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "VNC authentication failed",
             ));
         }
     }
-    stream.write_all(&0u32.to_be_bytes())?;
+    handshake.write_all(&0u32.to_be_bytes())?;
     let mut shared = [0];
-    stream.read_exact(&mut shared)?;
+    handshake.read_exact(&mut shared)?;
     if shared[0] > 1 {
         return Err(invalid("invalid ClientInit shared flag"));
     }
@@ -788,12 +809,10 @@ fn serve_client(
                 queued: Arc::clone(&wake_queued),
             },
         );
-    let resized = Arc::new(AtomicBool::new(false));
     let reader = {
         let mut stream = stream.try_clone()?;
         let framebuffer = Arc::clone(framebuffer);
         let events = events.clone();
-        let resized = Arc::clone(&resized);
         std::thread::Builder::new()
             .name("topvnc-rfb-reader".into())
             .spawn(move || {
@@ -803,7 +822,7 @@ fn serve_client(
                         &session_sender,
                         &events,
                         &framebuffer,
-                        &resized,
+                        generation,
                         client_id,
                     ) {
                         break error;
@@ -818,7 +837,6 @@ fn serve_client(
         clipboard,
         &session_receiver,
         &wake_queued,
-        &resized,
         generation,
         tile_count,
     );
@@ -835,7 +853,7 @@ fn read_client_message(
     session: &SyncSender<SessionInput>,
     events: &SyncSender<ClientEvent>,
     framebuffer: &Arc<Mutex<ServerFramebuffer>>,
-    resized: &AtomicBool,
+    initial_generation: u64,
     client_id: u64,
 ) -> io::Result<()> {
     let session_closed = || io::Error::new(io::ErrorKind::BrokenPipe, "session writer closed");
@@ -896,16 +914,21 @@ fn read_client_message(
             stream.read_exact(&mut data)?;
             let x = u16::from_be_bytes([data[1], data[2]]);
             let y = u16::from_be_bytes([data[3], data[4]]);
-            let in_bounds = {
+            let (in_bounds, resized) = {
                 let fb = framebuffer
                     .lock()
                     .map_err(|_| invalid("framebuffer lock is poisoned"))?;
-                x < fb.framebuffer.width && y < fb.framebuffer.height
+                (
+                    x < fb.framebuffer.width && y < fb.framebuffer.height,
+                    fb.generation != initial_generation,
+                )
             };
             if !in_bounds {
                 // After a resize, pointer events sent for the old size may
                 // still be in flight; drop them instead of ending the session.
-                if resized.load(Ordering::Acquire) {
+                // This checks the framebuffer itself, not the writer, which
+                // may not have noticed the resize yet.
+                if resized {
                     return Ok(());
                 }
                 return Err(invalid("pointer outside framebuffer"));
@@ -951,7 +974,6 @@ fn write_client_updates(
     clipboard: &Arc<Mutex<ServerClipboard>>,
     receiver: &std::sync::mpsc::Receiver<SessionInput>,
     wake_queued: &AtomicBool,
-    resized: &AtomicBool,
     mut generation: u64,
     tile_count: usize,
 ) -> io::Result<()> {
@@ -961,6 +983,9 @@ fn write_client_updates(
     let mut output = Vec::new();
     let mut clipboard_revision = 0;
     let mut pending: Option<PendingRequest> = None;
+    // Set once the framebuffer has been resized; requests sized for the old
+    // framebuffer are then clipped instead of ending the session.
+    let mut resized = false;
     loop {
         send_pending_clipboard(stream, clipboard, &mut clipboard_revision)?;
         let (current_generation, width, height) = {
@@ -976,7 +1001,7 @@ fn write_client_updates(
                     "desktop size changed and the client does not support DesktopSize",
                 ));
             }
-            resized.store(true, Ordering::Release);
+            resized = true;
             // Answer the next request with the new size; the client then
             // requests pixels for the new framebuffer.
             if pending.take().is_some() {
@@ -992,7 +1017,7 @@ fn write_client_updates(
                 shared,
                 &seen_revisions,
                 waiting.request,
-                resized.load(Ordering::Acquire),
+                resized,
                 generation,
             )?;
             if let Some(update) = update
@@ -2242,6 +2267,37 @@ mod tests {
             }
         );
         server.stop();
+    }
+
+    #[test]
+    fn reader_drops_stale_pointer_events_before_the_writer_sees_a_resize() {
+        let shared = Arc::new(Mutex::new(ServerFramebuffer::new(
+            Framebuffer::new(4, 4).unwrap(),
+        )));
+        let (session, _session_receiver) = std::sync::mpsc::sync_channel(1);
+        let (events, event_receiver) = std::sync::mpsc::sync_channel(1);
+        let (mut server_stream, mut client_stream) = tcp_pair();
+        let mut read_pointer = |x: u8, y: u8| {
+            client_stream.write_all(&[5, 0, 0, x, 0, y]).unwrap();
+            read_client_message(&mut server_stream, &session, &events, &shared, 0, 1)
+        };
+
+        // Out of bounds without a resize is a protocol error.
+        assert!(read_pointer(9, 0).is_err());
+        // The writer has not run, so only the framebuffer knows it shrank.
+        update_server_framebuffer(&shared, &Framebuffer::new(2, 2).unwrap()).unwrap();
+        read_pointer(3, 3).unwrap();
+        assert!(event_receiver.try_recv().is_err());
+        read_pointer(1, 1).unwrap();
+        assert_eq!(
+            event_receiver.try_recv().unwrap(),
+            ClientEvent::Pointer {
+                client_id: 1,
+                buttons: 0,
+                x: 1,
+                y: 1,
+            }
+        );
     }
 
     #[test]
