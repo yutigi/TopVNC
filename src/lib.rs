@@ -31,6 +31,23 @@ const SERVER_WRITE_CHUNK_BYTES: usize = 64 * 1024;
 /// password, before its connection slot is released.
 const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const DESKTOP_SIZE_ENCODING: i32 = -223;
+/// Pseudo-encoding: the client understands Fence messages.
+const FENCE_ENCODING: i32 = -312;
+/// Pseudo-encoding: the client understands ContinuousUpdates.
+const CONTINUOUS_UPDATES_ENCODING: i32 = -313;
+/// Message type of EnableContinuousUpdates (client) and
+/// EndOfContinuousUpdates (server).
+const CONTINUOUS_UPDATES_MESSAGE: u8 = 150;
+const FENCE_MESSAGE: u8 = 248;
+const FENCE_BLOCK_BEFORE: u32 = 1 << 0;
+const FENCE_BLOCK_AFTER: u32 = 1 << 1;
+const FENCE_SYNC_NEXT: u32 = 1 << 2;
+const FENCE_REQUEST: u32 = 1 << 31;
+const FENCE_SUPPORTED_FLAGS: u32 = FENCE_BLOCK_BEFORE | FENCE_BLOCK_AFTER | FENCE_SYNC_NEXT;
+const MAX_FENCE_PAYLOAD: usize = 64;
+/// Continuous updates keep at most this many unacknowledged updates on the
+/// wire, so a slow link cannot build up a queue of stale frames.
+const MAX_UPDATES_IN_FLIGHT: usize = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Client socket read buffer; large enough for many small rectangles per read.
@@ -92,6 +109,7 @@ struct StatsCounters {
     frames: std::sync::atomic::AtomicU64,
     /// The last rectangle's wire encoding, or `i64::MIN` before the first.
     last_encoding: std::sync::atomic::AtomicI64,
+    continuous_updates: AtomicBool,
 }
 
 /// A point-in-time copy of [`SessionStats`].
@@ -103,6 +121,8 @@ pub struct StatsSnapshot {
     pub frames: u64,
     /// The encoding of the most recent rectangle.
     pub encoding: Option<i32>,
+    /// The server pushes updates without a request per frame.
+    pub continuous_updates: bool,
 }
 
 impl SessionStats {
@@ -118,6 +138,7 @@ impl SessionStats {
             bytes: self.0.bytes.load(Ordering::Relaxed),
             frames: self.0.frames.load(Ordering::Relaxed),
             encoding: (encoding != i64::MIN).then_some(encoding as i32),
+            continuous_updates: self.0.continuous_updates.load(Ordering::Relaxed),
         }
     }
 }
@@ -255,7 +276,7 @@ pub enum Encoding {
 impl Encoding {
     /// The SetEncodings list the client sends, most preferred first.
     fn advertised(self) -> Vec<i32> {
-        match self {
+        let mut encodings = match self {
             Self::Raw => vec![0],
             Self::Zlib => vec![6],
             Self::Tight { quality } => vec![
@@ -265,7 +286,11 @@ impl Encoding {
                 tight::QUALITY_LEVEL_0 + i32::from(quality.min(9)),
                 tight::COMPRESS_LEVEL_0 + i32::from(CLIENT_TIGHT_COMPRESS_LEVEL),
             ],
-        }
+        };
+        // Servers that support them push updates without a request per
+        // frame, with fences for flow control.
+        encodings.extend([FENCE_ENCODING, CONTINUOUS_UPDATES_ENCODING]);
+        encodings
     }
 
     fn accepts(self, wire_encoding: i32) -> bool {
@@ -376,6 +401,17 @@ enum SessionInput {
     PixelFormat(ServerPixelFormat),
     Encodings(ClientEncodings),
     UpdateRequest(UpdateRequest),
+    /// EnableContinuousUpdates: start pushing changes in `region`, or stop.
+    ContinuousUpdates {
+        enable: bool,
+        region: UpdateRequest,
+    },
+    /// A Fence message from the client: a request to echo, or a response
+    /// to one of the server's.
+    Fence {
+        flags: u32,
+        payload: Vec<u8>,
+    },
     /// The framebuffer or clipboard changed.
     Wake,
     /// The client's reader stopped; the session ends with this error.
@@ -1096,6 +1132,28 @@ fn read_client_message(
                 .send(ClientEvent::ClipboardText { client_id, text })
                 .map_err(|_| input_closed())?;
         }
+        CONTINUOUS_UPDATES_MESSAGE => {
+            let mut data = [0; 9];
+            stream.read_exact(&mut data)?;
+            if data[0] > 1 {
+                return Err(invalid("invalid EnableContinuousUpdates flag"));
+            }
+            let region = parse_update_request([
+                1, data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
+            ])?;
+            session
+                .send(SessionInput::ContinuousUpdates {
+                    enable: data[0] != 0,
+                    region,
+                })
+                .map_err(|_| session_closed())?;
+        }
+        FENCE_MESSAGE => {
+            let (flags, payload) = read_fence(stream)?;
+            session
+                .send(SessionInput::Fence { flags, payload })
+                .map_err(|_| session_closed())?;
+        }
         _ => return Err(invalid("unknown client message")),
     }
     Ok(())
@@ -1105,6 +1163,8 @@ fn read_client_message(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ClientEncodings {
     desktop_size: bool,
+    fence: bool,
+    continuous_updates: bool,
     /// Set when the client prefers Tight over Raw.
     tight: Option<TightSettings>,
 }
@@ -1121,6 +1181,8 @@ impl ClientEncodings {
                     preferred.get_or_insert(encoding);
                 }
                 DESKTOP_SIZE_ENCODING => result.desktop_size = true,
+                FENCE_ENCODING => result.fence = true,
+                CONTINUOUS_UPDATES_ENCODING => result.continuous_updates = true,
                 level @ tight::QUALITY_LEVEL_0..=-23 => {
                     quality.get_or_insert((level - tight::QUALITY_LEVEL_0) as u8);
                 }
@@ -1147,6 +1209,171 @@ struct PendingRequest {
     deadline: Instant,
 }
 
+/// Read a Fence message body after its type byte.
+fn read_fence(stream: &mut impl Read) -> io::Result<(u32, Vec<u8>)> {
+    let mut header = [0; 8];
+    stream.read_exact(&mut header)?;
+    let flags = u32::from_be_bytes(header[3..7].try_into().unwrap());
+    let length = usize::from(header[7]);
+    if length > MAX_FENCE_PAYLOAD {
+        return Err(invalid("fence payload is too long"));
+    }
+    let mut payload = vec![0; length];
+    stream.read_exact(&mut payload)?;
+    Ok((flags, payload))
+}
+
+fn fence_message(flags: u32, payload: &[u8]) -> Vec<u8> {
+    let mut message = vec![FENCE_MESSAGE, 0, 0, 0];
+    message.extend_from_slice(&flags.to_be_bytes());
+    message.push(payload.len().min(MAX_FENCE_PAYLOAD) as u8);
+    message.extend_from_slice(&payload[..payload.len().min(MAX_FENCE_PAYLOAD)]);
+    message
+}
+
+/// When continuous updates may send the next update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendWindow {
+    Open,
+    /// The link has probably finished sending the update in flight.
+    OpensAt(Instant),
+    /// Wait for a fence acknowledgement.
+    Closed,
+}
+
+/// Flow control for continuous updates. Every pushed update is followed by
+/// a fence; its acknowledgement shows the update was received and decoded.
+/// While one update is in flight, the next is sent once the link has
+/// probably finished transmitting everything before it, judged from the
+/// measured throughput. Waiting for the acknowledgement as well would leave
+/// the link idle for a round trip every frame; sending earlier would queue
+/// stale frames.
+#[derive(Debug, Default)]
+struct FlowControl {
+    in_flight: std::collections::VecDeque<(u32, usize, Instant)>,
+    next_fence: u32,
+    /// Recent throughput samples in bytes per second.
+    samples: std::collections::VecDeque<f64>,
+    /// When the previous acknowledgement arrived.
+    last_acknowledgement: Option<Instant>,
+    /// When the link is expected to finish transmitting what was sent.
+    link_free: Option<Instant>,
+    /// Shortest round trip of a bare fence: the link's fixed delay.
+    base_delay: Option<Duration>,
+    /// When the unanswered probe fence was sent.
+    probe_sent: Option<Instant>,
+    last_probe: Option<Instant>,
+}
+
+/// Throughput samples kept; the estimate is their maximum.
+const FLOW_SAMPLES: usize = 8;
+/// Updates are paced as if the link were this fraction of its estimated
+/// throughput, so an estimate that is a little high, as after a burst,
+/// drains instead of building a queue.
+const FLOW_PACING: f64 = 0.95;
+/// Payload of probe fences; update fences carry four-byte sequence numbers.
+const FLOW_PROBE: [u8; 1] = [0xff];
+/// How often the round trip is re-measured while nothing is in flight.
+const FLOW_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+impl FlowControl {
+    /// Whether to send a probe fence now: only on an idle link, so its
+    /// round trip carries no transmission or queueing time.
+    fn probe_due(&self, now: Instant) -> bool {
+        self.in_flight.is_empty()
+            && self.probe_sent.is_none()
+            && self
+                .last_probe
+                .is_none_or(|last| now.saturating_duration_since(last) >= FLOW_PROBE_INTERVAL)
+    }
+
+    fn probing(&mut self, now: Instant) -> &'static [u8] {
+        self.probe_sent = Some(now);
+        self.last_probe = Some(now);
+        &FLOW_PROBE
+    }
+
+    /// Estimated link throughput in bytes per second.
+    fn throughput(&self) -> Option<f64> {
+        self.samples.iter().copied().reduce(f64::max)
+    }
+
+    fn window(&self) -> SendWindow {
+        match self.in_flight.len() {
+            0 => SendWindow::Open,
+            count if count >= MAX_UPDATES_IN_FLIGHT => SendWindow::Closed,
+            _ => self
+                .link_free
+                .map_or(SendWindow::Closed, SendWindow::OpensAt),
+        }
+    }
+
+    /// Record an update of `bytes` written at `sent`; returns the fence
+    /// payload to send after it.
+    fn sent(&mut self, bytes: usize, sent: Instant) -> [u8; 4] {
+        let sequence = self.next_fence;
+        self.next_fence = self.next_fence.wrapping_add(1);
+        self.in_flight.push_back((sequence, bytes, sent));
+        // A client that never answers fences cannot grow this without bound.
+        if self.in_flight.len() > 16 {
+            self.in_flight.pop_front();
+        }
+        // Updates leave the link in order: this one starts once the link
+        // has finished the ones before it.
+        self.link_free = self.throughput().map(|rate| {
+            self.link_free.map_or(sent, |free| free.max(sent))
+                + Duration::from_secs_f64(bytes as f64 / (rate * FLOW_PACING))
+        });
+        sequence.to_be_bytes()
+    }
+
+    fn acknowledged(&mut self, payload: &[u8], now: Instant) {
+        if payload == FLOW_PROBE {
+            if let Some(sent) = self.probe_sent.take() {
+                let round_trip = now.saturating_duration_since(sent);
+                self.base_delay = Some(
+                    self.base_delay
+                        .map_or(round_trip, |base| base.min(round_trip)),
+                );
+            }
+            return;
+        }
+        let Ok(sequence) = <[u8; 4]>::try_from(payload).map(u32::from_be_bytes) else {
+            return;
+        };
+        let Some(position) = self.in_flight.iter().position(|entry| entry.0 == sequence) else {
+            return;
+        };
+        let (_, bytes, sent) = self.in_flight[position];
+        self.in_flight.drain(..=position);
+        let previous = self.last_acknowledgement.replace(now);
+        if position > 0 {
+            return;
+        }
+        // Two upper bounds on this update's transmission time, so bytes over
+        // either never overestimates the throughput: the delay beyond the
+        // link's fixed round trip, and, because updates are delivered in
+        // order, the gap since the previous acknowledgement. The smaller one
+        // excludes queueing (the first can include it) and idle time (the
+        // second can). The maximum of recent samples is the estimate.
+        let beyond_delay = self
+            .base_delay
+            .map(|base| now.saturating_duration_since(sent).saturating_sub(base));
+        let since_previous = previous.map(|previous| now.saturating_duration_since(previous));
+        let transfer = match (beyond_delay, since_previous) {
+            (Some(beyond), Some(gap)) => beyond.min(gap),
+            (Some(bound), None) | (None, Some(bound)) => bound,
+            (None, None) => return,
+        }
+        .max(Duration::from_micros(500));
+        if self.samples.len() == FLOW_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples
+            .push_back(bytes as f64 / transfer.as_secs_f64());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_client_updates(
     stream: &mut TcpStream,
@@ -1166,6 +1393,10 @@ fn write_client_updates(
     // Set once the framebuffer has been resized; requests sized for the old
     // framebuffer are then clipped instead of ending the session.
     let mut resized = false;
+    // The region continuous updates cover, while they are enabled.
+    let mut continuous: Option<UpdateRequest> = None;
+    let mut announced_continuous = false;
+    let mut flow = FlowControl::default();
     loop {
         send_pending_clipboard(stream, clipboard, &mut clipboard_revision)?;
         let (current_generation, width, height) = {
@@ -1174,6 +1405,8 @@ fn write_client_updates(
                 .map_err(|_| invalid("framebuffer lock is poisoned"))?;
             (fb.generation, fb.framebuffer.width, fb.framebuffer.height)
         };
+        let tight = encodings.tight.filter(|_| pixel_format.has_tight_pixels());
+        let mut window = flow.window();
         if current_generation != generation {
             if !encodings.desktop_size {
                 return Err(io::Error::new(
@@ -1182,9 +1415,10 @@ fn write_client_updates(
                 ));
             }
             resized = true;
-            // Answer the next request with the new size; the client then
-            // requests pixels for the new framebuffer.
-            if pending.take().is_some() {
+            // Answer the next request with the new size, or send it right
+            // away to a client receiving continuous updates; the client then
+            // asks for pixels of the new framebuffer.
+            if pending.take().is_some() || continuous.is_some() {
                 write_desktop_size(stream, width, height)?;
                 generation = current_generation;
                 let tiles = usize::from(width).div_ceil(SERVER_TILE_SIZE)
@@ -1203,48 +1437,110 @@ fn write_client_updates(
             if let Some(update) = update
                 && (!update.rectangles.is_empty() || Instant::now() >= waiting.deadline)
             {
-                match encodings.tight.filter(|_| pixel_format.has_tight_pixels()) {
-                    Some(settings) => write_tight_update(
-                        stream,
-                        shared,
-                        &mut seen_revisions,
-                        &mut output,
-                        settings,
-                        update,
-                        generation,
-                    )?,
-                    None => write_update(
-                        stream,
-                        shared,
-                        &mut seen_revisions,
-                        &mut output,
-                        pixel_format,
-                        update,
-                        generation,
-                    )?,
+                let bytes = write_prepared_update(
+                    stream,
+                    shared,
+                    &mut seen_revisions,
+                    &mut output,
+                    pixel_format,
+                    tight,
+                    update,
+                    generation,
+                )?;
+                // Track requested updates too, so flow control knows what is
+                // still on the wire when continuous updates start.
+                if encodings.fence {
+                    let payload = flow.sent(bytes, Instant::now());
+                    stream
+                        .write_all(&fence_message(FENCE_REQUEST | FENCE_BLOCK_BEFORE, &payload))?;
                 }
                 pending = None;
             }
+        } else if let Some(region) = continuous {
+            let now = Instant::now();
+            if flow.probe_due(now) {
+                let probe = flow.probing(now);
+                stream.write_all(&fence_message(FENCE_REQUEST | FENCE_BLOCK_BEFORE, probe))?;
+            }
+            let open = match window {
+                SendWindow::Open => true,
+                SendWindow::OpensAt(at) => Instant::now() >= at,
+                SendWindow::Closed => false,
+            };
+            if open
+                && let Some(update) =
+                    prepare_update(shared, &seen_revisions, region, true, generation)?
+                && !update.rectangles.is_empty()
+            {
+                let bytes = write_prepared_update(
+                    stream,
+                    shared,
+                    &mut seen_revisions,
+                    &mut output,
+                    pixel_format,
+                    tight,
+                    update,
+                    generation,
+                )?;
+                let payload = flow.sent(bytes, Instant::now());
+                stream.write_all(&fence_message(FENCE_REQUEST | FENCE_BLOCK_BEFORE, &payload))?;
+                window = flow.window();
+            }
         }
-        let timeout = match &pending {
-            Some(waiting) if current_generation == generation => waiting
-                .deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1)),
-            _ => SERVER_IDLE_WAKE_INTERVAL,
-        };
-        match receiver.recv_timeout(timeout) {
+        let now = Instant::now();
+        let mut timeout = SERVER_IDLE_WAKE_INTERVAL;
+        if let Some(waiting) = &pending
+            && current_generation == generation
+        {
+            timeout = waiting.deadline.saturating_duration_since(now);
+        }
+        if continuous.is_some()
+            && let SendWindow::OpensAt(at) = window
+        {
+            timeout = timeout.min(at.saturating_duration_since(now));
+        }
+        match receiver.recv_timeout(timeout.max(Duration::from_millis(1))) {
             Ok(SessionInput::PixelFormat(format)) => pixel_format = format,
-            Ok(SessionInput::Encodings(advertised)) => encodings = advertised,
+            Ok(SessionInput::Encodings(advertised)) => {
+                encodings = advertised;
+                // Continuous updates rely on fences for flow control.
+                if encodings.continuous_updates && encodings.fence && !announced_continuous {
+                    stream.write_all(&[CONTINUOUS_UPDATES_MESSAGE])?;
+                    announced_continuous = true;
+                }
+            }
             Ok(SessionInput::UpdateRequest(request)) => {
-                pending = Some(PendingRequest {
-                    request,
-                    deadline: if request.incremental {
-                        Instant::now() + SERVER_EMPTY_UPDATE_INTERVAL
-                    } else {
-                        Instant::now()
-                    },
-                });
+                // Continuous updates already cover incremental requests.
+                if continuous.is_none() || !request.incremental {
+                    pending = Some(PendingRequest {
+                        request,
+                        deadline: if request.incremental {
+                            Instant::now() + SERVER_EMPTY_UPDATE_INTERVAL
+                        } else {
+                            Instant::now()
+                        },
+                    });
+                }
+            }
+            Ok(SessionInput::ContinuousUpdates { enable, region }) => {
+                if !announced_continuous {
+                    return Err(invalid("continuous updates were not offered"));
+                }
+                if enable {
+                    continuous = Some(region);
+                } else if continuous.take().is_some() {
+                    flow = FlowControl::default();
+                    stream.write_all(&[CONTINUOUS_UPDATES_MESSAGE])?;
+                }
+            }
+            Ok(SessionInput::Fence { flags, payload }) => {
+                if flags & FENCE_REQUEST != 0 {
+                    // Messages are handled in order, which satisfies every
+                    // supported flag.
+                    stream.write_all(&fence_message(flags & FENCE_SUPPORTED_FLAGS, &payload))?;
+                } else {
+                    flow.acknowledged(&payload, Instant::now());
+                }
             }
             Ok(SessionInput::Wake) => wake_queued.store(false, Ordering::Release),
             Ok(SessionInput::Closed(error)) => return Err(error),
@@ -1256,6 +1552,41 @@ fn write_client_updates(
                 ));
             }
         }
+    }
+}
+
+/// Write a prepared update with Tight when the client accepts it, otherwise
+/// Raw. Returns the bytes written.
+#[allow(clippy::too_many_arguments)]
+fn write_prepared_update(
+    stream: &mut TcpStream,
+    shared: &Arc<Mutex<ServerFramebuffer>>,
+    seen_revisions: &mut [u64],
+    output: &mut Vec<u8>,
+    pixel_format: ServerPixelFormat,
+    tight: Option<TightSettings>,
+    update: PreparedUpdate,
+    generation: u64,
+) -> io::Result<usize> {
+    match tight {
+        Some(settings) => write_tight_update(
+            stream,
+            shared,
+            seen_revisions,
+            output,
+            settings,
+            update,
+            generation,
+        ),
+        None => write_update(
+            stream,
+            shared,
+            seen_revisions,
+            output,
+            pixel_format,
+            update,
+            generation,
+        ),
     }
 }
 
@@ -1539,7 +1870,8 @@ fn write_update(
     pixel_format: ServerPixelFormat,
     update: PreparedUpdate,
     generation: u64,
-) -> io::Result<()> {
+) -> io::Result<usize> {
+    let mut written = 0;
     output.clear();
     output.extend_from_slice(&[0, 0]);
     output.extend_from_slice(&(update.rectangles.len() as u16).to_be_bytes());
@@ -1565,6 +1897,7 @@ fn write_update(
             }
             if output.len() >= SERVER_WRITE_CHUNK_BYTES {
                 stream.write_all(output)?;
+                written += output.len();
                 output.clear();
             }
         }
@@ -1573,11 +1906,12 @@ fn write_update(
         }
     }
     stream.write_all(output)?;
+    written += output.len();
     output.clear();
     for (index, revision) in update.acknowledged {
         seen_revisions[index] = revision;
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Merge changed tiles into larger rectangles and split them to Tight's size
@@ -1694,7 +2028,8 @@ fn write_tight_update(
     settings: TightSettings,
     update: PreparedUpdate,
     generation: u64,
-) -> io::Result<()> {
+) -> io::Result<usize> {
+    let mut written = 0;
     let rects = tight_rects(&update.rectangles);
     if rects.len() > usize::from(u16::MAX) {
         return Err(invalid("too many changed framebuffer rectangles"));
@@ -1735,10 +2070,12 @@ fn write_tight_update(
         output.extend_from_slice(body);
         if output.len() >= SERVER_WRITE_CHUNK_BYTES {
             stream.write_all(output)?;
+            written += output.len();
             output.clear();
         }
     }
     stream.write_all(output)?;
+    written += output.len();
     output.clear();
     for rect in &update.rectangles {
         if let Some(index) = rect.tile_index {
@@ -1748,7 +2085,7 @@ fn write_tight_update(
     for (index, revision) in update.acknowledged {
         seen_revisions[index] = revision;
     }
-    Ok(())
+    Ok(written)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2044,13 +2381,25 @@ pub fn read_update_with_encoding(
         decoder,
         || Ok(()),
         |_| {},
+        |_| Ok(()),
         apply,
     )
 }
 
+/// Server messages about the update stream itself.
+enum ServerControl<'a> {
+    /// The server supports continuous updates, or stopped sending them.
+    EndOfContinuousUpdates,
+    Fence {
+        flags: u32,
+        payload: &'a [u8],
+    },
+}
+
 /// `started` runs once the FramebufferUpdate header arrives, before any
-/// rectangle data is read, and `rectangle` once per rectangle with its
-/// encoding.
+/// rectangle data is read, `rectangle` once per rectangle with its
+/// encoding, and `control` for continuous-update and fence messages that
+/// arrive before the update.
 #[allow(clippy::too_many_arguments)]
 fn read_update_inner(
     reader: &mut impl Read,
@@ -2060,6 +2409,7 @@ fn read_update_inner(
     decoder: &mut UpdateDecoder,
     mut started: impl FnMut() -> io::Result<()>,
     mut rectangle: impl FnMut(i32),
+    mut control: impl FnMut(ServerControl<'_>) -> io::Result<()>,
     mut apply: impl FnMut(u16, u16, u16, u16, &[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
     loop {
@@ -2141,6 +2491,14 @@ fn read_update_inner(
                     return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
                 }
             }
+            CONTINUOUS_UPDATES_MESSAGE => control(ServerControl::EndOfContinuousUpdates)?,
+            FENCE_MESSAGE => {
+                let (flags, payload) = read_fence(reader)?;
+                control(ServerControl::Fence {
+                    flags,
+                    payload: &payload,
+                })?;
+            }
             _ => return Err(invalid("unknown server message type")),
         }
     }
@@ -2189,6 +2547,28 @@ impl InputWriter {
         self.send(&key_packet(keysym, down))
     }
 
+    fn enable_continuous_updates(&self, enable: bool, width: u16, height: u16) -> io::Result<()> {
+        let mut message = [
+            CONTINUOUS_UPDATES_MESSAGE,
+            u8::from(enable),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        message[6..8].copy_from_slice(&width.to_be_bytes());
+        message[8..10].copy_from_slice(&height.to_be_bytes());
+        self.send(&message)
+    }
+
+    fn fence(&self, flags: u32, payload: &[u8]) -> io::Result<()> {
+        self.send(&fence_message(flags, payload))
+    }
+
     pub fn pointer(&self, buttons: u8, x: u16, y: u16) -> io::Result<()> {
         self.send(&pointer_packet(buttons, x, y))
     }
@@ -2214,6 +2594,10 @@ pub struct Session {
     /// Whether the next update should be requested as soon as the current
     /// one starts arriving.
     pipeline: bool,
+    /// Accept continuous updates when the server offers them.
+    want_continuous: bool,
+    /// The server pushes updates; no requests are needed.
+    continuous: bool,
     writer: InputWriter,
     encoding: Encoding,
     decoder: UpdateDecoder,
@@ -2301,6 +2685,8 @@ impl Session {
             reader,
             stats,
             pipeline: true,
+            want_continuous: true,
+            continuous: false,
             writer: InputWriter(Arc::new(Mutex::new(stream))),
             encoding,
             decoder: UpdateDecoder::new(),
@@ -2309,6 +2695,12 @@ impl Session {
 
     pub fn writer(&self) -> InputWriter {
         self.writer.clone()
+    }
+
+    /// Whether to accept continuous updates when the server offers them; on
+    /// by default. Call before the first read.
+    pub fn set_continuous_updates(&mut self, enabled: bool) {
+        self.want_continuous = enabled;
     }
 
     /// Counters that stay readable after the session moves to another thread.
@@ -2363,13 +2755,16 @@ impl Session {
             refresh: || writer.request_update(false, width, height),
             requested: false,
         };
-        let early = request_next && self.pipeline;
+        let continuous = std::cell::Cell::new(self.continuous);
+        let want_continuous = self.want_continuous;
+        let pipeline = self.pipeline;
         let counters = &self.stats.0;
         let network_wait = &counters.network_wait_nanos;
         let mut wait_before_body = None;
+        let mut requested_early = false;
         let mut rectangles = 0u32;
         let mut apply = apply;
-        read_update_inner(
+        let result = read_update_inner(
             &mut reader,
             (width, height),
             scratch,
@@ -2377,8 +2772,9 @@ impl Session {
             &mut self.decoder,
             || {
                 wait_before_body = Some(network_wait.load(Ordering::Relaxed));
-                if early {
+                if request_next && pipeline && !continuous.get() {
                     writer.request_update(true, width, height)?;
+                    requested_early = true;
                 }
                 Ok(())
             },
@@ -2388,17 +2784,42 @@ impl Session {
                     .last_encoding
                     .store(i64::from(encoding), Ordering::Relaxed);
             },
+            |message| match message {
+                ServerControl::EndOfContinuousUpdates => {
+                    if continuous.get() {
+                        // The server stopped pushing; go back to requests.
+                        continuous.set(false);
+                        writer.request_update(true, width, height)
+                    } else if want_continuous && request_next {
+                        continuous.set(true);
+                        writer.enable_continuous_updates(true, width, height)
+                    } else {
+                        Ok(())
+                    }
+                }
+                // Messages are handled in order, which satisfies every
+                // supported flag.
+                ServerControl::Fence { flags, payload } if flags & FENCE_REQUEST != 0 => {
+                    writer.fence(flags & FENCE_SUPPORTED_FLAGS, payload)
+                }
+                ServerControl::Fence { .. } => Ok(()),
+            },
             |x, y, w, h, bytes| apply(x, y, w, h, bytes),
-        )?;
+        );
+        self.continuous = continuous.get();
+        counters
+            .continuous_updates
+            .store(self.continuous, Ordering::Relaxed);
+        result?;
         if rectangles > 0 {
             counters.frames.fetch_add(1, Ordering::Relaxed);
         }
-        if request_next {
+        if request_next && !self.continuous {
             if let Some(before) = wait_before_body {
                 let waited = network_wait.load(Ordering::Relaxed).saturating_sub(before);
                 self.pipeline = Duration::from_nanos(waited) <= PIPELINE_MAX_NETWORK_WAIT;
             }
-            if !early {
+            if !requested_early {
                 writer.request_update(true, width, height)?;
             }
         }
@@ -2431,6 +2852,7 @@ mod tests {
             update,
             generation,
         )
+        .map(|_| ())
     }
 
     fn tcp_pair() -> (TcpStream, TcpStream) {
@@ -3265,6 +3687,8 @@ mod tests {
         let mut changed = source.clone();
         changed.pixels_mut()[299] = 0x00ff00;
         server.update_framebuffer(&changed).unwrap();
+        // TopVNC's server offers continuous updates and the session takes them.
+        assert!(session.stats().snapshot().continuous_updates);
         let deadline = Instant::now() + Duration::from_secs(2);
         while received.pixels()[299] != 0x00ff00 {
             assert!(Instant::now() < deadline, "the change never arrived");
@@ -3445,6 +3869,195 @@ mod tests {
         }
     }
 
+    /// Read one server message: (type, body). Updates return their raw
+    /// rectangles' headers; fences return flags and payload.
+    enum ServerMessage {
+        Update(Vec<(u16, u16, u16, u16)>),
+        Fence(u32, Vec<u8>),
+        EndOfContinuousUpdates,
+    }
+
+    fn read_server_message(client: &mut TcpStream) -> ServerMessage {
+        let mut kind = [0];
+        client.read_exact(&mut kind).unwrap();
+        match kind[0] {
+            0 => {
+                let mut header = [0; 3];
+                client.read_exact(&mut header).unwrap();
+                let count = u16::from_be_bytes([header[1], header[2]]);
+                let rects = (0..count)
+                    .map(|_| {
+                        let mut rect = [0; 12];
+                        client.read_exact(&mut rect).unwrap();
+                        let field =
+                            |index: usize| u16::from_be_bytes([rect[index], rect[index + 1]]);
+                        assert_eq!(i32::from_be_bytes(rect[8..12].try_into().unwrap()), 0);
+                        let mut pixels = vec![0; usize::from(field(4)) * usize::from(field(6)) * 4];
+                        client.read_exact(&mut pixels).unwrap();
+                        (field(0), field(2), field(4), field(6))
+                    })
+                    .collect();
+                ServerMessage::Update(rects)
+            }
+            FENCE_MESSAGE => {
+                let (flags, payload) = read_fence(client).unwrap();
+                ServerMessage::Fence(flags, payload)
+            }
+            CONTINUOUS_UPDATES_MESSAGE => ServerMessage::EndOfContinuousUpdates,
+            other => panic!("unexpected server message {other}"),
+        }
+    }
+
+    /// Skip probe fences, answering them, and return the next other message.
+    fn next_message(client: &mut TcpStream) -> ServerMessage {
+        loop {
+            match read_server_message(client) {
+                ServerMessage::Fence(flags, payload) if payload == FLOW_PROBE => {
+                    assert_ne!(flags & FENCE_REQUEST, 0);
+                    client
+                        .write_all(&fence_message(flags & FENCE_SUPPORTED_FLAGS, &payload))
+                        .unwrap();
+                }
+                message => return message,
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_updates_push_changes_and_wait_for_fences() {
+        let (server, address) = start_insecure_server(Framebuffer::new(64, 64).unwrap());
+        let (mut client, width, height) =
+            raw_client(address, &[0, FENCE_ENCODING, CONTINUOUS_UPDATES_ENCODING]);
+        // Advertising both pseudo-encodings is answered with
+        // EndOfContinuousUpdates, which offers them.
+        assert!(matches!(
+            read_server_message(&mut client),
+            ServerMessage::EndOfContinuousUpdates
+        ));
+        let mut enable = [CONTINUOUS_UPDATES_MESSAGE, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        enable[6..8].copy_from_slice(&width.to_be_bytes());
+        enable[8..10].copy_from_slice(&height.to_be_bytes());
+        client.write_all(&enable).unwrap();
+
+        // A change is pushed without a request and followed by a fence.
+        let mut frame = Framebuffer::new(64, 64).unwrap();
+        frame.pixels_mut()[0] = 0xff0000;
+        server.update_framebuffer(&frame).unwrap();
+        let ServerMessage::Update(rects) = next_message(&mut client) else {
+            panic!("expected a pushed update");
+        };
+        assert_eq!(rects, vec![(0, 0, 64, 64)]);
+        let ServerMessage::Fence(flags, sequence) = next_message(&mut client) else {
+            panic!("expected a fence after the update");
+        };
+        assert_eq!(flags, FENCE_REQUEST | FENCE_BLOCK_BEFORE);
+        assert_eq!(sequence.len(), 4);
+
+        // Without a throughput estimate, the next change waits for the
+        // fence to be answered.
+        frame.pixels_mut()[0] = 0x00ff00;
+        server.update_framebuffer(&frame).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut byte = [0];
+        assert!(client.peek(&mut byte).is_err());
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(&fence_message(FENCE_BLOCK_BEFORE, &sequence))
+            .unwrap();
+        assert!(matches!(
+            next_message(&mut client),
+            ServerMessage::Update(_)
+        ));
+
+        // Disabling continuous updates is confirmed.
+        enable[1] = 0;
+        client.write_all(&enable).unwrap();
+        loop {
+            match next_message(&mut client) {
+                ServerMessage::EndOfContinuousUpdates => break,
+                ServerMessage::Fence(..) => {}
+                ServerMessage::Update(_) => panic!("no update without a request"),
+            }
+        }
+        server.stop();
+    }
+
+    #[test]
+    fn server_answers_client_fences_and_rejects_unoffered_continuous_updates() {
+        let (server, address) = start_insecure_server(Framebuffer::new(8, 8).unwrap());
+        let (mut client, _, _) = raw_client(address, &[0, FENCE_ENCODING]);
+        client
+            .write_all(&fence_message(
+                FENCE_REQUEST | FENCE_BLOCK_AFTER | (1 << 3),
+                b"hi",
+            ))
+            .unwrap();
+        let ServerMessage::Fence(flags, payload) = read_server_message(&mut client) else {
+            panic!("expected a fence response");
+        };
+        // Unknown flags and the request flag are cleared.
+        assert_eq!(flags, FENCE_BLOCK_AFTER);
+        assert_eq!(payload, b"hi");
+        // Continuous updates were not offered (no -313), so enabling them
+        // ends the session.
+        client
+            .write_all(&[CONTINUOUS_UPDATES_MESSAGE, 1, 0, 0, 0, 0, 0, 8, 0, 8])
+            .unwrap();
+        assert_eq!(client.read(&mut [0; 16]).unwrap_or(0), 0);
+        server.stop();
+    }
+
+    #[test]
+    fn flow_control_paces_updates_from_measured_throughput() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut flow = FlowControl::default();
+        assert!(flow.probe_due(at(0)));
+        assert_eq!(flow.probing(at(0)), FLOW_PROBE);
+        assert!(!flow.probe_due(at(1)));
+        // A 10 ms round trip on an idle link.
+        flow.acknowledged(&FLOW_PROBE, at(10));
+        assert_eq!(flow.base_delay, Some(Duration::from_millis(10)));
+        assert_eq!(flow.window(), SendWindow::Open);
+
+        // 1 MB acknowledged 30 ms after it was sent: 20 ms beyond the round
+        // trip, so 50 MB/s.
+        let first = flow.sent(1_000_000, at(100));
+        assert_eq!(flow.window(), SendWindow::Closed);
+        flow.acknowledged(&first, at(130));
+        assert_eq!(flow.throughput(), Some(50_000_000.0));
+
+        // With one update in flight, the next may go once the link has
+        // probably sent it: 1 MB at 95% of 50 MB/s is about 21 ms.
+        flow.sent(1_000_000, at(200));
+        let SendWindow::OpensAt(opens) = flow.window() else {
+            panic!("expected a timed window");
+        };
+        let wait = opens - at(200);
+        assert!(wait > Duration::from_millis(20) && wait < Duration::from_millis(22));
+        // A second update queues behind the first on the link.
+        flow.sent(1_000_000, opens);
+        flow.sent(1_000_000, opens);
+        assert_eq!(flow.window(), SendWindow::Closed);
+
+        // Unknown and malformed acknowledgements are ignored.
+        flow.acknowledged(&[1, 2, 3], at(400));
+        flow.acknowledged(&99u32.to_be_bytes(), at(400));
+        assert_eq!(flow.in_flight.len(), 3);
+        // Acknowledging the last one clears everything before it.
+        let last = flow.in_flight.back().unwrap().0.to_be_bytes();
+        flow.acknowledged(&last, at(400));
+        assert!(flow.in_flight.is_empty());
+        assert_eq!(flow.window(), SendWindow::Open);
+        // Probes repeat only on an idle link, once a second.
+        assert!(!flow.probe_due(at(900)));
+        assert!(flow.probe_due(at(1000)));
+    }
+
     #[test]
     fn server_reports_rfb_38_authentication_failure_reason() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3607,7 +4220,7 @@ mod tests {
         let (client, mut server) = socket_pair();
         let worker = std::thread::spawn(move || {
             server.write_all(mock_server().input.get_ref()).unwrap();
-            let mut handshake = [0; 42];
+            let mut handshake = [0; 50];
             server.read_exact(&mut handshake).unwrap();
             let mut request = [0; 10];
             server.read_exact(&mut request).unwrap();
@@ -3701,7 +4314,7 @@ mod tests {
         assert_eq!(&server.output[12..14], &[1, 1]); // Security type, ClientInit.
         assert_eq!(&server.output[14..18], &[0, 0, 0, 0]); // SetPixelFormat header.
         assert_eq!(&server.output[18..22], &[32, 24, 0, 1]);
-        assert_eq!(&server.output[34..], &[2, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(&server.output[34..], &set_encodings(&[0]));
         assert_eq!(info.security, Security::None);
     }
 
@@ -3709,7 +4322,19 @@ mod tests {
     fn handshake_advertises_zlib_only_when_selected() {
         let mut server = mock_server();
         negotiate_with_encoding(&mut server, true, Encoding::Zlib, || unreachable!()).unwrap();
-        assert_eq!(&server.output[34..], &[2, 0, 0, 1, 0, 0, 0, 6]);
+        assert_eq!(&server.output[34..], &set_encodings(&[6]));
+    }
+
+    /// SetEncodings for `encodings`, followed by the fence and
+    /// continuous-updates pseudo-encodings every mode advertises.
+    fn set_encodings(encodings: &[i32]) -> Vec<u8> {
+        let all = [encodings, &[FENCE_ENCODING, CONTINUOUS_UPDATES_ENCODING]].concat();
+        let mut message = vec![2, 0];
+        message.extend_from_slice(&(all.len() as u16).to_be_bytes());
+        for encoding in all {
+            message.extend_from_slice(&encoding.to_be_bytes());
+        }
+        message
     }
 
     #[test]
@@ -3722,11 +4347,7 @@ mod tests {
             || unreachable!(),
         )
         .unwrap();
-        let mut expected = vec![2, 0, 0, 5];
-        for encoding in [7, 6, 0, -26, -255] {
-            expected.extend_from_slice(&i32::to_be_bytes(encoding));
-        }
-        assert_eq!(&server.output[34..], &expected);
+        assert_eq!(&server.output[34..], &set_encodings(&[7, 6, 0, -26, -255]));
     }
 
     #[test]
@@ -3873,7 +4494,7 @@ mod tests {
         assert_eq!(info.security, Security::VncPassword);
         assert_eq!(&server.output[..12], b"RFB 003.008\n");
         assert_eq!(server.output[12], 2);
-        assert_eq!(server.output.len(), 12 + 1 + 16 + 1 + 20 + 8);
+        assert_eq!(server.output.len(), 12 + 1 + 16 + 1 + 20 + 16);
     }
 
     #[test]
