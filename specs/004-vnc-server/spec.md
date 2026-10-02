@@ -43,7 +43,7 @@ Provide a reusable RFB server endpoint and a usable Windows host mode that captu
 
 ## Limitations
 
-The server supports RFB 3.8 and Raw encoding only. It does not encrypt TCP; deployments must use a secured network or tunnel. Standard VNC authentication retains its protocol limitation of using only the first eight password bytes. Clipboard text is limited to Latin-1; Windows text outside that range is replaced with `?` for viewers.
+The server supports RFB 3.8 with Raw encoding, and Tight with JPEG as specified in spec 006. It does not encrypt TCP; deployments must use a secured network or tunnel. Standard VNC authentication retains its protocol limitation of using only the first eight password bytes. Clipboard text is limited to Latin-1; Windows text outside that range is replaced with `?` for viewers.
 
 The secure desktop (UAC prompts, the lock screen) cannot be captured by a user process; the last image stays on screen until capture resumes. One display is served per server process, and the Server tab runs one server at a time. Printable ASCII keysyms are mapped to US-layout virtual keys. TopVNC's own viewer does not yet advertise DesktopSize, so it is disconnected when the served display changes size and must reconnect. The macOS host backend is specified in spec 005; a Linux backend remains future work.
 

@@ -8,14 +8,15 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 
 *TopVNC running on Windows, with connection and display settings in one window.*
 
-**Early development:** the native client has been compiled and tested on Windows, where it connected to a live macOS VNC server, and on macOS, where it connected to a live server over the local network. The Windows server mode compiles and links, and its platform-neutral logic is tested, but live desktop capture and input injection have not yet been verified on Windows (an earlier attempt outside an interactive desktop was denied with `0x80070005`). The macOS server mode builds and its platform-neutral logic is tested on macOS, but live capture and input injection have not yet been validated. Full remote control and macOS unlocking remain under live validation. The Linux client build is untested; Linux hosting is not implemented. Performance goals have not yet been established by end-to-end benchmarks.
+**Early development:** the native client has been compiled and tested on Windows, where it connected to a live macOS VNC server, and on macOS, where it connected to a live server over the local network. The Windows server mode compiles and links, and its platform-neutral logic is tested, but live desktop capture and input injection have not yet been verified on Windows (an earlier attempt outside an interactive desktop was denied with `0x80070005`). The macOS server mode builds and its platform-neutral logic is tested on macOS, but live capture and input injection have not yet been validated. Full remote control and macOS unlocking remain under live validation. The Linux client build is untested; Linux hosting is not implemented. Frame rate and latency have been measured end to end between TopVNC's own server and client over an emulated network link ([Performance](#performance)); they have not yet been measured with live desktop capture.
 
 [Quick start](#quick-start) · [Controls](#controls-and-display-settings) · [Security](#security-and-saved-settings) · [Development](#development) · [Roadmap](#roadmap)
 
 ## Features
 
 - **Native connection UI** with a masked password field, input validation, and connection errors shown in the window.
-- **Raw and Zlib encodings**, 32-bit true color, and incremental framebuffer updates.
+- **Tight encoding with JPEG** (the default), plus Raw and Zlib, with 32-bit true color and incremental framebuffer updates. Full-screen motion such as games fits in a fraction of Raw's bandwidth; see [Performance](#performance).
+- **Adaptive request pipelining**: the next update is requested as soon as the current one starts arriving, unless the link is already saturated.
 - **Keyboard and mouse input** for interacting with the remote desktop.
 - **Adjustable display** with fit-to-window or native pixels, smooth or sharp scaling, and 30, 60, or 120 FPS presentation limits.
 - **In-session settings** accessible through **F8**, including disconnect and a resizable on-screen settings button.
@@ -36,7 +37,7 @@ cargo run --release
 
 1. Enter the server address and port (usually `5900`). Use brackets around IPv6 addresses, such as `[::1]`.
 2. Enter the server's VNC password.
-3. Choose Raw or Zlib, the initial window size, presentation rate, and scaling mode.
+3. Choose the compression (Tight JPEG for games and video, Raw for a lossless image on a fast link), the initial window size, presentation rate, and scaling mode.
 4. Click **Connect**. Press **F8** during the session to adjust display settings or disconnect.
 
 > **Transport security:** TopVNC currently uses unencrypted TCP. VNC password authentication does not encrypt the framebuffer or input traffic. Use an isolated network or a separately secured tunnel for sensitive sessions. See [Security and saved settings](#security-and-saved-settings).
@@ -57,13 +58,14 @@ cargo run --release -- 127.0.0.1:5900 --window 1280x720
 | `--native-size` | Show native pixels; center and crop if the image is larger than the window. |
 | `--window WIDTHxHEIGHT` | Set a custom initial window size, such as `1280x720`. |
 | `--allow-insecure` | Explicitly allow a server offering unauthenticated `None` security. |
+| `--quality LEVEL` | JPEG quality level for Tight, from 0 (smallest) to 9 (best); default 6. Lower it on a slow link. |
 | `--input-debug` | Log outgoing key and pointer events for troubleshooting. |
 
 Do not use `--input-debug` while typing passwords: it logs key events.
 
 ### Serve this desktop
 
-Open the **Server** tab in the TopVNC window, enter a password, and click **Start server**. The tab binds to `127.0.0.1:5900` by default; click **All networks** to listen on every interface, or enter a display number to share a display other than the primary one. It shows the served size, address, and number of connected viewers, and keeps running while you use TopVNC as a viewer. Closing TopVNC stops the server. Server settings and passwords are not saved.
+Open the **Server** tab in the TopVNC window, enter a password, and click **Start server**. The tab binds to `127.0.0.1:5900` by default; click **All networks** to listen on every interface, or enter a display number to share a display other than the primary one. **Served size** scales the image viewers receive, from 0.25× to 1.00× of the display's pixel size: drag the slider, or click **Full** or **Half**. Half size serves a Retina display at its size in points, a quarter of the pixels, which cuts encoding time and bandwidth for games. It shows the served size, address, and number of connected viewers, and keeps running while you use TopVNC as a viewer. Closing TopVNC stops the server. Server settings and passwords are not saved.
 
 You can also run the server as a separate console mode. It binds to localhost by default and prompts for a VNC password:
 
@@ -71,9 +73,10 @@ You can also run the server as a separate console mode. It binds to localhost by
 cargo run --release -- --serve
 cargo run --release -- --serve 0.0.0.0:5900
 cargo run --release -- --serve 0.0.0.0:5900 --display 2
+cargo run --release -- --serve 0.0.0.0:5900 --scale 0.5
 ```
 
-The second command listens on all network interfaces. Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
+The second and later commands listen on all network interfaces, and `--scale` sets the served size (0.25 to 1). Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
 
 The server shares the primary display unless `--display NUMBER` selects another attached display (numbered from 1). Run it in an interactive, unlocked session: services and disconnected Remote Desktop sessions cannot capture the desktop. While Windows shows the secure desktop (UAC prompts, the lock screen), viewers keep the last image and capture resumes automatically afterward. If the display resolution changes, viewers that support the DesktopSize extension follow the new size; others, including TopVNC's own viewer for now, are disconnected and can reconnect.
 
@@ -84,7 +87,7 @@ Hosting a Mac needs macOS 12.3 or later and two permissions, which the Server ta
 - **Screen Recording** (*System Settings → Privacy & Security → Screen & System Audio Recording*) is required. Without it the server asks for access and refuses to start; quit and relaunch after granting it.
 - **Accessibility** (*System Settings → Privacy & Security → Accessibility*) lets viewers type and use the mouse. Without it the server runs view-only and shows a warning, and remote input starts as soon as access is granted, without a restart.
 
-When TopVNC runs from a terminal, including `cargo run`, macOS grants both permissions to the terminal app, not to TopVNC. The server shares the main display, or `--display NUMBER` in ScreenCaptureKit's display order, at its native pixel size: a Retina display is served at its full pixel resolution, which makes Raw updates large. The cursor is part of the captured image. If port 5900 is already taken, macOS Screen Sharing or Remote Management may be listening on it; choose another port such as 5901. A Mac that is locked cannot be captured or unlocked through this server: viewers keep the last image, and starting the server while the Mac is locked fails.
+When TopVNC runs from a terminal, including `cargo run`, macOS grants both permissions to the terminal app, not to TopVNC. The server shares the main display, or `--display NUMBER` in ScreenCaptureKit's display order, at its native pixel size by default: a Retina display is then served at its full pixel resolution, which makes updates large. For games, serve at half size and use Tight JPEG in the viewer. ScreenCaptureKit scales the image on the GPU. The cursor is part of the captured image. If port 5900 is already taken, macOS Screen Sharing or Remote Management may be listening on it; choose another port such as 5901. A Mac that is locked cannot be captured or unlocked through this server: viewers keep the last image, and starting the server while the Mac is locked fails.
 
 ## Controls and display settings
 
@@ -100,7 +103,29 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 | F8 button size | Adjust the on-screen settings button from 0.5× to 2.0×. |
 | Disconnect | Return to the connection form. |
 
-The initial viewer fits within the primary display by default when the remote screen is larger. Only affected regions are rescaled after framebuffer updates. The next incremental update is requested as soon as the previous update is decoded, independently of the presentation FPS limit.
+The initial viewer fits within the primary display by default when the remote screen is larger. Only affected regions are rescaled after framebuffer updates, and an image that is not scaled is copied directly. The network thread requests updates independently of the presentation FPS limit.
+
+## Performance
+
+Games and video change the whole screen every frame. A Raw 1920×1080 frame is about 8.3 MB, which limits a 1 Gbit/s link to about 15 frames per second. TopVNC's server and client both support Tight encoding:
+
+- Flat areas stay lossless and sharp: single colors are sent as fills, and areas of up to 16 colors as palettes.
+- Everything else is sent as JPEG at the viewer's quality level.
+- Changed tiles are merged into large rectangles and encoded on several threads.
+
+Results from `cargo run --release --example latency_bench`, between TopVNC's server and client through a local proxy that emulates the link. The source is a panning 1920×1080 scene at 60 fps, with 2 ms one-way delay. Latency is from the server receiving a frame until the client has all of it. Desktop capture, display, and input are not included.
+
+| Link | Encoding | Frames per second | Mean latency | Per frame |
+| --- | --- | --- | --- | --- |
+| 1 Gbit/s | Raw (0.2.0 behavior) | 15.2 | 73.0 ms | 8.2 MB |
+| 1 Gbit/s | Tight, quality 6 (default) | 60.0 | 13.8 ms | 255 KB |
+| 100 Mbit/s | Raw (0.2.0 behavior) | 1.8 | 669.5 ms | 7.4 MB |
+| 100 Mbit/s | Tight, quality 6 (default) | 49.2 | 28.4 ms | 254 KB |
+| 100 Mbit/s | Tight, quality 3 | 60.4 | 11.7 ms | 89 KB |
+
+The scene is synthetic, so real games compress differently. If a link cannot keep up, lower `--quality`.
+
+Tight between TopVNC's server and client is covered by tests. Tight against third-party servers and viewers, and with live desktop capture, has not yet been validated. See [`specs/006-low-latency-gaming/spec.md`](specs/006-low-latency-gaming/spec.md) for the full measurements.
 
 ## Security and saved settings
 
@@ -144,6 +169,7 @@ cargo run
 | Path | Purpose |
 | --- | --- |
 | [`src/lib.rs`](src/lib.rs) | Reusable RFB protocol handling, authentication, decoding, framebuffer state, and session logic. |
+| [`src/tight.rs`](src/tight.rs) | Tight encoding: the server's Fill, palette, JPEG, and zlib encoder and the client decoder. |
 | [`src/main.rs`](src/main.rs) | Native application, session worker, input handling, and software presentation. |
 | [`src/ui.rs`](src/ui.rs) | Connect and Server tabs and in-session settings UI. |
 | [`src/settings.rs`](src/settings.rs) | Saved connection details and platform-specific password storage. |
@@ -151,6 +177,7 @@ cargo run
 | [`src/windows_server.rs`](src/windows_server.rs) | Windows Desktop Duplication capture and remote keyboard/mouse injection for the Server tab and `--serve`. |
 | [`src/macos_server.rs`](src/macos_server.rs) | macOS ScreenCaptureKit capture, Quartz keyboard/mouse injection, and pasteboard sync for the Server tab and `--serve`. |
 | [`build.rs`](build.rs) | Weak-links ScreenCaptureKit so the app still starts on macOS releases older than 12.3. |
+| [`examples/latency_bench.rs`](examples/latency_bench.rs) | End-to-end frame rate and latency benchmark over an emulated network link. |
 | [`specs/004-vnc-server/spec.md`](specs/004-vnc-server/spec.md) | Server scope, security behavior, and limitations. |
 | [`specs/`](specs/) | Feature scope and acceptance criteria. |
 
@@ -166,5 +193,6 @@ For contributions, read [AGENTS.md](AGENTS.md), record scope and acceptance crit
 - Validate native clients on macOS and Linux.
 - Add clipboard integration, remote desktop resizing, and relative pointer input.
 - Expand authentication and transport security options, plus additional encodings.
-- Add GPU presentation and profile end-to-end input-to-display latency.
+- Validate reduced served sizes with live capture, add ContinuousUpdates with congestion control, and consider a video codec for lower bandwidth.
+- Add GPU presentation and profile end-to-end input-to-display latency with live capture.
 - Build a browser client and gateway sharing the native session behavior where web APIs allow it.
