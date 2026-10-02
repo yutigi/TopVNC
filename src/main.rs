@@ -2,8 +2,9 @@ use minifb::{InputCallback, Key, MouseButton, MouseMode, ScaleMode, Window, Wind
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 use topvnc::{Encoding, Framebuffer, Session, StatsSnapshot, encoding_name};
 
 // Each host backend uses part of the shared logic; tests cover all of it.
@@ -321,6 +322,11 @@ impl ScaledFrame {
     }
 }
 
+/// How often the window thread polls input while no frame arrives.
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+/// The window is redrawn at least this often, even without new frames.
+const REDRAW_INTERVAL: Duration = Duration::from_millis(250);
+
 struct FrameState {
     framebuffer: Framebuffer,
     /// Area changed by fully received updates and not yet presented.
@@ -333,11 +339,17 @@ fn throughput(before: StatsSnapshot, after: StatsSnapshot, elapsed: std::time::D
     let frames = after.frames.saturating_sub(before.frames);
     let bytes = after.bytes.saturating_sub(before.bytes) as f64;
     format!(
-        "{:.0} fps · {:.0} KB/frame · {:.0} Mbit/s · {}",
+        "{:.0} fps · {:.0} KB/frame · {:.0} Mbit/s · {}{}",
         frames as f64 / seconds,
         bytes / frames.max(1) as f64 / 1000.0,
         bytes * 8.0 / seconds / 1e6,
-        after.encoding.map_or("waiting", encoding_name)
+        after.encoding.map_or("waiting", encoding_name),
+        // Continuous updates: the server pushes frames without requests.
+        if after.continuous_updates {
+            " · push"
+        } else {
+            ""
+        }
     )
 }
 
@@ -1117,11 +1129,16 @@ fn run_session_inner(
     );
     let writer = session.writer();
     let stats = session.stats();
-    let framebuffer = Arc::new(Mutex::new(FrameState {
-        framebuffer: Framebuffer::new(info.width, info.height)?,
-        dirty: None,
-    }));
-    let worker_framebuffer = Arc::clone(&framebuffer);
+    // The condition variable wakes the window thread when an update has
+    // fully arrived.
+    let shared = Arc::new((
+        Mutex::new(FrameState {
+            framebuffer: Framebuffer::new(info.width, info.height)?,
+            dirty: None,
+        }),
+        Condvar::new(),
+    ));
+    let worker_shared = Arc::clone(&shared);
     let worker_writer = writer.clone();
     let (error_tx, error_rx) = mpsc::channel();
     thread::spawn(move || {
@@ -1134,6 +1151,7 @@ fn run_session_inner(
                 let mut received: Option<Rect> = None;
                 // Rectangles are decoded before the lock is taken; the lock
                 // only covers copying pixels into the shared framebuffer.
+                let (worker_framebuffer, frame_ready) = &*worker_shared;
                 session.read_update_pipelined(&mut scratch, |x, y, width, height, bytes| {
                     worker_framebuffer
                         .lock()
@@ -1153,6 +1171,7 @@ fn run_session_inner(
                 if let Some(rect) = received {
                     let mut frame = worker_framebuffer.lock().unwrap();
                     frame.dirty = Some(frame.dirty.map_or(rect, |dirty| dirty.union(rect)));
+                    frame_ready.notify_one();
                 }
             }
         })();
@@ -1176,7 +1195,10 @@ fn run_session_inner(
             ..WindowOptions::default()
         },
     )?;
-    window.set_target_fps(config.fps);
+    // The loop paces itself: it presents each frame as soon as it arrives,
+    // up to the FPS limit, and polls input between frames.
+    window.set_target_fps(0);
+    let (framebuffer, frame_ready) = &*shared;
     let mut scaled = ScaledFrame::with_settings(
         remote,
         window.get_size(),
@@ -1195,12 +1217,33 @@ fn run_session_inner(
     let mut dragging_ui_scale = false;
     let mut ui_captured_mouse = false;
     let mut redraw = false;
-    let mut last_stats = (std::time::Instant::now(), stats.snapshot());
+    // The settings overlay changed and must be drawn.
+    let mut ui_changed = true;
+    let mut last_present = Instant::now();
+    let mut drew_frame = true;
+    let mut last_stats = (Instant::now(), stats.snapshot());
     while window.is_open() {
+        // Sleep until a frame arrives, the next present is allowed, or input
+        // is due to be polled again.
+        if !drew_frame {
+            let frame_interval = Duration::from_secs_f64(1.0 / config.fps.max(1) as f64);
+            let guard = framebuffer.lock().unwrap();
+            let wait = if guard.dirty.is_none() {
+                INPUT_POLL_INTERVAL
+            } else {
+                (last_present + frame_interval)
+                    .saturating_duration_since(Instant::now())
+                    .min(INPUT_POLL_INTERVAL)
+            };
+            if !wait.is_zero() {
+                drop(frame_ready.wait_timeout(guard, wait).unwrap());
+            }
+        }
+        drew_frame = false;
         // Live throughput in the title bar shows whether the link or the
         // encoding limits the frame rate.
-        if last_stats.0.elapsed() >= std::time::Duration::from_secs(1) {
-            let now = (std::time::Instant::now(), stats.snapshot());
+        if last_stats.0.elapsed() >= Duration::from_secs(1) {
+            let now = (Instant::now(), stats.snapshot());
             window.set_title(&format!(
                 "{title} — {}",
                 throughput(last_stats.1, now.1, now.0 - last_stats.0)
@@ -1224,45 +1267,60 @@ fn run_session_inner(
             scaled = ScaledFrame::with_settings(remote, size, config.window_mode, config.quality)?;
             redraw = false;
         }
-        let dirty = {
-            let mut frame = framebuffer.lock().unwrap();
-            if let Some(dirty) = frame.dirty.take() {
-                copy_area(&frame.framebuffer, &mut presented, dirty);
-                Some(dirty)
+        let frame_interval = Duration::from_secs_f64(1.0 / config.fps.max(1) as f64);
+        let frame_waiting = framebuffer.lock().unwrap().dirty.is_some();
+        let present = full_redraw
+            || ui_changed
+            || last_present.elapsed() >= REDRAW_INTERVAL
+            || (frame_waiting && last_present.elapsed() >= frame_interval);
+        if present {
+            let dirty = {
+                let mut frame = framebuffer.lock().unwrap();
+                if let Some(dirty) = frame.dirty.take() {
+                    copy_area(&frame.framebuffer, &mut presented, dirty);
+                    Some(dirty)
+                } else {
+                    None
+                }
+            };
+            let dirty = if full_redraw {
+                Some(Rect {
+                    x0: 0,
+                    y0: 0,
+                    x1: remote.0,
+                    y1: remote.1,
+                })
             } else {
-                None
+                dirty
+            };
+            if let Some(dirty) = dirty {
+                scaled.update(&presented, dirty);
             }
-        };
-        let dirty = if full_redraw {
-            Some(Rect {
-                x0: 0,
-                y0: 0,
-                x1: remote.0,
-                y1: remote.1,
-            })
+            let area = if settings_open {
+                ui::SETTINGS_PANEL
+            } else {
+                ui::open_settings_box(config.ui_scale)
+            };
+            let backup = backup_region(&scaled.pixels, size.0, size.1, area);
+            ui::overlay(
+                &mut Canvas::new(&mut scaled.pixels, size.0, size.1),
+                config,
+                settings_open,
+            );
+            let update_result = window.update_with_buffer(&scaled.pixels, size.0, size.1);
+            restore_region(&mut scaled.pixels, size.0, size.1, area, &backup);
+            update_result?;
+            last_present = Instant::now();
+            drew_frame = true;
+            ui_changed = false;
         } else {
-            dirty
-        };
-        if let Some(dirty) = dirty {
-            scaled.update(&presented, dirty);
+            // Pump input events without uploading a frame.
+            window.update();
         }
-        let area = if settings_open {
-            ui::SETTINGS_PANEL
-        } else {
-            ui::open_settings_box(config.ui_scale)
-        };
-        let backup = backup_region(&scaled.pixels, size.0, size.1, area);
-        ui::overlay(
-            &mut Canvas::new(&mut scaled.pixels, size.0, size.1),
-            config,
-            settings_open,
-        );
-        let update_result = window.update_with_buffer(&scaled.pixels, size.0, size.1);
-        restore_region(&mut scaled.pixels, size.0, size.1, area, &backup);
-        update_result?;
 
         for event in input_rx.try_iter() {
             if let InputEvent::Key(Key::F8, true) = event {
+                ui_changed = true;
                 settings_open = !settings_open;
                 dragging_ui_scale = false;
                 ui_captured_mouse = true;
@@ -1298,6 +1356,9 @@ fn run_session_inner(
         let click = ui_state.click(window.get_mouse_down(MouseButton::Left));
         let (mx, my) = (mouse.0 as usize, mouse.1 as usize);
         let was_settings_open = settings_open;
+        if click || dragging_ui_scale {
+            ui_changed = true;
+        }
         if click {
             if !settings_open && ui::open_settings_box(config.ui_scale).contains(mx, my) {
                 settings_open = true;
@@ -1334,7 +1395,6 @@ fn run_session_inner(
                     writer.shutdown()?;
                     return Ok(None);
                 }
-                window.set_target_fps(config.fps);
             }
         }
         if dragging_ui_scale {
@@ -1566,16 +1626,24 @@ mod tests {
         let before = StatsSnapshot {
             bytes: 1_000_000,
             frames: 10,
-            encoding: None,
+            ..StatsSnapshot::default()
         };
         let after = StatsSnapshot {
             bytes: 13_000_000,
             frames: 70,
             encoding: Some(7),
+            continuous_updates: false,
         };
         assert_eq!(
             throughput(before, after, std::time::Duration::from_secs(2)),
             "30 fps · 200 KB/frame · 48 Mbit/s · Tight"
+        );
+        let pushed = StatsSnapshot {
+            continuous_updates: true,
+            ..after
+        };
+        assert!(
+            throughput(before, pushed, std::time::Duration::from_secs(2)).ends_with("Tight · push")
         );
         assert_eq!(
             throughput(before, before, std::time::Duration::from_secs(1)),

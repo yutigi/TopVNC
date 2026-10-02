@@ -16,6 +16,10 @@
 //!
 //! Run with `cargo run --release --example latency_bench -- [--size WxH]
 //! [--seconds N] [--fps N] [--delay-ms N] [--mbps N,N,...]`.
+//!
+//! `--serve HOST:PORT` instead serves the scene without authentication until
+//! interrupted, for trying a viewer against moving content:
+//! `topvnc HOST:PORT --allow-insecure`.
 
 use std::error::Error;
 use std::io::{self, Read, Write};
@@ -33,6 +37,8 @@ struct Options {
     fps: f64,
     delay: Duration,
     links_mbps: Vec<f64>,
+    /// Serve the scene at this address for a viewer instead of measuring.
+    serve: Option<String>,
 }
 
 fn options() -> Result<Options, Box<dyn Error>> {
@@ -43,6 +49,7 @@ fn options() -> Result<Options, Box<dyn Error>> {
         fps: 60.0,
         delay: Duration::from_millis(2),
         links_mbps: vec![100.0, 1000.0],
+        serve: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -57,6 +64,7 @@ fn options() -> Result<Options, Box<dyn Error>> {
             "--seconds" => options.seconds = value()?.parse()?,
             "--fps" => options.fps = value()?.parse()?,
             "--delay-ms" => options.delay = Duration::from_millis(value()?.parse()?),
+            "--serve" => options.serve = Some(value()?),
             "--mbps" => {
                 options.links_mbps = value()?
                     .split(',')
@@ -175,8 +183,9 @@ fn pipe(
             }
         }
     });
-    let started = Instant::now();
-    let mut sent = 0u64;
+    // When the link finishes what it has accepted so far. Idle time earns
+    // no credit, so bursts never exceed the link rate.
+    let mut busy_until = Instant::now();
     for (arrived, chunk) in receiver {
         let due = arrived + delay;
         let now = Instant::now();
@@ -184,9 +193,13 @@ fn pipe(
             thread::sleep(due - now);
         }
         if let Some(rate) = bits_per_second {
-            // The link cannot have finished sending earlier chunks yet.
-            let busy_until = started + Duration::from_secs_f64(sent as f64 * 8.0 / rate);
             let now = Instant::now();
+            // A gap longer than sleep overshoot means the link went idle.
+            if now > busy_until + Duration::from_millis(2) {
+                busy_until = now;
+            }
+            busy_until += Duration::from_secs_f64(chunk.len() as f64 * 8.0 / rate);
+            // The chunk is fully across once the link has sent it.
             if busy_until > now {
                 thread::sleep(busy_until - now);
             }
@@ -194,7 +207,6 @@ fn pipe(
         if to.write_all(&chunk).is_err() {
             break;
         }
-        sent += chunk.len() as u64;
         counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
     }
     let _ = to.shutdown(Shutdown::Write);
@@ -236,12 +248,21 @@ fn start_link(
     Ok((address, downstream))
 }
 
+/// How the client gets each next update.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Requests {
+    /// Request after each update arrives, as TopVNC 0.2.0 did.
+    AfterEach,
+    /// `Session::read_update_pipelined` without continuous updates.
+    Adaptive,
+    /// Continuous updates: the server pushes frames, with fence flow control.
+    Push,
+}
+
 struct Mode {
     name: &'static str,
     encoding: Encoding,
-    /// Uses `Session::read_update_pipelined`, which requests the next
-    /// update itself; otherwise the next update is requested after each one.
-    pipelined: bool,
+    requests: Requests,
 }
 
 struct Outcome {
@@ -305,6 +326,7 @@ fn run(
         Session::connect_with_encoding(&link.to_string(), true, mode.encoding, || {
             unreachable!("the benchmark server uses no authentication")
         })?;
+    session.set_continuous_updates(mode.requests == Requests::Push);
     let writer = session.writer();
     let (width, height) = (options.width, options.height);
     let mut received = Framebuffer::new(width, height)?;
@@ -318,7 +340,7 @@ fn run(
     writer.request_update(false, width, height)?;
     while Instant::now() < end {
         let apply = |x, y, w, h, bytes: &[u8]| received.apply_raw(x, y, w, h, bytes);
-        if mode.pipelined {
+        if mode.requests != Requests::AfterEach {
             session.read_update_pipelined(&mut scratch, apply)?;
         } else {
             session.read_update_with(&mut scratch, apply)?;
@@ -360,42 +382,87 @@ fn run(
     })
 }
 
+/// Serve the panning scene until the process is stopped.
+fn serve_scene(options: &Options, scene: &Scene, address: &str) -> Result<(), Box<dyn Error>> {
+    let mut framebuffer = Framebuffer::new(options.width, options.height)?;
+    scene.render(1, &mut framebuffer);
+    let server = Arc::new(VncServer::bind(
+        address,
+        framebuffer.clone(),
+        ServerConfig {
+            allow_insecure: true,
+            ..ServerConfig::default()
+        },
+    )?);
+    let runner = Arc::clone(&server);
+    thread::spawn(move || runner.run());
+    println!(
+        "Serving a {}x{} scene at {} fps on {} without authentication.",
+        options.width,
+        options.height,
+        options.fps,
+        server.local_addr()?
+    );
+    let interval = Duration::from_secs_f64(1.0 / options.fps);
+    let start = Instant::now();
+    for frame in 2u32.. {
+        scene.render(frame, &mut framebuffer);
+        server.update_framebuffer(&framebuffer)?;
+        // Drain input so viewers never stall on a full event queue.
+        while server.try_event().is_ok() {}
+        let next = start + interval * (frame - 1);
+        let now = Instant::now();
+        if next > now {
+            thread::sleep(next - now);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let options = options()?;
     let scene = Arc::new(Scene::new(
         usize::from(options.width),
         usize::from(options.height),
     ));
+    if let Some(address) = &options.serve {
+        return serve_scene(&options, &scene, address);
+    }
     let modes = [
         Mode {
             name: "Raw, request after each update (0.2.0)",
             encoding: Encoding::Raw,
-            pipelined: false,
+            requests: Requests::AfterEach,
         },
         Mode {
-            name: "Raw, adaptive pipelining",
+            name: "Raw, push",
             encoding: Encoding::Raw,
-            pipelined: true,
+            requests: Requests::Push,
         },
         Mode {
-            name: "Tight JPEG quality 9, adaptive",
+            name: "Tight JPEG quality 9, push",
             encoding: Encoding::Tight { quality: 9 },
-            pipelined: true,
+            requests: Requests::Push,
         },
         Mode {
             name: "Tight JPEG quality 6, request after each",
             encoding: Encoding::Tight { quality: 6 },
-            pipelined: false,
+            requests: Requests::AfterEach,
         },
         Mode {
-            name: "Tight JPEG quality 6, adaptive",
+            name: "Tight JPEG quality 6, adaptive pipelining",
             encoding: Encoding::Tight { quality: 6 },
-            pipelined: true,
+            requests: Requests::Adaptive,
         },
         Mode {
-            name: "Tight JPEG quality 3, adaptive",
+            name: "Tight JPEG quality 6, push",
+            encoding: Encoding::Tight { quality: 6 },
+            requests: Requests::Push,
+        },
+        Mode {
+            name: "Tight JPEG quality 3, push",
             encoding: Encoding::Tight { quality: 3 },
-            pipelined: true,
+            requests: Requests::Push,
         },
     ];
     println!(

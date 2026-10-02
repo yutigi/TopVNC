@@ -16,7 +16,8 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 
 - **Native connection UI** with a masked password field, input validation, and connection errors shown in the window.
 - **Tight encoding with JPEG** (the default), plus Raw and Zlib, with 32-bit true color and incremental framebuffer updates. Full-screen motion such as games fits in a fraction of Raw's bandwidth; see [Performance](#performance).
-- **Adaptive request pipelining**: the next update is requested as soon as the current one starts arriving, unless the link is already saturated.
+- **Pushed updates** (RFB ContinuousUpdates with Fence flow control): the server sends each new frame without waiting for a request, keeping at most a few frames in flight from the measured throughput. Servers without them get adaptive request pipelining.
+- **Event-driven presentation**: frames are shown as soon as they arrive, up to the FPS limit, and mouse and keyboard input is polled about every 2 ms.
 - **Keyboard and mouse input** for interacting with the remote desktop.
 - **Adjustable display** with fit-to-window or native pixels, smooth or sharp scaling, and 30, 60, or 120 FPS presentation limits.
 - **In-session settings** accessible through **F8**, including disconnect and a resizable on-screen settings button.
@@ -113,15 +114,28 @@ Games and video change the whole screen every frame. A Raw 1920×1080 frame is a
 - Everything else is sent as JPEG at the viewer's quality level.
 - Changed tiles are merged into large rectangles and encoded on several threads.
 
-Results from `cargo run --release --example latency_bench`, between TopVNC's server and client through a local proxy that emulates the link. The source is a panning 1920×1080 scene at 60 fps, with 2 ms one-way delay. Latency is from the server receiving a frame until the client has all of it. Desktop capture, display, and input are not included.
+Each frame normally waits for the viewer's request, so a Wi-Fi round trip of 10–20 ms caps the frame rate well below 60 even when the link has room. When both ends support ContinuousUpdates and Fence, as TopVNC's server and viewer do, the server pushes frames instead. A fence after each update tells it what the viewer has received, and it paces frames to the throughput it measures, so frames do not queue on a slow link.
+
+Results from `cargo run --release --example latency_bench`, between TopVNC's server and viewer through a local proxy that emulates the link. Latency is from the server receiving a frame until the viewer has all of it. Desktop capture, display, and input are not included.
+
+Half-size Retina (1512×982) at 60 fps, Tight quality 6, 8 ms each way (Wi-Fi-like):
+
+| Link | Requests | Frames per second | Mean latency |
+| --- | --- | --- | --- |
+| 150 Mbit/s | One request per frame | 23.8 | 40.7 ms |
+| 150 Mbit/s | Pushed | 58.0 | 30.0 ms |
+| 300 Mbit/s | One request per frame | 27.8 | 33.4 ms |
+| 300 Mbit/s | Pushed | 60.5 | 22.6 ms |
+
+1920×1080 at 60 fps, 2 ms each way:
 
 | Link | Encoding | Frames per second | Mean latency | Per frame |
 | --- | --- | --- | --- | --- |
-| 1 Gbit/s | Raw (0.2.0 behavior) | 15.2 | 73.0 ms | 8.2 MB |
-| 1 Gbit/s | Tight, quality 6 (default) | 60.0 | 13.8 ms | 255 KB |
-| 100 Mbit/s | Raw (0.2.0 behavior) | 1.8 | 669.5 ms | 7.4 MB |
-| 100 Mbit/s | Tight, quality 6 (default) | 49.2 | 28.4 ms | 254 KB |
-| 100 Mbit/s | Tight, quality 3 | 60.4 | 11.7 ms | 89 KB |
+| 1 Gbit/s | Raw, one request per frame (0.2.0) | 14.0 | 79.2 ms | 8.2 MB |
+| 1 Gbit/s | Tight quality 6, pushed | 60.2 | 14.6 ms | 255 KB |
+| 100 Mbit/s | Raw, one request per frame (0.2.0) | 1.5 | 805.0 ms | 6.9 MB |
+| 100 Mbit/s | Tight quality 6, pushed | 29.2 | 46.4 ms | 253 KB |
+| 100 Mbit/s | Tight quality 3, pushed | 59.0 | 22.2 ms | 89 KB |
 
 The scene is synthetic, so real games compress differently. If a link cannot keep up, lower `--quality`.
 
@@ -134,7 +148,7 @@ For playable results:
   | --- | --- | --- |
   | 3024×1964 (full) | 26.3 | 55.6 ms |
   | 1512×982 (half) | 60.3 | 13.6 ms |
-- **Read the title bar.** During a session, the viewer's title shows frames per second, KB per frame, Mbit/s, and the encoding the server sends. If it says Raw, the server does not support Tight.
+- **Read the title bar.** During a session, the viewer's title shows frames per second, KB per frame, Mbit/s, the encoding the server sends, and `push` when the server pushes frames. If it says Raw, the server does not support Tight; without `push`, every frame waits a round trip.
 
 Tight between TopVNC's server and client is covered by tests. Tight against third-party servers and viewers, and with live desktop capture, has not yet been validated. See [`specs/006-low-latency-gaming/spec.md`](specs/006-low-latency-gaming/spec.md) for the full measurements.
 

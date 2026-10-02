@@ -4,9 +4,9 @@
 
 Make full-screen motion, such as games and video, usable over a local network. Before this change the server sent only Raw 32-bit pixels: a 1920×1080 frame is about 8.3 MB, so a 1 Gbit/s link carried at most about 15 frames per second, a 100 Mbit/s link under 2, and every changed frame waited one round trip for the next request.
 
-This feature adds Tight encoding with JPEG to the server and client, lets the client request the next update early when the link has capacity, removes stalls between the client's network thread and window thread, and lets hosts serve a display at a reduced size. A Retina display at half size is served at its size in points, a quarter of the pixels.
+This feature adds Tight encoding with JPEG to the server and client, lets the server push frames without a request per frame (ContinuousUpdates with Fence flow control), lets the client request the next update early from servers without push, removes stalls between the client's network thread and window thread, and lets hosts serve a display at a reduced size. A Retina display at half size is served at its size in points, a quarter of the pixels.
 
-Out of scope: video codecs (H.264, HEVC), ContinuousUpdates and Fence congestion control, relative pointer input, GPU presentation, audio, and changing the served size while the server runs.
+Out of scope: video codecs (H.264, HEVC), relative pointer input, GPU presentation, audio, and changing the served size while the server runs.
 
 ## Acceptance criteria
 
@@ -24,10 +24,33 @@ Out of scope: video codecs (H.264, HEVC), ContinuousUpdates and Fence congestion
 - **Client decoder.** The client decodes Fill, JPEG, and basic compression with the copy, palette (1–256 colors), and gradient filters across four persistent zlib streams, with stream resets. It rejects unknown compression types and filters, palette indexes past the palette, zlib data that inflates to any length other than the expected one (including output held back after all input is consumed), and JPEG data whose size does not match its rectangle.
 - **Client negotiation.** With Tight selected, the client advertises Tight, Zlib, and Raw, in that order, plus a quality level and compression level 1. It accepts Raw, Zlib, or Tight rectangles, so servers without Tight still work.
 
+### Pushed updates (ContinuousUpdates and Fence)
+
+- **Protocol.** These are the community RFB extensions:
+  - pseudo-encodings Fence (-312) and ContinuousUpdates (-313);
+  - EnableContinuousUpdates (client message 150) and EndOfContinuousUpdates (server message 150);
+  - Fence (message 248 in both directions), with the BlockBefore, BlockAfter, SyncNext, and Request flags and at most 64 bytes of payload.
+- **Server.**
+  - Offers continuous updates with EndOfContinuousUpdates once a client advertises both pseudo-encodings. An EnableContinuousUpdates that was not offered ends the session.
+  - While continuous updates are enabled, it ignores incremental requests, pushes changes in the enabled region as they happen, and still answers non-incremental requests. Disabling them is confirmed with EndOfContinuousUpdates.
+  - Sends a fence request after every update to a client that supports fences, and answers fence requests from the client by echoing the payload with only the supported flags.
+- **Flow control.**
+  - At most three pushed updates are unacknowledged.
+  - With one or two in flight, the next update goes out when the link is expected to have finished everything before it. That time comes from the measured throughput, paced at 95%.
+  - **Throughput samples.** Each acknowledged update gives `bytes / time`, where `time` is the smaller of two upper bounds on its transmission time:
+    - its acknowledgement delay beyond the link's fixed round trip;
+    - the gap since the previous acknowledgement, valid because updates are delivered in order.
+  - The estimate is the maximum of the last eight samples.
+  - The fixed round trip comes from probe fences, sent only when nothing is in flight and at most once a second.
+- **Client.**
+  - Every compression mode advertises both pseudo-encodings.
+  - On EndOfContinuousUpdates the session enables continuous updates for the whole framebuffer and stops sending requests. If the server later ends them, the session goes back to requests.
+  - Fence requests are answered at once, with only the supported flags. `Session::set_continuous_updates(false)` declines continuous updates.
+
 ### Client
 
 - **Default.** Tight with JPEG quality level 6 is the default compression. The connection form offers Raw, Zlib, and Tight JPEG, and `--quality 0-9` sets the JPEG quality level.
-- **Adaptive pipelining.** The network worker sends the first full request and then reads with `Session::read_update_pipelined`, which requests each next incremental update itself.
+- **Adaptive pipelining.** The network worker sends the first full request and then reads with `Session::read_update_pipelined`. Without continuous updates, it requests each next incremental update itself.
   - While the link has spare capacity, the request goes out as soon as an update's header arrives, so the server can prepare the next frame without waiting a round trip.
   - The session times how long it blocks on the socket while reading each update's body. If that exceeds 6 ms, the link is the bottleneck and an early request would only queue a second frame behind the first. The next request is then sent after the update completes.
 - **Buffered reads.** Client socket reads go through a 256 KB buffer.
@@ -37,6 +60,8 @@ Out of scope: video codecs (H.264, HEVC), ContinuousUpdates and Fence congestion
   - Bilinear scaling blends red and blue in one multiply and green in another.
   - When the drawn image is not scaled (Native mode, or Fit at exactly the remote size), rows are copied directly.
   - Fit mode rounds the drawn size, so a window with the remote's own size draws it unscaled. Before, truncation drew one column or row short and resampled the whole image.
+  - The window loop paces itself instead of minifb's fixed frame tick. The network thread signals a condition variable when an update has fully arrived. The window thread presents it at once, at most at the FPS setting.
+  - Between frames the loop only pumps input events, polling mouse and keyboard about every 2 ms. It still redraws at least every 250 ms and whenever the settings overlay changes.
 
 ### Served size (hosts)
 
@@ -77,12 +102,18 @@ The benchmark runs the embedded server and a TopVNC `Session` through a local TC
   - mean and 95th-percentile latency, from publishing a frame on the server to the client having all of it;
   - server-to-client traffic.
 - Desktop capture, display, and input injection are not included.
+- Each row runs push mode or one of the request modes (`Session::set_continuous_updates`).
+- **Link emulation.**
+  - The proxy paces each chunk at the link rate.
+  - A gap longer than 2 ms counts as idle time, which earns no credit, so bursts never exceed the link rate.
+  - An earlier version banked idle time, and the extra speed after idle periods let one throughput sample overestimate the link. Measurements before that fix (items 4 and 5 below) are not directly comparable with item 6.
+- `--serve HOST:PORT` serves the scene without authentication until stopped, for trying a viewer against moving content.
 
 ## Validation status
 
 Recorded on 2026-10-02 on an M3 Max MacBook Pro, macOS 26.5.1:
 
-1. `cargo test --workspace` passes (52 library tests, 1 ignored timing test, and 55 binary tests), as does `cargo clippy --workspace --all-targets -- -D warnings`. Windows-target clippy (`cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`) passes, and the Windows release build links.
+1. `cargo test --workspace` passes (55 library tests and 56 binary tests, plus 2 ignored timing tests), as does `cargo clippy --workspace --all-targets -- -D warnings`. Windows-target clippy (`cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`) passes, and the Windows release build links.
 2. Tight is tested in four ways:
    - Round trips for each subencoding.
    - Hand-built gradient, stream persistence, and malformed-input cases.
@@ -120,9 +151,23 @@ Recorded on 2026-10-02 on an M3 Max MacBook Pro, macOS 26.5.1:
    - Over a 150 Mbit/s link with 4 ms one-way delay, quality 6:
      - 3024×1964: 26.3 fps, 55.6 ms mean latency.
      - 1512×982: 60.3 fps, 13.6 ms mean latency.
-6. **Served size.** Tested: served sizes and argument parsing; downscaler block averages, damage mapping, and coverage with uneven ratios; served-to-display pointer mapping; and the slider's range, hundredths, and normalized requests. The Server tab was rendered offscreen and checked. Windows-target clippy passes with the Windows wiring.
-7. **Not yet checked live.**
+6. **Pushed updates.**
+   - **Tests:** the offer and enable sequence; pushed updates followed by fences; waiting for the acknowledgement without a throughput estimate; disabling; answering client fences with unknown flags cleared; rejecting an unoffered enable; the flow-control pacing arithmetic; and TopVNC's session taking push mode against TopVNC's server.
+   - **Measurements** with the corrected emulator, `--size 1512x982 --delay-ms 8 --mbps 150,300`, quality 6:
+
+     | Link | Requests | Delivered | Mean latency | p95 latency |
+     | --- | --- | --- | --- | --- |
+     | 150 Mbit/s | after each update | 23.8 fps | 40.7 ms | 48.4 ms |
+     | 150 Mbit/s | pushed | 58.0 fps | 30.0 ms | 41.5 ms |
+     | 300 Mbit/s | after each update | 27.8 fps | 33.4 ms | 43.0 ms |
+     | 300 Mbit/s | pushed | 60.5 fps | 22.6 ms | 24.3 ms |
+   - **Saturated links** keep their request-mode latency with push: Raw at 150 Mbit/s was 337.8 ms pushed against 338.9 ms requested. Before the probe fences and the link-free tracking, push doubled it.
+   - **At 1920×1080 with a 2 ms delay**, quality 6, pushed: 60.2 fps and 14.6 ms at 1 Gbit/s; 29.2 fps and 46.4 ms at 100 Mbit/s, which the stream saturates. Quality 3 pushed at 100 Mbit/s: 59.0 fps and 22.2 ms.
+   - **The window loop has not been run live.** The viewer started from this environment's shell, but macOS listed no window for it, so the event-driven presentation loop is untested beyond compiling.
+7. **Served size.** Tested: served sizes and argument parsing; downscaler block averages, damage mapping, and coverage with uneven ratios; served-to-display pointer mapping; and the slider's range, hundredths, and normalized requests. The Server tab was rendered offscreen and checked. Windows-target clippy passes with the Windows wiring.
+8. **Not yet checked live.**
    - Tight against third-party servers (TigerVNC, TurboVNC, macOS Screen Sharing) and third-party viewers against the TopVNC server.
    - Latency with real desktop capture and input on Windows and macOS hosts.
    - CPU use on the host while encoding.
    - Reduced served sizes with ScreenCaptureKit and Desktop Duplication: image quality, pointer accuracy, and display changes while serving.
+   - Pushed updates over real Wi-Fi, and against TigerVNC (which also implements ContinuousUpdates and Fence).
