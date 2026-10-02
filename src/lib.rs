@@ -5,12 +5,15 @@
 use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use flate2::{Decompress, FlushDecompress};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod tight;
+use tight::{TightDecoder, TightSettings};
 
 pub const MAX_FRAMEBUFFER_DIMENSION: u16 = 8192;
 pub const MAX_FRAMEBUFFER_PIXELS: usize = 33_554_432;
@@ -30,6 +33,17 @@ const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const DESKTOP_SIZE_ENCODING: i32 = -223;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Client socket read buffer; large enough for many small rectangles per read.
+const CLIENT_READ_BUFFER_BYTES: usize = 256 * 1024;
+/// When the client waited longer than this for one update's data, the link
+/// is the bottleneck: requesting the next update early would only queue a
+/// second frame behind the first, so it is requested after the update.
+const PIPELINE_MAX_NETWORK_WAIT: Duration = Duration::from_millis(6);
+/// Updates with fewer pixels than this are encoded on the session thread.
+const SERVER_PARALLEL_ENCODE_PIXELS: usize = 128 * 1024;
+/// The compression level the client requests with Tight: fast zlib, since
+/// most gaming content is sent as JPEG anyway.
+const CLIENT_TIGHT_COMPRESS_LEVEL: u8 = 1;
 
 fn timed_out(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, message)
@@ -64,6 +78,24 @@ impl<R: Read, F: FnMut() -> io::Result<()>> Read for RefreshReader<R, F> {
                 result => return result,
             }
         }
+    }
+}
+
+/// Counts the time spent blocked reading from the socket.
+struct WaitTimer<R> {
+    inner: R,
+    waited_nanos: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<R: Read> Read for WaitTimer<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let started = Instant::now();
+        let result = self.inner.read(bytes);
+        self.waited_nanos.fetch_add(
+            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        result
     }
 }
 
@@ -158,6 +190,59 @@ pub enum Security {
 pub enum Encoding {
     Raw,
     Zlib,
+    /// Tight with JPEG at an RFB quality level from 0 (smallest) to 9 (best).
+    /// Zlib and Raw are accepted from servers without Tight.
+    Tight {
+        quality: u8,
+    },
+}
+
+impl Encoding {
+    /// The SetEncodings list the client sends, most preferred first.
+    fn advertised(self) -> Vec<i32> {
+        match self {
+            Self::Raw => vec![0],
+            Self::Zlib => vec![6],
+            Self::Tight { quality } => vec![
+                tight::TIGHT_ENCODING,
+                6,
+                0,
+                tight::QUALITY_LEVEL_0 + i32::from(quality.min(9)),
+                tight::COMPRESS_LEVEL_0 + i32::from(CLIENT_TIGHT_COMPRESS_LEVEL),
+            ],
+        }
+    }
+
+    fn accepts(self, wire_encoding: i32) -> bool {
+        matches!(
+            (self, wire_encoding),
+            (_, 0)
+                | (Self::Zlib | Self::Tight { .. }, 6)
+                | (Self::Tight { .. }, tight::TIGHT_ENCODING)
+        )
+    }
+}
+
+/// Decoder state that persists across framebuffer updates: the Zlib stream
+/// and Tight's four zlib streams.
+pub struct UpdateDecoder {
+    zlib: Decompress,
+    tight: TightDecoder,
+}
+
+impl UpdateDecoder {
+    pub fn new() -> Self {
+        Self {
+            zlib: Decompress::new(true),
+            tight: TightDecoder::new(),
+        }
+    }
+}
+
+impl Default for UpdateDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Events received from a remote RFB client connected to a [`VncServer`].
@@ -234,9 +319,7 @@ struct ServerClipboard {
 /// Messages delivered to one client's update writer.
 enum SessionInput {
     PixelFormat(ServerPixelFormat),
-    Encodings {
-        desktop_size: bool,
-    },
+    Encodings(ClientEncodings),
     UpdateRequest(UpdateRequest),
     /// The framebuffer or clipboard changed.
     Wake,
@@ -880,11 +963,13 @@ fn read_client_message(
             }
             let mut encodings = vec![0; count * 4];
             stream.read_exact(&mut encodings)?;
-            let desktop_size = encodings.chunks_exact(4).any(|encoding| {
-                i32::from_be_bytes(encoding.try_into().unwrap()) == DESKTOP_SIZE_ENCODING
-            });
+            let encodings = ClientEncodings::parse(
+                encodings
+                    .chunks_exact(4)
+                    .map(|encoding| i32::from_be_bytes(encoding.try_into().unwrap())),
+            );
             session
-                .send(SessionInput::Encodings { desktop_size })
+                .send(SessionInput::Encodings(encodings))
                 .map_err(|_| session_closed())?;
         }
         3 => {
@@ -961,6 +1046,46 @@ fn read_client_message(
     Ok(())
 }
 
+/// What a client advertised with SetEncodings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClientEncodings {
+    desktop_size: bool,
+    /// Set when the client prefers Tight over Raw.
+    tight: Option<TightSettings>,
+}
+
+impl ClientEncodings {
+    fn parse(encodings: impl Iterator<Item = i32>) -> Self {
+        let mut result = Self::default();
+        let mut preferred = None;
+        let mut quality = None;
+        let mut compression = None;
+        for encoding in encodings {
+            match encoding {
+                0 | tight::TIGHT_ENCODING => {
+                    preferred.get_or_insert(encoding);
+                }
+                DESKTOP_SIZE_ENCODING => result.desktop_size = true,
+                level @ tight::QUALITY_LEVEL_0..=-23 => {
+                    quality.get_or_insert((level - tight::QUALITY_LEVEL_0) as u8);
+                }
+                level @ tight::COMPRESS_LEVEL_0..=-247 => {
+                    compression.get_or_insert((level - tight::COMPRESS_LEVEL_0) as u8);
+                }
+                _ => {}
+            }
+        }
+        if preferred == Some(tight::TIGHT_ENCODING) {
+            let defaults = TightSettings::default();
+            result.tight = Some(TightSettings {
+                quality,
+                compression: compression.unwrap_or(defaults.compression),
+            });
+        }
+        result
+    }
+}
+
 struct PendingRequest {
     request: UpdateRequest,
     /// When an unchanged incremental request is answered with an empty update.
@@ -979,7 +1104,7 @@ fn write_client_updates(
 ) -> io::Result<()> {
     let mut seen_revisions = vec![u64::MAX; tile_count];
     let mut pixel_format = ServerPixelFormat::DEFAULT;
-    let mut desktop_size = false;
+    let mut encodings = ClientEncodings::default();
     let mut output = Vec::new();
     let mut clipboard_revision = 0;
     let mut pending: Option<PendingRequest> = None;
@@ -995,7 +1120,7 @@ fn write_client_updates(
             (fb.generation, fb.framebuffer.width, fb.framebuffer.height)
         };
         if current_generation != generation {
-            if !desktop_size {
+            if !encodings.desktop_size {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "desktop size changed and the client does not support DesktopSize",
@@ -1023,15 +1148,26 @@ fn write_client_updates(
             if let Some(update) = update
                 && (!update.rectangles.is_empty() || Instant::now() >= waiting.deadline)
             {
-                write_update(
-                    stream,
-                    shared,
-                    &mut seen_revisions,
-                    &mut output,
-                    pixel_format,
-                    update,
-                    generation,
-                )?;
+                match encodings.tight.filter(|_| pixel_format.has_tight_pixels()) {
+                    Some(settings) => write_tight_update(
+                        stream,
+                        shared,
+                        &mut seen_revisions,
+                        &mut output,
+                        settings,
+                        update,
+                        generation,
+                    )?,
+                    None => write_update(
+                        stream,
+                        shared,
+                        &mut seen_revisions,
+                        &mut output,
+                        pixel_format,
+                        update,
+                        generation,
+                    )?,
+                }
                 pending = None;
             }
         }
@@ -1044,9 +1180,7 @@ fn write_client_updates(
         };
         match receiver.recv_timeout(timeout) {
             Ok(SessionInput::PixelFormat(format)) => pixel_format = format,
-            Ok(SessionInput::Encodings {
-                desktop_size: supported,
-            }) => desktop_size = supported,
+            Ok(SessionInput::Encodings(advertised)) => encodings = advertised,
             Ok(SessionInput::UpdateRequest(request)) => {
                 pending = Some(PendingRequest {
                     request,
@@ -1170,6 +1304,15 @@ impl ServerPixelFormat {
 
     fn bytes_per_pixel(self) -> usize {
         usize::from(self.bits_per_pixel / 8)
+    }
+
+    /// Tight's compact 3-byte pixels need three 8-bit channels in a 32-bit
+    /// pixel; other formats are served as Raw.
+    fn has_tight_pixels(self) -> bool {
+        self.bits_per_pixel == 32
+            && self.red_max == 255
+            && self.green_max == 255
+            && self.blue_max == 255
     }
 
     fn encode_row(self, pixels: &[u32], output: &mut Vec<u8>) {
@@ -1382,6 +1525,177 @@ fn write_update(
     Ok(())
 }
 
+/// Merge changed tiles into larger rectangles and split them to Tight's size
+/// limits. Merging only joins rectangles that share a full edge, so the
+/// result covers exactly the same pixels.
+fn tight_rects(rects: &[ServerRect]) -> Vec<(usize, usize, usize, usize)> {
+    // Rectangles arrive in row-major tile order, so horizontal neighbors are
+    // consecutive.
+    let mut runs: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for rect in rects {
+        let (x, y, width, height) = (
+            usize::from(rect.x),
+            usize::from(rect.y),
+            usize::from(rect.width),
+            usize::from(rect.height),
+        );
+        if let Some(last) = runs.last_mut()
+            && last.1 == y
+            && last.3 == height
+            && last.0 + last.2 == x
+            && last.2 + width <= tight::MAX_RECT_WIDTH
+        {
+            last.2 += width;
+        } else {
+            runs.push((x, y, width, height));
+        }
+    }
+    // Join runs with the run directly above that has the same columns.
+    let mut merged: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(runs.len());
+    let mut open = std::collections::HashMap::new();
+    for (x, y, width, height) in runs {
+        if let Some(index) = open.remove(&(x, width, y)) {
+            let above: &mut (usize, usize, usize, usize) = &mut merged[index];
+            if above.3 + height <= tight::MAX_RECT_HEIGHT {
+                above.3 += height;
+                open.insert((x, width, y + height), index);
+                continue;
+            }
+        }
+        open.insert((x, width, y + height), merged.len());
+        merged.push((x, y, width, height));
+    }
+    let mut result = Vec::with_capacity(merged.len());
+    for (x, y, width, height) in merged {
+        for band_y in (y..y + height).step_by(tight::MAX_RECT_HEIGHT) {
+            for band_x in (x..x + width).step_by(tight::MAX_RECT_WIDTH) {
+                result.push((
+                    band_x,
+                    band_y,
+                    tight::MAX_RECT_WIDTH.min(x + width - band_x),
+                    tight::MAX_RECT_HEIGHT.min(y + height - band_y),
+                ));
+            }
+        }
+    }
+    result
+}
+
+/// Encode each rectangle's pixels as a Tight body, in parallel when the
+/// update is large.
+fn encode_tight_rects(
+    snapshots: &[(Vec<u32>, usize, usize)],
+    settings: TightSettings,
+) -> io::Result<Vec<Vec<u8>>> {
+    let encode = |(pixels, width, height): &(Vec<u32>, usize, usize)| {
+        let mut body = Vec::new();
+        tight::encode_rect(pixels, *width, *height, settings, &mut body).map(|_| body)
+    };
+    let pixels: usize = snapshots.iter().map(|(pixels, ..)| pixels.len()).sum();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(snapshots.len());
+    if workers <= 1 || pixels < SERVER_PARALLEL_ENCODE_PIXELS {
+        return snapshots.iter().map(encode).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut bodies: Vec<Option<io::Result<Vec<u8>>>> = Vec::new();
+    bodies.resize_with(snapshots.len(), || None);
+    std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(snapshot) = snapshots.get(index) else {
+                            return done;
+                        };
+                        done.push((index, encode(snapshot)));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            for (index, body) in handle.join().expect("Tight encoder thread panicked") {
+                bodies[index] = Some(body);
+            }
+        }
+    });
+    bodies
+        .into_iter()
+        .map(|body| body.expect("every rectangle was encoded"))
+        .collect()
+}
+
+/// Write a prepared update with Tight encoding. The rectangles are copied
+/// under one framebuffer lock, so every update shows a single captured frame,
+/// then encoded without holding the lock.
+fn write_tight_update(
+    stream: &mut TcpStream,
+    shared: &Arc<Mutex<ServerFramebuffer>>,
+    seen_revisions: &mut [u64],
+    output: &mut Vec<u8>,
+    settings: TightSettings,
+    update: PreparedUpdate,
+    generation: u64,
+) -> io::Result<()> {
+    let rects = tight_rects(&update.rectangles);
+    if rects.len() > usize::from(u16::MAX) {
+        return Err(invalid("too many changed framebuffer rectangles"));
+    }
+    let snapshots = {
+        let fb = shared
+            .lock()
+            .map_err(|_| invalid("framebuffer lock is poisoned"))?;
+        let stride = fb.framebuffer.width();
+        rects
+            .iter()
+            .map(|&(x, y, width, height)| {
+                // After a resize the remaining area is sent black; the client
+                // receives the new size in its next update.
+                let pixels = if fb.generation == generation {
+                    let mut pixels = Vec::with_capacity(width * height);
+                    for row in y..y + height {
+                        let start = row * stride + x;
+                        pixels.extend_from_slice(&fb.framebuffer.pixels[start..start + width]);
+                    }
+                    pixels
+                } else {
+                    vec![0; width * height]
+                };
+                (pixels, width, height)
+            })
+            .collect::<Vec<_>>()
+    };
+    let bodies = encode_tight_rects(&snapshots, settings)?;
+    output.clear();
+    output.extend_from_slice(&[0, 0]);
+    output.extend_from_slice(&(rects.len() as u16).to_be_bytes());
+    for (&(x, y, width, height), body) in rects.iter().zip(&bodies) {
+        for value in [x, y, width, height] {
+            output.extend_from_slice(&(value as u16).to_be_bytes());
+        }
+        output.extend_from_slice(&tight::TIGHT_ENCODING.to_be_bytes());
+        output.extend_from_slice(body);
+        if output.len() >= SERVER_WRITE_CHUNK_BYTES {
+            stream.write_all(output)?;
+            output.clear();
+        }
+    }
+    stream.write_all(output)?;
+    output.clear();
+    for rect in &update.rectangles {
+        if let Some(index) = rect.tile_index {
+            seen_revisions[index] = rect.revision;
+        }
+    }
+    for (index, revision) in update.acknowledged {
+        seen_revisions[index] = revision;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Version {
     V3_3,
@@ -1548,12 +1862,13 @@ pub fn negotiate_with_encoding(
     stream.write_all(&[
         0, 0, 0, 0, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0,
     ])?;
-    let encoding_id: i32 = match encoding {
-        Encoding::Raw => 0,
-        Encoding::Zlib => 6,
-    };
-    stream.write_all(&[2, 0, 0, 1])?;
-    stream.write_all(&encoding_id.to_be_bytes())?;
+    let advertised = encoding.advertised();
+    let mut message = vec![2, 0];
+    message.extend_from_slice(&(advertised.len() as u16).to_be_bytes());
+    for encoding_id in advertised {
+        message.extend_from_slice(&encoding_id.to_be_bytes());
+    }
+    stream.write_all(&message)?;
     Ok(ServerInfo {
         width,
         height,
@@ -1650,18 +1965,42 @@ pub fn read_update_with(
         frame_height,
         scratch,
         Encoding::Raw,
-        &mut Decompress::new(true),
+        &mut UpdateDecoder::new(),
         apply,
     )
 }
 
+/// Read one framebuffer update. Every rectangle is decoded to 32-bit
+/// B, G, R, X bytes before `apply` receives it.
 pub fn read_update_with_encoding(
     reader: &mut impl Read,
     frame_width: u16,
     frame_height: u16,
     scratch: &mut Vec<u8>,
     selected_encoding: Encoding,
-    decoder: &mut Decompress,
+    decoder: &mut UpdateDecoder,
+    apply: impl FnMut(u16, u16, u16, u16, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    read_update_inner(
+        reader,
+        (frame_width, frame_height),
+        scratch,
+        selected_encoding,
+        decoder,
+        || Ok(()),
+        apply,
+    )
+}
+
+/// `started` runs once the FramebufferUpdate header arrives, before any
+/// rectangle data is read.
+fn read_update_inner(
+    reader: &mut impl Read,
+    (frame_width, frame_height): (u16, u16),
+    scratch: &mut Vec<u8>,
+    selected_encoding: Encoding,
+    decoder: &mut UpdateDecoder,
+    mut started: impl FnMut() -> io::Result<()>,
     mut apply: impl FnMut(u16, u16, u16, u16, &[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
     loop {
@@ -1671,6 +2010,7 @@ pub fn read_update_with_encoding(
             0 => {
                 let mut header = [0; 3];
                 reader.read_exact(&mut header)?;
+                started()?;
                 let count = u16::from_be_bytes([header[1], header[2]]);
                 for _ in 0..count {
                     let mut rect = [0; 12];
@@ -1680,9 +2020,7 @@ pub fn read_update_with_encoding(
                     let width = u16::from_be_bytes([rect[4], rect[5]]);
                     let height = u16::from_be_bytes([rect[6], rect[7]]);
                     let wire_encoding = i32::from_be_bytes(rect[8..12].try_into().unwrap());
-                    if wire_encoding != 0
-                        && !(wire_encoding == 6 && selected_encoding == Encoding::Zlib)
-                    {
+                    if !selected_encoding.accepts(wire_encoding) {
                         return Err(invalid("server sent an unsupported encoding"));
                     }
                     if width == 0
@@ -1693,28 +2031,38 @@ pub fn read_update_with_encoding(
                         return Err(invalid("server sent an out-of-bounds rectangle"));
                     }
                     let length = usize::from(width) * usize::from(height) * 4;
-                    scratch.resize(length, 0);
-                    if wire_encoding == 0 {
-                        reader.read_exact(scratch)?;
-                    } else {
-                        let compressed_length = read_u32(reader)? as usize;
-                        // A zlib block may expand slightly; cap it before allocating.
-                        let limit = length + length / 1000 + 65_536;
-                        if compressed_length > limit {
-                            return Err(invalid("compressed rectangle exceeds size limit"));
+                    match wire_encoding {
+                        0 => {
+                            scratch.resize(length, 0);
+                            reader.read_exact(scratch)?;
                         }
-                        let mut compressed = vec![0; compressed_length];
-                        reader.read_exact(&mut compressed)?;
-                        let input_before = decoder.total_in();
-                        let output_before = decoder.total_out();
-                        decoder
-                            .decompress(&compressed, scratch, FlushDecompress::Sync)
-                            .map_err(|_| invalid("invalid zlib rectangle"))?;
-                        if decoder.total_in() - input_before != compressed_length as u64
-                            || decoder.total_out() - output_before != length as u64
-                        {
-                            return Err(invalid("zlib rectangle has incorrect decoded length"));
+                        6 => {
+                            scratch.resize(length, 0);
+                            let compressed_length = read_u32(reader)? as usize;
+                            // A zlib block may expand slightly; cap it before allocating.
+                            let limit = length + length / 1000 + 65_536;
+                            if compressed_length > limit {
+                                return Err(invalid("compressed rectangle exceeds size limit"));
+                            }
+                            let mut compressed = vec![0; compressed_length];
+                            reader.read_exact(&mut compressed)?;
+                            let zlib = &mut decoder.zlib;
+                            let input_before = zlib.total_in();
+                            let output_before = zlib.total_out();
+                            zlib.decompress(&compressed, scratch, FlushDecompress::Sync)
+                                .map_err(|_| invalid("invalid zlib rectangle"))?;
+                            if zlib.total_in() - input_before != compressed_length as u64
+                                || zlib.total_out() - output_before != length as u64
+                            {
+                                return Err(invalid("zlib rectangle has incorrect decoded length"));
+                            }
                         }
+                        _ => decoder.tight.read_rect(
+                            reader,
+                            usize::from(width),
+                            usize::from(height),
+                            scratch,
+                        )?,
                     }
                     apply(x, y, width, height, scratch)?;
                 }
@@ -1801,10 +2149,15 @@ fn pointer_packet(buttons: u8, x: u16, y: u16) -> [u8; 6] {
 
 pub struct Session {
     pub info: ServerInfo,
-    reader: TcpStream,
+    reader: BufReader<WaitTimer<TcpStream>>,
+    /// Total time `reader` has spent waiting for the network.
+    network_wait: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the next update should be requested as soon as the current
+    /// one starts arriving.
+    pipeline: bool,
     writer: InputWriter,
     encoding: Encoding,
-    decoder: Decompress,
+    decoder: UpdateDecoder,
 }
 
 impl Session {
@@ -1876,13 +2229,22 @@ impl Session {
         })?;
         stream.set_read_timeout(Some(UPDATE_IDLE_TIMEOUT))?;
         stream.set_write_timeout(Some(UPDATE_IDLE_TIMEOUT))?;
-        let reader = stream.try_clone()?;
+        let network_wait = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reader = BufReader::with_capacity(
+            CLIENT_READ_BUFFER_BYTES,
+            WaitTimer {
+                inner: stream.try_clone()?,
+                waited_nanos: Arc::clone(&network_wait),
+            },
+        );
         Ok(Self {
             info,
             reader,
+            network_wait,
+            pipeline: true,
             writer: InputWriter(Arc::new(Mutex::new(stream))),
             encoding,
-            decoder: Decompress::new(true),
+            decoder: UpdateDecoder::new(),
         })
     }
 
@@ -1905,6 +2267,31 @@ impl Session {
         scratch: &mut Vec<u8>,
         apply: impl FnMut(u16, u16, u16, u16, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.read_update_requesting(false, scratch, apply)
+    }
+
+    /// Like [`Session::read_update_with`], but also request the next
+    /// incremental update. While the link has spare capacity, the request is
+    /// sent as soon as this update starts arriving, so the server can prepare
+    /// the next frame without waiting a round trip. When the client waited
+    /// long for the previous update's data, the link is saturated and an
+    /// early request would only queue frames, so the request is sent after
+    /// the update instead. Call [`InputWriter::request_update`] once before
+    /// the first read.
+    pub fn read_update_pipelined(
+        &mut self,
+        scratch: &mut Vec<u8>,
+        apply: impl FnMut(u16, u16, u16, u16, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.read_update_requesting(true, scratch, apply)
+    }
+
+    fn read_update_requesting(
+        &mut self,
+        request_next: bool,
+        scratch: &mut Vec<u8>,
+        apply: impl FnMut(u16, u16, u16, u16, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
         let writer = &self.writer;
         let (width, height) = (self.info.width, self.info.height);
         let mut reader = RefreshReader {
@@ -1912,15 +2299,34 @@ impl Session {
             refresh: || writer.request_update(false, width, height),
             requested: false,
         };
-        read_update_with_encoding(
+        let early = request_next && self.pipeline;
+        let network_wait = &self.network_wait;
+        let mut wait_before_body = None;
+        read_update_inner(
             &mut reader,
-            self.info.width,
-            self.info.height,
+            (width, height),
             scratch,
             self.encoding,
             &mut self.decoder,
+            || {
+                wait_before_body = Some(network_wait.load(Ordering::Relaxed));
+                if early {
+                    writer.request_update(true, width, height)?;
+                }
+                Ok(())
+            },
             apply,
-        )
+        )?;
+        if request_next {
+            if let Some(before) = wait_before_body {
+                let waited = network_wait.load(Ordering::Relaxed).saturating_sub(before);
+                self.pipeline = Duration::from_nanos(waited) <= PIPELINE_MAX_NETWORK_WAIT;
+            }
+            if !early {
+                writer.request_update(true, width, height)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2711,6 +3117,250 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
+    /// Smooth many-color content on the left, two-color stripes on the
+    /// right, with edge tiles narrower and shorter than 64 pixels.
+    fn mixed_content(width: u16, height: u16) -> Framebuffer {
+        let mut framebuffer = Framebuffer::new(width, height).unwrap();
+        let columns = usize::from(width);
+        for (index, pixel) in framebuffer.pixels_mut().iter_mut().enumerate() {
+            let (x, y) = ((index % columns) as u32, (index / columns) as u32);
+            *pixel = if x < 150 {
+                (x * 255 / 150) << 16 | (y * 255 / u32::from(height)) << 8 | ((x + y) / 2)
+            } else if (y / 3) % 2 == 0 {
+                0xffffff
+            } else {
+                0x202020
+            };
+        }
+        framebuffer
+    }
+
+    #[test]
+    fn tight_without_a_quality_level_is_lossless() {
+        let source = mixed_content(300, 140);
+        let (server, address) = start_insecure_server(source.clone());
+        let (mut client, width, height) = raw_client(address, &[tight::TIGHT_ENCODING]);
+        request(&mut client, false, width, height);
+        let mut received = Framebuffer::new(width, height).unwrap();
+        read_update_with_encoding(
+            &mut client,
+            width,
+            height,
+            &mut Vec::new(),
+            Encoding::Tight { quality: 0 },
+            &mut UpdateDecoder::new(),
+            |x, y, width, height, bytes| received.apply_raw(x, y, width, height, bytes),
+        )
+        .unwrap();
+        assert_eq!(received.pixels(), source.pixels());
+        server.stop();
+    }
+
+    #[test]
+    fn tight_session_receives_jpeg_and_pipelined_incremental_updates() {
+        let source = mixed_content(300, 140);
+        let (server, address) = start_insecure_server(source.clone());
+        let mut session = Session::connect_with_encoding(
+            &address.to_string(),
+            true,
+            Encoding::Tight { quality: 9 },
+            || unreachable!(),
+        )
+        .unwrap();
+        let writer = session.writer();
+        let mut received = Framebuffer::new(300, 140).unwrap();
+        let mut scratch = Vec::new();
+        writer.request_update(false, 300, 140).unwrap();
+        session
+            .read_update_pipelined(&mut scratch, |x, y, width, height, bytes| {
+                received.apply_raw(x, y, width, height, bytes)
+            })
+            .unwrap();
+        for (expected, actual) in source.pixels().iter().zip(received.pixels()) {
+            for shift in [0, 8, 16] {
+                let difference =
+                    ((expected >> shift & 0xff) as i32 - (actual >> shift & 0xff) as i32).abs();
+                assert!(difference <= 16, "{expected:06x} received as {actual:06x}");
+            }
+        }
+
+        // The next request was sent when the first update started arriving,
+        // so the change arrives without another explicit request.
+        let mut changed = source.clone();
+        changed.pixels_mut()[299] = 0x00ff00;
+        server.update_framebuffer(&changed).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while received.pixels()[299] != 0x00ff00 {
+            assert!(Instant::now() < deadline, "the change never arrived");
+            session
+                .read_update_pipelined(&mut scratch, |x, y, width, height, bytes| {
+                    received.apply_raw(x, y, width, height, bytes)
+                })
+                .unwrap();
+        }
+        server.stop();
+    }
+
+    #[test]
+    fn tight_clients_with_other_pixel_formats_receive_raw() {
+        let (server, address) = start_insecure_server(mixed_content(70, 10));
+        let (mut client, width, height) =
+            raw_client(address, &[tight::TIGHT_ENCODING, tight::QUALITY_LEVEL_0]);
+        // 16-bit RGB565, little-endian.
+        client
+            .write_all(&[
+                0, 0, 0, 0, 16, 16, 0, 1, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0,
+            ])
+            .unwrap();
+        request(&mut client, false, width, height);
+        let mut header = [0; 16];
+        client.read_exact(&mut header).unwrap();
+        assert_eq!(i32::from_be_bytes(header[12..16].try_into().unwrap()), 0);
+        server.stop();
+    }
+
+    #[test]
+    fn client_encodings_follow_the_preference_order() {
+        let parse = |encodings: &[i32]| ClientEncodings::parse(encodings.iter().copied());
+        assert_eq!(parse(&[0, 7, -30]).tight, None);
+        assert_eq!(
+            parse(&[7, 0, -30, -250, -29]).tight,
+            Some(TightSettings {
+                quality: Some(2),
+                compression: 6,
+            })
+        );
+        assert_eq!(parse(&[7]).tight, Some(TightSettings::default()));
+        let with_size = parse(&[DESKTOP_SIZE_ENCODING, 7]);
+        assert!(with_size.desktop_size);
+        assert!(with_size.tight.is_some());
+        assert_eq!(parse(&[6, 1, -33, -246]), ClientEncodings::default());
+    }
+
+    #[test]
+    fn tight_rectangles_merge_tiles_and_respect_size_limits() {
+        let tile = |x: u16, y: u16, width: u16, height: u16| ServerRect {
+            x,
+            y,
+            width,
+            height,
+            tile_index: None,
+            revision: 0,
+        };
+        // A 3x2 block of tiles plus a separate tile below it.
+        let mut rects = Vec::new();
+        for row in 0..2 {
+            for column in 0..3 {
+                rects.push(tile(column * 64, row * 64, 64, 64));
+            }
+        }
+        rects.push(tile(64, 128, 64, 20));
+        assert_eq!(
+            tight_rects(&rects),
+            vec![(0, 0, 192, 128), (64, 128, 64, 20)]
+        );
+
+        // A full 2560x320 area: 2048-pixel-wide and 256-pixel-tall pieces.
+        let rects = (0..5)
+            .flat_map(|row| (0..40).map(move |column| tile(column * 64, row * 64, 64, 64)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tight_rects(&rects),
+            vec![
+                (0, 0, 2048, 256),
+                (2048, 0, 512, 256),
+                (0, 256, 2048, 64),
+                (2048, 256, 512, 64),
+            ]
+        );
+        // A non-incremental request is a single rectangle; it is split too.
+        assert_eq!(
+            tight_rects(&[tile(0, 0, 2100, 300)]),
+            vec![
+                (0, 0, 2048, 256),
+                (2048, 0, 52, 256),
+                (0, 256, 2048, 44),
+                (2048, 256, 52, 44),
+            ]
+        );
+    }
+
+    /// Codec timing for a 1920x1080 frame of smooth, grainy content:
+    /// `cargo test --release --lib tight_codec_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn tight_codec_timing() {
+        let (width, height) = (1920usize, 1080usize);
+        let mut seed = 1u32;
+        let pixels: Vec<u32> = (0..width * height)
+            .map(|index| {
+                let (x, y) = ((index % width) as f32, (index / width) as f32);
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let grain = (seed % 13) as f32 - 6.0;
+                let wave = 40.0 * ((x * 0.03).sin() * (y * 0.02).cos());
+                let channel = |base: f32| (base + wave + grain).clamp(0.0, 255.0) as u32;
+                channel(120.0) << 16 | channel(90.0 + y * 0.1) << 8 | channel(60.0 + x * 0.05)
+            })
+            .collect();
+        let tiles = (0..height.div_ceil(64))
+            .flat_map(|row| {
+                (0..width.div_ceil(64)).map(move |column| ServerRect {
+                    x: (column * 64) as u16,
+                    y: (row * 64) as u16,
+                    width: 64.min(width - column * 64) as u16,
+                    height: 64.min(height - row * 64) as u16,
+                    tile_index: None,
+                    revision: 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let rects = tight_rects(&tiles);
+        let snapshots = rects
+            .iter()
+            .map(|&(x, y, w, h)| {
+                let mut copy = Vec::with_capacity(w * h);
+                for row in y..y + h {
+                    copy.extend_from_slice(&pixels[row * width + x..row * width + x + w]);
+                }
+                (copy, w, h)
+            })
+            .collect::<Vec<_>>();
+        for quality in [3, 6, 9] {
+            let settings = TightSettings {
+                quality: Some(quality),
+                compression: 1,
+            };
+            let started = Instant::now();
+            let bodies = encode_tight_rects(&snapshots, settings).unwrap();
+            let encoded = started.elapsed();
+            let sequential = Instant::now();
+            for (pixels, w, h) in &snapshots {
+                tight::encode_rect(pixels, *w, *h, settings, &mut Vec::new()).unwrap();
+            }
+            let sequential = sequential.elapsed();
+            let mut decoder = tight::TightDecoder::new();
+            let mut output = Vec::new();
+            let started = Instant::now();
+            for (body, &(_, _, w, h)) in bodies.iter().zip(&rects) {
+                decoder
+                    .read_rect(&mut Cursor::new(body), w, h, &mut output)
+                    .unwrap();
+            }
+            let decoded = started.elapsed();
+            let bytes: usize = bodies.iter().map(Vec::len).sum();
+            println!(
+                "quality {quality}: {} rects, {:.0} KB, encode {:.1} ms parallel / {:.1} ms one thread, decode {:.1} ms",
+                rects.len(),
+                bytes as f64 / 1000.0,
+                encoded.as_secs_f64() * 1000.0,
+                sequential.as_secs_f64() * 1000.0,
+                decoded.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
     #[test]
     fn server_reports_rfb_38_authentication_failure_reason() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2893,6 +3543,8 @@ mod tests {
             Session::from_stream(client, true, || unreachable!(), Duration::from_secs(2)).unwrap();
         session
             .reader
+            .get_ref()
+            .inner
             .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
         let mut frame = Framebuffer::new(2, 1).unwrap();
@@ -2977,9 +3629,26 @@ mod tests {
     }
 
     #[test]
+    fn handshake_advertises_tight_with_zlib_and_raw_fallbacks() {
+        let mut server = mock_server();
+        negotiate_with_encoding(
+            &mut server,
+            true,
+            Encoding::Tight { quality: 6 },
+            || unreachable!(),
+        )
+        .unwrap();
+        let mut expected = vec![2, 0, 0, 5];
+        for encoding in [7, 6, 0, -26, -255] {
+            expected.extend_from_slice(&i32::to_be_bytes(encoding));
+        }
+        assert_eq!(&server.output[34..], &expected);
+    }
+
+    #[test]
     fn zlib_rectangles_share_a_stream_across_updates() {
         let mut compressor = Compress::new(ZlibLevel::default(), true);
-        let mut decoder = Decompress::new(true);
+        let mut decoder = UpdateDecoder::new();
         let mut scratch = Vec::new();
         let mut frame = Framebuffer::new(2, 1).unwrap();
         for pixel in [[1, 2, 3, 0], [4, 5, 6, 0]] {
@@ -3037,7 +3706,7 @@ mod tests {
         let mut oversized = header.clone();
         oversized.extend_from_slice(&65_541u32.to_be_bytes());
         let mut scratch = Vec::new();
-        let mut decoder = Decompress::new(true);
+        let mut decoder = UpdateDecoder::new();
         assert_eq!(
             read_update_with_encoding(
                 &mut Cursor::new(oversized),

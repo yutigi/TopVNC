@@ -6,7 +6,8 @@ use crate::desktop_host::{
     FrameSlot, HostPermissions, KeyIdentity, MAC_FLAG_ALPHA_SHIFT, MAX_CLIPBOARD_CHARS, MacKeyCode,
     Rect, RemoteInputState, Rotation, ServeOptions, ServerNotice, display_point, frame_damage,
     latin1_from_unicode, latin1_to_string, macos_event_flags, macos_key_flags, macos_key_identity,
-    macos_modifier_flags, parse_serve_arguments, unicode_key_units, validate_capture_dimensions,
+    macos_modifier_flags, parse_serve_arguments, served_size, unicode_key_units,
+    validate_capture_dimensions,
 };
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -212,12 +213,13 @@ pub fn serve(
         address,
         display,
         allow_insecure,
+        scale,
     } = options;
     require_supported_macos()?;
     require_screen_recording()?;
     let input_allowed = accessibility_trusted_prompting();
     let _reconfiguration = ReconfigurationCallback::register();
-    let capture = DisplayCapture::start(display)?;
+    let capture = DisplayCapture::start(display, scale)?;
     let mut framebuffer = Framebuffer::new(capture.width, capture.height)?;
     let started = Instant::now();
     while started.elapsed() < FIRST_FRAME_TIMEOUT {
@@ -297,6 +299,7 @@ pub fn serve(
         let result = serve_desktop(
             &server,
             display,
+            scale,
             capture,
             framebuffer,
             &placement,
@@ -334,6 +337,7 @@ fn bind_error(error: std::io::Error, address: &str) -> Box<dyn Error> {
 fn serve_desktop(
     server: &VncServer,
     display: Option<usize>,
+    scale: f32,
     capture: DisplayCapture,
     mut framebuffer: Framebuffer,
     placement: &Mutex<InputPlacement>,
@@ -417,7 +421,7 @@ fn serve_desktop(
                 continue;
             }
             DISPLAY_RECONFIGURED.store(false, Ordering::Release);
-            match DisplayCapture::start(display) {
+            match DisplayCapture::start(display, scale) {
                 Ok(recreated) => {
                     let size = (recreated.width, recreated.height);
                     if size != (framebuffer.width() as u16, framebuffer.height() as u16) {
@@ -590,6 +594,8 @@ struct StreamShared {
     stopped: Mutex<Option<String>>,
     /// The next complete frame must be copied in full.
     full_frame_pending: AtomicBool,
+    /// Treat every frame as fully damaged.
+    every_frame_full: bool,
 }
 
 struct ObserverIvars {
@@ -671,15 +677,16 @@ fn accept_frame(shared: &StreamShared, sample: &CMSampleBuffer) {
     let Some(surface) = CVPixelBufferGetIOSurface(Some(&buffer)) else {
         return;
     };
-    let damage = if shared.full_frame_pending.swap(false, Ordering::AcqRel) {
-        FrameDamage::Full
-    } else {
-        let dirty = info
-            .objectForKey(unsafe { SCStreamFrameInfoDirtyRects })
-            .and_then(|rects| rects.downcast::<NSArray>().ok())
-            .map(|rects| dirty_rects(&rects));
-        frame_damage(dirty.as_deref(), surface.width(), surface.height())
-    };
+    let damage =
+        if shared.full_frame_pending.swap(false, Ordering::AcqRel) || shared.every_frame_full {
+            FrameDamage::Full
+        } else {
+            let dirty = info
+                .objectForKey(unsafe { SCStreamFrameInfoDirtyRects })
+                .and_then(|rects| rects.downcast::<NSArray>().ok())
+                .map(|rects| dirty_rects(&rects));
+            frame_damage(dirty.as_deref(), surface.width(), surface.height())
+        };
     // The replaced frame, if any, is released after the hand-off lock.
     drop(shared.frames.publish(PixelBuffer(buffer), damage));
 }
@@ -794,13 +801,17 @@ fn display_name(display: CGDirectDisplayID) -> Option<String> {
     receiver.recv_timeout(DISPLAY_NAME_TIMEOUT).ok().flatten()
 }
 
-/// A running ScreenCaptureKit stream of one display at its pixel size.
+/// A running ScreenCaptureKit stream of one display, at its pixel size or
+/// scaled down by ScreenCaptureKit.
 struct DisplayCapture {
     stream: Retained<SCStream>,
     observer: Retained<StreamObserver>,
     shared: Arc<StreamShared>,
     _queue: DispatchRetained<DispatchQueue>,
     display: CGDirectDisplayID,
+    /// The display's pixel size, which a restart is needed to follow.
+    native: (u16, u16),
+    /// The served size of each frame.
     width: u16,
     height: u16,
     name: String,
@@ -808,8 +819,8 @@ struct DisplayCapture {
 
 impl DisplayCapture {
     /// Capture the display numbered `display` (1-based, in `SCShareableContent`
-    /// order), or the main display.
-    fn start(display: Option<usize>) -> Result<Self, Box<dyn Error>> {
+    /// order), or the main display, at `scale` times its pixel size.
+    fn start(display: Option<usize>, scale: f32) -> Result<Self, Box<dyn Error>> {
         let displays = shareable_displays()?;
         if displays.is_empty() {
             // ScreenCaptureKit lists no displays while the session is locked.
@@ -833,7 +844,8 @@ impl DisplayCapture {
             }
         };
         let id = unsafe { selected.displayID() };
-        let (width, height) = display_pixel_size(id)?;
+        let native = display_pixel_size(id)?;
+        let (width, height) = served_size(native.0, native.1, scale);
 
         let filter = unsafe {
             SCContentFilter::initWithDisplay_excludingWindows(
@@ -856,6 +868,10 @@ impl DisplayCapture {
             frames: FrameSlot::default(),
             stopped: Mutex::new(None),
             full_frame_pending: AtomicBool::new(true),
+            // ScreenCaptureKit scales on the GPU. Its dirty rectangles are not
+            // relied on for scaled frames: each frame is copied whole and the
+            // RFB server's tile comparison finds what changed.
+            every_frame_full: (width, height) != native,
         });
         let observer = StreamObserver::new(Arc::clone(&shared));
         let stream = unsafe {
@@ -890,6 +906,7 @@ impl DisplayCapture {
             shared,
             _queue: queue,
             display: id,
+            native,
             width,
             height,
             name: display_name(id).unwrap_or_else(|| format!("display {id}")),
@@ -913,7 +930,7 @@ impl DisplayCapture {
             return Some("the main display changed".into());
         }
         match display_pixel_size(self.display) {
-            Ok(size) if size == (self.width, self.height) => None,
+            Ok(size) if size == self.native => None,
             Ok((width, height)) => Some(format!("now {width}x{height} pixels")),
             Err(error) => Some(error),
         }

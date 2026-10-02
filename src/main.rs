@@ -22,16 +22,24 @@ use ui::{
     UiState, WindowMode,
 };
 
-impl From<Compression> for Encoding {
-    fn from(value: Compression) -> Self {
-        match value {
-            Compression::Raw => Encoding::Raw,
-            Compression::Zlib => Encoding::Zlib,
-        }
+fn encoding(config: &Config) -> Encoding {
+    match config.compression {
+        Compression::Raw => Encoding::Raw,
+        Compression::Zlib => Encoding::Zlib,
+        Compression::Tight => Encoding::Tight {
+            quality: config.jpeg_quality,
+        },
     }
 }
 
-const USAGE: &str = "usage: topvnc [HOST:PORT] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--input-debug]";
+const USAGE: &str = "usage: topvnc [HOST:PORT] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--quality 0-9] [--input-debug]";
+
+fn parse_quality(value: &str) -> Result<u8, Box<dyn Error>> {
+    match value.parse::<u8>() {
+        Ok(quality) if quality <= 9 => Ok(quality),
+        _ => Err("--quality must be a JPEG quality level from 0 to 9".into()),
+    }
+}
 
 fn parse_size(value: &str) -> Result<(usize, usize), Box<dyn Error>> {
     let (width, height) = value
@@ -100,12 +108,13 @@ fn draw_rect(remote: (usize, usize), window: (usize, usize)) -> Option<Rect> {
     if remote.0 == 0 || remote.1 == 0 || window.0 == 0 || window.1 == 0 {
         return None;
     }
-    let remote_aspect = remote.0 as f32 / remote.1 as f32;
-    let window_aspect = window.0 as f32 / window.1 as f32;
+    let remote_aspect = remote.0 as f64 / remote.1 as f64;
+    let window_aspect = window.0 as f64 / window.1 as f64;
+    // Round so a window with the remote's own size draws it unscaled.
     let (width, height) = if remote_aspect > window_aspect {
-        (window.0, (window.0 as f32 / remote_aspect) as usize)
+        (window.0, (window.0 as f64 / remote_aspect).round() as usize)
     } else {
-        ((window.1 as f32 * remote_aspect) as usize, window.1)
+        ((window.1 as f64 * remote_aspect).round() as usize, window.1)
     };
     let width = width.max(1).min(window.0);
     let height = height.max(1).min(window.1);
@@ -141,16 +150,19 @@ fn sample_taps(source: usize, target: usize) -> Vec<SampleTap> {
         .collect()
 }
 
+/// Blend two 0x00RRGGBB pixels; `weight` (0..=256) is `b`'s share. Red and
+/// blue are blended together in one multiply, green in another.
+#[inline]
+fn lerp(a: u32, b: u32, weight: u32) -> u32 {
+    let inverse = 256 - weight;
+    let red_blue = ((a & 0xff00ff) * inverse + (b & 0xff00ff) * weight + 0x800080) >> 8;
+    let green = ((a & 0x00ff00) * inverse + (b & 0x00ff00) * weight + 0x008000) >> 8;
+    (red_blue & 0xff00ff) | (green & 0x00ff00)
+}
+
+#[inline]
 fn bilinear(a: u32, b: u32, c: u32, d: u32, x_weight: u32, y_weight: u32) -> u32 {
-    let mut result = 0;
-    for shift in [0, 8, 16] {
-        let channel = |pixel: u32| (pixel >> shift) & 0xff;
-        let top = channel(a) * (256 - x_weight) + channel(b) * x_weight;
-        let bottom = channel(c) * (256 - x_weight) + channel(d) * x_weight;
-        let value = (top * (256 - y_weight) + bottom * y_weight + 32768) >> 16;
-        result |= value << shift;
-    }
-    result
+    lerp(lerp(a, b, x_weight), lerp(c, d, x_weight), y_weight)
 }
 
 struct ScaledFrame {
@@ -159,6 +171,9 @@ struct ScaledFrame {
     pixels: Vec<u32>,
     x_taps: Vec<SampleTap>,
     y_taps: Vec<SampleTap>,
+    /// Columns map one-to-one onto consecutive source columns, so rows can
+    /// be copied instead of sampled.
+    copy_rows: bool,
     quality: Quality,
     mode: WindowMode,
 }
@@ -219,12 +234,19 @@ impl ScaledFrame {
                 sample_taps(remote.1, draw.y1 - draw.y0),
             )
         };
+        let unscaled = |taps: &[SampleTap]| {
+            // With a zero weight only `lo` contributes to a sample.
+            taps.iter().all(|tap| tap.weight == 0)
+                && taps.windows(2).all(|pair| pair[1].lo == pair[0].lo + 1)
+        };
+        let copy_rows = unscaled(&x_taps) && unscaled(&y_taps);
         Ok(Self {
             window,
             draw,
             pixels: vec![0; count],
             x_taps,
             y_taps,
+            copy_rows,
             quality,
             mode,
         })
@@ -254,6 +276,17 @@ impl ScaledFrame {
         };
         let source_width = source.width();
         let source_pixels = source.pixels();
+        if self.copy_rows {
+            let length = x_end - x_start + 1;
+            let source_x = self.x_taps[x_start].lo;
+            for y in y_start..=y_end {
+                let target = (self.draw.y0 + y) * self.window.0 + self.draw.x0 + x_start;
+                let source = self.y_taps[y].lo * source_width + source_x;
+                self.pixels[target..target + length]
+                    .copy_from_slice(&source_pixels[source..source + length]);
+            }
+            return;
+        }
         for y in y_start..=y_end {
             let y_tap = self.y_taps[y];
             let target_row = (self.draw.y0 + y) * self.window.0 + self.draw.x0;
@@ -290,7 +323,19 @@ impl ScaledFrame {
 
 struct FrameState {
     framebuffer: Framebuffer,
+    /// Area changed by fully received updates and not yet presented.
     dirty: Option<Rect>,
+}
+
+/// Copy `area` of `source` into the same place in `target`.
+fn copy_area(source: &Framebuffer, target: &mut Framebuffer, area: Rect) {
+    let width = source.width();
+    let source = source.pixels();
+    let target = target.pixels_mut();
+    for row in area.y0..area.y1 {
+        let range = row * width + area.x0..row * width + area.x1;
+        target[range.clone()].copy_from_slice(&source[range]);
+    }
 }
 
 /// Map a mouse position in an aspect-fitted window to remote framebuffer pixels.
@@ -511,6 +556,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 config.window_mode = WindowMode::Custom;
                 config.window_size = value;
             }
+            "--quality" => {
+                let value = args
+                    .next()
+                    .ok_or("--quality requires a level from 0 to 9")?;
+                config.jpeg_quality = parse_quality(&value)?;
+            }
             "--input-debug" => input_debug = true,
             _ if arg.starts_with('-') || address.is_some() => return Err(USAGE.into()),
             _ => address = Some(arg),
@@ -633,6 +684,7 @@ impl HostedServer {
             address: request.address,
             display: request.display,
             allow_insecure: request.allow_insecure,
+            scale: request.scale,
         };
         self.authenticated = request.password.is_some();
         let password = request.password;
@@ -782,6 +834,7 @@ fn show_landing(
     let (result_tx, result_rx) = mpsc::channel::<Result<Session, String>>();
     let mut connecting = false;
     let mut permissions_checked: Option<std::time::Instant> = None;
+    let mut dragging_serve_scale = false;
     while window.is_open() {
         // Permissions can change in System Settings while the window is open.
         if server.view.phase == ServerPhase::Stopped
@@ -868,6 +921,15 @@ fn show_landing(
             if editable && ui::ALL_NETWORKS.contains(x, y) {
                 serve.host = ui::ALL_NETWORKS_HOST.into();
             }
+            if editable && ui::SERVE_SCALE_SLIDER.contains(x, y) {
+                dragging_serve_scale = true;
+            }
+            if editable && ui::SERVE_FULL_SIZE.contains(x, y) {
+                serve.scale = 1.0;
+            }
+            if editable && ui::SERVE_HALF_SIZE.contains(x, y) {
+                serve.scale = 0.5;
+            }
             if ui::CONNECT.contains(x, y) {
                 server_clicked = true;
             }
@@ -891,6 +953,9 @@ fn show_landing(
             }
             if ui::ZLIB.contains(x, y) {
                 config.compression = Compression::Zlib;
+            }
+            if ui::TIGHT.contains(x, y) {
+                config.compression = Compression::Tight;
             }
             if ui::FIT.contains(x, y) {
                 config.window_mode = WindowMode::Fit;
@@ -920,6 +985,18 @@ fn show_landing(
                 connect_clicked = true;
             }
         }
+        // The served-size slider follows the mouse until the button is
+        // released; it is locked while the server runs.
+        if dragging_serve_scale {
+            if window.get_mouse_down(MouseButton::Left)
+                && state.tab == Tab::Server
+                && server.view.phase == ServerPhase::Stopped
+            {
+                config.serve.scale = ui::serve_scale_from_slider_x(x);
+            } else {
+                dragging_serve_scale = false;
+            }
+        }
         if server_clicked {
             match server.view.phase {
                 ServerPhase::Stopped => match config.serve.request() {
@@ -942,12 +1019,12 @@ fn show_landing(
                     let sender = result_tx.clone();
                     let password = config.password.clone();
                     let allow_insecure = config.allow_insecure;
-                    let compression = config.compression;
+                    let encoding = encoding(&config);
                     thread::spawn(move || {
                         let result = Session::connect_with_encoding(
                             &address,
                             allow_insecure,
-                            compression.into(),
+                            encoding,
                             || Ok(password.clone()),
                         )
                         .map_err(|error| error.to_string());
@@ -1035,22 +1112,33 @@ fn run_session_inner(
     thread::spawn(move || {
         let result: std::io::Result<()> = (|| {
             let mut scratch = Vec::new();
-            let mut incremental = false;
+            // Each update requests the next one as soon as it starts arriving,
+            // so the server never waits a round trip between frames.
+            worker_writer.request_update(false, info.width, info.height)?;
             loop {
-                worker_writer.request_update(incremental, info.width, info.height)?;
-                session.read_update_with(&mut scratch, |x, y, width, height, bytes| {
-                    let mut frame = worker_framebuffer.lock().unwrap();
-                    frame.framebuffer.apply_raw(x, y, width, height, bytes)?;
+                let mut received: Option<Rect> = None;
+                // Rectangles are decoded before the lock is taken; the lock
+                // only covers copying pixels into the shared framebuffer.
+                session.read_update_pipelined(&mut scratch, |x, y, width, height, bytes| {
+                    worker_framebuffer
+                        .lock()
+                        .unwrap()
+                        .framebuffer
+                        .apply_raw(x, y, width, height, bytes)?;
                     let rect = Rect {
                         x0: usize::from(x),
                         y0: usize::from(y),
                         x1: usize::from(x) + usize::from(width),
                         y1: usize::from(y) + usize::from(height),
                     };
-                    frame.dirty = Some(frame.dirty.map_or(rect, |dirty| dirty.union(rect)));
+                    received = Some(received.map_or(rect, |area| area.union(rect)));
                     Ok(())
                 })?;
-                incremental = true;
+                // Present an update only once all of it has arrived.
+                if let Some(rect) = received {
+                    let mut frame = worker_framebuffer.lock().unwrap();
+                    frame.dirty = Some(frame.dirty.map_or(rect, |dirty| dirty.union(rect)));
+                }
             }
         })();
         let _ = error_tx.send(result);
@@ -1079,6 +1167,9 @@ fn run_session_inner(
         config.window_mode,
         config.quality,
     )?;
+    // The window thread scales from its own copy, so the network thread never
+    // waits for scaling.
+    let mut presented = Framebuffer::new(info.width, info.height)?;
     let (input_tx, input_rx) = mpsc::channel();
     window.set_input_callback(Box::new(KeyEvents(input_tx)));
     let mut pressed_keys = HashMap::new();
@@ -1106,22 +1197,27 @@ fn run_session_inner(
             scaled = ScaledFrame::with_settings(remote, size, config.window_mode, config.quality)?;
             redraw = false;
         }
-        {
+        let dirty = {
             let mut frame = framebuffer.lock().unwrap();
-            let dirty = if full_redraw {
-                frame.dirty = None;
-                Some(Rect {
-                    x0: 0,
-                    y0: 0,
-                    x1: remote.0,
-                    y1: remote.1,
-                })
+            if let Some(dirty) = frame.dirty.take() {
+                copy_area(&frame.framebuffer, &mut presented, dirty);
+                Some(dirty)
             } else {
-                frame.dirty.take()
-            };
-            if let Some(dirty) = dirty {
-                scaled.update(&frame.framebuffer, dirty);
+                None
             }
+        };
+        let dirty = if full_redraw {
+            Some(Rect {
+                x0: 0,
+                y0: 0,
+                x1: remote.0,
+                y1: remote.1,
+            })
+        } else {
+            dirty
+        };
+        if let Some(dirty) = dirty {
+            scaled.update(&presented, dirty);
         }
         let area = if settings_open {
             ui::SETTINGS_PANEL
@@ -1301,6 +1397,15 @@ mod tests {
     }
 
     #[test]
+    fn quality_parser_accepts_rfb_levels_only() {
+        assert_eq!(parse_quality("0").unwrap(), 0);
+        assert_eq!(parse_quality("9").unwrap(), 9);
+        assert!(parse_quality("10").is_err());
+        assert!(parse_quality("-1").is_err());
+        assert!(parse_quality("high").is_err());
+    }
+
+    #[test]
     fn window_size_parser_rejects_invalid_dimensions() {
         assert_eq!(parse_size("1280x720").unwrap(), (1280, 720));
         assert!(parse_size("0x720").is_err());
@@ -1402,6 +1507,49 @@ mod tests {
         let mut complete = ScaledFrame::new((4, 4), (6, 6)).unwrap();
         complete.update(&source, full);
         assert_eq!(partial.pixels, complete.pixels);
+    }
+
+    #[test]
+    fn unscaled_frames_copy_rows_and_match_sampling() {
+        let mut source = Framebuffer::new(5, 3).unwrap();
+        for (index, pixel) in source.pixels_mut().iter_mut().enumerate() {
+            *pixel = index as u32 * 0x010203;
+        }
+        let full = Rect {
+            x0: 0,
+            y0: 0,
+            x1: 5,
+            y1: 3,
+        };
+        let mut copied = ScaledFrame::new((5, 3), (5, 3)).unwrap();
+        assert!(copied.copy_rows);
+        copied.update(&source, full);
+        assert_eq!(copied.pixels, source.pixels());
+        // The same frame sampled tap by tap gives the same pixels.
+        let mut sampled = ScaledFrame::new((5, 3), (5, 3)).unwrap();
+        sampled.copy_rows = false;
+        sampled.update(&source, full);
+        assert_eq!(sampled.pixels, copied.pixels);
+        // Scaled frames keep sampling.
+        assert!(!ScaledFrame::new((5, 3), (10, 6)).unwrap().copy_rows);
+    }
+
+    #[test]
+    fn copy_area_copies_only_the_area() {
+        let mut source = Framebuffer::new(3, 2).unwrap();
+        source.pixels_mut().fill(7);
+        let mut target = Framebuffer::new(3, 2).unwrap();
+        copy_area(
+            &source,
+            &mut target,
+            Rect {
+                x0: 1,
+                y0: 1,
+                x1: 3,
+                y1: 2,
+            },
+        );
+        assert_eq!(target.pixels(), &[0, 0, 0, 0, 7, 7]);
     }
 
     #[test]

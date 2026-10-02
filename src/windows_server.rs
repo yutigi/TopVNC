@@ -3,9 +3,9 @@
 
 use crate::desktop_host::{
     CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureSurface, CursorKind, CursorShape, DesktopImage,
-    KeyIdentity, PointerTransition, Rect, RemoteInputState, Rotation, WHEEL_DELTA,
-    absolute_mouse_coordinate, latin1_from_unicode, latin1_to_utf16, unicode_key_units,
-    validate_capture_dimensions, windows_key_identity,
+    Downscaler, KeyIdentity, PointerTransition, Rect, RemoteInputState, Rotation, WHEEL_DELTA,
+    absolute_mouse_coordinate, latin1_from_unicode, latin1_to_utf16, native_coordinate,
+    served_size, unicode_key_units, validate_capture_dimensions, windows_key_identity,
 };
 use crate::desktop_host::{
     MAX_CLIPBOARD_CHARS, ServeOptions, ServerNotice, VirtualKey, parse_serve_arguments,
@@ -103,6 +103,62 @@ struct DisplayPlacement {
     top: i32,
     width: u16,
     height: u16,
+    /// The framebuffer size viewers see, smaller than the display when the
+    /// served image is scaled down.
+    served_width: u16,
+    served_height: u16,
+}
+
+/// What viewers see: the captured image itself, or a downscaled copy.
+struct ServedImage {
+    scaled: Option<(Downscaler, Framebuffer)>,
+    regions: Vec<DamageRect>,
+}
+
+impl ServedImage {
+    fn new(native: (u16, u16), scale: f32) -> Result<Self, Box<dyn Error>> {
+        let served = served_size(native.0, native.1, scale);
+        let scaled = if served == native {
+            None
+        } else {
+            Some((
+                Downscaler::new(native, served),
+                Framebuffer::new(served.0, served.1)?,
+            ))
+        };
+        Ok(Self {
+            scaled,
+            regions: Vec::new(),
+        })
+    }
+
+    fn size(&self, captured: &Framebuffer) -> (u16, u16) {
+        let image = self.image(captured);
+        (image.width() as u16, image.height() as u16)
+    }
+
+    fn image<'a>(&'a self, captured: &'a Framebuffer) -> &'a Framebuffer {
+        self.scaled
+            .as_ref()
+            .map_or(captured, |(_, framebuffer)| framebuffer)
+    }
+
+    /// Bring the served image up to date with `damage`, in captured pixels.
+    /// `regions` then holds the served regions that changed.
+    fn update(&mut self, captured: &Framebuffer, damage: &[Rect]) {
+        self.regions.clear();
+        match &mut self.scaled {
+            None => self.regions.extend(damage.iter().map(damage_rect)),
+            Some((scaler, served)) => {
+                for rect in damage {
+                    if let Some(area) = scaler.served_rect(*rect) {
+                        scaler.scale(captured.pixels(), served.pixels_mut(), area);
+                        self.regions.push(damage_rect(&area));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Run `topvnc --serve` until the console asks the server to stop.
@@ -149,6 +205,7 @@ pub fn serve(
         address,
         display,
         allow_insecure,
+        scale,
     } = options;
     // The GUI process stays DPI-unaware for its own windows, so the capture
     // and input threads opt in to physical pixels individually.
@@ -168,19 +225,30 @@ pub fn serve(
         capture.next_frame(&mut image, &mut captured)?;
     }
     image.present(&captured, framebuffer.pixels_mut(), &mut damage);
+    let native = (capture.placement.width, capture.placement.height);
+    let mut served = ServedImage::new(native, scale)?;
+    served.update(
+        &framebuffer,
+        &[Rect::new(0, 0, i32::from(native.0), i32::from(native.1))],
+    );
+    let (served_width, served_height) = served.size(&framebuffer);
     let config = ServerConfig {
         name: "TopVNC Windows Desktop".into(),
         password,
         allow_insecure,
     };
-    let server = VncServer::bind(&address, framebuffer.clone(), config)?;
+    let server = VncServer::bind(&address, served.image(&framebuffer).clone(), config)?;
     report(ServerNotice::Serving {
         address: server.local_addr()?,
         display: capture.name.clone(),
-        width: capture.placement.width,
-        height: capture.placement.height,
+        width: served_width,
+        height: served_height,
     });
-    let placement = Mutex::new(capture.placement);
+    let placement = Mutex::new(DisplayPlacement {
+        served_width,
+        served_height,
+        ..capture.placement
+    });
     // Remote input is injected on its own thread so it never waits for a
     // frame to be captured or copied.
     let remote_clipboard_sequence = AtomicU32::new(0);
@@ -218,9 +286,11 @@ pub fn serve(
         let result = serve_desktop(
             &server,
             display,
+            scale,
             capture,
             framebuffer,
             image,
+            served,
             &placement,
             &remote_clipboard_sequence,
             shutdown,
@@ -243,9 +313,11 @@ pub fn serve(
 fn serve_desktop(
     server: &VncServer,
     display: Option<usize>,
+    scale: f32,
     capture: DesktopCapture,
     mut framebuffer: Framebuffer,
     mut image: DesktopImage,
+    mut served: ServedImage,
     placement: &Mutex<DisplayPlacement>,
     remote_clipboard_sequence: &AtomicU32,
     shutdown: &AtomicBool,
@@ -300,16 +372,20 @@ fn serve_desktop(
                 Ok(recreated) => {
                     let size = (recreated.placement.width, recreated.placement.height);
                     if size != (framebuffer.width() as u16, framebuffer.height() as u16) {
-                        report(ServerNotice::Resized {
-                            width: size.0,
-                            height: size.1,
-                        });
                         framebuffer = Framebuffer::new(size.0, size.1)?;
                         image = DesktopImage::new(size.0, size.1);
+                        served = ServedImage::new(size, scale)?;
+                        let (width, height) = served.size(&framebuffer);
+                        report(ServerNotice::Resized { width, height });
                     }
+                    let (served_width, served_height) = served.size(&framebuffer);
                     *placement
                         .lock()
-                        .map_err(|_| "display placement lock poisoned")? = recreated.placement;
+                        .map_err(|_| "display placement lock poisoned")? = DisplayPlacement {
+                        served_width,
+                        served_height,
+                        ..recreated.placement
+                    };
                     report(ServerNotice::Message("Desktop capture resumed.".into()));
                     capture = Some(recreated);
                     retry_delay = CAPTURE_RETRY_MIN;
@@ -345,8 +421,10 @@ fn serve_desktop(
         damage.clear();
         image.present(&captured, framebuffer.pixels_mut(), &mut damage);
         if !damage.is_empty() {
-            let regions = damage.iter().map(damage_rect).collect::<Vec<_>>();
-            server.update_framebuffer_regions(&framebuffer, &regions)?;
+            served.update(&framebuffer, &damage);
+            if !served.regions.is_empty() {
+                server.update_framebuffer_regions(served.image(&framebuffer), &served.regions)?;
+            }
         }
     }
     Ok(())
@@ -528,9 +606,20 @@ fn button_inputs(previous: u8, next: u8) -> Vec<INPUT> {
 }
 
 fn inject_pointer(placement: DisplayPlacement, x: u16, y: u16, transition: PointerTransition) {
-    // The framebuffer can briefly be larger than a display that just shrank.
-    let x = placement.left + i32::from(x.min(placement.width.saturating_sub(1)));
-    let y = placement.top + i32::from(y.min(placement.height.saturating_sub(1)));
+    // Served pixels map to the display pixel under their center; this also
+    // clamps a framebuffer briefly larger than a display that just shrank.
+    let x = placement.left
+        + i32::from(native_coordinate(
+            x,
+            placement.served_width,
+            placement.width,
+        ));
+    let y = placement.top
+        + i32::from(native_coordinate(
+            y,
+            placement.served_height,
+            placement.height,
+        ));
     let (virtual_left, virtual_top, virtual_width, virtual_height) = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -1028,6 +1117,8 @@ fn display_placement(desc: &DXGI_OUTPUT_DESC) -> Result<DisplayPlacement, Box<dy
         top: area.top,
         width,
         height,
+        served_width: width,
+        served_height: height,
     })
 }
 

@@ -20,15 +20,138 @@ pub const CAPTURE_RETRY_MIN: Duration = Duration::from_millis(250);
 pub const CAPTURE_RETRY_MAX: Duration = Duration::from_secs(2);
 
 pub const SERVE_USAGE: &str =
-    "usage: topvnc --serve [HOST:PORT] [--display NUMBER] [--allow-insecure]";
+    "usage: topvnc --serve [HOST:PORT] [--display NUMBER] [--scale 0.25-1] [--allow-insecure]";
+
+/// The smallest served size, as a fraction of the display's pixel size.
+pub const MIN_SERVE_SCALE: f32 = 0.25;
 
 /// Options for `topvnc --serve`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServeOptions {
     pub address: String,
     /// 1-based display number; `None` serves the primary display.
     pub display: Option<usize>,
     pub allow_insecure: bool,
+    /// Served size as a fraction of the display's pixel size, from
+    /// [`MIN_SERVE_SCALE`] to 1. A Retina display at 0.5 is served at its
+    /// size in points.
+    pub scale: f32,
+}
+
+/// Round `scale` to hundredths and clamp it to the served-size range.
+/// Values that are not numbers serve the full size.
+pub fn normalize_serve_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        ((scale.clamp(MIN_SERVE_SCALE, 1.0) * 100.0).round() / 100.0).clamp(MIN_SERVE_SCALE, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// The framebuffer size served for a `width` x `height` display at `scale`.
+pub fn served_size(width: u16, height: u16, scale: f32) -> (u16, u16) {
+    let scale = normalize_serve_scale(scale);
+    if scale >= 1.0 {
+        return (width, height);
+    }
+    let axis = |pixels: u16| ((f32::from(pixels) * scale).round() as u16).clamp(1, pixels.max(1));
+    (axis(width), axis(height))
+}
+
+/// The captured pixel under the center of served pixel `value` on an axis
+/// of `served` served and `native` captured pixels. Values past the edge
+/// clamp to the last pixel.
+pub fn native_coordinate(value: u16, served: u16, native: u16) -> u16 {
+    if served == 0 || native == 0 {
+        return 0;
+    }
+    let value = u32::from(value.min(served - 1));
+    let center = (2 * value + 1) * u32::from(native) / (2 * u32::from(served));
+    center.min(u32::from(native) - 1) as u16
+}
+
+/// Area-average downscaling from a captured image to a smaller served
+/// framebuffer. Each served pixel averages the block of captured pixels it
+/// covers, so only damaged blocks need to be recomputed.
+#[derive(Debug, Clone)]
+pub struct Downscaler {
+    native: (usize, usize),
+    served: (usize, usize),
+    /// Captured columns and rows `[start, end)` covered by each served one.
+    columns: Vec<(usize, usize)>,
+    rows: Vec<(usize, usize)>,
+}
+
+impl Downscaler {
+    /// `served` must be no larger than `native` on either axis.
+    pub fn new(native: (u16, u16), served: (u16, u16)) -> Self {
+        let spans = |native: usize, served: usize| -> Vec<(usize, usize)> {
+            (0..served)
+                .map(|index| {
+                    let start = index * native / served;
+                    let end = ((index + 1) * native / served).max(start + 1);
+                    (start, end.min(native))
+                })
+                .collect()
+        };
+        let native = (usize::from(native.0), usize::from(native.1));
+        let served = (
+            usize::from(served.0).min(native.0),
+            usize::from(served.1).min(native.1),
+        );
+        Self {
+            native,
+            served,
+            columns: spans(native.0, served.0),
+            rows: spans(native.1, served.1),
+        }
+    }
+
+    pub fn served_size(&self) -> (usize, usize) {
+        self.served
+    }
+
+    /// The served pixels whose blocks overlap `damage`, a rectangle in
+    /// captured pixels.
+    pub fn served_rect(&self, damage: Rect) -> Option<Rect> {
+        let damage =
+            damage.intersect(Rect::new(0, 0, self.native.0 as i32, self.native.1 as i32))?;
+        // Spans are sorted and contiguous, so the first and last overlapping
+        // spans bound the result.
+        let range = |spans: &[(usize, usize)], low: i32, high: i32| {
+            let (low, high) = (low as usize, high as usize);
+            let first = spans.partition_point(|span| span.1 <= low);
+            let last = spans.partition_point(|span| span.0 < high);
+            (first as i32, last as i32)
+        };
+        let (left, right) = range(&self.columns, damage.left, damage.right);
+        let (top, bottom) = range(&self.rows, damage.top, damage.bottom);
+        Some(Rect::new(left, top, right, bottom)).filter(|rect| !rect.is_empty())
+    }
+
+    /// Recompute served pixels in `area` (served coordinates) from `source`,
+    /// a captured 0x00RRGGBB image.
+    pub fn scale(&self, source: &[u32], target: &mut [u32], area: Rect) {
+        for row in area.top as usize..area.bottom as usize {
+            let (row_start, row_end) = self.rows[row];
+            for column in area.left as usize..area.right as usize {
+                let (column_start, column_end) = self.columns[column];
+                let (mut red, mut green, mut blue) = (0u32, 0u32, 0u32);
+                for source_row in row_start..row_end {
+                    let line = &source[source_row * self.native.0..][column_start..column_end];
+                    for pixel in line {
+                        red += pixel >> 16 & 0xff;
+                        green += pixel >> 8 & 0xff;
+                        blue += pixel & 0xff;
+                    }
+                }
+                let count = ((row_end - row_start) * (column_end - column_start)) as u32;
+                let average = |sum: u32| (sum + count / 2) / count;
+                target[row * self.served.0 + column] =
+                    average(red) << 16 | average(green) << 8 | average(blue);
+            }
+        }
+    }
 }
 
 /// Progress a desktop server host reports while it runs.
@@ -93,8 +216,10 @@ pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'sta
         address: "127.0.0.1:5900".to_owned(),
         display: None,
         allow_insecure: false,
+        scale: 1.0,
     };
     let mut address_set = false;
+    let mut scale_set = false;
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -106,6 +231,15 @@ pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'sta
                     .filter(|number| *number > 0)
                     .ok_or(SERVE_USAGE)?;
                 options.display = Some(number);
+            }
+            "--scale" if !scale_set => {
+                options.scale = arguments
+                    .next()
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .filter(|scale| (MIN_SERVE_SCALE..=1.0).contains(scale))
+                    .map(normalize_serve_scale)
+                    .ok_or(SERVE_USAGE)?;
+                scale_set = true;
             }
             _ if argument.starts_with('-') || address_set => return Err(SERVE_USAGE),
             _ => {
@@ -1221,6 +1355,7 @@ mod tests {
                 address: "127.0.0.1:5900".into(),
                 display: None,
                 allow_insecure: false,
+                scale: 1.0,
             })
         );
         assert_eq!(
@@ -1234,18 +1369,95 @@ mod tests {
                 address: "0.0.0.0:5901".into(),
                 display: Some(2),
                 allow_insecure: true,
+                scale: 1.0,
             })
+        );
+        assert_eq!(
+            parse_serve_arguments(&arguments(&["--scale", "0.5"])).map(|options| options.scale),
+            Ok(0.5)
+        );
+        assert_eq!(
+            parse_serve_arguments(&arguments(&["--scale", "0.333"])).map(|options| options.scale),
+            Ok(0.33)
         );
         for invalid in [
             &["--display"][..],
             &["--display", "0"],
             &["--display", "x"],
             &["--display", "1", "--display", "2"],
+            &["--scale"],
+            &["--scale", "0.2"],
+            &["--scale", "1.5"],
+            &["--scale", "NaN"],
+            &["--scale", "0.5", "--scale", "0.5"],
             &["a:1", "b:2"],
             &["--unknown"],
         ] {
             assert_eq!(parse_serve_arguments(&arguments(invalid)), Err(SERVE_USAGE));
         }
+    }
+
+    #[test]
+    fn served_sizes_scale_and_clamp() {
+        assert_eq!(served_size(3024, 1964, 1.0), (3024, 1964));
+        assert_eq!(served_size(3024, 1964, 0.5), (1512, 982));
+        assert_eq!(served_size(1920, 1080, 0.75), (1440, 810));
+        // Below the minimum, above full size, and not a number.
+        assert_eq!(served_size(1000, 1000, 0.1), (250, 250));
+        assert_eq!(served_size(1000, 1000, 3.0), (1000, 1000));
+        assert_eq!(served_size(1000, 1000, f32::NAN), (1000, 1000));
+        assert_eq!(served_size(1, 1, 0.25), (1, 1));
+        assert_eq!(normalize_serve_scale(0.504), 0.5);
+    }
+
+    #[test]
+    fn downscaler_averages_each_block() {
+        // 4x2 captured pixels to 2x1 served: each served pixel is a 2x2 block.
+        let source = [
+            0x000000, 0x020406, 0xfefefe, 0xffffff, //
+            0x040404, 0x060402, 0xffffff, 0xfdfdfd,
+        ];
+        let scaler = Downscaler::new((4, 2), (2, 1));
+        let mut target = [0; 2];
+        scaler.scale(&source, &mut target, Rect::new(0, 0, 2, 1));
+        assert_eq!(target, [0x030303, 0xfefefe]);
+    }
+
+    #[test]
+    fn served_coordinates_map_to_the_captured_pixel_under_their_center() {
+        assert_eq!(native_coordinate(0, 1512, 3024), 1);
+        assert_eq!(native_coordinate(1511, 1512, 3024), 3023);
+        assert_eq!(native_coordinate(100, 1000, 1000), 100);
+        // A third: served pixel 1 covers captured 3..6, centered on 4.
+        assert_eq!(native_coordinate(1, 4, 12), 4);
+        // Past the edge clamps; empty axes map to zero.
+        assert_eq!(native_coordinate(5000, 1512, 3024), 3023);
+        assert_eq!(native_coordinate(3, 0, 10), 0);
+    }
+
+    #[test]
+    fn downscaler_limits_work_to_blocks_touching_the_damage() {
+        let scaler = Downscaler::new((3024, 1964), (1512, 982));
+        assert_eq!(scaler.served_size(), (1512, 982));
+        assert_eq!(
+            scaler.served_rect(Rect::new(3, 4, 5, 5)),
+            Some(Rect::new(1, 2, 3, 3))
+        );
+        assert_eq!(
+            scaler.served_rect(Rect::new(0, 0, 3024, 1964)),
+            Some(Rect::new(0, 0, 1512, 982))
+        );
+        assert_eq!(scaler.served_rect(Rect::new(4000, 0, 4100, 10)), None);
+        // Uneven ratios still cover every captured pixel exactly once.
+        let uneven = Downscaler::new((10, 7), (4, 3));
+        let covered: usize = uneven.columns.iter().map(|(start, end)| end - start).sum();
+        assert_eq!(covered, 10);
+        assert_eq!(uneven.columns.first().unwrap().0, 0);
+        assert!(uneven.columns.windows(2).all(|pair| pair[0].1 == pair[1].0));
+        let source: Vec<u32> = (0..70).collect();
+        let mut target = vec![0; 12];
+        uneven.scale(&source, &mut target, Rect::new(0, 0, 4, 3));
+        assert!(target.iter().all(|pixel| *pixel < 70));
     }
 
     fn check_disconnect_releases_only_that_clients_input<K>(key: fn(u32) -> K)

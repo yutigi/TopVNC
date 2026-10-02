@@ -1,4 +1,4 @@
-use crate::desktop_host::HostPermissions;
+use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, normalize_serve_scale};
 use minifb::Key;
 
 pub const BG: u32 = 0x0b1020;
@@ -27,7 +27,13 @@ pub enum Quality {
 pub enum Compression {
     Raw,
     Zlib,
+    /// Tight with JPEG for photographic and game content; falls back to Zlib
+    /// or Raw on servers without Tight.
+    Tight,
 }
+
+/// RFB JPEG quality level (0-9) used with Tight unless `--quality` sets one.
+pub const DEFAULT_JPEG_QUALITY: u8 = 6;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -40,6 +46,8 @@ pub struct Config {
     pub fps: usize,
     pub quality: Quality,
     pub compression: Compression,
+    /// RFB JPEG quality level, 0 (smallest) to 9 (best), used with Tight.
+    pub jpeg_quality: u8,
     pub ui_scale: f32,
     pub serve: ServeForm,
 }
@@ -55,7 +63,8 @@ impl Default for Config {
             window_size: "1280x720".into(),
             fps: 60,
             quality: Quality::Smooth,
-            compression: Compression::Raw,
+            compression: Compression::Tight,
+            jpeg_quality: DEFAULT_JPEG_QUALITY,
             ui_scale: 1.0,
             serve: ServeForm::default(),
         }
@@ -89,6 +98,8 @@ pub struct ServeForm {
     pub password: String,
     pub display: String,
     pub allow_insecure: bool,
+    /// Served size as a fraction of the display's pixel size.
+    pub scale: f32,
 }
 
 impl Default for ServeForm {
@@ -99,12 +110,13 @@ impl Default for ServeForm {
             password: String::new(),
             display: String::new(),
             allow_insecure: false,
+            scale: 1.0,
         }
     }
 }
 
 /// A validated request to start serving this desktop.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct ServeRequest {
     pub address: String,
     /// 1-based display number; `None` serves the primary display.
@@ -112,6 +124,8 @@ pub struct ServeRequest {
     /// `None` only when unauthenticated access was explicitly allowed.
     pub password: Option<String>,
     pub allow_insecure: bool,
+    /// Served size as a fraction of the display's pixel size.
+    pub scale: f32,
 }
 
 impl ServeForm {
@@ -142,6 +156,7 @@ impl ServeForm {
             display,
             password,
             allow_insecure: self.allow_insecure,
+            scale: normalize_serve_scale(self.scale),
         })
     }
 }
@@ -472,15 +487,21 @@ pub const PASSWORD: Box2 = Box2 {
     h: 40,
 };
 pub const RAW: Box2 = Box2 {
-    x: 542,
+    x: 400,
     y: 280,
-    w: 95,
+    w: 80,
     h: 36,
 };
 pub const ZLIB: Box2 = Box2 {
-    x: 649,
+    x: 490,
     y: 280,
-    w: 109,
+    w: 90,
+    h: 36,
+};
+pub const TIGHT: Box2 = Box2 {
+    x: 590,
+    y: 280,
+    w: 168,
     h: 36,
 };
 pub const INSECURE: Box2 = Box2 {
@@ -571,15 +592,50 @@ pub const SERVE_DISPLAY: Box2 = Box2 {
 pub const LOCAL_ONLY: Box2 = Box2 {
     x: 40,
     y: 386,
-    w: 220,
+    w: 196,
     h: 36,
 };
 pub const ALL_NETWORKS: Box2 = Box2 {
-    x: 272,
+    x: 248,
     y: 386,
-    w: 220,
+    w: 196,
     h: 36,
 };
+/// Clickable and draggable area of the served-size slider.
+pub const SERVE_SCALE_SLIDER: Box2 = Box2 {
+    x: 460,
+    y: 386,
+    w: 160,
+    h: 36,
+};
+pub const SERVE_FULL_SIZE: Box2 = Box2 {
+    x: 628,
+    y: 386,
+    w: 62,
+    h: 36,
+};
+pub const SERVE_HALF_SIZE: Box2 = Box2 {
+    x: 696,
+    y: 386,
+    w: 62,
+    h: 36,
+};
+const SERVE_SLIDER_LEFT: usize = 468;
+const SERVE_SLIDER_RIGHT: usize = 612;
+
+/// The served-size scale at slider position `x`, in hundredths.
+pub fn serve_scale_from_slider_x(x: usize) -> f32 {
+    let fraction = (x.saturating_sub(SERVE_SLIDER_LEFT) as f32
+        / (SERVE_SLIDER_RIGHT - SERVE_SLIDER_LEFT) as f32)
+        .clamp(0.0, 1.0);
+    normalize_serve_scale(MIN_SERVE_SCALE + fraction * (1.0 - MIN_SERVE_SCALE))
+}
+
+fn serve_slider_x(scale: f32) -> usize {
+    let fraction = (normalize_serve_scale(scale) - MIN_SERVE_SCALE) / (1.0 - MIN_SERVE_SCALE);
+    SERVE_SLIDER_LEFT
+        + (fraction * (SERVE_SLIDER_RIGHT - SERVE_SLIDER_LEFT) as f32).round() as usize
+}
 const SERVER_STATUS: Box2 = Box2 {
     x: 40,
     y: 478,
@@ -653,9 +709,14 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
         canvas.text(45, 296, "X", BG, 2);
     }
     canvas.text(76, 296, "ALLOW NONE AUTHENTICATION", TEXT, 2);
-    canvas.label(420, 258, "COMPRESSION");
+    canvas.label(400, 258, "COMPRESSION");
     canvas.button(RAW, "RAW", config.compression == Compression::Raw);
     canvas.button(ZLIB, "ZLIB", config.compression == Compression::Zlib);
+    canvas.button(
+        TIGHT,
+        "TIGHT JPEG",
+        config.compression == Compression::Tight,
+    );
     canvas.text(
         40,
         331,
@@ -760,6 +821,40 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
         "ALL NETWORKS",
         form.host.trim() == ALL_NETWORKS_HOST,
     );
+    canvas.label(460, 362, "SERVED SIZE");
+    let scale = normalize_serve_scale(form.scale);
+    canvas.text(698, 362, &format!("{scale:.2}X"), TEXT, 2);
+    let track_y = SERVE_SCALE_SLIDER.y + 15;
+    canvas.fill(
+        Box2 {
+            x: SERVE_SLIDER_LEFT,
+            y: track_y,
+            w: SERVE_SLIDER_RIGHT - SERVE_SLIDER_LEFT,
+            h: 6,
+        },
+        BORDER,
+    );
+    let thumb = serve_slider_x(scale);
+    canvas.fill(
+        Box2 {
+            x: SERVE_SLIDER_LEFT,
+            y: track_y,
+            w: thumb - SERVE_SLIDER_LEFT,
+            h: 6,
+        },
+        ACCENT,
+    );
+    canvas.fill(
+        Box2 {
+            x: thumb.saturating_sub(6),
+            y: SERVE_SCALE_SLIDER.y + 5,
+            w: 12,
+            h: 26,
+        },
+        ACCENT,
+    );
+    canvas.button(SERVE_FULL_SIZE, "FULL", scale == 1.0);
+    canvas.button(SERVE_HALF_SIZE, "HALF", scale == 0.5);
 
     canvas.label(40, 456, "STATUS");
     canvas.fill(SERVER_STATUS, PANEL);
@@ -1264,5 +1359,34 @@ mod tests {
         assert_eq!(form.request().unwrap().address, "[::]:5900");
         form.port = "0".into();
         assert!(form.request().is_err());
+    }
+
+    #[test]
+    fn serve_scale_follows_the_slider_in_hundredths() {
+        assert_eq!(serve_scale_from_slider_x(0), MIN_SERVE_SCALE);
+        assert_eq!(
+            serve_scale_from_slider_x(SERVE_SLIDER_LEFT),
+            MIN_SERVE_SCALE
+        );
+        assert_eq!(serve_scale_from_slider_x(SERVE_SLIDER_RIGHT), 1.0);
+        assert_eq!(serve_scale_from_slider_x(800), 1.0);
+        for scale in [0.25, 0.5, 0.73, 1.0] {
+            let at = serve_scale_from_slider_x(serve_slider_x(scale));
+            assert!((at - scale).abs() <= 0.01, "{scale} came back as {at}");
+        }
+        // Each slider pixel lands on a hundredth.
+        for x in SERVE_SLIDER_LEFT..=SERVE_SLIDER_RIGHT {
+            let scale = serve_scale_from_slider_x(x);
+            assert_eq!((scale * 100.0).round() / 100.0, scale);
+        }
+        // Requests carry the normalized scale.
+        let mut form = ServeForm {
+            allow_insecure: true,
+            scale: 0.4999,
+            ..ServeForm::default()
+        };
+        assert_eq!(form.request().unwrap().scale, 0.5);
+        form.scale = 7.0;
+        assert_eq!(form.request().unwrap().scale, 1.0);
     }
 }
