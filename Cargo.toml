@@ -30,3 +30,12 @@ objc2-core-video = { version = "0.3", default-features = false, features = ["std
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSObject", "NSProcessInfo", "NSString", "NSValue"] }
 objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "libc", "objc2-core-foundation", "IOSurfaceRef", "IOSurfaceTypes"] }
 objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media", "SCShareableContent", "SCStream"] }
+
+# Streaming is unusable without optimization: unoptimized JPEG and zlib code
+# is about 50 times slower. Debug builds optimize dependencies fully and this
+# crate lightly, so `cargo run` stays fast enough to test with.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

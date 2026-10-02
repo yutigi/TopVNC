@@ -125,6 +125,17 @@ Results from `cargo run --release --example latency_bench`, between TopVNC's ser
 
 The scene is synthetic, so real games compress differently. If a link cannot keep up, lower `--quality`.
 
+For playable results:
+
+- **Use release builds** (`cargo run --release`, or `target/release/topvnc`) on both machines. Debug builds optimize dependencies, but TopVNC's own code runs about 2–3 times slower than in release.
+- **Serve a Retina Mac at half size.** A full-size frame from a 14-inch MacBook Pro is about 3.7 times the data of a half-size one. Over a 150 Mbit/s Wi-Fi-like link (4 ms each way):
+
+  | Served size | Frames per second | Mean latency |
+  | --- | --- | --- |
+  | 3024×1964 (full) | 26.3 | 55.6 ms |
+  | 1512×982 (half) | 60.3 | 13.6 ms |
+- **Read the title bar.** During a session, the viewer's title shows frames per second, KB per frame, Mbit/s, and the encoding the server sends. If it says Raw, the server does not support Tight.
+
 Tight between TopVNC's server and client is covered by tests. Tight against third-party servers and viewers, and with live desktop capture, has not yet been validated. See [`specs/006-low-latency-gaming/spec.md`](specs/006-low-latency-gaming/spec.md) for the full measurements.
 
 ## Security and saved settings

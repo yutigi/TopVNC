@@ -57,6 +57,15 @@ Out of scope: video codecs (H.264, HEVC), ContinuousUpdates and Fence congestion
   - Remote pointer positions map to the display pixel under the served pixel's center.
   - After a display mode change, the served size is recomputed from the new display size.
 
+### Diagnostics and builds
+
+- `Session::stats` returns counters that stay readable after the session moves to its worker thread: bytes received, updates that changed at least one rectangle, and the last rectangle's encoding.
+- The viewer's title bar shows frames per second, KB per frame, Mbit/s, and the encoding, refreshed once a second.
+- Debug builds optimize every dependency at level 3 and this crate at level 1.
+  - Before: a 3024×1964 frame at quality 6 took 126 ms to encode and 683 ms to decode.
+  - After: 14 ms to encode and 28 ms to decode.
+  - Release: 5.2 ms to encode and 12.4 ms to decode.
+
 ### Measurement (`examples/latency_bench.rs`)
 
 The benchmark runs the embedded server and a TopVNC `Session` through a local TCP proxy that limits bandwidth and adds one-way delay.
@@ -101,8 +110,18 @@ Recorded on 2026-10-02 on an M3 Max MacBook Pro, macOS 26.5.1:
    - With a 6 ms one-way delay at 300 Mbit/s, adaptive pipelining delivered 51.3 fps at quality 6, against 37.0 fps when requesting after each update. Mean latency was 27.0 ms against 28.4 ms.
    - On a saturated link, adaptive pipelining keeps Raw at its previous latency (1 Gbit/s: 73.3 ms). Pipelining unconditionally doubled it (about 137 ms).
    - At 100 Mbit/s, saturated Raw can still alternate between early and late requests, so its p95 latency rises to about 1.3 s.
-5. **Served size.** Tested: served sizes and argument parsing; downscaler block averages, damage mapping, and coverage with uneven ratios; served-to-display pointer mapping; and the slider's range, hundredths, and normalized requests. The Server tab was rendered offscreen and checked. Windows-target clippy passes with the Windows wiring.
-6. **Not yet checked live.**
+5. **Retina sizes.**
+   - Per-stage timings at 3024×1964 in release (`cargo test --release --bin topvnc stage_timing -- --ignored --nocapture`, then `tight_codec_timing` with `TOPVNC_TIMING_SIZES`):
+     - Host: copy 1.9 ms, tile compare 2.5 ms, quality-6 encode 5.2 ms (616 KB).
+     - Viewer: decode 12.4 ms, mirror 1.6 ms, scaling to 1413×918 3.2 ms.
+   - At 1512×982:
+     - Host: copy 0.4 ms, tile compare 0.5 ms, encode 3.0 ms (165 KB).
+     - Viewer: decode 3.0 ms.
+   - Over a 150 Mbit/s link with 4 ms one-way delay, quality 6:
+     - 3024×1964: 26.3 fps, 55.6 ms mean latency.
+     - 1512×982: 60.3 fps, 13.6 ms mean latency.
+6. **Served size.** Tested: served sizes and argument parsing; downscaler block averages, damage mapping, and coverage with uneven ratios; served-to-display pointer mapping; and the slider's range, hundredths, and normalized requests. The Server tab was rendered offscreen and checked. Windows-target clippy passes with the Windows wiring.
+7. **Not yet checked live.**
    - Tight against third-party servers (TigerVNC, TurboVNC, macOS Screen Sharing) and third-party viewers against the TopVNC server.
    - Latency with real desktop capture and input on Windows and macOS hosts.
    - CPU use on the host while encoding.

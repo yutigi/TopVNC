@@ -81,20 +81,75 @@ impl<R: Read, F: FnMut() -> io::Result<()>> Read for RefreshReader<R, F> {
     }
 }
 
-/// Counts the time spent blocked reading from the socket.
+/// Running totals for a client session, readable from any thread.
+#[derive(Clone, Default)]
+pub struct SessionStats(Arc<StatsCounters>);
+
+#[derive(Default)]
+struct StatsCounters {
+    network_wait_nanos: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+    frames: std::sync::atomic::AtomicU64,
+    /// The last rectangle's wire encoding, or `i64::MIN` before the first.
+    last_encoding: std::sync::atomic::AtomicI64,
+}
+
+/// A point-in-time copy of [`SessionStats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    /// Bytes received from the server since the handshake.
+    pub bytes: u64,
+    /// Framebuffer updates that changed at least one rectangle.
+    pub frames: u64,
+    /// The encoding of the most recent rectangle.
+    pub encoding: Option<i32>,
+}
+
+impl SessionStats {
+    fn new() -> Self {
+        let stats = Self::default();
+        stats.0.last_encoding.store(i64::MIN, Ordering::Relaxed);
+        stats
+    }
+
+    pub fn snapshot(&self) -> StatsSnapshot {
+        let encoding = self.0.last_encoding.load(Ordering::Relaxed);
+        StatsSnapshot {
+            bytes: self.0.bytes.load(Ordering::Relaxed),
+            frames: self.0.frames.load(Ordering::Relaxed),
+            encoding: (encoding != i64::MIN).then_some(encoding as i32),
+        }
+    }
+}
+
+/// A short name for an RFB encoding number.
+pub fn encoding_name(encoding: i32) -> &'static str {
+    match encoding {
+        0 => "Raw",
+        6 => "Zlib",
+        tight::TIGHT_ENCODING => "Tight",
+        _ => "other",
+    }
+}
+
+/// Counts received bytes and the time spent blocked reading the socket.
 struct WaitTimer<R> {
     inner: R,
-    waited_nanos: Arc<std::sync::atomic::AtomicU64>,
+    stats: SessionStats,
 }
 
 impl<R: Read> Read for WaitTimer<R> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let started = Instant::now();
         let result = self.inner.read(bytes);
-        self.waited_nanos.fetch_add(
+        let counters = &self.stats.0;
+        counters.network_wait_nanos.fetch_add(
             started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
+        if let Ok(count) = result {
+            counters.bytes.fetch_add(count as u64, Ordering::Relaxed);
+        }
         result
     }
 }
@@ -1988,12 +2043,15 @@ pub fn read_update_with_encoding(
         selected_encoding,
         decoder,
         || Ok(()),
+        |_| {},
         apply,
     )
 }
 
 /// `started` runs once the FramebufferUpdate header arrives, before any
-/// rectangle data is read.
+/// rectangle data is read, and `rectangle` once per rectangle with its
+/// encoding.
+#[allow(clippy::too_many_arguments)]
 fn read_update_inner(
     reader: &mut impl Read,
     (frame_width, frame_height): (u16, u16),
@@ -2001,6 +2059,7 @@ fn read_update_inner(
     selected_encoding: Encoding,
     decoder: &mut UpdateDecoder,
     mut started: impl FnMut() -> io::Result<()>,
+    mut rectangle: impl FnMut(i32),
     mut apply: impl FnMut(u16, u16, u16, u16, &[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
     loop {
@@ -2023,6 +2082,7 @@ fn read_update_inner(
                     if !selected_encoding.accepts(wire_encoding) {
                         return Err(invalid("server sent an unsupported encoding"));
                     }
+                    rectangle(wire_encoding);
                     if width == 0
                         || height == 0
                         || usize::from(x) + usize::from(width) > usize::from(frame_width)
@@ -2150,8 +2210,7 @@ fn pointer_packet(buttons: u8, x: u16, y: u16) -> [u8; 6] {
 pub struct Session {
     pub info: ServerInfo,
     reader: BufReader<WaitTimer<TcpStream>>,
-    /// Total time `reader` has spent waiting for the network.
-    network_wait: Arc<std::sync::atomic::AtomicU64>,
+    stats: SessionStats,
     /// Whether the next update should be requested as soon as the current
     /// one starts arriving.
     pipeline: bool,
@@ -2229,18 +2288,18 @@ impl Session {
         })?;
         stream.set_read_timeout(Some(UPDATE_IDLE_TIMEOUT))?;
         stream.set_write_timeout(Some(UPDATE_IDLE_TIMEOUT))?;
-        let network_wait = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stats = SessionStats::new();
         let reader = BufReader::with_capacity(
             CLIENT_READ_BUFFER_BYTES,
             WaitTimer {
                 inner: stream.try_clone()?,
-                waited_nanos: Arc::clone(&network_wait),
+                stats: stats.clone(),
             },
         );
         Ok(Self {
             info,
             reader,
-            network_wait,
+            stats,
             pipeline: true,
             writer: InputWriter(Arc::new(Mutex::new(stream))),
             encoding,
@@ -2250,6 +2309,11 @@ impl Session {
 
     pub fn writer(&self) -> InputWriter {
         self.writer.clone()
+    }
+
+    /// Counters that stay readable after the session moves to another thread.
+    pub fn stats(&self) -> SessionStats {
+        self.stats.clone()
     }
 
     pub fn read_update(
@@ -2300,8 +2364,11 @@ impl Session {
             requested: false,
         };
         let early = request_next && self.pipeline;
-        let network_wait = &self.network_wait;
+        let counters = &self.stats.0;
+        let network_wait = &counters.network_wait_nanos;
         let mut wait_before_body = None;
+        let mut rectangles = 0u32;
+        let mut apply = apply;
         read_update_inner(
             &mut reader,
             (width, height),
@@ -2315,8 +2382,17 @@ impl Session {
                 }
                 Ok(())
             },
-            apply,
+            |encoding| {
+                rectangles += 1;
+                counters
+                    .last_encoding
+                    .store(i64::from(encoding), Ordering::Relaxed);
+            },
+            |x, y, w, h, bytes| apply(x, y, w, h, bytes),
         )?;
+        if rectangles > 0 {
+            counters.frames.fetch_add(1, Ordering::Relaxed);
+        }
         if request_next {
             if let Some(before) = wait_before_body {
                 let waited = network_wait.load(Ordering::Relaxed).saturating_sub(before);
@@ -3290,7 +3366,15 @@ mod tests {
     #[test]
     #[ignore]
     fn tight_codec_timing() {
-        let (width, height) = (1920usize, 1080usize);
+        let sizes = std::env::var("TOPVNC_TIMING_SIZES").unwrap_or_else(|_| "1920x1080".into());
+        for size in sizes.split(',') {
+            let (width, height) = size.split_once('x').unwrap();
+            tight_codec_timing_at(width.parse().unwrap(), height.parse().unwrap());
+        }
+    }
+
+    fn tight_codec_timing_at(width: usize, height: usize) {
+        println!("{width}x{height}:");
         let mut seed = 1u32;
         let pixels: Vec<u32> = (0..width * height)
             .map(|index| {

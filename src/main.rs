@@ -4,7 +4,7 @@ use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use topvnc::{Encoding, Framebuffer, Session};
+use topvnc::{Encoding, Framebuffer, Session, StatsSnapshot, encoding_name};
 
 // Each host backend uses part of the shared logic; tests cover all of it.
 #[allow(dead_code)]
@@ -325,6 +325,20 @@ struct FrameState {
     framebuffer: Framebuffer,
     /// Area changed by fully received updates and not yet presented.
     dirty: Option<Rect>,
+}
+
+/// Frame rate, size, bandwidth, and encoding between two stats snapshots.
+fn throughput(before: StatsSnapshot, after: StatsSnapshot, elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs_f64().max(1e-3);
+    let frames = after.frames.saturating_sub(before.frames);
+    let bytes = after.bytes.saturating_sub(before.bytes) as f64;
+    format!(
+        "{:.0} fps · {:.0} KB/frame · {:.0} Mbit/s · {}",
+        frames as f64 / seconds,
+        bytes / frames.max(1) as f64 / 1000.0,
+        bytes * 8.0 / seconds / 1e6,
+        after.encoding.map_or("waiting", encoding_name)
+    )
 }
 
 /// Copy `area` of `source` into the same place in `target`.
@@ -1102,6 +1116,7 @@ fn run_session_inner(
         info.security
     );
     let writer = session.writer();
+    let stats = session.stats();
     let framebuffer = Arc::new(Mutex::new(FrameState {
         framebuffer: Framebuffer::new(info.width, info.height)?,
         dirty: None,
@@ -1150,8 +1165,9 @@ fn run_session_inner(
         WindowMode::Native => remote,
         WindowMode::Custom => config.custom_size()?,
     };
+    let title = format!("TopVNC — {}", info.name);
     let mut window = Window::new(
-        &format!("TopVNC — {}", info.name),
+        &title,
         initial.0,
         initial.1,
         WindowOptions {
@@ -1179,7 +1195,18 @@ fn run_session_inner(
     let mut dragging_ui_scale = false;
     let mut ui_captured_mouse = false;
     let mut redraw = false;
+    let mut last_stats = (std::time::Instant::now(), stats.snapshot());
     while window.is_open() {
+        // Live throughput in the title bar shows whether the link or the
+        // encoding limits the frame rate.
+        if last_stats.0.elapsed() >= std::time::Duration::from_secs(1) {
+            let now = (std::time::Instant::now(), stats.snapshot());
+            window.set_title(&format!(
+                "{title} — {}",
+                throughput(last_stats.1, now.1, now.0 - last_stats.0)
+            ));
+            last_stats = now;
+        }
         if let Ok(Err(error)) = error_rx.try_recv() {
             writer.shutdown()?;
             return Ok(Some(error.to_string()));
@@ -1535,6 +1562,28 @@ mod tests {
     }
 
     #[test]
+    fn throughput_reports_rate_size_bandwidth_and_encoding() {
+        let before = StatsSnapshot {
+            bytes: 1_000_000,
+            frames: 10,
+            encoding: None,
+        };
+        let after = StatsSnapshot {
+            bytes: 13_000_000,
+            frames: 70,
+            encoding: Some(7),
+        };
+        assert_eq!(
+            throughput(before, after, std::time::Duration::from_secs(2)),
+            "30 fps · 200 KB/frame · 48 Mbit/s · Tight"
+        );
+        assert_eq!(
+            throughput(before, before, std::time::Duration::from_secs(1)),
+            "0 fps · 0 KB/frame · 0 Mbit/s · waiting"
+        );
+    }
+
+    #[test]
     fn copy_area_copies_only_the_area() {
         let mut source = Framebuffer::new(3, 2).unwrap();
         source.pixels_mut().fill(7);
@@ -1664,5 +1713,95 @@ mod tests {
             pointer_for_mode(0.0, 0.0, (2, 2), (4, 2), &scaled),
             Some((1, 0))
         );
+    }
+}
+
+#[cfg(test)]
+mod stage_timing {
+    use super::*;
+    use desktop_host::{CaptureSurface, Rect as HostRect, Rotation};
+    use std::time::Instant;
+    use topvnc::{DamageRect, ServerConfig, VncServer};
+
+    /// `cargo test --release --bin topvnc stage_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn stage_timing() {
+        for (width, height) in [(3024usize, 1964usize), (1512, 982), (1920, 1080)] {
+            let mut seed = 7u32;
+            let bytes: Vec<u8> = (0..width * height * 4)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as u8
+                })
+                .collect();
+            let surface = CaptureSurface {
+                bytes: &bytes,
+                row_pitch: width * 4,
+                width,
+                height,
+                rotation: Rotation::Identity,
+            };
+            let mut framebuffer = Framebuffer::new(width as u16, height as u16).unwrap();
+            let started = Instant::now();
+            surface.copy_rect(
+                HostRect::new(0, 0, width as i32, height as i32),
+                framebuffer.pixels_mut(),
+                width,
+            );
+            let copy = started.elapsed();
+            let server = VncServer::bind(
+                "127.0.0.1:0",
+                Framebuffer::new(width as u16, height as u16).unwrap(),
+                ServerConfig {
+                    allow_insecure: true,
+                    ..ServerConfig::default()
+                },
+            )
+            .unwrap();
+            let damage = [DamageRect {
+                x: 0,
+                y: 0,
+                width: width as u16,
+                height: height as u16,
+            }];
+            let started = Instant::now();
+            server
+                .update_framebuffer_regions(&framebuffer, &damage)
+                .unwrap();
+            let compare = started.elapsed();
+            let full = Rect {
+                x0: 0,
+                y0: 0,
+                x1: width,
+                y1: height,
+            };
+            let mut presented = Framebuffer::new(width as u16, height as u16).unwrap();
+            let started = Instant::now();
+            copy_area(&framebuffer, &mut presented, full);
+            let mirror = started.elapsed();
+            let window = fit_dimensions((width, height), (1820, 918));
+            let mut scaled = ScaledFrame::with_settings(
+                (width, height),
+                window,
+                WindowMode::Fit,
+                Quality::Smooth,
+            )
+            .unwrap();
+            let started = Instant::now();
+            scaled.update(&presented, full);
+            let scale = started.elapsed();
+            println!(
+                "{width}x{height}: host copy {:.1} ms, tile compare {:.1} ms | viewer mirror {:.1} ms, scale to {}x{} {:.1} ms",
+                copy.as_secs_f64() * 1e3,
+                compare.as_secs_f64() * 1e3,
+                mirror.as_secs_f64() * 1e3,
+                window.0,
+                window.1,
+                scale.as_secs_f64() * 1e3,
+            );
+        }
     }
 }
