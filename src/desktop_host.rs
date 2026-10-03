@@ -8,7 +8,11 @@ use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
-use topvnc::{MAX_FRAMEBUFFER_DIMENSION, MAX_FRAMEBUFFER_PIXELS};
+use topvnc::{
+    BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
+    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, MAX_FRAMEBUFFER_DIMENSION,
+    MAX_FRAMEBUFFER_PIXELS,
+};
 
 pub const MAX_HELD_KEYS_PER_CLIENT: usize = 256;
 /// Largest clipboard text accepted from the host system, in characters.
@@ -19,16 +23,153 @@ pub const WHEEL_DELTA: i32 = 120;
 pub const CAPTURE_RETRY_MIN: Duration = Duration::from_millis(250);
 pub const CAPTURE_RETRY_MAX: Duration = Duration::from_secs(2);
 
-pub const SERVE_USAGE: &str =
-    "usage: topvnc --serve [HOST:PORT] [--display NUMBER] [--allow-insecure]";
+pub const SERVE_USAGE: &str = "usage: topvnc --serve [HOST:PORT] [--display NUMBER] [--scale 0.25-1] [--mouse auto|relative|absolute] [--allow-insecure]";
+
+/// The smallest served size, as a fraction of the display's pixel size.
+pub const MIN_SERVE_SCALE: f32 = 0.25;
 
 /// Options for `topvnc --serve`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServeOptions {
     pub address: String,
     /// 1-based display number; `None` serves the primary display.
     pub display: Option<usize>,
     pub allow_insecure: bool,
+    /// Served size as a fraction of the display's pixel size, from
+    /// [`MIN_SERVE_SCALE`] to 1. A Retina display at 0.5 is served at its
+    /// size in points.
+    pub scale: f32,
+    pub mouse: MouseMode,
+}
+
+/// When the host asks viewers for relative pointer motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseMode {
+    /// While a game hides the cursor; Windows hosts only, since macOS has
+    /// no reliable cursor-visibility state. Mac hosts stay absolute.
+    #[default]
+    Auto,
+    /// Always, for games the automatic mode misses. Viewers lock their
+    /// pointer for the whole session.
+    Relative,
+    /// Never.
+    Absolute,
+}
+
+/// Round `scale` to hundredths and clamp it to the served-size range.
+/// Values that are not numbers serve the full size.
+pub fn normalize_serve_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        ((scale.clamp(MIN_SERVE_SCALE, 1.0) * 100.0).round() / 100.0).clamp(MIN_SERVE_SCALE, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// The framebuffer size served for a `width` x `height` display at `scale`.
+pub fn served_size(width: u16, height: u16, scale: f32) -> (u16, u16) {
+    let scale = normalize_serve_scale(scale);
+    if scale >= 1.0 {
+        return (width, height);
+    }
+    let axis = |pixels: u16| ((f32::from(pixels) * scale).round() as u16).clamp(1, pixels.max(1));
+    (axis(width), axis(height))
+}
+
+/// The captured pixel under the center of served pixel `value` on an axis
+/// of `served` served and `native` captured pixels. Values past the edge
+/// clamp to the last pixel.
+pub fn native_coordinate(value: u16, served: u16, native: u16) -> u16 {
+    if served == 0 || native == 0 {
+        return 0;
+    }
+    let value = u32::from(value.min(served - 1));
+    let center = (2 * value + 1) * u32::from(native) / (2 * u32::from(served));
+    center.min(u32::from(native) - 1) as u16
+}
+
+/// Area-average downscaling from a captured image to a smaller served
+/// framebuffer. Each served pixel averages the block of captured pixels it
+/// covers, so only damaged blocks need to be recomputed.
+#[derive(Debug, Clone)]
+pub struct Downscaler {
+    native: (usize, usize),
+    served: (usize, usize),
+    /// Captured columns and rows `[start, end)` covered by each served one.
+    columns: Vec<(usize, usize)>,
+    rows: Vec<(usize, usize)>,
+}
+
+impl Downscaler {
+    /// `served` must be no larger than `native` on either axis.
+    pub fn new(native: (u16, u16), served: (u16, u16)) -> Self {
+        let spans = |native: usize, served: usize| -> Vec<(usize, usize)> {
+            (0..served)
+                .map(|index| {
+                    let start = index * native / served;
+                    let end = ((index + 1) * native / served).max(start + 1);
+                    (start, end.min(native))
+                })
+                .collect()
+        };
+        let native = (usize::from(native.0), usize::from(native.1));
+        let served = (
+            usize::from(served.0).min(native.0),
+            usize::from(served.1).min(native.1),
+        );
+        Self {
+            native,
+            served,
+            columns: spans(native.0, served.0),
+            rows: spans(native.1, served.1),
+        }
+    }
+
+    pub fn served_size(&self) -> (usize, usize) {
+        self.served
+    }
+
+    /// The served pixels whose blocks overlap `damage`, a rectangle in
+    /// captured pixels.
+    pub fn served_rect(&self, damage: Rect) -> Option<Rect> {
+        let damage =
+            damage.intersect(Rect::new(0, 0, self.native.0 as i32, self.native.1 as i32))?;
+        // Spans are sorted and contiguous, so the first and last overlapping
+        // spans bound the result.
+        let range = |spans: &[(usize, usize)], low: i32, high: i32| {
+            let (low, high) = (low as usize, high as usize);
+            let first = spans.partition_point(|span| span.1 <= low);
+            let last = spans.partition_point(|span| span.0 < high);
+            (first as i32, last as i32)
+        };
+        let (left, right) = range(&self.columns, damage.left, damage.right);
+        let (top, bottom) = range(&self.rows, damage.top, damage.bottom);
+        Some(Rect::new(left, top, right, bottom)).filter(|rect| !rect.is_empty())
+    }
+
+    /// Recompute served pixels in `area` (served coordinates) from `source`,
+    /// a captured 0x00RRGGBB image.
+    pub fn scale(&self, source: &[u32], target: &mut [u32], area: Rect) {
+        for row in area.top as usize..area.bottom as usize {
+            let (row_start, row_end) = self.rows[row];
+            for column in area.left as usize..area.right as usize {
+                let (column_start, column_end) = self.columns[column];
+                let (mut red, mut green, mut blue) = (0u32, 0u32, 0u32);
+                for source_row in row_start..row_end {
+                    let line = &source[source_row * self.native.0..][column_start..column_end];
+                    for pixel in line {
+                        red += pixel >> 16 & 0xff;
+                        green += pixel >> 8 & 0xff;
+                        blue += pixel & 0xff;
+                    }
+                }
+                let count = ((row_end - row_start) * (column_end - column_start)) as u32;
+                let average = |sum: u32| (sum + count / 2) / count;
+                target[row * self.served.0 + column] =
+                    average(red) << 16 | average(green) << 8 | average(blue);
+            }
+        }
+    }
 }
 
 /// Progress a desktop server host reports while it runs.
@@ -93,8 +234,12 @@ pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'sta
         address: "127.0.0.1:5900".to_owned(),
         display: None,
         allow_insecure: false,
+        scale: 1.0,
+        mouse: MouseMode::Auto,
     };
     let mut address_set = false;
+    let mut scale_set = false;
+    let mut mouse_set = false;
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -106,6 +251,24 @@ pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'sta
                     .filter(|number| *number > 0)
                     .ok_or(SERVE_USAGE)?;
                 options.display = Some(number);
+            }
+            "--scale" if !scale_set => {
+                options.scale = arguments
+                    .next()
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .filter(|scale| (MIN_SERVE_SCALE..=1.0).contains(scale))
+                    .map(normalize_serve_scale)
+                    .ok_or(SERVE_USAGE)?;
+                scale_set = true;
+            }
+            "--mouse" if !mouse_set => {
+                options.mouse = match arguments.next().map(String::as_str) {
+                    Some("auto") => MouseMode::Auto,
+                    Some("relative") => MouseMode::Relative,
+                    Some("absolute") => MouseMode::Absolute,
+                    _ => return Err(SERVE_USAGE),
+                };
+                mouse_set = true;
             }
             _ if argument.starts_with('-') || address_set => return Err(SERVE_USAGE),
             _ => {
@@ -461,6 +624,38 @@ pub struct DisplayBounds {
     pub height: f64,
 }
 
+/// Where a relative move of (`dx`, `dy`) points from `from` lands, kept on
+/// the display at `bounds`.
+pub fn relative_point(
+    from: (f64, f64),
+    dx: i32,
+    dy: i32,
+    bounds: DisplayBounds,
+) -> Option<(f64, f64)> {
+    if ![
+        from.0,
+        from.1,
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+        || bounds.width <= 0.0
+        || bounds.height <= 0.0
+    {
+        return None;
+    }
+    let axis = |value: f64, delta: i32, origin: f64, extent: f64| {
+        (value + f64::from(delta)).clamp(origin, origin + (extent - 1.0).max(0.0))
+    };
+    Some((
+        axis(from.0, dx, bounds.x, bounds.width),
+        axis(from.1, dy, bounds.y, bounds.height),
+    ))
+}
+
 /// The global point at the center of framebuffer pixel (`x`, `y`) when a
 /// `pixels`-sized framebuffer covers the display at `bounds`. Pixels past
 /// the edge, as after the display shrinks, clamp to the last pixel.
@@ -497,7 +692,7 @@ pub const CLICK_SLOP_PIXELS: i32 = 4;
 
 #[derive(Debug, Clone, Copy)]
 struct Click {
-    button: u8,
+    button: u16,
     at: Instant,
     x: i32,
     y: i32,
@@ -514,7 +709,7 @@ impl ClickTracker {
     /// Click count for pressing `button` at pixel (`x`, `y`): one more than
     /// the previous press when it used the same button within `interval` and
     /// `CLICK_SLOP_PIXELS`, otherwise 1.
-    pub fn press(&mut self, button: u8, x: i32, y: i32, at: Instant, interval: Duration) -> i64 {
+    pub fn press(&mut self, button: u16, x: i32, y: i32, at: Instant, interval: Duration) -> i64 {
         let count = match self.last {
             Some(last)
                 if last.button == button
@@ -537,7 +732,7 @@ impl ClickTracker {
     }
 
     /// Click count for releasing `button`: that of its latest press.
-    pub fn release(&self, button: u8) -> i64 {
+    pub fn release(&self, button: u16) -> i64 {
         match self.last {
             Some(last) if last.button == button => last.count,
             _ => 1,
@@ -548,10 +743,10 @@ impl ClickTracker {
 /// Button state to inject for one pointer event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointerTransition {
-    /// Held buttons (bits 0-2) across all clients before the event.
-    pub previous: u8,
+    /// Held buttons (`HELD_BUTTONS`) across all clients before the event.
+    pub previous: u16,
     /// Held buttons across all clients after the event.
-    pub buttons: u8,
+    pub buttons: u16,
     /// Wheel notches: positive scrolls up.
     pub vertical_notches: i32,
     /// Wheel notches: positive scrolls right.
@@ -562,7 +757,7 @@ pub struct PointerTransition {
 /// disconnect releases only its own input. `K` is the backend's key type.
 pub struct RemoteInputState<K> {
     key_owners: HashMap<K, HashSet<u64>>,
-    client_buttons: HashMap<u64, u8>,
+    client_buttons: HashMap<u64, u16>,
 }
 
 impl<K> Default for RemoteInputState<K> {
@@ -574,7 +769,9 @@ impl<K> Default for RemoteInputState<K> {
     }
 }
 
-const HELD_BUTTONS: u8 = 0b0000_0111;
+/// Buttons that stay down until released; the wheel buttons are pulses.
+pub const HELD_BUTTONS: u16 =
+    BUTTON_LEFT | BUTTON_MIDDLE | BUTTON_RIGHT | BUTTON_BACK | BUTTON_FORWARD;
 
 impl<K: Copy + Eq + Hash + Ord> RemoteInputState<K> {
     /// Returns whether the key transition must be injected.
@@ -617,28 +814,28 @@ impl<K: Copy + Eq + Hash + Ord> RemoteInputState<K> {
         self.key_owners.keys().copied()
     }
 
-    pub fn pointer_event(&mut self, client_id: u64, buttons: u8) -> PointerTransition {
+    pub fn pointer_event(&mut self, client_id: u64, buttons: u16) -> PointerTransition {
         let old_client_buttons = self.client_buttons.insert(client_id, buttons).unwrap_or(0);
-        let pressed = |mask: u8| buttons & mask != 0 && old_client_buttons & mask == 0;
-        let notches = |positive: u8, negative: u8| {
+        let pressed = |mask: u16| buttons & mask != 0 && old_client_buttons & mask == 0;
+        let notches = |positive: u16, negative: u16| {
             i32::from(pressed(positive)) - i32::from(pressed(negative))
         };
         PointerTransition {
             previous: self.combined_buttons_except(client_id, old_client_buttons),
             buttons: self.combined_buttons(),
             // RFB buttons 4/5 scroll up/down and 6/7 scroll left/right.
-            vertical_notches: notches(8, 16),
-            horizontal_notches: notches(64, 32),
+            vertical_notches: notches(BUTTON_WHEEL_UP, BUTTON_WHEEL_DOWN),
+            horizontal_notches: notches(BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_LEFT),
         }
     }
 
-    fn combined_buttons(&self) -> u8 {
+    fn combined_buttons(&self) -> u16 {
         self.client_buttons
             .values()
             .fold(0, |all, state| all | (state & HELD_BUTTONS))
     }
 
-    fn combined_buttons_except(&self, client_id: u64, replacement: u8) -> u8 {
+    fn combined_buttons_except(&self, client_id: u64, replacement: u16) -> u16 {
         self.client_buttons
             .iter()
             .filter(|(id, _)| **id != client_id)
@@ -648,7 +845,7 @@ impl<K: Copy + Eq + Hash + Ord> RemoteInputState<K> {
     }
 
     /// Forget a client; returns keys to release and the button transition.
-    pub fn disconnect(&mut self, client_id: u64) -> (Vec<K>, u8, u8) {
+    pub fn disconnect(&mut self, client_id: u64) -> (Vec<K>, u16, u16) {
         let previous = self.combined_buttons();
         let mut released = Vec::new();
         self.key_owners.retain(|key, owners| {
@@ -663,13 +860,50 @@ impl<K: Copy + Eq + Hash + Ord> RemoteInputState<K> {
     }
 
     /// Forget all clients; returns every held key and button.
-    pub fn release_all(&mut self) -> (Vec<K>, u8) {
+    pub fn release_all(&mut self) -> (Vec<K>, u16) {
         let mut keys = self.key_owners.keys().copied().collect::<Vec<_>>();
         keys.sort_unstable();
         let buttons = self.combined_buttons();
         self.key_owners.clear();
         self.client_buttons.clear();
         (keys, buttons)
+    }
+}
+
+/// Frames per second to capture from a display refreshing at `refresh` Hz:
+/// its rate, so a 120 Hz display is not captured at 60, between 60 and 240.
+/// Displays that report no rate are captured at 60.
+pub fn capture_rate(refresh: f64) -> i32 {
+    if refresh.is_finite() && refresh >= 1.0 {
+        (refresh.round() as i32).clamp(60, 240)
+    } else {
+        60
+    }
+}
+
+/// How long the host cursor must stay hidden before viewers are asked for
+/// relative motion. Brief hides, such as while typing, do not lock the
+/// viewer's pointer.
+pub const RELATIVE_POINTER_DELAY: Duration = Duration::from_millis(150);
+
+/// Decides when a host asks viewers for relative pointer motion. Games that
+/// turn the camera with the mouse hide the cursor, so motion is relative
+/// once the cursor has stayed hidden for [`RELATIVE_POINTER_DELAY`], and
+/// absolute again as soon as it is shown.
+#[derive(Debug, Default)]
+pub struct PointerModeHint {
+    hidden_since: Option<Instant>,
+}
+
+impl PointerModeHint {
+    /// Returns whether to ask for relative motion.
+    pub fn update(&mut self, cursor_visible: bool, now: Instant) -> bool {
+        if cursor_visible {
+            self.hidden_since = None;
+            return false;
+        }
+        let since = *self.hidden_since.get_or_insert(now);
+        now.saturating_duration_since(since) >= RELATIVE_POINTER_DELAY
     }
 }
 
@@ -1221,6 +1455,8 @@ mod tests {
                 address: "127.0.0.1:5900".into(),
                 display: None,
                 allow_insecure: false,
+                scale: 1.0,
+                mouse: MouseMode::Auto,
             })
         );
         assert_eq!(
@@ -1234,18 +1470,109 @@ mod tests {
                 address: "0.0.0.0:5901".into(),
                 display: Some(2),
                 allow_insecure: true,
+                scale: 1.0,
+                mouse: MouseMode::Auto,
             })
         );
+        assert_eq!(
+            parse_serve_arguments(&arguments(&["--scale", "0.5"])).map(|options| options.scale),
+            Ok(0.5)
+        );
+        assert_eq!(
+            parse_serve_arguments(&arguments(&["--scale", "0.333"])).map(|options| options.scale),
+            Ok(0.33)
+        );
+        for (value, mode) in [
+            ("auto", MouseMode::Auto),
+            ("relative", MouseMode::Relative),
+            ("absolute", MouseMode::Absolute),
+        ] {
+            assert_eq!(
+                parse_serve_arguments(&arguments(&["--mouse", value])).map(|options| options.mouse),
+                Ok(mode)
+            );
+        }
         for invalid in [
             &["--display"][..],
             &["--display", "0"],
             &["--display", "x"],
             &["--display", "1", "--display", "2"],
+            &["--scale"],
+            &["--scale", "0.2"],
+            &["--scale", "1.5"],
+            &["--scale", "NaN"],
+            &["--scale", "0.5", "--scale", "0.5"],
+            &["--mouse"],
+            &["--mouse", "locked"],
+            &["--mouse", "auto", "--mouse", "auto"],
             &["a:1", "b:2"],
             &["--unknown"],
         ] {
             assert_eq!(parse_serve_arguments(&arguments(invalid)), Err(SERVE_USAGE));
         }
+    }
+
+    #[test]
+    fn served_sizes_scale_and_clamp() {
+        assert_eq!(served_size(3024, 1964, 1.0), (3024, 1964));
+        assert_eq!(served_size(3024, 1964, 0.5), (1512, 982));
+        assert_eq!(served_size(1920, 1080, 0.75), (1440, 810));
+        // Below the minimum, above full size, and not a number.
+        assert_eq!(served_size(1000, 1000, 0.1), (250, 250));
+        assert_eq!(served_size(1000, 1000, 3.0), (1000, 1000));
+        assert_eq!(served_size(1000, 1000, f32::NAN), (1000, 1000));
+        assert_eq!(served_size(1, 1, 0.25), (1, 1));
+        assert_eq!(normalize_serve_scale(0.504), 0.5);
+    }
+
+    #[test]
+    fn downscaler_averages_each_block() {
+        // 4x2 captured pixels to 2x1 served: each served pixel is a 2x2 block.
+        let source = [
+            0x000000, 0x020406, 0xfefefe, 0xffffff, //
+            0x040404, 0x060402, 0xffffff, 0xfdfdfd,
+        ];
+        let scaler = Downscaler::new((4, 2), (2, 1));
+        let mut target = [0; 2];
+        scaler.scale(&source, &mut target, Rect::new(0, 0, 2, 1));
+        assert_eq!(target, [0x030303, 0xfefefe]);
+    }
+
+    #[test]
+    fn served_coordinates_map_to_the_captured_pixel_under_their_center() {
+        assert_eq!(native_coordinate(0, 1512, 3024), 1);
+        assert_eq!(native_coordinate(1511, 1512, 3024), 3023);
+        assert_eq!(native_coordinate(100, 1000, 1000), 100);
+        // A third: served pixel 1 covers captured 3..6, centered on 4.
+        assert_eq!(native_coordinate(1, 4, 12), 4);
+        // Past the edge clamps; empty axes map to zero.
+        assert_eq!(native_coordinate(5000, 1512, 3024), 3023);
+        assert_eq!(native_coordinate(3, 0, 10), 0);
+    }
+
+    #[test]
+    fn downscaler_limits_work_to_blocks_touching_the_damage() {
+        let scaler = Downscaler::new((3024, 1964), (1512, 982));
+        assert_eq!(scaler.served_size(), (1512, 982));
+        assert_eq!(
+            scaler.served_rect(Rect::new(3, 4, 5, 5)),
+            Some(Rect::new(1, 2, 3, 3))
+        );
+        assert_eq!(
+            scaler.served_rect(Rect::new(0, 0, 3024, 1964)),
+            Some(Rect::new(0, 0, 1512, 982))
+        );
+        assert_eq!(scaler.served_rect(Rect::new(4000, 0, 4100, 10)), None);
+        // Uneven ratios still cover every captured pixel exactly once.
+        let uneven = Downscaler::new((10, 7), (4, 3));
+        let covered: usize = uneven.columns.iter().map(|(start, end)| end - start).sum();
+        assert_eq!(covered, 10);
+        assert_eq!(uneven.columns.first().unwrap().0, 0);
+        assert!(uneven.columns.windows(2).all(|pair| pair[0].1 == pair[1].0));
+        let source: Vec<u32> = (0..70).collect();
+        let mut target = vec![0; 12];
+        uneven.scale(&source, &mut target, Rect::new(0, 0, 4, 3));
+        assert!(target.iter().all(|pixel| *pixel < 70));
     }
 
     fn check_disconnect_releases_only_that_clients_input<K>(key: fn(u32) -> K)
@@ -1329,6 +1656,76 @@ mod tests {
         assert_eq!(state.pointer_event(1, 16), transition(0, 0, -1, 0));
         assert_eq!(state.pointer_event(1, 32 | 1), transition(0, 1, 0, -1));
         assert_eq!(state.pointer_event(1, 64 | 1), transition(1, 1, 0, 1));
+    }
+
+    #[test]
+    fn back_and_forward_are_held_like_buttons() {
+        let mut state = RemoteInputState::<KeyIdentity>::default();
+        let transition = state.pointer_event(1, BUTTON_BACK | BUTTON_WHEEL_UP);
+        assert_eq!((transition.previous, transition.buttons), (0, BUTTON_BACK));
+        assert_eq!(transition.vertical_notches, 1);
+        let transition = state.pointer_event(2, BUTTON_FORWARD);
+        assert_eq!(
+            (transition.previous, transition.buttons),
+            (BUTTON_BACK, BUTTON_BACK | BUTTON_FORWARD)
+        );
+        let (_, previous, buttons) = state.disconnect(1);
+        assert_eq!(
+            (previous, buttons),
+            (BUTTON_BACK | BUTTON_FORWARD, BUTTON_FORWARD)
+        );
+        assert_eq!(state.release_all(), (Vec::new(), BUTTON_FORWARD));
+    }
+
+    #[test]
+    fn capture_follows_the_display_refresh_rate() {
+        assert_eq!(capture_rate(120.0), 120);
+        assert_eq!(capture_rate(59.94), 60);
+        assert_eq!(capture_rate(143.9), 144);
+        assert_eq!(capture_rate(30.0), 60);
+        assert_eq!(capture_rate(360.0), 240);
+        assert_eq!(capture_rate(0.0), 60);
+        assert_eq!(capture_rate(f64::NAN), 60);
+    }
+
+    #[test]
+    fn relative_mode_waits_for_the_cursor_to_stay_hidden() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut hint = PointerModeHint::default();
+        assert!(!hint.update(true, at(0)));
+        assert!(!hint.update(false, at(10)));
+        assert!(!hint.update(false, at(10 + 149)));
+        assert!(hint.update(false, at(10 + 150)));
+        assert!(hint.update(false, at(5000)));
+        // Showing the cursor is absolute at once, and the delay restarts.
+        assert!(!hint.update(true, at(5001)));
+        assert!(!hint.update(false, at(5002)));
+        assert!(!hint.update(false, at(5100)));
+        assert!(hint.update(false, at(5152)));
+    }
+
+    #[test]
+    fn relative_moves_stay_on_the_display() {
+        let display = DisplayBounds {
+            x: -1440.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        };
+        assert_eq!(
+            relative_point((-700.0, 400.0), 10, -20, display),
+            Some((-690.0, 380.0))
+        );
+        assert_eq!(
+            relative_point((-700.0, 400.0), -5000, 5000, display),
+            Some((-1440.0, 899.0))
+        );
+        assert_eq!(
+            relative_point((-1.5, 0.0), 30, -30, display),
+            Some((-1.0, 0.0))
+        );
+        assert_eq!(relative_point((f64::NAN, 0.0), 1, 1, display), None);
     }
 
     #[test]

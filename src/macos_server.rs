@@ -4,12 +4,14 @@
 use crate::desktop_host::{
     CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureSurface, ClickTracker, DisplayBounds, FrameDamage,
     FrameSlot, HostPermissions, KeyIdentity, MAC_FLAG_ALPHA_SHIFT, MAX_CLIPBOARD_CHARS, MacKeyCode,
-    Rect, RemoteInputState, Rotation, ServeOptions, ServerNotice, display_point, frame_damage,
-    latin1_from_unicode, latin1_to_string, macos_event_flags, macos_key_flags, macos_key_identity,
-    macos_modifier_flags, parse_serve_arguments, unicode_key_units, validate_capture_dimensions,
+    MouseMode, PointerTransition, Rect, RemoteInputState, Rotation, ServeOptions, ServerNotice,
+    capture_rate, display_point, frame_damage, latin1_from_unicode, latin1_to_string,
+    macos_event_flags, macos_key_flags, macos_key_identity, macos_modifier_flags,
+    parse_serve_arguments, relative_point, served_size, unicode_key_units,
+    validate_capture_dimensions,
 };
 use block2::RcBlock;
-use dispatch2::{DispatchQueue, DispatchRetained};
+use dispatch2::{DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AllocAnyThread, DefinedClass, MainThreadMarker, define_class, msg_send};
@@ -44,7 +46,10 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use topvnc::{ClientEvent, DamageRect, Framebuffer, ServerConfig, VncServer};
+use topvnc::{
+    BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, ClientEvent, DamageRect,
+    Framebuffer, ServerConfig, VncServer,
+};
 
 static SERVER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Set by the display reconfiguration callback; one server runs per process.
@@ -212,12 +217,15 @@ pub fn serve(
         address,
         display,
         allow_insecure,
+        scale,
+        mouse,
     } = options;
     require_supported_macos()?;
     require_screen_recording()?;
+    interactive_qos();
     let input_allowed = accessibility_trusted_prompting();
     let _reconfiguration = ReconfigurationCallback::register();
-    let capture = DisplayCapture::start(display)?;
+    let capture = DisplayCapture::start(display, scale)?;
     let mut framebuffer = Framebuffer::new(capture.width, capture.height)?;
     let started = Instant::now();
     while started.elapsed() < FIRST_FRAME_TIMEOUT {
@@ -237,9 +245,14 @@ pub fn serve(
         name: "TopVNC macOS Desktop".into(),
         password,
         allow_insecure,
+        // Session, input, and encoder threads do not inherit QoS.
+        thread_setup: Some(interactive_qos),
     };
     let server = VncServer::bind(&address, framebuffer.clone(), config)
         .map_err(|error| bind_error(error, &address))?;
+    // macOS has no system-wide cursor visibility to follow, so only an
+    // explicit choice asks viewers for relative motion.
+    server.set_relative_pointer(mouse == MouseMode::Relative);
     report(ServerNotice::Serving {
         address: server.local_addr()?,
         display: capture.name.clone(),
@@ -271,6 +284,7 @@ pub fn serve(
         let listener_thread = thread::Builder::new()
             .name("topvnc-rfb-listener".into())
             .spawn_scoped(scope, || {
+                interactive_qos();
                 if let Err(error) = server.run() {
                     report(ServerNotice::Message(format!(
                         "VNC listener stopped: {error}"
@@ -283,6 +297,7 @@ pub fn serve(
         let input_thread = thread::Builder::new()
             .name("topvnc-input".into())
             .spawn_scoped(scope, || {
+                interactive_qos();
                 run_input(
                     &server,
                     &placement,
@@ -297,6 +312,7 @@ pub fn serve(
         let result = serve_desktop(
             &server,
             display,
+            scale,
             capture,
             framebuffer,
             &placement,
@@ -314,6 +330,16 @@ pub fn serve(
         input_thread.join().map_err(|_| "input thread panicked")?;
         result
     })
+}
+
+/// Run the calling thread at user-interactive QoS, which keeps capture,
+/// encoding, and input injection on performance cores while a game or other
+/// foreground work loads the efficiency cores.
+fn interactive_qos() {
+    // SAFETY: changes only the calling thread's scheduling class.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
 }
 
 fn bind_error(error: std::io::Error, address: &str) -> Box<dyn Error> {
@@ -334,6 +360,7 @@ fn bind_error(error: std::io::Error, address: &str) -> Box<dyn Error> {
 fn serve_desktop(
     server: &VncServer,
     display: Option<usize>,
+    scale: f32,
     capture: DisplayCapture,
     mut framebuffer: Framebuffer,
     placement: &Mutex<InputPlacement>,
@@ -417,7 +444,7 @@ fn serve_desktop(
                 continue;
             }
             DISPLAY_RECONFIGURED.store(false, Ordering::Release);
-            match DisplayCapture::start(display) {
+            match DisplayCapture::start(display, scale) {
                 Ok(recreated) => {
                     let size = (recreated.width, recreated.height);
                     if size != (framebuffer.width() as u16, framebuffer.height() as u16) {
@@ -590,6 +617,8 @@ struct StreamShared {
     stopped: Mutex<Option<String>>,
     /// The next complete frame must be copied in full.
     full_frame_pending: AtomicBool,
+    /// Treat every frame as fully damaged.
+    every_frame_full: bool,
 }
 
 struct ObserverIvars {
@@ -671,15 +700,16 @@ fn accept_frame(shared: &StreamShared, sample: &CMSampleBuffer) {
     let Some(surface) = CVPixelBufferGetIOSurface(Some(&buffer)) else {
         return;
     };
-    let damage = if shared.full_frame_pending.swap(false, Ordering::AcqRel) {
-        FrameDamage::Full
-    } else {
-        let dirty = info
-            .objectForKey(unsafe { SCStreamFrameInfoDirtyRects })
-            .and_then(|rects| rects.downcast::<NSArray>().ok())
-            .map(|rects| dirty_rects(&rects));
-        frame_damage(dirty.as_deref(), surface.width(), surface.height())
-    };
+    let damage =
+        if shared.full_frame_pending.swap(false, Ordering::AcqRel) || shared.every_frame_full {
+            FrameDamage::Full
+        } else {
+            let dirty = info
+                .objectForKey(unsafe { SCStreamFrameInfoDirtyRects })
+                .and_then(|rects| rects.downcast::<NSArray>().ok())
+                .map(|rects| dirty_rects(&rects));
+            frame_damage(dirty.as_deref(), surface.width(), surface.height())
+        };
     // The replaced frame, if any, is released after the hand-off lock.
     drop(shared.frames.publish(PixelBuffer(buffer), damage));
 }
@@ -794,13 +824,17 @@ fn display_name(display: CGDirectDisplayID) -> Option<String> {
     receiver.recv_timeout(DISPLAY_NAME_TIMEOUT).ok().flatten()
 }
 
-/// A running ScreenCaptureKit stream of one display at its pixel size.
+/// A running ScreenCaptureKit stream of one display, at its pixel size or
+/// scaled down by ScreenCaptureKit.
 struct DisplayCapture {
     stream: Retained<SCStream>,
     observer: Retained<StreamObserver>,
     shared: Arc<StreamShared>,
     _queue: DispatchRetained<DispatchQueue>,
     display: CGDirectDisplayID,
+    /// The display's pixel size, which a restart is needed to follow.
+    native: (u16, u16),
+    /// The served size of each frame.
     width: u16,
     height: u16,
     name: String,
@@ -808,8 +842,8 @@ struct DisplayCapture {
 
 impl DisplayCapture {
     /// Capture the display numbered `display` (1-based, in `SCShareableContent`
-    /// order), or the main display.
-    fn start(display: Option<usize>) -> Result<Self, Box<dyn Error>> {
+    /// order), or the main display, at `scale` times its pixel size.
+    fn start(display: Option<usize>, scale: f32) -> Result<Self, Box<dyn Error>> {
         let displays = shareable_displays()?;
         if displays.is_empty() {
             // ScreenCaptureKit lists no displays while the session is locked.
@@ -833,7 +867,13 @@ impl DisplayCapture {
             }
         };
         let id = unsafe { selected.displayID() };
-        let (width, height) = display_pixel_size(id)?;
+        let native = display_pixel_size(id)?;
+        let (width, height) = served_size(native.0, native.1, scale);
+        // A 120 Hz display captured at 60 fps adds up to a frame of latency.
+        let rate = capture_rate(
+            CGDisplayCopyDisplayMode(id)
+                .map_or(0.0, |mode| CGDisplayMode::refresh_rate(Some(&mode))),
+        );
 
         let filter = unsafe {
             SCContentFilter::initWithDisplay_excludingWindows(
@@ -846,7 +886,7 @@ impl DisplayCapture {
         unsafe {
             configuration.setWidth(usize::from(width));
             configuration.setHeight(usize::from(height));
-            configuration.setMinimumFrameInterval(CMTime::new(1, 60));
+            configuration.setMinimumFrameInterval(CMTime::new(1, rate));
             configuration.setPixelFormat(kCVPixelFormatType_32BGRA);
             configuration.setQueueDepth(STREAM_QUEUE_DEPTH);
             configuration.setShowsCursor(true);
@@ -856,6 +896,10 @@ impl DisplayCapture {
             frames: FrameSlot::default(),
             stopped: Mutex::new(None),
             full_frame_pending: AtomicBool::new(true),
+            // ScreenCaptureKit scales on the GPU. Its dirty rectangles are not
+            // relied on for scaled frames: each frame is copied whole and the
+            // RFB server's tile comparison finds what changed.
+            every_frame_full: (width, height) != native,
         });
         let observer = StreamObserver::new(Arc::clone(&shared));
         let stream = unsafe {
@@ -866,7 +910,15 @@ impl DisplayCapture {
                 Some(ProtocolObject::from_ref(&*observer)),
             )
         };
-        let queue = DispatchQueue::new("com.topvnc.capture", None);
+        // Frames are handed off on this queue; keep it on performance cores.
+        let queue = DispatchQueue::new(
+            "com.topvnc.capture",
+            Some(&DispatchQueueAttr::with_qos_class(
+                DispatchQueueAttr::SERIAL,
+                DispatchQoS::UserInteractive,
+                0,
+            )),
+        );
         unsafe {
             stream.addStreamOutput_type_sampleHandlerQueue_error(
                 ProtocolObject::from_ref(&*observer),
@@ -890,6 +942,7 @@ impl DisplayCapture {
             shared,
             _queue: queue,
             display: id,
+            native,
             width,
             height,
             name: display_name(id).unwrap_or_else(|| format!("display {id}")),
@@ -913,7 +966,7 @@ impl DisplayCapture {
             return Some("the main display changed".into());
         }
         match display_pixel_size(self.display) {
-            Ok(size) if size == (self.width, self.height) => None,
+            Ok(size) if size == self.native => None,
             Ok((width, height)) => Some(format!("now {width}x{height} pixels")),
             Err(error) => Some(error),
         }
@@ -1061,7 +1114,12 @@ fn run_input(
         match (event, injector.as_mut()) {
             // Without Accessibility access, macOS drops posted events; ignore
             // them so no key or button is recorded as held.
-            (ClientEvent::Key { .. } | ClientEvent::Pointer { .. }, _) if !input_allowed => {}
+            (
+                ClientEvent::Key { .. }
+                | ClientEvent::Pointer { .. }
+                | ClientEvent::RelativePointer { .. },
+                _,
+            ) if !input_allowed => {}
             (
                 ClientEvent::Key {
                     client_id,
@@ -1082,6 +1140,20 @@ fn run_input(
                 let placement = placement.lock().ok().map(|placement| *placement);
                 if let Some(placement) = placement {
                     injector.pointer(client_id, buttons, x, y, placement);
+                }
+            }
+            (
+                ClientEvent::RelativePointer {
+                    client_id,
+                    buttons,
+                    dx,
+                    dy,
+                },
+                Some(injector),
+            ) => {
+                let placement = placement.lock().ok().map(|placement| *placement);
+                if let Some(placement) = placement {
+                    injector.relative_pointer(client_id, buttons, dx, dy, placement);
                 }
             }
             (ClientEvent::ClientDisconnected { client_id }, Some(injector)) => {
@@ -1112,24 +1184,37 @@ struct Injector {
     last_point: Option<CGPoint>,
 }
 
-const BUTTONS: [(u8, CGEventType, CGEventType, CGMouseButton); 3] = [
+const BUTTONS: [(u16, CGEventType, CGEventType, CGMouseButton); 5] = [
     (
-        1,
+        BUTTON_LEFT,
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,
         CGMouseButton::Left,
     ),
     (
-        2,
+        BUTTON_MIDDLE,
         CGEventType::OtherMouseDown,
         CGEventType::OtherMouseUp,
         CGMouseButton::Center,
     ),
     (
-        4,
+        BUTTON_RIGHT,
         CGEventType::RightMouseDown,
         CGEventType::RightMouseUp,
         CGMouseButton::Right,
+    ),
+    // Other-mouse buttons 3 and 4 are back and forward.
+    (
+        BUTTON_BACK,
+        CGEventType::OtherMouseDown,
+        CGEventType::OtherMouseUp,
+        CGMouseButton(3),
+    ),
+    (
+        BUTTON_FORWARD,
+        CGEventType::OtherMouseDown,
+        CGEventType::OtherMouseUp,
+        CGMouseButton(4),
     ),
 ];
 
@@ -1212,36 +1297,81 @@ impl Injector {
         }
     }
 
-    fn pointer(&mut self, client_id: u64, buttons: u8, x: u16, y: u16, placement: InputPlacement) {
+    fn pointer(&mut self, client_id: u64, buttons: u16, x: u16, y: u16, placement: InputPlacement) {
         let transition = self.input.pointer_event(client_id, buttons);
-        // The display's current placement, so moves follow arrangement and
-        // scale changes as soon as they happen.
-        let bounds = CGDisplayBounds(placement.display);
         let point = display_point(
             x,
             y,
             (placement.width, placement.height),
-            DisplayBounds {
-                x: bounds.origin.x,
-                y: bounds.origin.y,
-                width: bounds.size.width,
-                height: bounds.size.height,
-            },
+            display_bounds(placement.display),
         )
         .map(|(x, y)| CGPoint { x, y })
         .or(self.last_point)
         .unwrap_or_else(current_pointer_location);
+        self.move_and_press(transition, point, None, (i32::from(x), i32::from(y)));
+    }
+
+    /// Move the pointer by (`dx`, `dy`) points, kept on the display, and
+    /// report the delta to applications that read it, as games do.
+    fn relative_pointer(
+        &mut self,
+        client_id: u64,
+        buttons: u16,
+        dx: i32,
+        dy: i32,
+        placement: InputPlacement,
+    ) {
+        let transition = self.input.pointer_event(client_id, buttons);
+        // The system's position, so moves made locally or by the
+        // application, such as recentering, are respected.
+        let from = current_pointer_location();
+        let point = relative_point((from.x, from.y), dx, dy, display_bounds(placement.display))
+            .map_or(from, |(x, y)| CGPoint { x, y });
+        let delta = (dx != 0 || dy != 0).then_some((dx, dy));
+        self.move_and_press(transition, point, delta, (point.x as i32, point.y as i32));
+    }
+
+    /// Move to `point`, with `delta` in the event's delta fields when the
+    /// motion is relative, then post button and wheel changes there. Click
+    /// counts compare `click_at` between presses.
+    fn move_and_press(
+        &mut self,
+        transition: PointerTransition,
+        point: CGPoint,
+        delta: Option<(i32, i32)>,
+        click_at: (i32, i32),
+    ) {
         let flags = self.modifier_flags();
-        if self.last_point != Some(point) {
+        if self.last_point != Some(point) || delta.is_some() {
             self.last_point = Some(point);
             // Moves with a button held are drags of the lowest held button.
             let (kind, button) = match transition.previous {
-                held if held & 1 != 0 => (CGEventType::LeftMouseDragged, CGMouseButton::Left),
-                held if held & 4 != 0 => (CGEventType::RightMouseDragged, CGMouseButton::Right),
-                held if held & 2 != 0 => (CGEventType::OtherMouseDragged, CGMouseButton::Center),
+                held if held & BUTTON_LEFT != 0 => {
+                    (CGEventType::LeftMouseDragged, CGMouseButton::Left)
+                }
+                held if held & BUTTON_RIGHT != 0 => {
+                    (CGEventType::RightMouseDragged, CGMouseButton::Right)
+                }
+                held if held & BUTTON_MIDDLE != 0 => {
+                    (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+                }
+                held if held & BUTTON_BACK != 0 => {
+                    (CGEventType::OtherMouseDragged, CGMouseButton(3))
+                }
+                held if held & BUTTON_FORWARD != 0 => {
+                    (CGEventType::OtherMouseDragged, CGMouseButton(4))
+                }
                 _ => (CGEventType::MouseMoved, CGMouseButton::Left),
             };
             if let Some(event) = CGEvent::new_mouse_event(Some(&self.source), kind, point, button) {
+                if let Some((dx, dy)) = delta {
+                    for (field, value) in [
+                        (CGEventField::MouseEventDeltaX, dx),
+                        (CGEventField::MouseEventDeltaY, dy),
+                    ] {
+                        CGEvent::set_integer_value_field(Some(&event), field, i64::from(value));
+                    }
+                }
                 self.post(&event, flags);
             }
         }
@@ -1254,8 +1384,8 @@ impl Injector {
             let count = if pressed {
                 self.clicks.press(
                     mask,
-                    i32::from(x),
-                    i32::from(y),
+                    click_at.0,
+                    click_at.1,
                     now,
                     self.double_click_interval,
                 )
@@ -1300,7 +1430,7 @@ impl Injector {
 
     /// Release buttons that went from `previous` to `buttons` where the
     /// pointer is now.
-    fn release_buttons(&self, previous: u8, buttons: u8) {
+    fn release_buttons(&self, previous: u16, buttons: u16) {
         if previous & !buttons == 0 {
             return;
         }
@@ -1329,6 +1459,18 @@ impl Drop for Injector {
             self.post_key(key, false, false);
         }
         self.release_buttons(buttons, 0);
+    }
+}
+
+/// The display's current placement in global points, so moves follow
+/// arrangement and scale changes as soon as they happen.
+fn display_bounds(display: CGDirectDisplayID) -> DisplayBounds {
+    let bounds = CGDisplayBounds(display);
+    DisplayBounds {
+        x: bounds.origin.x,
+        y: bounds.origin.y,
+        width: bounds.size.width,
+        height: bounds.size.height,
     }
 }
 
