@@ -86,7 +86,7 @@ Estimated for a Windows host at 60 Hz streaming 1920×1080 at Tight quality 6 to
 
 ### Viewer window, input, and presentation (winit + wgpu)
 
-- **Window layer.** minifb is removed. One winit event loop serves the connection window and session windows, pumped with `pump_app_events`. The network thread wakes it with an `EventLoopProxy` when an update has fully reached the GPU, so the loop never polls.
+- **Window layer.** minifb is removed. One winit event loop serves the connection window and session windows, pumped with `pump_app_events`. The network thread wakes it with an `EventLoopProxy` when an update has fully reached the GPU, so the loop never polls. (Spec 008 moves presenting from this loop to a presenter thread: on macOS the loop returns at most once per display refresh, too seldom to present an update's center and the rest separately.)
 - **Input.** Keyboard, mouse, and wheel events are handled in arrival order. The `keysym` mapping uses physical keys (winit `KeyCode`) with the US layout and the Shift state, as before.
   - Keypad keys send keypad keysyms (`KP_0`–`KP_9`, `KP_Enter`, and so on), so games can bind them separately from the main row.
   - Adds Caps Lock, Num Lock, Scroll Lock, Pause, Print Screen, the Menu key, and F13–F24.
@@ -99,9 +99,9 @@ Estimated for a Windows host at 60 Hz streaming 1920×1080 at Tight quality 6 to
   - All windows share one wgpu instance, adapter, and device.
 - **Uploads.** The network thread decodes into its own framebuffer and uploads each update's changed area to the texture with one `write_texture` call. Each update therefore reaches the GPU whole, and the window thread never copies or scales pixels.
 - **Presentation.**
-  - The window thread presents as soon as it is woken, at most at the FPS limit.
+  - The window thread presents as soon as it is woken, at most at the FPS limit. (Since spec 008 a presenter thread does this, as soon as the network thread marks an upload; the window thread draws only when the window, the overlay, or the layout changes.)
   - It uses `PresentMode::AutoNoVsync` (Immediate where supported: `displaySyncEnabled = NO` on macOS, tearing on Windows), falling back to Mailbox and then Fifo.
-  - `desired_maximum_frame_latency` is 1, giving two drawables on Metal.
+  - `desired_maximum_frame_latency` is 1, giving two drawables on Metal. (Spec 008 measured three: without a capture of the window, Core Animation then paces presents to the display's refresh.)
   - A window that cannot take a frame (not yet on screen, or occluded) is drawn again 16 ms later. A minimized or fully covered window draws nothing until it is shown.
 - **Settings.**
   - The FPS choices become 60, 120, and No limit; No limit is the default. The limit caps presentation only.
