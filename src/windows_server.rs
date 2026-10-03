@@ -219,6 +219,7 @@ pub fn serve(
         allow_insecure,
         scale,
         mouse,
+        foveation,
     } = options;
     // The GUI process stays DPI-unaware for its own windows, so the capture
     // and input threads opt in to physical pixels individually.
@@ -259,6 +260,7 @@ pub fn serve(
         allow_insecure,
         // The high priority class already covers every thread.
         thread_setup: None,
+        foveation,
     };
     let server = VncServer::bind(&address, served.image(&framebuffer).clone(), config)?;
     report(ServerNotice::Serving {

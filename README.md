@@ -29,6 +29,7 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
   - The back and forward side buttons reach the host too (ExtendedMouseButtons).
 - **GPU presentation** with winit and wgpu. Each frame is presented as soon as it arrives, without waiting for vertical sync, and scaled on the GPU. Input is sent as the system delivers it.
 - **Parallel encoding and decoding.** The server encodes a frame in bands on every core and sends each band as soon as it is ready. The viewer decodes JPEG bands in parallel.
+- **Foveated encoding for first-person games.** While a game has captured the mouse, the server encodes the center of the screen, where the crosshair is, first and at the viewer's quality. It lowers quality toward the edges as far as the link needs. On an emulated 150 Mbit/s link at 120 fps, frames arrive at about 106 fps instead of 50, and the time from input to a decoded frame that shows it falls from 57 to 37 ms. The updates are standard Tight. TopVNC's viewer is tested with them; other viewers are not yet.
 - **Keyboard and mouse input** for interacting with the remote desktop. Keys are sent by their position on a US keyboard, as games expect.
 - **Adjustable display** with fit-to-window or native pixels, smooth or sharp scaling, full screen, and 60 FPS, 120 FPS, or no presentation limit.
 - **In-session settings** accessible through **F8**, including disconnect and a resizable on-screen settings button.
@@ -77,7 +78,7 @@ Do not use `--input-debug` while typing passwords: it logs key events.
 
 ### Serve this desktop
 
-Open the **Server** tab in the TopVNC window, enter a password, and click **Start server**. The tab binds to `127.0.0.1:5900` by default; click **All networks** to listen on every interface, or enter a display number to share a display other than the primary one. **Served size** scales the image viewers receive, from 0.25× to 1.00× of the display's pixel size: drag the slider, or click **Full** or **Half**. Half size serves a Retina display at its size in points, a quarter of the pixels, which cuts encoding time and bandwidth for games. It shows the served size, address, and number of connected viewers, and keeps running while you use TopVNC as a viewer. Closing TopVNC stops the server. Server settings and passwords are not saved.
+Open the **Server** tab in the TopVNC window, enter a password, and click **Start server**. The tab binds to `127.0.0.1:5900` by default; click **All networks** to listen on every interface, or enter a display number to share a display other than the primary one. **Served size** scales the image viewers receive, from 0.25× to 1.00× of the display's pixel size: drag the slider, or click **Full** or **Half**. Half size serves a Retina display at its size in points, a quarter of the pixels, which cuts encoding time and bandwidth for games. **Foveation** chooses when the screen center is sent sharper and first (see `--foveate` below). The tab shows the served size, address, and number of connected viewers, and keeps running while you use TopVNC as a viewer. Closing TopVNC stops the server. Server settings and passwords are not saved.
 
 You can also run the server as a separate console mode. It binds to localhost by default and prompts for a VNC password:
 
@@ -87,6 +88,7 @@ cargo run --release -- --serve 0.0.0.0:5900
 cargo run --release -- --serve 0.0.0.0:5900 --display 2
 cargo run --release -- --serve 0.0.0.0:5900 --scale 0.5
 cargo run --release -- --serve 0.0.0.0:5900 --mouse relative
+cargo run --release -- --serve 0.0.0.0:5900 --foveate on
 ```
 
 The second and later commands listen on all network interfaces, and `--scale` sets the served size (0.25 to 1). `--mouse` chooses when the server asks viewers for relative mouse motion:
@@ -95,7 +97,15 @@ The second and later commands listen on all network interfaces, and `--scale` se
 - `relative` always asks, for games the automatic mode misses and for Mac hosts, which cannot tell when a game hides the cursor. The viewer's pointer then stays locked for the whole session.
 - `absolute` never asks.
 
-The Server tab uses `auto`. Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
+The Server tab uses `auto`.
+
+`--foveate` chooses when the server encodes foveated updates for first-person games. They send the screen center first, at the viewer's quality, with lower quality toward the edges, and the quality follows the link's measured throughput:
+
+- `auto`, the default, foveates while the server asks for relative mouse motion: while a game hides the cursor on a Windows host, or for the whole session with `--mouse relative`. Mac hosts never ask on their own, so use `--foveate on` or `--mouse relative` there.
+- `on` always foveates, for games the automatic mode misses.
+- `off` never does.
+
+Foveation applies only to viewers that receive Tight JPEG. Its zones assume a centered crosshair, which suits first-person games but not menus or strategy games. Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
 
 The server shares the primary display unless `--display NUMBER` selects another attached display (numbered from 1). Run it in an interactive, unlocked session: services and disconnected Remote Desktop sessions cannot capture the desktop. While Windows shows the secure desktop (UAC prompts, the lock screen), viewers keep the last image and capture resumes automatically afterward. If the display resolution changes, viewers that support the DesktopSize extension follow the new size; others, including TopVNC's own viewer for now, are disconnected and can reconnect.
 
@@ -176,7 +186,7 @@ For playable results:
 
   If it says Raw, the server does not support Tight; without `push`, every frame waits a round trip.
 
-Tight between TopVNC's server and client is covered by tests. Tight against third-party servers and viewers, and with live desktop capture, has not yet been validated. See [`specs/006-low-latency-gaming/spec.md`](specs/006-low-latency-gaming/spec.md) and [`specs/007-competitive-gaming/spec.md`](specs/007-competitive-gaming/spec.md) for the full measurements.
+Tight between TopVNC's server and client is covered by tests. Tight against third-party servers and viewers, and with live desktop capture, has not yet been validated. See [`specs/006-low-latency-gaming/spec.md`](specs/006-low-latency-gaming/spec.md), [`specs/007-competitive-gaming/spec.md`](specs/007-competitive-gaming/spec.md), and [`specs/008-foveated-tight/spec.md`](specs/008-foveated-tight/spec.md) for the full measurements.
 
 ### Playing fast games
 
@@ -188,6 +198,7 @@ Shooters such as Fortnite need mouse look, which works only with TopVNC's server
 - **Use a wired connection for the host.** On Wi-Fi, use Tight quality 3–4, or serve a high-resolution display at a reduced size.
 - **In the viewer,** use full screen and **No limit**. On macOS, turn off *Pointer acceleration* (System Settings → Mouse) so the same hand motion always turns the camera the same amount. Set sensitivity in the game.
 - **If the camera does not turn** because the game hides its cursor in a way Windows does not report, start the host with `--mouse relative`.
+- **Foveation** turns on by itself while the game has captured the mouse. On a Mac host, or for a game the automatic mode misses, use `--foveate on`.
 
 These settings and the Windows host's mouse handling have not yet been validated with a live game.
 
@@ -234,6 +245,7 @@ cargo run
 | --- | --- |
 | [`src/lib.rs`](src/lib.rs) | Reusable RFB protocol handling, authentication, decoding, framebuffer state, and session logic. |
 | [`src/tight.rs`](src/tight.rs) | Tight encoding: the server's Fill, palette, JPEG, and zlib encoder and the client decoder. |
+| [`src/fovea.rs`](src/fovea.rs) | Foveated Tight: quality zones around the screen center, center-first rectangle order, and quality steps that follow the link's throughput. |
 | [`src/main.rs`](src/main.rs) | Native application, connection and session loops, input handling, and pointer lock. |
 | [`src/window.rs`](src/window.rs) | winit event loop and wgpu presentation: windows, frame textures, and presenting without waiting for vertical sync. |
 | [`src/ui.rs`](src/ui.rs) | Connect and Server tabs and in-session settings UI. |
@@ -243,6 +255,7 @@ cargo run
 | [`src/macos_server.rs`](src/macos_server.rs) | macOS ScreenCaptureKit capture, Quartz keyboard/mouse injection, and pasteboard sync for the Server tab and `--serve`. |
 | [`build.rs`](build.rs) | Weak-links ScreenCaptureKit so the app still starts on macOS releases older than 12.3. |
 | [`examples/latency_bench.rs`](examples/latency_bench.rs) | End-to-end frame rate and latency benchmark over an emulated network link. |
+| [`examples/fovea_latency.rs`](examples/fovea_latency.rs) | End-to-end benchmark of foveated Tight on real game frames: center, full-update, and input latency. |
 | [`tools/screen_latency.swift`](tools/screen_latency.swift) | macOS tool that measures the time until benchmark frames are displayed in a viewer window. |
 | [`specs/004-vnc-server/spec.md`](specs/004-vnc-server/spec.md) | Server scope, security behavior, and limitations. |
 | [`specs/`](specs/) | Feature scope and acceptance criteria. |

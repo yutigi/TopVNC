@@ -12,6 +12,7 @@ use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod fovea;
 mod tight;
 use tight::{TightDecoder, TightSettings};
 
@@ -645,6 +646,8 @@ pub struct ServerConfig {
     /// session, input reader, and encoder threads. Hosts use it to set a
     /// scheduling class, which new threads do not inherit on every platform.
     pub thread_setup: Option<fn()>,
+    /// When to encode Tight updates foveated for first-person games.
+    pub foveation: Foveation,
 }
 
 impl Default for ServerConfig {
@@ -654,8 +657,28 @@ impl Default for ServerConfig {
             password: None,
             allow_insecure: false,
             thread_setup: None,
+            foveation: Foveation::Off,
         }
     }
+}
+
+/// When the server encodes Tight updates foveated (spec 008). JPEG quality
+/// falls by zone around the framebuffer center, where a first-person game's
+/// crosshair is, and the center is sent first. The center starts at the
+/// client's quality level; with continuous updates, the zones' quality then
+/// follows the link's measured throughput. Applies only to clients that
+/// receive Tight JPEG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Foveation {
+    /// Every rectangle uses the client's quality level.
+    #[default]
+    Off,
+    /// While the host asks for relative pointer motion
+    /// ([`VncServer::set_relative_pointer`]), as it does while a game has
+    /// captured the mouse.
+    Auto,
+    /// Always.
+    On,
 }
 
 /// A small RFB 3.8 server for applications that provide a framebuffer and
@@ -696,10 +719,11 @@ enum SessionInput {
         region: UpdateRequest,
     },
     /// A Fence message from the client: a request to echo, or a response
-    /// to one of the server's.
+    /// to one of the server's, with when it arrived.
     Fence {
         flags: u32,
         payload: Vec<u8>,
+        received: Instant,
     },
     /// The framebuffer or clipboard changed.
     Wake,
@@ -829,6 +853,9 @@ struct ServerFramebuffer {
     tile_columns: usize,
     /// Incremented whenever the framebuffer dimensions change.
     generation: u64,
+    /// Host frames that changed at least one tile, across resizes; sessions
+    /// time the host's frame rate with it.
+    frames: u64,
 }
 
 impl ServerFramebuffer {
@@ -841,13 +868,16 @@ impl ServerFramebuffer {
             revision: 0,
             tile_columns,
             generation: 0,
+            frames: 0,
         }
     }
 
     fn resize(&mut self, framebuffer: Framebuffer) {
         let generation = self.generation.wrapping_add(1);
+        let frames = self.frames;
         *self = Self::new(framebuffer);
         self.generation = generation;
+        self.frames = frames;
     }
 
     fn next_revision(&mut self) -> u64 {
@@ -859,8 +889,9 @@ impl ServerFramebuffer {
         self.revision
     }
 
-    /// Copy one tile from `source` and bump its revision if any pixel changed.
-    fn sync_tile(&mut self, index: usize, source: &Framebuffer) {
+    /// Copy one tile from `source` and bump its revision if any pixel
+    /// changed. Returns whether one did.
+    fn sync_tile(&mut self, index: usize, source: &Framebuffer) -> bool {
         let (x, y, width, height) = self.tile_rect(index);
         let stride = self.framebuffer.width();
         let mut changed = false;
@@ -876,6 +907,7 @@ impl ServerFramebuffer {
             let revision = self.next_revision();
             self.tile_revisions[index] = revision;
         }
+        changed
     }
 
     fn tile_rect(&self, index: usize) -> (usize, usize, usize, usize) {
@@ -1089,6 +1121,7 @@ impl VncServer {
                 relative_pointer: Arc::clone(&self.relative_pointer),
                 clipboard: Arc::clone(&self.clipboard),
                 thread_setup: self.config.thread_setup,
+                foveation: self.config.foveation,
             };
             let events = self.events.clone();
             let config = self.config.clone();
@@ -1183,6 +1216,7 @@ fn update_server_framebuffer_regions(
         return Err(invalid("damage rectangle is outside framebuffer"));
     }
     let mut visited = vec![false; current.tile_revisions.len()];
+    let mut changed = false;
     for rect in damage {
         if rect.width == 0 || rect.height == 0 {
             continue;
@@ -1195,11 +1229,12 @@ fn update_server_framebuffer_regions(
             for tile_column in column_start..=column_end {
                 let index = tile_row * current.tile_columns + tile_column;
                 if !std::mem::replace(&mut visited[index], true) {
-                    current.sync_tile(index, framebuffer);
+                    changed |= current.sync_tile(index, framebuffer);
                 }
             }
         }
     }
+    current.frames += u64::from(changed);
     Ok(())
 }
 
@@ -1234,6 +1269,7 @@ struct SessionShared {
     clipboard: Arc<Mutex<ServerClipboard>>,
     /// See [`ServerConfig::thread_setup`].
     thread_setup: Option<fn()>,
+    foveation: Foveation,
 }
 
 fn serve_client(
@@ -1572,7 +1608,11 @@ fn read_client_message(
         FENCE_MESSAGE => {
             let (flags, payload) = read_fence(stream)?;
             session
-                .send(SessionInput::Fence { flags, payload })
+                .send(SessionInput::Fence {
+                    flags,
+                    payload,
+                    received: Instant::now(),
+                })
                 .map_err(|_| session_closed())?;
         }
         _ => return Err(invalid("unknown client message")),
@@ -1677,10 +1717,18 @@ enum SendWindow {
 /// stale frames.
 #[derive(Debug, Default)]
 struct FlowControl {
-    in_flight: std::collections::VecDeque<(u32, usize, Instant)>,
+    in_flight: std::collections::VecDeque<InFlight>,
     next_fence: u32,
     /// Recent throughput samples in bytes per second.
     samples: std::collections::VecDeque<f64>,
+    /// Recent updates' bytes and delivery times; see
+    /// [`FlowControl::delivery_rate`].
+    deliveries: std::collections::VecDeque<(usize, Duration)>,
+    /// From the times acknowledgements arrived, which the session may
+    /// handle later: the shortest probe round trip, and when the previous
+    /// update's acknowledgement arrived.
+    arrival_base_delay: Option<Duration>,
+    last_arrival: Option<Instant>,
     /// When the previous acknowledgement arrived.
     last_acknowledgement: Option<Instant>,
     /// When the link is expected to finish transmitting what was sent.
@@ -1690,6 +1738,16 @@ struct FlowControl {
     /// When the unanswered probe fence was sent.
     probe_sent: Option<Instant>,
     last_probe: Option<Instant>,
+}
+
+/// An update waiting for its fence acknowledgement.
+#[derive(Debug, Clone, Copy)]
+struct InFlight {
+    sequence: u32,
+    bytes: usize,
+    /// When its first and last bytes were written.
+    first_write: Instant,
+    sent: Instant,
 }
 
 /// Throughput samples kept; the estimate is their maximum.
@@ -1725,6 +1783,37 @@ impl FlowControl {
         self.samples.iter().copied().reduce(f64::max)
     }
 
+    /// What the link sustains, in bytes per second, for deciding how much
+    /// to send: recent updates' bytes over their total delivery time.
+    ///
+    /// An update's delivery time is the smaller of two upper bounds on its
+    /// transmission time, both from the times acknowledgements arrived:
+    /// - from when its first byte was written to its acknowledgement, minus
+    ///   the link's fixed round trip, which includes waiting for the rest
+    ///   of the update to be encoded, decoding, and any queueing behind
+    ///   earlier updates;
+    /// - the gap since the previous acknowledgement, which includes any
+    ///   idle time.
+    ///
+    /// Summing keeps small updates, which a bursty link can deliver faster
+    /// than it sustains, from counting as much as large ones. The pacing
+    /// estimate, [`FlowControl::throughput`], overstates the rate when the
+    /// session handles acknowledgements late and back to back, and does not
+    /// count bytes streamed while the rest of an update was being encoded.
+    /// Needs half the samples.
+    fn delivery_rate(&self) -> Option<f64> {
+        if self.deliveries.len() < FLOW_SAMPLES / 2 {
+            return None;
+        }
+        let (bytes, time) = self
+            .deliveries
+            .iter()
+            .fold((0, Duration::ZERO), |(bytes, time), sample| {
+                (bytes + sample.0, time + sample.1)
+            });
+        Some(bytes as f64 / time.as_secs_f64())
+    }
+
     fn window(&self) -> SendWindow {
         match self.in_flight.len() {
             0 => SendWindow::Open,
@@ -1735,12 +1824,18 @@ impl FlowControl {
         }
     }
 
-    /// Record an update of `bytes` written at `sent`; returns the fence
-    /// payload to send after it.
-    fn sent(&mut self, bytes: usize, sent: Instant) -> [u8; 4] {
+    /// Record an update of `bytes` whose first and last bytes were written
+    /// at `first_write` and `sent`; returns the fence payload to send after
+    /// it.
+    fn sent(&mut self, bytes: usize, first_write: Instant, sent: Instant) -> [u8; 4] {
         let sequence = self.next_fence;
         self.next_fence = self.next_fence.wrapping_add(1);
-        self.in_flight.push_back((sequence, bytes, sent));
+        self.in_flight.push_back(InFlight {
+            sequence,
+            bytes,
+            first_write,
+            sent,
+        });
         // A client that never answers fences cannot grow this without bound.
         if self.in_flight.len() > 16 {
             self.in_flight.pop_front();
@@ -1754,12 +1849,19 @@ impl FlowControl {
         sequence.to_be_bytes()
     }
 
-    fn acknowledged(&mut self, payload: &[u8], now: Instant) {
+    /// Record a fence acknowledgement carrying `payload`, which arrived at
+    /// `arrived` and is handled at `now`.
+    fn acknowledged(&mut self, payload: &[u8], now: Instant, arrived: Instant) {
         if payload == FLOW_PROBE {
             if let Some(sent) = self.probe_sent.take() {
                 let round_trip = now.saturating_duration_since(sent);
                 self.base_delay = Some(
                     self.base_delay
+                        .map_or(round_trip, |base| base.min(round_trip)),
+                );
+                let round_trip = arrived.saturating_duration_since(sent);
+                self.arrival_base_delay = Some(
+                    self.arrival_base_delay
                         .map_or(round_trip, |base| base.min(round_trip)),
                 );
             }
@@ -1768,12 +1870,22 @@ impl FlowControl {
         let Ok(sequence) = <[u8; 4]>::try_from(payload).map(u32::from_be_bytes) else {
             return;
         };
-        let Some(position) = self.in_flight.iter().position(|entry| entry.0 == sequence) else {
+        let Some(position) = self
+            .in_flight
+            .iter()
+            .position(|entry| entry.sequence == sequence)
+        else {
             return;
         };
-        let (_, bytes, sent) = self.in_flight[position];
+        let InFlight {
+            bytes,
+            first_write,
+            sent,
+            ..
+        } = self.in_flight[position];
         self.in_flight.drain(..=position);
         let previous = self.last_acknowledgement.replace(now);
+        let previous_arrival = self.last_arrival.replace(arrived);
         if position > 0 {
             return;
         }
@@ -1798,6 +1910,20 @@ impl FlowControl {
         }
         self.samples
             .push_back(bytes as f64 / transfer.as_secs_f64());
+        if let Some(base) = self.arrival_base_delay {
+            let since_written = arrived
+                .saturating_duration_since(first_write)
+                .saturating_sub(base);
+            let delivery = previous_arrival
+                .map_or(since_written, |previous| {
+                    since_written.min(arrived.saturating_duration_since(previous))
+                })
+                .max(Duration::from_micros(500));
+            if self.deliveries.len() == FLOW_SAMPLES {
+                self.deliveries.pop_front();
+            }
+            self.deliveries.push_back((bytes, delivery));
+        }
     }
 }
 
@@ -1830,17 +1956,24 @@ fn write_client_updates(
     let mut encoder = SessionEncoder {
         pool: None,
         thread_setup: session.thread_setup,
+        fovea: fovea::State::new(),
     };
     // Pseudo-encoding rectangles waiting to be sent.
     let mut pseudo: Vec<PseudoRect> = Vec::new();
     loop {
         send_pending_clipboard(stream, &session.clipboard, &mut clipboard_revision)?;
-        let (current_generation, width, height) = {
+        let (current_generation, width, height, frames) = {
             let fb = shared
                 .lock()
                 .map_err(|_| invalid("framebuffer lock is poisoned"))?;
-            (fb.generation, fb.framebuffer.width, fb.framebuffer.height)
+            (
+                fb.generation,
+                fb.framebuffer.width,
+                fb.framebuffer.height,
+                fb.frames,
+            )
         };
+        encoder.fovea.observe_frames(frames, Instant::now());
         if encodings.pointer_motion_change {
             let relative = session.relative_pointer.load(Ordering::Acquire);
             if pointer_mode != Some(relative) {
@@ -1865,6 +1998,16 @@ fn write_client_updates(
             pseudo.clear();
         }
         let tight = encodings.tight.filter(|_| pixel_format.has_tight_pixels());
+        let foveate = match session.foveation {
+            Foveation::Off => false,
+            Foveation::Auto => session.relative_pointer.load(Ordering::Acquire),
+            Foveation::On => true,
+        };
+        // Quality levels by zone, when foveating a client that takes JPEG.
+        let zones = tight
+            .and_then(|settings| settings.quality)
+            .filter(|_| foveate)
+            .map(|level| encoder.fovea.levels(level));
         let mut window = flow.window();
         if current_generation != generation {
             if !encodings.desktop_size {
@@ -1898,13 +2041,14 @@ fn write_client_updates(
                     || !pseudo.is_empty()
                     || Instant::now() >= waiting.deadline)
             {
-                let bytes = write_prepared_update(
+                let (bytes, first_write) = write_prepared_update(
                     stream,
                     shared,
                     &mut seen_revisions,
                     &mut output,
                     pixel_format,
                     tight,
+                    zones,
                     update,
                     generation,
                     &mut encoder,
@@ -1915,7 +2059,7 @@ fn write_client_updates(
                 // Track requested updates too, so flow control knows what is
                 // still on the wire when continuous updates start.
                 if encodings.fence {
-                    let payload = flow.sent(bytes, Instant::now());
+                    let payload = flow.sent(bytes, first_write, Instant::now());
                     stream
                         .write_all(&fence_message(FENCE_REQUEST | FENCE_BLOCK_BEFORE, &payload))?;
                 }
@@ -1932,26 +2076,43 @@ fn write_client_updates(
                 SendWindow::OpensAt(at) => Instant::now() >= at,
                 SendWindow::Closed => false,
             };
-            if open
-                && let Some(update) =
-                    prepare_update(shared, &seen_revisions, region, true, generation)?
+            let mut prepared = if open {
+                prepare_update(shared, &seen_revisions, region, true, generation)?
+            } else {
+                None
+            };
+            // Before the emptiness check: leaving out the periphery can
+            // leave nothing to send yet.
+            if let Some(update) = &mut prepared {
+                if zones.is_some() {
+                    skip_periphery(shared, update, generation, &mut encoder.fovea)?;
+                } else {
+                    encoder.fovea.periphery_released();
+                }
+            }
+            if let Some(update) = prepared
                 && !update.rectangles.is_empty()
             {
-                let bytes = write_prepared_update(
+                let (bytes, first_write) = write_prepared_update(
                     stream,
                     shared,
                     &mut seen_revisions,
                     &mut output,
                     pixel_format,
                     tight,
+                    zones,
                     update,
                     generation,
                     &mut encoder,
                     &[],
                 )?;
-                let payload = flow.sent(bytes, Instant::now());
+                let sent = Instant::now();
+                let payload = flow.sent(bytes, first_write, sent);
                 stream.write_all(&fence_message(FENCE_REQUEST | FENCE_BLOCK_BEFORE, &payload))?;
                 window = flow.window();
+                if zones.is_some() {
+                    encoder.fovea.sent(bytes, flow.delivery_rate(), sent);
+                }
             }
         }
         let now = Instant::now();
@@ -1961,10 +2122,18 @@ fn write_client_updates(
         {
             timeout = waiting.deadline.saturating_duration_since(now);
         }
-        if continuous.is_some()
-            && let SendWindow::OpensAt(at) = window
-        {
-            timeout = timeout.min(at.saturating_duration_since(now));
+        if continuous.is_some() {
+            match window {
+                SendWindow::OpensAt(at) => timeout = timeout.min(at.saturating_duration_since(now)),
+                // Held-back periphery tiles go out on time even when nothing
+                // else changes.
+                SendWindow::Open => {
+                    if let Some(due) = encoder.fovea.periphery_due() {
+                        timeout = timeout.min(due.saturating_duration_since(now));
+                    }
+                }
+                SendWindow::Closed => {}
+            }
         }
         match receiver.recv_timeout(timeout.max(Duration::from_millis(1))) {
             Ok(SessionInput::PixelFormat(format)) => pixel_format = format,
@@ -2016,13 +2185,17 @@ fn write_client_updates(
                     stream.write_all(&[CONTINUOUS_UPDATES_MESSAGE])?;
                 }
             }
-            Ok(SessionInput::Fence { flags, payload }) => {
+            Ok(SessionInput::Fence {
+                flags,
+                payload,
+                received,
+            }) => {
                 if flags & FENCE_REQUEST != 0 {
                     // Messages are handled in order, which satisfies every
                     // supported flag.
                     stream.write_all(&fence_message(flags & FENCE_SUPPORTED_FLAGS, &payload))?;
                 } else {
-                    flow.acknowledged(&payload, Instant::now());
+                    flow.acknowledged(&payload, Instant::now(), received);
                 }
             }
             Ok(SessionInput::Wake) => wake_queued.store(false, Ordering::Release),
@@ -2039,7 +2212,9 @@ fn write_client_updates(
 }
 
 /// Write a prepared update with Tight when the client accepts it, otherwise
-/// Raw. Returns the bytes written.
+/// Raw. Tight updates are foveated when `zones` gives quality levels for
+/// the fovea, mid zone, and periphery. Returns the bytes written and when
+/// the first of them were.
 #[allow(clippy::too_many_arguments)]
 fn write_prepared_update(
     stream: &mut TcpStream,
@@ -2048,11 +2223,12 @@ fn write_prepared_update(
     output: &mut Vec<u8>,
     pixel_format: ServerPixelFormat,
     tight: Option<TightSettings>,
+    zones: Option<[u8; 3]>,
     update: PreparedUpdate,
     generation: u64,
     encoder: &mut SessionEncoder,
     pseudo: &[PseudoRect],
-) -> io::Result<usize> {
+) -> io::Result<(usize, Instant)> {
     match tight {
         Some(settings) => write_tight_update(
             stream,
@@ -2060,21 +2236,26 @@ fn write_prepared_update(
             seen_revisions,
             output,
             settings,
+            zones,
             update,
             generation,
             encoder,
             pseudo,
         ),
-        None => write_update(
-            stream,
-            shared,
-            seen_revisions,
-            output,
-            pixel_format,
-            update,
-            generation,
-            pseudo,
-        ),
+        None => {
+            let started = Instant::now();
+            write_update(
+                stream,
+                shared,
+                seen_revisions,
+                output,
+                pixel_format,
+                update,
+                generation,
+                pseudo,
+            )
+            .map(|bytes| (bytes, started))
+        }
     }
 }
 
@@ -2533,6 +2714,35 @@ fn tight_rects(rects: &[ServerRect], band_rows: usize) -> Vec<(usize, usize, usi
     result
 }
 
+/// Leave the periphery out of a continuous update when the session's rung
+/// sends it only with every Nth update (spec 008). Left-out tiles are not
+/// acknowledged, so they stay pending and go out with a later update.
+fn skip_periphery(
+    shared: &Arc<Mutex<ServerFramebuffer>>,
+    update: &mut PreparedUpdate,
+    generation: u64,
+    fovea: &mut fovea::State,
+) -> io::Result<()> {
+    let fb = shared
+        .lock()
+        .map_err(|_| invalid("framebuffer lock is poisoned"))?;
+    // Tile indexes refer to the framebuffer the update was prepared for.
+    if fb.generation != generation {
+        return Ok(());
+    }
+    let frame = (fb.framebuffer.width(), fb.framebuffer.height());
+    let periphery =
+        |index: usize| fovea::zone(fb.tile_rect(index), frame) == fovea::Zone::Periphery;
+    let in_periphery = |rect: &ServerRect| rect.tile_index.is_some_and(periphery);
+    let has_periphery = update.rectangles.iter().any(in_periphery);
+    let has_center = update.rectangles.iter().any(|rect| !in_periphery(rect));
+    if !fovea.send_periphery(has_center, has_periphery, Instant::now()) {
+        update.rectangles.retain(|rect| !in_periphery(rect));
+        update.acknowledged.retain(|&(index, _)| !periphery(index));
+    }
+    Ok(())
+}
+
 /// A rectangle's pixels, copied out of the framebuffer, with its size.
 type Snapshot = (Vec<u32>, usize, usize);
 
@@ -2540,7 +2750,7 @@ type Snapshot = (Vec<u32>, usize, usize);
 /// order through `next`.
 struct EncodeBatch {
     snapshots: Arc<Vec<Snapshot>>,
-    settings: TightSettings,
+    settings: Arc<Vec<TightSettings>>,
     next: Arc<std::sync::atomic::AtomicUsize>,
     results: std::sync::mpsc::Sender<(usize, io::Result<Vec<u8>>)>,
 }
@@ -2579,7 +2789,7 @@ impl EncodePool {
                                     pixels,
                                     *width,
                                     *height,
-                                    batch.settings,
+                                    batch.settings[index],
                                     &mut body,
                                 )
                                 .map(|_| body);
@@ -2602,19 +2812,20 @@ impl EncodePool {
     fn encode(
         &self,
         snapshots: Vec<Snapshot>,
-        settings: TightSettings,
+        settings: Vec<TightSettings>,
         mut ready: impl FnMut(usize, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         let stopped = || io::Error::other("a Tight encoder thread stopped");
         let count = snapshots.len();
         let snapshots = Arc::new(snapshots);
+        let settings = Arc::new(settings);
         let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (results, receiver) = std::sync::mpsc::channel();
         for batch in &self.batches {
             batch
                 .send(EncodeBatch {
                     snapshots: Arc::clone(&snapshots),
-                    settings,
+                    settings: Arc::clone(&settings),
                     next: Arc::clone(&next),
                     results: results.clone(),
                 })
@@ -2651,18 +2862,22 @@ fn encoder_threads() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
 }
 
-/// A session's encoder threads, started on first use.
+/// A session's encoder threads, started on first use, and its foveation
+/// state.
 struct SessionEncoder {
     pool: Option<EncodePool>,
     /// Runs first on every encoder thread; see [`ServerConfig::thread_setup`].
     thread_setup: Option<fn()>,
+    fovea: fovea::State,
 }
 
 /// Write a prepared update with Tight encoding. The rectangles are copied
 /// under one framebuffer lock, so every update shows a single captured frame,
 /// then encoded without holding the lock. Large updates are encoded on
 /// `pool`, which starts on first use, and each band is written as soon as it
-/// is ready.
+/// is ready. With `zones`, the update is foveated: rectangles are laid out
+/// by zone, center first, each at its zone's quality level. Returns the
+/// bytes written and when the first of them were.
 #[allow(clippy::too_many_arguments)]
 fn write_tight_update(
     stream: &mut TcpStream,
@@ -2670,28 +2885,53 @@ fn write_tight_update(
     seen_revisions: &mut [u64],
     output: &mut Vec<u8>,
     settings: TightSettings,
+    zones: Option<[u8; 3]>,
     update: PreparedUpdate,
     generation: u64,
     encoder: &mut SessionEncoder,
     pseudo: &[PseudoRect],
-) -> io::Result<usize> {
+) -> io::Result<(usize, Instant)> {
     let workers = encoder_threads();
-    let rows = update
-        .rectangles
-        .iter()
-        .map(|rect| usize::from(rect.y)..usize::from(rect.y) + usize::from(rect.height))
-        .reduce(|all, rows| all.start.min(rows.start)..all.end.max(rows.end))
-        .map_or(0, |rows| rows.len());
-    let rects = tight_rects(&update.rectangles, band_rows(rows, workers));
-    if rects.len() > usize::from(u16::MAX) {
-        return Err(invalid("too many changed framebuffer rectangles"));
-    }
-    let snapshots = {
+    let (rects, rect_settings, snapshots) = {
         let fb = shared
             .lock()
             .map_err(|_| invalid("framebuffer lock is poisoned"))?;
+        let frame = (fb.framebuffer.width(), fb.framebuffer.height());
+        // After a resize the update no longer matches the framebuffer's
+        // zones; it is sent black in bands.
+        let (rects, rect_settings): (Vec<_>, Vec<_>) = match zones
+            .filter(|_| fb.generation == generation)
+        {
+            Some(levels) => fovea::foveated_rects(&update.rectangles, frame)
+                .into_iter()
+                .map(|(rect, zone)| {
+                    let quality = Some(levels[zone as usize]);
+                    (
+                        rect,
+                        TightSettings {
+                            quality,
+                            ..settings
+                        },
+                    )
+                })
+                .unzip(),
+            None => {
+                let rows = update
+                    .rectangles
+                    .iter()
+                    .map(|rect| usize::from(rect.y)..usize::from(rect.y) + usize::from(rect.height))
+                    .reduce(|all, rows| all.start.min(rows.start)..all.end.max(rows.end))
+                    .map_or(0, |rows| rows.len());
+                let rects = tight_rects(&update.rectangles, band_rows(rows, workers));
+                let count = rects.len();
+                (rects, vec![settings; count])
+            }
+        };
+        if rects.len() > usize::from(u16::MAX) {
+            return Err(invalid("too many changed framebuffer rectangles"));
+        }
         let stride = fb.framebuffer.width();
-        rects
+        let snapshots = rects
             .iter()
             .map(|&(x, y, width, height)| {
                 // After a resize the remaining area is sent black; the client
@@ -2708,9 +2948,11 @@ fn write_tight_update(
                 };
                 (pixels, width, height)
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (rects, rect_settings, snapshots)
     };
     let mut written = 0;
+    let mut first_write = None;
     output.clear();
     update_header(output, pseudo, rects.len())?;
     {
@@ -2724,6 +2966,7 @@ fn write_tight_update(
             // Send bands as they become ready, so transmission overlaps the
             // encoding of the rest.
             if output.len() >= SERVER_STREAM_FLUSH_BYTES {
+                first_write.get_or_insert_with(Instant::now);
                 stream.write_all(output)?;
                 written += output.len();
                 output.clear();
@@ -2738,15 +2981,16 @@ fn write_tight_update(
                     .pool
                     .insert(EncodePool::new(workers, encoder.thread_setup)?),
             };
-            pool.encode(snapshots, settings, &mut ready)?;
+            pool.encode(snapshots, rect_settings, &mut ready)?;
         } else {
             for (index, (pixels, width, height)) in snapshots.iter().enumerate() {
                 let mut body = Vec::new();
-                tight::encode_rect(pixels, *width, *height, settings, &mut body)?;
+                tight::encode_rect(pixels, *width, *height, rect_settings[index], &mut body)?;
                 ready(index, &body)?;
             }
         }
     }
+    let first_write = *first_write.get_or_insert_with(Instant::now);
     stream.write_all(output)?;
     written += output.len();
     output.clear();
@@ -2758,7 +3002,7 @@ fn write_tight_update(
     for (index, revision) in update.acknowledged {
         seen_revisions[index] = revision;
     }
-    Ok(written)
+    Ok((written, first_write))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3747,6 +3991,7 @@ mod tests {
             relative_pointer: Arc::new(AtomicBool::new(false)),
             clipboard: Arc::new(Mutex::new(ServerClipboard::default())),
             thread_setup: None,
+            foveation: Foveation::Off,
         }
     }
 
@@ -3961,17 +4206,20 @@ mod tests {
     }
 
     fn start_insecure_server(framebuffer: Framebuffer) -> (Arc<VncServer>, std::net::SocketAddr) {
-        let server = Arc::new(
-            VncServer::bind(
-                "127.0.0.1:0",
-                framebuffer,
-                ServerConfig {
-                    allow_insecure: true,
-                    ..ServerConfig::default()
-                },
-            )
-            .unwrap(),
-        );
+        start_server(
+            framebuffer,
+            ServerConfig {
+                allow_insecure: true,
+                ..ServerConfig::default()
+            },
+        )
+    }
+
+    fn start_server(
+        framebuffer: Framebuffer,
+        config: ServerConfig,
+    ) -> (Arc<VncServer>, std::net::SocketAddr) {
+        let server = Arc::new(VncServer::bind("127.0.0.1:0", framebuffer, config).unwrap());
         let address = server.local_addr().unwrap();
         let runner = Arc::clone(&server);
         std::thread::spawn(move || runner.run());
@@ -4817,6 +5065,451 @@ mod tests {
         );
     }
 
+    /// Smooth, grainy content like a game frame, which Tight sends as JPEG.
+    fn grainy_frame(width: u16, height: u16) -> Framebuffer {
+        let mut framebuffer = Framebuffer::new(width, height).unwrap();
+        let columns = usize::from(width);
+        let mut seed = 3u32;
+        for (index, pixel) in framebuffer.pixels_mut().iter_mut().enumerate() {
+            let (x, y) = ((index % columns) as f32, (index / columns) as f32);
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let grain = (seed % 9) as f32 - 4.0;
+            let wave = 50.0 * ((x * 0.05).sin() * (y * 0.04).cos());
+            let channel = |base: f32| (base + wave + grain).clamp(0.0, 255.0) as u32;
+            *pixel =
+                channel(120.0) << 16 | channel(100.0 + y * 0.1) << 8 | channel(70.0 + x * 0.05);
+        }
+        framebuffer
+    }
+
+    fn full_region(width: u16, height: u16) -> UpdateRequest {
+        UpdateRequest {
+            incremental: true,
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    fn session_encoder(fovea: fovea::State) -> SessionEncoder {
+        SessionEncoder {
+            pool: None,
+            thread_setup: None,
+            fovea,
+        }
+    }
+
+    /// Write `update` with Tight and return the FramebufferUpdate's bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn tight_update_bytes(
+        shared: &Arc<Mutex<ServerFramebuffer>>,
+        seen_revisions: &mut [u64],
+        settings: TightSettings,
+        zones: Option<[u8; 3]>,
+        update: PreparedUpdate,
+        encoder: &mut SessionEncoder,
+    ) -> Vec<u8> {
+        let (mut server, mut client) = tcp_pair();
+        let generation = shared.lock().unwrap().generation;
+        let (bytes, _) = write_tight_update(
+            &mut server,
+            shared,
+            seen_revisions,
+            &mut Vec::new(),
+            settings,
+            zones,
+            update,
+            generation,
+            encoder,
+            &[],
+        )
+        .unwrap();
+        let mut message = vec![0; bytes];
+        client.read_exact(&mut message).unwrap();
+        message
+    }
+
+    fn decode_tight(message: &[u8], width: u16, height: u16) -> Framebuffer {
+        let mut framebuffer = Framebuffer::new(width, height).unwrap();
+        read_update_with_encoding(
+            &mut Cursor::new(message),
+            width,
+            height,
+            &mut Vec::new(),
+            Encoding::Tight { quality: 6 },
+            &mut UpdateDecoder::new(),
+            |x, y, w, h, bytes| framebuffer.apply_raw(x, y, w, h, bytes),
+        )
+        .unwrap();
+        framebuffer
+    }
+
+    #[test]
+    fn foveated_updates_send_each_zone_at_its_level_center_first() {
+        let (width, height) = (640u16, 384u16);
+        let frame = (usize::from(width), usize::from(height));
+        let source = grainy_frame(width, height);
+        let shared = Arc::new(Mutex::new(ServerFramebuffer::new(source.clone())));
+        let tile_count = shared.lock().unwrap().tile_revisions.len();
+        let mut seen_revisions = vec![u64::MAX; tile_count];
+        let update = prepare_update(
+            &shared,
+            &seen_revisions,
+            full_region(width, height),
+            false,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        let changed = update.rectangles.clone();
+        let mut encoder = session_encoder(fovea::State::new());
+        let settings = TightSettings {
+            quality: Some(6),
+            compression: 1,
+        };
+        let zones = encoder.fovea.levels(6);
+        assert_eq!(zones, [6, 4, 1]);
+        let message = tight_update_bytes(
+            &shared,
+            &mut seen_revisions,
+            settings,
+            Some(zones),
+            update,
+            &mut encoder,
+        );
+        assert!(seen_revisions.iter().all(|revision| *revision != u64::MAX));
+
+        // Center first, and every rectangle exactly as Tight encodes it at
+        // its zone's level.
+        let layout = fovea::foveated_rects(&changed, frame);
+        assert_eq!(layout[0], ((192, 128, 256, 64), fovea::Zone::Fovea));
+        assert_eq!(layout.last().unwrap().1, fovea::Zone::Periphery);
+        let mut expected = vec![0, 0];
+        expected.extend_from_slice(&(layout.len() as u16).to_be_bytes());
+        for &((x, y, w, h), zone) in &layout {
+            for value in [x, y, w, h] {
+                expected.extend_from_slice(&(value as u16).to_be_bytes());
+            }
+            expected.extend_from_slice(&tight::TIGHT_ENCODING.to_be_bytes());
+            let mut pixels = Vec::with_capacity(w * h);
+            for row in y..y + h {
+                pixels.extend_from_slice(&source.pixels()[row * frame.0 + x..][..w]);
+            }
+            let zone_settings = TightSettings {
+                quality: Some(zones[zone as usize]),
+                ..settings
+            };
+            tight::encode_rect(&pixels, w, h, zone_settings, &mut expected).unwrap();
+        }
+        assert_eq!(message, expected);
+
+        // The mixed-quality update decodes; the fovea is pixel-identical to
+        // today's bands at the client's level, and sharper than the
+        // periphery.
+        let foveated = decode_tight(&message, width, height);
+        let mut seen_revisions = vec![u64::MAX; tile_count];
+        let update = prepare_update(
+            &shared,
+            &seen_revisions,
+            full_region(width, height),
+            false,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        let banded = decode_tight(
+            &tight_update_bytes(
+                &shared,
+                &mut seen_revisions,
+                settings,
+                None,
+                update,
+                &mut encoder,
+            ),
+            width,
+            height,
+        );
+        let mut error = [(0u64, 0u64); 3];
+        for &((x, y, w, h), zone) in &layout {
+            for row in y..y + h {
+                for index in row * frame.0 + x..row * frame.0 + x + w {
+                    let (actual, wanted) = (foveated.pixels()[index], source.pixels()[index]);
+                    if zone == fovea::Zone::Fovea {
+                        assert_eq!(actual, banded.pixels()[index]);
+                    }
+                    for shift in [0, 8, 16] {
+                        let difference = (i64::from(actual >> shift & 0xff)
+                            - i64::from(wanted >> shift & 0xff))
+                        .unsigned_abs();
+                        error[zone as usize].0 += difference;
+                    }
+                    error[zone as usize].1 += 3;
+                }
+            }
+        }
+        let mean = error.map(|(sum, count)| sum as f64 / count as f64);
+        assert!(mean[0] < mean[1] && mean[1] < mean[2], "{mean:?}");
+        assert!(mean[2] < 12.0, "{mean:?}");
+    }
+
+    #[test]
+    fn auto_foveation_follows_the_hosts_relative_pointer_wish() {
+        let (width, height) = (640u16, 384u16);
+        let (server, address) = start_server(
+            grainy_frame(width, height),
+            ServerConfig {
+                allow_insecure: true,
+                foveation: Foveation::Auto,
+                ..ServerConfig::default()
+            },
+        );
+        // The client does not support relative motion; foveation follows
+        // the host's wish anyway.
+        let (mut client, width, height) = raw_client(
+            address,
+            &[tight::TIGHT_ENCODING, tight::QUALITY_LEVEL_0 + 6],
+        );
+        let mut decoder = UpdateDecoder::new();
+        let mut layout = |client: &mut TcpStream| {
+            request(client, false, width, height);
+            let mut rects = Vec::new();
+            read_update_with_encoding(
+                client,
+                width,
+                height,
+                &mut Vec::new(),
+                Encoding::Tight { quality: 6 },
+                &mut decoder,
+                |x, y, w, h, _| {
+                    rects.push((
+                        usize::from(x),
+                        usize::from(y),
+                        usize::from(w),
+                        usize::from(h),
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            rects
+        };
+        let whole = [ServerRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+            tile_index: None,
+            revision: 0,
+        }];
+        let bands = tight_rects(&whole, band_rows(usize::from(height), encoder_threads()));
+        let foveated: Vec<_> = fovea::foveated_rects(&whole, (640, 384))
+            .into_iter()
+            .map(|(rect, _)| rect)
+            .collect();
+        assert_eq!(layout(&mut client), bands);
+        server.set_relative_pointer(true);
+        assert_eq!(layout(&mut client), foveated);
+        server.set_relative_pointer(false);
+        assert_eq!(layout(&mut client), bands);
+        server.stop();
+    }
+
+    #[test]
+    fn held_back_periphery_tiles_stay_pending_and_go_out_later() {
+        let (width, height) = (640u16, 384u16);
+        let frame = (usize::from(width), usize::from(height));
+        let mut source = grainy_frame(width, height);
+        let shared = Arc::new(Mutex::new(ServerFramebuffer::new(source.clone())));
+        let periphery: Vec<bool> = {
+            let fb = shared.lock().unwrap();
+            (0..fb.tile_revisions.len())
+                .map(|index| fovea::zone(fb.tile_rect(index), frame) == fovea::Zone::Periphery)
+                .collect()
+        };
+        let in_periphery =
+            |rect: &ServerRect| rect.tile_index.is_some_and(|index| periphery[index]);
+        let mut seen_revisions = vec![u64::MAX; periphery.len()];
+        // Rung 3 sends the periphery with every second update.
+        let mut encoder = session_encoder(fovea::State::at_rung(3));
+        let settings = TightSettings {
+            quality: Some(6),
+            compression: 1,
+        };
+        let zones = Some(encoder.fovea.levels(6));
+        let region = full_region(width, height);
+
+        let mut first = prepare_update(&shared, &seen_revisions, region, true, 0)
+            .unwrap()
+            .unwrap();
+        skip_periphery(&shared, &mut first, 0, &mut encoder.fovea).unwrap();
+        assert!(!first.rectangles.is_empty());
+        assert!(!first.rectangles.iter().any(in_periphery));
+        assert!(
+            !first
+                .acknowledged
+                .iter()
+                .any(|&(index, _)| periphery[index])
+        );
+        assert!(encoder.fovea.periphery_due().is_some());
+        tight_update_bytes(
+            &shared,
+            &mut seen_revisions,
+            settings,
+            zones,
+            first,
+            &mut encoder,
+        );
+        for (index, revision) in seen_revisions.iter().enumerate() {
+            assert_eq!(*revision == u64::MAX, periphery[index], "tile {index}");
+        }
+
+        // The next update with a center change carries the held-back tiles.
+        source.pixels_mut()[192 * frame.0 + 320] ^= 0xffffff;
+        update_server_framebuffer(&shared, &Geometry::default(), &source).unwrap();
+        let mut second = prepare_update(&shared, &seen_revisions, region, true, 0)
+            .unwrap()
+            .unwrap();
+        skip_periphery(&shared, &mut second, 0, &mut encoder.fovea).unwrap();
+        assert_eq!(encoder.fovea.periphery_due(), None);
+        assert_eq!(
+            second
+                .rectangles
+                .iter()
+                .filter(|rect| in_periphery(rect))
+                .count(),
+            periphery.iter().filter(|tile| **tile).count()
+        );
+        assert_eq!(
+            second
+                .rectangles
+                .iter()
+                .filter(|rect| !in_periphery(rect))
+                .count(),
+            1
+        );
+        tight_update_bytes(
+            &shared,
+            &mut seen_revisions,
+            settings,
+            zones,
+            second,
+            &mut encoder,
+        );
+        let third = prepare_update(&shared, &seen_revisions, region, true, 0)
+            .unwrap()
+            .unwrap();
+        assert!(third.rectangles.is_empty());
+    }
+
+    #[test]
+    fn topvnc_session_decodes_foveated_updates() {
+        let (width, height) = (640u16, 384u16);
+        let source = grainy_frame(width, height);
+        let (server, address) = start_server(
+            source.clone(),
+            ServerConfig {
+                allow_insecure: true,
+                foveation: Foveation::On,
+                ..ServerConfig::default()
+            },
+        );
+        let mut session = Session::connect_with_encoding(
+            &address.to_string(),
+            true,
+            Encoding::Tight { quality: 6 },
+            || unreachable!(),
+        )
+        .unwrap();
+        let writer = session.writer();
+        let mut received = Framebuffer::new(width, height).unwrap();
+        let mut scratch = Vec::new();
+        writer.request_update(false, width, height).unwrap();
+        read_until_pixels(&mut session, &mut scratch, &mut received, true);
+        let mut worst = [0; 3];
+        for (index, (wanted, actual)) in source.pixels().iter().zip(received.pixels()).enumerate() {
+            let (x, y) = (index % usize::from(width), index / usize::from(width));
+            let zone = fovea::zone((x / 64 * 64, y / 64 * 64, 64, 64), (640, 384)) as usize;
+            for shift in [0, 8, 16] {
+                let difference = (wanted >> shift & 0xff).abs_diff(actual >> shift & 0xff);
+                worst[zone] = worst[zone].max(difference);
+            }
+        }
+        // The center is as close as quality 6 gets; the periphery, at
+        // level 1, is coarser.
+        assert!(worst[0] <= 24 && worst[0] < worst[2], "{worst:?}");
+        assert!(worst[2] <= 64, "{worst:?}");
+        server.stop();
+    }
+
+    #[test]
+    fn delivery_rate_follows_arrival_times() {
+        let start = Instant::now();
+        let at = |us: u64| start + Duration::from_micros(us);
+        let mut flow = FlowControl::default();
+        flow.probing(at(0));
+        // The probe arrived after 10 ms and was handled 2 ms later.
+        flow.acknowledged(&FLOW_PROBE, at(12_000), at(10_000));
+        assert_eq!(flow.base_delay, Some(Duration::from_millis(12)));
+        assert_eq!(flow.arrival_base_delay, Some(Duration::from_millis(10)));
+        // 1 MB written from 100 ms and acknowledged on arrival at 130 ms:
+        // 20 ms beyond the round trip, a link of 50 MB/s.
+        let first = flow.sent(1_000_000, at(100_000), at(105_000));
+        flow.acknowledged(&first, at(130_000), at(130_000));
+        // Two updates queued back to back: their acknowledgements arrive
+        // 20 ms apart, the second one's transmission time, but the session
+        // handles them together. The pacing estimate takes the 0.1 ms gap
+        // as a transfer at 2 GB/s; the delivery estimate takes the gap
+        // between arrivals instead of the time since the third was written,
+        // which includes 20 ms of queueing.
+        let second = flow.sent(1_000_000, at(200_000), at(205_000));
+        let third = flow.sent(1_000_000, at(205_000), at(210_000));
+        flow.acknowledged(&second, at(256_000), at(235_000));
+        flow.acknowledged(&third, at(256_100), at(255_000));
+        assert_eq!(flow.throughput(), Some(2e9));
+        assert_eq!(flow.delivery_rate(), None, "needs four samples");
+        let fourth = flow.sent(1_000_000, at(300_000), at(305_000));
+        flow.acknowledged(&fourth, at(330_000), at(330_000));
+        // A small update delivered in a burst barely moves the estimate:
+        // 4.01 MB over 20 + 25 + 20 + 20 + 0.5 ms.
+        let small = flow.sent(10_000, at(400_000), at(400_000));
+        flow.acknowledged(&small, at(410_100), at(410_100));
+        let rate = flow.delivery_rate().unwrap();
+        assert!((rate - 4.01e6 / 0.0855).abs() < 1.0, "{rate}");
+        // Without a measured round trip there are no delivery samples.
+        let mut unprobed = FlowControl::default();
+        for update in 0..8 {
+            let sent = at(update * 10_000);
+            let payload = unprobed.sent(1000, sent, sent);
+            let arrived = sent + Duration::from_millis(5);
+            unprobed.acknowledged(&payload, arrived, arrived);
+        }
+        assert!(unprobed.throughput().is_some());
+        assert_eq!(unprobed.delivery_rate(), None);
+    }
+
+    #[test]
+    fn host_frames_count_changes_across_resizes() {
+        let geometry = Geometry::default();
+        let mut frame = Framebuffer::new(128, 64).unwrap();
+        let shared = Arc::new(Mutex::new(ServerFramebuffer::new(frame.clone())));
+        let frames = || shared.lock().unwrap().frames;
+        // A publish that changes nothing is not a frame.
+        update_server_framebuffer(&shared, &geometry, &frame).unwrap();
+        assert_eq!(frames(), 0);
+        frame.pixels_mut()[0] = 0xffffff;
+        update_server_framebuffer(&shared, &geometry, &frame).unwrap();
+        assert_eq!(frames(), 1);
+        let mut resized = Framebuffer::new(64, 64).unwrap();
+        update_server_framebuffer(&shared, &geometry, &resized).unwrap();
+        assert_eq!(frames(), 1);
+        resized.pixels_mut()[0] = 0x00ff00;
+        update_server_framebuffer(&shared, &geometry, &resized).unwrap();
+        assert_eq!(frames(), 2);
+    }
+
     /// Codec timing for a 1920x1080 frame of smooth, grainy content:
     /// `cargo test --release --lib tight_codec_timing -- --ignored --nocapture`.
     #[test]
@@ -4858,9 +5551,37 @@ mod tests {
             .collect::<Vec<_>>();
         let workers = encoder_threads();
         let pool = EncodePool::new(workers, None).unwrap();
-        // 0.2's bands, then bands sized for this machine's threads.
+        let settings = |quality| TightSettings {
+            quality: Some(quality),
+            compression: 1,
+        };
+        // 0.2's bands, then bands sized for this machine's threads, then the
+        // first foveated rungs (spec 008) as a quality-6 client gets them.
+        let mut cases = Vec::new();
         for rows in [tight::MAX_RECT_HEIGHT, band_rows(height, workers)] {
             let rects = tight_rects(&tiles, rows);
+            for quality in [3, 6, 9] {
+                let all = vec![settings(quality); rects.len()];
+                cases.push((
+                    format!("{rows}-row bands, quality {quality}"),
+                    rects.clone(),
+                    all,
+                ));
+            }
+        }
+        let layout = fovea::foveated_rects(&tiles, (width, height));
+        for (rung, name) in [(0, "Sharp"), (1, "Balanced"), (2, "Wi-Fi")] {
+            let levels = fovea::State::at_rung(rung).levels(6);
+            cases.push((
+                format!("foveated {name} {levels:?}"),
+                layout.iter().map(|&(rect, _)| rect).collect(),
+                layout
+                    .iter()
+                    .map(|&(_, zone)| settings(levels[zone as usize]))
+                    .collect(),
+            ));
+        }
+        for (name, rects, rect_settings) in cases {
             let snapshots = rects
                 .iter()
                 .map(|&(x, y, w, h)| {
@@ -4871,85 +5592,90 @@ mod tests {
                     (copy, w, h)
                 })
                 .collect::<Vec<_>>();
-            for quality in [3, 6, 9] {
-                let settings = TightSettings {
-                    quality: Some(quality),
-                    compression: 1,
-                };
-                // Warm the threads and allocator, then time the second run.
-                let mut bodies = Vec::new();
-                let mut first = Duration::ZERO;
-                for _ in 0..2 {
-                    bodies.clear();
-                    let started = Instant::now();
-                    pool.encode(snapshots.clone(), settings, |index, body| {
-                        if index == 0 {
-                            first = started.elapsed();
-                        }
-                        bodies.push(body.to_vec());
-                        Ok(())
-                    })
-                    .unwrap();
-                }
+            // The rectangle holding the framebuffer's center pixel.
+            let center = rects
+                .iter()
+                .position(|&(x, y, w, h)| {
+                    (x..x + w).contains(&(width / 2)) && (y..y + h).contains(&(height / 2))
+                })
+                .unwrap();
+            // Warm the threads and allocator, then time the second run.
+            let mut bodies = Vec::new();
+            let (mut first, mut centered) = (Duration::ZERO, Duration::ZERO);
+            for _ in 0..2 {
+                bodies.clear();
                 let started = Instant::now();
-                pool.encode(snapshots.clone(), settings, |_, _| Ok(()))
-                    .unwrap();
-                let encoded = started.elapsed();
-                let sequential = Instant::now();
-                for (pixels, w, h) in &snapshots {
-                    tight::encode_rect(pixels, *w, *h, settings, &mut Vec::new()).unwrap();
-                }
-                let sequential = sequential.elapsed();
-                let mut decoder = tight::TightDecoder::new();
-                let mut output = Vec::new();
-                let started = Instant::now();
-                for (body, &(_, _, w, h)) in bodies.iter().zip(&rects) {
-                    decoder
-                        .read_rect(&mut Cursor::new(body), w, h, &mut output)
-                        .unwrap();
-                }
-                let decoded = started.elapsed();
-                // The same bands as one update, decoded the way a session
-                // does, with JPEG on the decoder threads.
-                let mut update = vec![0, 0];
-                update.extend_from_slice(&(rects.len() as u16).to_be_bytes());
-                for (body, &(x, y, w, h)) in bodies.iter().zip(&rects) {
-                    for value in [x, y, w, h] {
-                        update.extend_from_slice(&(value as u16).to_be_bytes());
+                pool.encode(snapshots.clone(), rect_settings.clone(), |index, body| {
+                    if index == 0 {
+                        first = started.elapsed();
                     }
-                    update.extend_from_slice(&tight::TIGHT_ENCODING.to_be_bytes());
-                    update.extend_from_slice(body);
-                }
-                let mut update_decoder = UpdateDecoder::new();
-                let mut framebuffer = Framebuffer::new(width as u16, height as u16).unwrap();
-                let mut pooled = Duration::ZERO;
-                // The first run starts the threads.
-                for _ in 0..2 {
-                    let started = Instant::now();
-                    read_update_with_encoding(
-                        &mut Cursor::new(&update),
-                        width as u16,
-                        height as u16,
-                        &mut Vec::new(),
-                        Encoding::Tight { quality },
-                        &mut update_decoder,
-                        |x, y, w, h, bytes| framebuffer.apply_raw(x, y, w, h, bytes),
-                    )
-                    .unwrap();
-                    pooled = started.elapsed();
-                }
-                let bytes: usize = bodies.iter().map(Vec::len).sum();
-                println!(
-                    "{rows}-row bands, quality {quality}: {} rects, {:.0} KB, encode {:.1} ms on {workers} threads (first band {:.1} ms) / {:.1} ms one thread, decode {:.1} ms one thread / {:.1} ms with decoder threads, including framebuffer writes",
-                    rects.len(),
-                    bytes as f64 / 1000.0,
-                    encoded.as_secs_f64() * 1000.0,
-                    first.as_secs_f64() * 1000.0,
-                    sequential.as_secs_f64() * 1000.0,
-                    decoded.as_secs_f64() * 1000.0,
-                    pooled.as_secs_f64() * 1000.0
-                );
+                    if index == center {
+                        centered = started.elapsed();
+                    }
+                    bodies.push(body.to_vec());
+                    Ok(())
+                })
+                .unwrap();
             }
+            let started = Instant::now();
+            pool.encode(snapshots.clone(), rect_settings.clone(), |_, _| Ok(()))
+                .unwrap();
+            let encoded = started.elapsed();
+            let sequential = Instant::now();
+            for ((pixels, w, h), settings) in snapshots.iter().zip(&rect_settings) {
+                tight::encode_rect(pixels, *w, *h, *settings, &mut Vec::new()).unwrap();
+            }
+            let sequential = sequential.elapsed();
+            let mut decoder = tight::TightDecoder::new();
+            let mut output = Vec::new();
+            let started = Instant::now();
+            for (body, &(_, _, w, h)) in bodies.iter().zip(&rects) {
+                decoder
+                    .read_rect(&mut Cursor::new(body), w, h, &mut output)
+                    .unwrap();
+            }
+            let decoded = started.elapsed();
+            // The same rectangles as one update, decoded the way a session
+            // does, with JPEG on the decoder threads.
+            let mut update = vec![0, 0];
+            update.extend_from_slice(&(rects.len() as u16).to_be_bytes());
+            for (body, &(x, y, w, h)) in bodies.iter().zip(&rects) {
+                for value in [x, y, w, h] {
+                    update.extend_from_slice(&(value as u16).to_be_bytes());
+                }
+                update.extend_from_slice(&tight::TIGHT_ENCODING.to_be_bytes());
+                update.extend_from_slice(body);
+            }
+            let mut update_decoder = UpdateDecoder::new();
+            let mut framebuffer = Framebuffer::new(width as u16, height as u16).unwrap();
+            let mut pooled = Duration::ZERO;
+            // The first run starts the threads.
+            for _ in 0..2 {
+                let started = Instant::now();
+                read_update_with_encoding(
+                    &mut Cursor::new(&update),
+                    width as u16,
+                    height as u16,
+                    &mut Vec::new(),
+                    Encoding::Tight { quality: 6 },
+                    &mut update_decoder,
+                    |x, y, w, h, bytes| framebuffer.apply_raw(x, y, w, h, bytes),
+                )
+                .unwrap();
+                pooled = started.elapsed();
+            }
+            let bytes: usize = bodies.iter().map(Vec::len).sum();
+            println!(
+                "{name}: {} rects, {:.0} KB, encode {:.1} ms on {workers} threads (first rectangle {:.1} ms, center {:.1} ms) / {:.1} ms one thread, decode {:.1} ms one thread / {:.1} ms with decoder threads, including framebuffer writes",
+                rects.len(),
+                bytes as f64 / 1000.0,
+                encoded.as_secs_f64() * 1000.0,
+                first.as_secs_f64() * 1000.0,
+                centered.as_secs_f64() * 1000.0,
+                sequential.as_secs_f64() * 1000.0,
+                decoded.as_secs_f64() * 1000.0,
+                pooled.as_secs_f64() * 1000.0
+            );
         }
     }
 
@@ -4979,26 +5705,36 @@ mod tests {
             })
             .collect::<Vec<Snapshot>>();
         let mut order = Vec::new();
-        pool.encode(snapshots.clone(), settings, |index, body| {
-            let (pixels, width, height) = &snapshots[index];
-            let mut expected = Vec::new();
-            tight::encode_rect(pixels, *width, *height, settings, &mut expected).unwrap();
-            assert_eq!(body, expected);
-            order.push(index);
-            Ok(())
-        })
+        pool.encode(
+            snapshots.clone(),
+            vec![settings; snapshots.len()],
+            |index, body| {
+                let (pixels, width, height) = &snapshots[index];
+                let mut expected = Vec::new();
+                tight::encode_rect(pixels, *width, *height, settings, &mut expected).unwrap();
+                assert_eq!(body, expected);
+                order.push(index);
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(order, (0..12).collect::<Vec<_>>());
         // An error from the writer ends the update; the pool stays usable.
-        let failed = pool.encode(snapshots.clone(), settings, |_, _| {
-            Err(io::Error::other("link closed"))
-        });
+        let failed = pool.encode(
+            snapshots.clone(),
+            vec![settings; snapshots.len()],
+            |_, _| Err(io::Error::other("link closed")),
+        );
         assert!(failed.is_err());
         let mut count = 0;
-        pool.encode(snapshots, settings, |_, _| {
-            count += 1;
-            Ok(())
-        })
+        pool.encode(
+            snapshots.clone(),
+            vec![settings; snapshots.len()],
+            |_, _| {
+                count += 1;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(count, 12);
     }
@@ -5154,37 +5890,37 @@ mod tests {
         assert_eq!(flow.probing(at(0)), FLOW_PROBE);
         assert!(!flow.probe_due(at(1)));
         // A 10 ms round trip on an idle link.
-        flow.acknowledged(&FLOW_PROBE, at(10));
+        flow.acknowledged(&FLOW_PROBE, at(10), at(10));
         assert_eq!(flow.base_delay, Some(Duration::from_millis(10)));
         assert_eq!(flow.window(), SendWindow::Open);
 
         // 1 MB acknowledged 30 ms after it was sent: 20 ms beyond the round
         // trip, so 50 MB/s.
-        let first = flow.sent(1_000_000, at(100));
+        let first = flow.sent(1_000_000, at(100), at(100));
         assert_eq!(flow.window(), SendWindow::Closed);
-        flow.acknowledged(&first, at(130));
+        flow.acknowledged(&first, at(130), at(130));
         assert_eq!(flow.throughput(), Some(50_000_000.0));
 
         // With one update in flight, the next may go once the link has
         // probably sent it: 1 MB at 95% of 50 MB/s is about 21 ms.
-        flow.sent(1_000_000, at(200));
+        flow.sent(1_000_000, at(200), at(200));
         let SendWindow::OpensAt(opens) = flow.window() else {
             panic!("expected a timed window");
         };
         let wait = opens - at(200);
         assert!(wait > Duration::from_millis(20) && wait < Duration::from_millis(22));
         // A second update queues behind the first on the link.
-        flow.sent(1_000_000, opens);
-        flow.sent(1_000_000, opens);
+        flow.sent(1_000_000, opens, opens);
+        flow.sent(1_000_000, opens, opens);
         assert_eq!(flow.window(), SendWindow::Closed);
 
         // Unknown and malformed acknowledgements are ignored.
-        flow.acknowledged(&[1, 2, 3], at(400));
-        flow.acknowledged(&99u32.to_be_bytes(), at(400));
+        flow.acknowledged(&[1, 2, 3], at(400), at(400));
+        flow.acknowledged(&99u32.to_be_bytes(), at(400), at(400));
         assert_eq!(flow.in_flight.len(), 3);
         // Acknowledging the last one clears everything before it.
-        let last = flow.in_flight.back().unwrap().0.to_be_bytes();
-        flow.acknowledged(&last, at(400));
+        let last = flow.in_flight.back().unwrap().sequence.to_be_bytes();
+        flow.acknowledged(&last, at(400), at(400));
         assert!(flow.in_flight.is_empty());
         assert_eq!(flow.window(), SendWindow::Open);
         // Probes repeat only on an idle link, once a second.
