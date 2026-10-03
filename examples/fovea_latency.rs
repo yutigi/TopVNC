@@ -25,6 +25,17 @@
 //!   [--modes NAME,NAME] [--json OUT.jsonl] [--label TEXT]
 //!
 //! `specs/008-foveated-tight/rnd/fetch_frames.py` writes suitable frames.
+//!
+//! `--serve HOST:PORT` instead serves the panning frame until interrupted,
+//! without authentication and with foveation on (`--foveate auto|on|off`),
+//! for trying a viewer: `topvnc HOST:PORT --allow-insecure`. With
+//! `--link MBPS:DELAY_MS` the viewer reaches the server through the same
+//! link emulation as the measurements, which accepts one viewer. Frames also
+//! carry their number at the bottom-left, clear of the viewer's settings
+//! button, so `tools/center_lead.swift` can compare what a viewer's window
+//! shows at the center and at the edge. On macOS `--publish-log PATH` records
+//! when each frame was published, in `CLOCK_UPTIME_RAW` nanoseconds, so that
+//! tool can also report the time until the center and the edge are on screen.
 
 use std::error::Error;
 use std::io::{self, Read, Write};
@@ -42,6 +53,9 @@ const PAN: usize = 23;
 const CENTER_FRAME: (usize, usize) = (896, 512);
 const CENTER_INPUT: (usize, usize) = (960, 512);
 const PERIPHERY_FRAME: (usize, usize) = (0, 0);
+/// The frame number again, in a periphery tile a viewer's settings button
+/// does not cover, for screen captures (`--serve`).
+const SCREEN_PERIPHERY: (usize, usize) = (0, 960);
 const INPUT_INTERVAL: Duration = Duration::from_millis(4);
 /// Link emulation granularity: about six full-size Ethernet frames.
 const SLICE_BYTES: usize = 8 * 1024;
@@ -158,11 +172,12 @@ fn pipe(
 }
 
 fn start_link(
+    listen: &str,
     server: std::net::SocketAddr,
     delay: Duration,
     mbps: f64,
 ) -> io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let listener = TcpListener::bind(listen)?;
     let address = listener.local_addr()?;
     let downstream = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&downstream);
@@ -269,7 +284,7 @@ fn run(
     )?);
     let runner = Arc::clone(&server);
     thread::spawn(move || runner.run());
-    let (link, downstream) = start_link(server.local_addr()?, delay, mbps)?;
+    let (link, downstream) = start_link("127.0.0.1:0", server.local_addr()?, delay, mbps)?;
 
     let published = Arc::new(Mutex::new(vec![Instant::now(); 2]));
     let stop = Arc::new(AtomicBool::new(false));
@@ -433,8 +448,95 @@ fn run(
     Ok(stats)
 }
 
+/// `CLOCK_UPTIME_RAW` in nanoseconds: the clock of macOS display and capture
+/// timestamps.
+#[cfg(target_os = "macos")]
+fn uptime_nanos() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: writes only to `time`.
+    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut time) };
+    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+}
+
+/// Serve the panning frame at `address` until interrupted, behind the link
+/// emulation when `link` is (Mbit/s, one-way delay in ms), logging each
+/// frame's publish time to `publish_log` when given.
+fn serve(
+    scene: &Scene,
+    address: &str,
+    fps: f64,
+    foveation: Foveation,
+    link: Option<(f64, u64)>,
+    publish_log: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let mut framebuffer = Framebuffer::new(WIDTH as u16, HEIGHT as u16)?;
+    scene.render(1, 0, &mut framebuffer);
+    let server = Arc::new(VncServer::bind(
+        if link.is_some() {
+            "127.0.0.1:0"
+        } else {
+            address
+        },
+        framebuffer.clone(),
+        ServerConfig {
+            allow_insecure: true,
+            foveation,
+            ..ServerConfig::default()
+        },
+    )?);
+    let runner = Arc::clone(&server);
+    thread::spawn(move || runner.run());
+    let reachable = match link {
+        Some((mbps, delay_ms)) => {
+            let delay = Duration::from_millis(delay_ms);
+            start_link(address, server.local_addr()?, delay, mbps)?.0
+        }
+        None => server.local_addr()?,
+    };
+    println!(
+        "Serving {WIDTH}x{HEIGHT} at {fps} fps on {reachable} without authentication, foveation {foveation:?}{}.",
+        link.map_or(String::new(), |(mbps, delay_ms)| format!(
+            ", {mbps} Mbit/s and {delay_ms} ms each way for one viewer"
+        ))
+    );
+    #[cfg(target_os = "macos")]
+    let mut publish_log = publish_log
+        .map(|path| std::fs::File::create(path).map(io::LineWriter::new))
+        .transpose()?;
+    #[cfg(not(target_os = "macos"))]
+    if publish_log.is_some() {
+        return Err("--publish-log is available on macOS only".into());
+    }
+    let interval = Duration::from_secs_f64(1.0 / fps);
+    let start = Instant::now();
+    for frame in 2u32.. {
+        // Drain input so viewers never stall on a full event queue.
+        while server.try_event().is_ok() {}
+        scene.render(frame, 0, &mut framebuffer);
+        marker(frame, framebuffer.pixels_mut(), SCREEN_PERIPHERY);
+        #[cfg(target_os = "macos")]
+        if let Some(log) = &mut publish_log {
+            writeln!(log, "{} {}", frame & 0xffff, uptime_nanos())?;
+        }
+        server.update_framebuffer(&framebuffer)?;
+        let next = start + interval * (frame - 1);
+        let now = Instant::now();
+        if next > now {
+            thread::sleep(next - now);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut frame_path = None;
+    let mut serve_at = None;
+    let mut serve_link = None;
+    let mut serve_log = None;
+    let mut serve_foveation = Foveation::On;
     let mut fps = 120.0;
     let mut seconds = 5.0;
     let mut links = vec![(1000.0, 2u64), (300.0, 4), (150.0, 8), (75.0, 8)];
@@ -460,6 +562,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--modes" => selected = Some(value()?.split(',').map(String::from).collect()),
             "--json" => json = Some(value()?),
             "--label" => label = value()?,
+            "--serve" => serve_at = Some(value()?),
+            "--publish-log" => serve_log = Some(value()?),
+            "--link" => {
+                let link = value()?;
+                let (mbps, delay) = link.split_once(':').ok_or("--link is MBPS:DELAY_MS")?;
+                serve_link = Some((mbps.parse()?, delay.parse()?));
+            }
+            "--foveate" => {
+                serve_foveation = match value()?.as_str() {
+                    "auto" => Foveation::Auto,
+                    "on" => Foveation::On,
+                    "off" => Foveation::Off,
+                    _ => return Err("--foveate is auto, on, or off".into()),
+                }
+            }
             _ => return Err(format!("unknown argument {arg}").into()),
         }
     }
@@ -471,6 +588,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect();
     assert_eq!(frame.len(), WIDTH * HEIGHT);
     let scene = Arc::new(Scene::new(&frame));
+    if let Some(address) = serve_at {
+        return serve(
+            &scene,
+            &address,
+            fps,
+            serve_foveation,
+            serve_link,
+            serve_log.as_deref(),
+        );
+    }
     let mut out = json
         .map(|path| {
             std::fs::OpenOptions::new()

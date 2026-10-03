@@ -26,7 +26,9 @@
 //! the viewer's settings button does not cover it, and on macOS
 //! `--publish-log PATH` records when each frame was published, in
 //! `CLOCK_UPTIME_RAW` nanoseconds, so a screen capture of the viewer can
-//! measure the time until each frame is on screen.
+//! measure the time until each frame is on screen. `--foveate auto|on|off`
+//! (default off) chooses whether the server encodes foveated updates, which
+//! a viewer at JPEG quality shows center first (spec 008).
 
 use std::error::Error;
 use std::io::{self, Read, Write};
@@ -35,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use topvnc::{Encoding, Framebuffer, ServerConfig, Session, VncServer};
+use topvnc::{Encoding, Foveation, Framebuffer, ServerConfig, Session, VncServer};
 
 struct Options {
     width: u16,
@@ -52,6 +54,8 @@ struct Options {
     print_input: bool,
     /// While serving, log each frame's publish time to this file.
     publish_log: Option<String>,
+    /// While serving, when to encode foveated updates.
+    foveation: Foveation,
 }
 
 fn options() -> Result<Options, Box<dyn Error>> {
@@ -66,6 +70,7 @@ fn options() -> Result<Options, Box<dyn Error>> {
         relative_mouse: false,
         print_input: false,
         publish_log: None,
+        foveation: Foveation::Off,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -84,6 +89,14 @@ fn options() -> Result<Options, Box<dyn Error>> {
             "--relative-mouse" => options.relative_mouse = true,
             "--print-input" => options.print_input = true,
             "--publish-log" => options.publish_log = Some(value()?),
+            "--foveate" => {
+                options.foveation = match value()?.as_str() {
+                    "auto" => Foveation::Auto,
+                    "on" => Foveation::On,
+                    "off" => Foveation::Off,
+                    _ => return Err("--foveate is auto, on, or off".into()),
+                }
+            }
             "--mbps" => {
                 options.links_mbps = value()?
                     .split(',')
@@ -429,6 +442,7 @@ fn serve_scene(options: &Options, scene: &Scene, address: &str) -> Result<(), Bo
         framebuffer.clone(),
         ServerConfig {
             allow_insecure: true,
+            foveation: options.foveation,
             ..ServerConfig::default()
         },
     )?);

@@ -372,6 +372,194 @@ impl State {
     }
 }
 
+/// A framebuffer area, in pixels, for a viewer to upload to the GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadArea {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl UploadArea {
+    fn right(self) -> usize {
+        self.x + self.width
+    }
+
+    fn bottom(self) -> usize {
+        self.y + self.height
+    }
+
+    fn pixels(self) -> usize {
+        self.width * self.height
+    }
+
+    fn union(self, other: Self) -> Self {
+        let (x, y) = (self.x.min(other.x), self.y.min(other.y));
+        Self {
+            x,
+            y,
+            width: self.right().max(other.right()) - x,
+            height: self.bottom().max(other.bottom()) - y,
+        }
+    }
+
+    fn inside(self, outer: Self) -> bool {
+        self.x >= outer.x
+            && self.y >= outer.y
+            && self.right() <= outer.right()
+            && self.bottom() <= outer.bottom()
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
+}
+
+/// The fovea of a framebuffer of `frame` (width, height) pixels: the tiles
+/// [`zone`] puts in [`Zone::Fovea`]. Both of its conditions are on one axis
+/// each, so those tiles always form a box. `None` for a frame too small to
+/// have one.
+fn fovea_box(frame: (usize, usize)) -> Option<UploadArea> {
+    let mut bounds: Option<UploadArea> = None;
+    for y in (0..frame.1).step_by(SERVER_TILE_SIZE) {
+        for x in (0..frame.0).step_by(SERVER_TILE_SIZE) {
+            let tile = UploadArea {
+                x,
+                y,
+                width: SERVER_TILE_SIZE.min(frame.0 - x),
+                height: SERVER_TILE_SIZE.min(frame.1 - y),
+            };
+            if zone((tile.x, tile.y, tile.width, tile.height), frame) == Zone::Fovea {
+                bounds = Some(bounds.map_or(tile, |area| area.union(tile)));
+            }
+        }
+    }
+    bounds
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    /// No rectangle has arrived.
+    First,
+    /// Every rectangle so far is inside the fovea box.
+    Center,
+    /// The center was handed out, or the update does not start there.
+    Rest,
+}
+
+/// Finds when the center of a framebuffer update is complete, so a viewer
+/// can put it on the screen before the rest of the update arrives (spec 008,
+/// Step 2).
+///
+/// A foveating server sends the fovea's rectangles first. An update counts
+/// as center-first when its first rectangle lies inside the fovea box, which
+/// bands sent from the top never do. Its center is complete once the
+/// rectangles inside the box cover it, or, when the update changes only part
+/// of the center, when the first rectangle outside the box arrives. At that
+/// moment [`CenterWatch::rectangle`] hands out what has been applied so far,
+/// and [`CenterWatch::finish`] hands out the rest when the update ends, so a
+/// viewer uploads every rectangle it applied.
+///
+/// Per update: [`CenterWatch::begin`], then [`CenterWatch::rectangle`] after
+/// each rectangle is applied to the framebuffer, then [`CenterWatch::finish`].
+pub struct CenterWatch {
+    /// The fovea box of the framebuffer, when it has one.
+    center: Option<UploadArea>,
+    enabled: bool,
+    stage: Stage,
+    /// The rectangles of this update seen inside the box.
+    inside: Vec<UploadArea>,
+    /// Their pixels. It counts the box's covered pixels only while no two of
+    /// them overlap, as a requested update's rectangles can.
+    covered: usize,
+    disjoint: bool,
+    /// The union of what was applied since an area was last handed out.
+    unsent: Option<UploadArea>,
+}
+
+impl CenterWatch {
+    /// A watch for a framebuffer of `width` by `height` pixels.
+    pub fn new(width: u16, height: u16) -> Self {
+        Self {
+            center: fovea_box((usize::from(width), usize::from(height))),
+            enabled: true,
+            stage: Stage::First,
+            inside: Vec::new(),
+            covered: 0,
+            disjoint: true,
+            unsent: None,
+        }
+    }
+
+    /// Start an update. While `enabled` is false, [`CenterWatch::rectangle`]
+    /// never hands out an area, and [`CenterWatch::finish`] returns the
+    /// whole update's, as a viewer without early presentation uploads it.
+    pub fn begin(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.stage = Stage::First;
+        self.inside.clear();
+        self.covered = 0;
+        self.disjoint = true;
+        self.unsent = None;
+    }
+
+    fn add_unsent(&mut self, area: UploadArea) {
+        self.unsent = Some(self.unsent.map_or(area, |unsent| unsent.union(area)));
+    }
+
+    /// The rectangle (`x`, `y`, `width`, `height`) was applied to the
+    /// framebuffer. Returns the area to upload and present now, when the
+    /// center of the update is complete.
+    pub fn rectangle(&mut self, x: u16, y: u16, width: u16, height: u16) -> Option<UploadArea> {
+        let rect = UploadArea {
+            x: usize::from(x),
+            y: usize::from(y),
+            width: usize::from(width),
+            height: usize::from(height),
+        };
+        let Some(center) = self.center.filter(|_| self.enabled) else {
+            self.add_unsent(rect);
+            return None;
+        };
+        match (self.stage, rect.inside(center)) {
+            (Stage::Rest, _) | (Stage::First, false) => {
+                self.stage = Stage::Rest;
+                self.add_unsent(rect);
+                None
+            }
+            (Stage::Center, false) => {
+                // The center rectangles are over: show them, and leave this
+                // one for the end.
+                self.stage = Stage::Rest;
+                self.unsent.replace(rect)
+            }
+            (Stage::First | Stage::Center, true) => {
+                self.stage = Stage::Center;
+                self.add_unsent(rect);
+                self.disjoint &= self.inside.iter().all(|seen| !seen.overlaps(rect));
+                self.inside.push(rect);
+                self.covered += rect.pixels();
+                if self.disjoint && self.covered >= center.pixels() {
+                    self.stage = Stage::Rest;
+                    return self.unsent.take();
+                }
+                None
+            }
+        }
+    }
+
+    /// The update ended. Returns what is still to upload: everything applied
+    /// since the center was handed out, or the whole update when it never was.
+    pub fn finish(&mut self) -> Option<UploadArea> {
+        self.stage = Stage::Rest;
+        self.unsent.take()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,5 +848,203 @@ mod tests {
         let mut balanced = State::new();
         assert!(balanced.send_periphery(true, true, at(0)));
         assert!(balanced.send_periphery(false, true, at(0)));
+    }
+
+    fn area(x: usize, y: usize, width: usize, height: usize) -> UploadArea {
+        UploadArea {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// The area handed out after each rectangle, and at the end, when
+    /// `rects` arrive in order at a watch for a `width` by `height` frame.
+    fn watched(
+        (width, height): (u16, u16),
+        enabled: bool,
+        rects: &[Rect],
+    ) -> (Vec<Option<UploadArea>>, Option<UploadArea>) {
+        let mut watch = CenterWatch::new(width, height);
+        watch.begin(enabled);
+        let handed = rects
+            .iter()
+            .map(|&(x, y, w, h)| watch.rectangle(x as u16, y as u16, w as u16, h as u16))
+            .collect();
+        (handed, watch.finish())
+    }
+
+    /// Every rectangle lies inside an area handed out when it arrived or
+    /// later, so a viewer that uploads those areas misses no pixel.
+    fn assert_uploaded(rects: &[Rect], handed: &[Option<UploadArea>], rest: Option<UploadArea>) {
+        for (index, &(x, y, w, h)) in rects.iter().enumerate() {
+            let rect = area(x, y, w, h);
+            let uploaded = handed[index..].iter().flatten().chain(&rest);
+            assert!(
+                uploaded.into_iter().any(|area| rect.inside(*area)),
+                "rectangle {index} is never uploaded"
+            );
+        }
+    }
+
+    /// The six 640x64 rectangles of the fovea at 1080p.
+    fn fovea_rects() -> Vec<Rect> {
+        (0..6).map(|row| (640, 320 + row * 64, 640, 64)).collect()
+    }
+
+    fn center_first_update() -> Vec<Rect> {
+        foveated_rects(&tiles(1920, 1080), (1920, 1080))
+            .into_iter()
+            .map(|(rect, _)| rect)
+            .collect()
+    }
+
+    #[test]
+    fn the_fovea_box_is_the_fovea_tiles() {
+        assert_eq!(fovea_box((1920, 1080)), Some(area(640, 320, 640, 384)));
+        assert_eq!(fovea_box((640, 384)), Some(area(192, 128, 256, 128)));
+        // A frame so flat that no tile center is within the fovea.
+        assert_eq!(fovea_box((1000, 64)), None);
+        for frame in [(1920, 1080), (1512, 982), (100, 70), (3024, 1964), (64, 64)] {
+            let fovea = fovea_box(frame);
+            for y in (0..frame.1).step_by(64) {
+                for x in (0..frame.0).step_by(64) {
+                    let tile = area(x, y, 64.min(frame.0 - x), 64.min(frame.1 - y));
+                    let in_box = fovea.is_some_and(|fovea| tile.inside(fovea));
+                    let tile_zone = zone((tile.x, tile.y, tile.width, tile.height), frame);
+                    assert_eq!(
+                        in_box,
+                        tile_zone == Zone::Fovea,
+                        "{frame:?} tile ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_center_first_update_shows_the_center_after_its_fovea_rectangles() {
+        let rects = center_first_update();
+        assert_eq!(rects.len(), 32);
+        let (handed, rest) = watched((1920, 1080), true, &rects);
+        // The fovea is six 64-row rectangles; the sixth completes the box.
+        let moments: Vec<usize> = (0..rects.len()).filter(|&i| handed[i].is_some()).collect();
+        assert_eq!(moments, [5]);
+        assert_eq!(handed[5], Some(area(640, 320, 640, 384)));
+        // The other 26 rectangles reach from the mid zone to every edge.
+        assert_eq!(rest, Some(area(0, 0, 1920, 1080)));
+        assert_uploaded(&rects, &handed, rest);
+    }
+
+    #[test]
+    fn bands_from_the_top_are_presented_whole() {
+        let bands: Vec<Rect> = (0..17)
+            .map(|band| (0, band * 64, 1920, 64.min(1080 - band * 64)))
+            .collect();
+        let (handed, rest) = watched((1920, 1080), true, &bands);
+        assert!(handed.iter().all(Option::is_none));
+        assert_eq!(rest, Some(area(0, 0, 1920, 1080)));
+    }
+
+    #[test]
+    fn a_partial_center_is_shown_when_the_first_outside_rectangle_arrives() {
+        // Two changed fovea tiles, then a mid-zone and a periphery band.
+        let rects = [
+            (704, 384, 64, 64),
+            (1088, 512, 64, 64),
+            (320, 128, 1280, 128),
+            (0, 0, 1920, 128),
+        ];
+        let (handed, rest) = watched((1920, 1080), true, &rects);
+        // What was applied before the outside rectangle: its bounds, not
+        // the whole box, and not including the rectangle that ended it.
+        assert_eq!(handed, [None, None, Some(area(704, 384, 448, 192)), None]);
+        assert_eq!(rest, Some(area(0, 0, 1920, 256)));
+        assert_uploaded(&rects, &handed, rest);
+    }
+
+    #[test]
+    fn a_center_only_update_leaves_nothing_for_the_end() {
+        let rects = fovea_rects();
+        let (handed, rest) = watched((1920, 1080), true, &rects);
+        assert_eq!(handed[5], Some(area(640, 320, 640, 384)));
+        assert!(handed[..5].iter().all(Option::is_none));
+        assert_eq!(rest, None);
+    }
+
+    #[test]
+    fn one_rectangle_can_complete_the_center() {
+        let rects = [(640, 320, 640, 384), (0, 0, 1920, 128)];
+        let (handed, rest) = watched((1920, 1080), true, &rects);
+        assert_eq!(handed, [Some(area(640, 320, 640, 384)), None]);
+        assert_eq!(rest, Some(area(0, 0, 1920, 128)));
+    }
+
+    #[test]
+    fn a_rectangle_crossing_the_box_edge_is_outside_it() {
+        // Starts left of the fovea, so the update does not start there.
+        let rects = [(600, 320, 64, 64), (640, 384, 64, 64)];
+        let (handed, rest) = watched((1920, 1080), true, &rects);
+        assert!(handed.iter().all(Option::is_none));
+        assert_eq!(rest, Some(area(600, 320, 104, 128)));
+    }
+
+    #[test]
+    fn a_disabled_watch_hands_out_the_whole_update_at_the_end() {
+        let rects = center_first_update();
+        let (handed, rest) = watched((1920, 1080), false, &rects);
+        assert!(handed.iter().all(Option::is_none));
+        assert_eq!(rest, Some(area(0, 0, 1920, 1080)));
+        // So does a frame with no fovea.
+        let (handed, rest) = watched((1000, 64), true, &[(0, 0, 64, 64), (500, 0, 64, 64)]);
+        assert!(handed.iter().all(Option::is_none));
+        assert_eq!(rest, Some(area(0, 0, 564, 64)));
+    }
+
+    #[test]
+    fn overlapping_center_rectangles_do_not_count_twice() {
+        // The first fovea rectangle twice and the sixth never: the pixels
+        // of the rectangles sum to the box's before it is covered.
+        let fovea = fovea_rects();
+        let mut rects = vec![fovea[0]];
+        rects.extend(&fovea[..5]);
+        rects.push((0, 0, 1920, 128));
+        let (handed, rest) = watched((1920, 1080), true, &rects);
+        assert!(handed[..6].iter().all(Option::is_none));
+        // The outside rectangle ends the center instead.
+        assert_eq!(handed[6], Some(area(640, 320, 640, 320)));
+        assert_eq!(rest, Some(area(0, 0, 1920, 128)));
+        assert_uploaded(&rects, &handed, rest);
+    }
+
+    #[test]
+    fn a_watch_starts_every_update_afresh() {
+        let mut watch = CenterWatch::new(1920, 1080);
+        for update in 0..3 {
+            // Center first, then bands from the top, then center first.
+            let rects = if update == 1 {
+                vec![(0, 0, 1920, 64), (640, 320, 640, 64)]
+            } else {
+                fovea_rects()
+            };
+            watch.begin(true);
+            let handed: Vec<_> = rects
+                .iter()
+                .map(|&(x, y, w, h)| watch.rectangle(x as u16, y as u16, w as u16, h as u16))
+                .collect();
+            let shown = handed.iter().flatten().count();
+            let rest = watch.finish();
+            if update == 1 {
+                assert_eq!((shown, rest), (0, Some(area(0, 0, 1920, 384))));
+            } else {
+                assert_eq!((shown, rest), (1, None));
+            }
+        }
+        // An update cut short in the middle of the center leaves nothing.
+        watch.begin(true);
+        assert!(watch.rectangle(640, 320, 640, 64).is_none());
+        watch.begin(true);
+        assert_eq!(watch.finish(), None);
     }
 }

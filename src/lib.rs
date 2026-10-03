@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 mod fovea;
 mod tight;
+pub use fovea::{CenterWatch, UploadArea};
 use tight::{TightDecoder, TightSettings};
 
 pub const MAX_FRAMEBUFFER_DIMENSION: u16 = 8192;
@@ -5538,6 +5539,88 @@ mod tests {
         // level 1, is coarser.
         assert!(worst[0] <= 24 && worst[0] < worst[2], "{worst:?}");
         assert!(worst[2] <= 64, "{worst:?}");
+        server.stop();
+    }
+
+    /// Copy `area` of `source` into `texture`, as a viewer uploads it.
+    fn upload_area(texture: &mut [u32], source: &Framebuffer, area: UploadArea) {
+        let stride = source.width();
+        for row in area.y..area.y + area.height {
+            let range = row * stride + area.x..row * stride + area.x + area.width;
+            texture[range.clone()].copy_from_slice(&source.pixels()[range]);
+        }
+    }
+
+    #[test]
+    fn viewer_presents_the_center_of_a_foveated_update_before_the_rest() {
+        let (width, height) = (640u16, 384u16);
+        let (server, address) = start_server(
+            grainy_frame(width, height),
+            ServerConfig {
+                allow_insecure: true,
+                foveation: Foveation::On,
+                ..ServerConfig::default()
+            },
+        );
+        let mut session = Session::connect_with_encoding(
+            &address.to_string(),
+            true,
+            Encoding::Tight { quality: 6 },
+            || unreachable!(),
+        )
+        .unwrap();
+        let writer = session.writer();
+        let mut received = Framebuffer::new(width, height).unwrap();
+        // The GPU texture, blank at first, and a copy of it from the moment
+        // the center went up.
+        let mut texture = vec![0u32; usize::from(width) * usize::from(height)];
+        let mut at_center = None;
+        let mut watch = CenterWatch::new(width, height);
+        let mut scratch = Vec::new();
+        writer.request_update(false, width, height).unwrap();
+        for _ in 0..8 {
+            watch.begin(true);
+            let mut rectangles = 0;
+            session
+                .read_update_pipelined(&mut scratch, |x, y, w, h, bytes| {
+                    received.apply_raw(x, y, w, h, bytes)?;
+                    rectangles += 1;
+                    if let Some(area) = watch.rectangle(x, y, w, h) {
+                        upload_area(&mut texture, &received, area);
+                        at_center = Some((rectangles, area, texture.clone()));
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            if let Some(area) = watch.finish() {
+                upload_area(&mut texture, &received, area);
+            }
+            if rectangles > 0 {
+                break;
+            }
+        }
+        let (rectangles, area, shown) = at_center.expect("the center went up before the end");
+        // A 640x384 frame's fovea is two 256x64 rectangles, sent first.
+        let fovea = UploadArea {
+            x: 192,
+            y: 128,
+            width: 256,
+            height: 128,
+        };
+        assert_eq!((rectangles, area), (2, fovea));
+        // When the center went up, it was the only part of the new frame on
+        // the texture.
+        assert!(received.pixels().iter().all(|pixel| *pixel != 0));
+        for (index, (shown, new)) in shown.iter().zip(received.pixels()).enumerate() {
+            let (x, y) = (index % usize::from(width), index / usize::from(width));
+            if (192..448).contains(&x) && (128..256).contains(&y) {
+                assert_eq!(shown, new, "center pixel ({x}, {y})");
+            } else {
+                assert_eq!(*shown, 0, "pixel ({x}, {y}) went up early");
+            }
+        }
+        // The rest followed, so the texture ends up as the whole frame.
+        assert_eq!(texture, received.pixels());
         server.stop();
     }
 

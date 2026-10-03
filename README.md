@@ -27,9 +27,10 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
   - When the host hides its cursor, as games do while you aim, the viewer locks and hides its pointer and sends raw relative motion, so the camera turns freely. This uses the QEMU Pointer Motion Change extension.
   - **F8** or switching to another app releases the pointer.
   - The back and forward side buttons reach the host too (ExtendedMouseButtons).
-- **GPU presentation** with winit and wgpu. Each frame is presented as soon as it arrives, without waiting for vertical sync, and scaled on the GPU. Input is sent as the system delivers it.
+- **GPU presentation** with winit and wgpu. A presenter thread shows each frame as soon as the network thread has uploaded it, without waiting for vertical sync or for the window's event loop, and scaled on the GPU. Input is sent as the system delivers it.
 - **Parallel encoding and decoding.** The server encodes a frame in bands on every core and sends each band as soon as it is ready. The viewer decodes JPEG bands in parallel.
 - **Foveated encoding for first-person games.** While a game has captured the mouse, the server encodes the center of the screen, where the crosshair is, first and at the viewer's quality. It lowers quality toward the edges as far as the link needs. On an emulated 150 Mbit/s link at 120 fps, frames arrive at about 106 fps instead of 50, and the time from input to a decoded frame that shows it falls from 57 to 37 ms. The updates are standard Tight. TopVNC's viewer is tested with them; other viewers are not yet.
+- **Early presentation of the center.** When an update starts with the center, as foveated updates do, the viewer uploads and presents the center as soon as it is complete, ahead of the rest of the update. On an emulated 300 Mbit/s link with a 97 fps scene, a Mac viewer put the center on screen 3.4–4.3 ms sooner (about 20.3 to 16.5 ms from publishing) and the edges 0.2–1.0 ms later. For a moment the center is a frame newer than the edges. It needs **No limit** in the frame limit setting.
 - **Keyboard and mouse input** for interacting with the remote desktop. Keys are sent by their position on a US keyboard, as games expect.
 - **Adjustable display** with fit-to-window or native pixels, smooth or sharp scaling, full screen, and 60 FPS, 120 FPS, or no presentation limit.
 - **In-session settings** accessible through **F8**, including the encoding and JPEG quality, disconnect, and a resizable on-screen settings button.
@@ -128,7 +129,7 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 | Window edges | Drag to resize the viewer. |
 | Fit / 1:1 pixels | Scale the remote image to the window while preserving its aspect ratio, or show native pixels, centered and cropped when necessary. |
 | Full screen | Switch the viewer to full screen and back. |
-| 60 FPS / 120 FPS / No limit | Cap local presentation. **No limit**, the default, presents every frame as it arrives. This does not set the server's frame rate. |
+| 60 FPS / 120 FPS / No limit | Cap local presentation. **No limit**, the default, presents every frame as it arrives, and the center of a foveated update as soon as it is complete. A limit shows whole updates only, at most that often. This does not set the server's frame rate. |
 | Smooth / Sharp | Choose the scaling appearance. |
 | Encoding: Raw / Zlib / Tight JPEG | Switch the encoding without reconnecting; the server uses it from its next update. Servers without Zlib, including TopVNC's, send Raw instead. |
 | JPEG quality 0–9 | With Tight JPEG, trade image quality for bandwidth: 0 sends the least data, 9 looks best. Raw and Zlib are lossless and ignore it. |
@@ -184,7 +185,8 @@ For playable results:
 - **Read the title bar.** During a session, the viewer's title shows:
   - frames per second, KB per frame, and Mbit/s;
   - the encoding the server sends, and `push` when the server pushes frames;
-  - the mean time from a frame's arrival to its presentation.
+  - the mean time from a frame's upload to its presentation;
+  - with a foveating server and **No limit**, how far ahead of the rest of its update the center was presented, as `center 4.2 ms early`.
 
   If it says Raw, the server does not support Tight; without `push`, every frame waits a round trip.
 
@@ -198,7 +200,7 @@ Shooters such as Fortnite need mouse look, which works only with TopVNC's server
 - **Cap the game's frame rate a little below what the host's GPU can sustain.** Capture copies frames on the same GPU, and a GPU at 100% makes each capture wait behind the game's rendering.
 - **Play in borderless windowed mode,** which Desktop Duplication captures most reliably.
 - **Use a wired connection for the host.** On Wi-Fi, use Tight quality 3–4, or serve a high-resolution display at a reduced size.
-- **In the viewer,** use full screen and **No limit**. On macOS, turn off *Pointer acceleration* (System Settings → Mouse) so the same hand motion always turns the camera the same amount. Set sensitivity in the game.
+- **In the viewer,** use full screen and **No limit**; a frame limit also turns off the early presentation of the center. On macOS, turn off *Pointer acceleration* (System Settings → Mouse) so the same hand motion always turns the camera the same amount. Set sensitivity in the game.
 - **If the camera does not turn** because the game hides its cursor in a way Windows does not report, start the host with `--mouse relative`.
 - **Foveation** turns on by itself while the game has captured the mouse. On a Mac host, or for a game the automatic mode misses, use `--foveate on`.
 
@@ -247,8 +249,8 @@ cargo run
 | --- | --- |
 | [`src/lib.rs`](src/lib.rs) | Reusable RFB protocol handling, authentication, decoding, framebuffer state, and session logic. |
 | [`src/tight.rs`](src/tight.rs) | Tight encoding: the server's Fill, palette, JPEG, and zlib encoder and the client decoder. |
-| [`src/fovea.rs`](src/fovea.rs) | Foveated Tight: quality zones around the screen center, center-first rectangle order, and quality steps that follow the link's throughput. |
-| [`src/main.rs`](src/main.rs) | Native application, connection and session loops, input handling, and pointer lock. |
+| [`src/fovea.rs`](src/fovea.rs) | Foveated Tight: quality zones around the screen center, center-first rectangle order, quality steps that follow the link's throughput, and the viewer's tracker that finds when an update's center is complete. |
+| [`src/main.rs`](src/main.rs) | Native application, connection and session loops, input handling, pointer lock, and the presenter thread that shows each update as it is uploaded. |
 | [`src/window.rs`](src/window.rs) | winit event loop and wgpu presentation: windows, frame textures, and presenting without waiting for vertical sync. |
 | [`src/ui.rs`](src/ui.rs) | Connect and Server tabs and in-session settings UI. |
 | [`src/settings.rs`](src/settings.rs) | Saved connection details and platform-specific password storage. |
@@ -257,8 +259,9 @@ cargo run
 | [`src/macos_server.rs`](src/macos_server.rs) | macOS ScreenCaptureKit capture, Quartz keyboard/mouse injection, and pasteboard sync for the Server tab and `--serve`. |
 | [`build.rs`](build.rs) | Weak-links ScreenCaptureKit so the app still starts on macOS releases older than 12.3. |
 | [`examples/latency_bench.rs`](examples/latency_bench.rs) | End-to-end frame rate and latency benchmark over an emulated network link. |
-| [`examples/fovea_latency.rs`](examples/fovea_latency.rs) | End-to-end benchmark of foveated Tight on real game frames: center, full-update, and input latency. |
+| [`examples/fovea_latency.rs`](examples/fovea_latency.rs) | End-to-end benchmark of foveated Tight on real game frames: center, full-update, and input latency. With `--serve` it serves the scene, optionally through the emulated link, to a real viewer. |
 | [`tools/screen_latency.swift`](tools/screen_latency.swift) | macOS tool that measures the time until benchmark frames are displayed in a viewer window. |
+| [`tools/center_lead.swift`](tools/center_lead.swift) | macOS tool that compares what a viewer's window shows at the center and at the edge of a `fovea_latency --serve` scene: how often and by how much the center is ahead, and the time from publishing to each being on screen. |
 | [`specs/004-vnc-server/spec.md`](specs/004-vnc-server/spec.md) | Server scope, security behavior, and limitations. |
 | [`specs/`](specs/) | Feature scope and acceptance criteria. |
 

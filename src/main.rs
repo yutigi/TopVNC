@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
-    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, Encoding, Foveation, Framebuffer,
-    InputWriter, Session, StatsSnapshot, encoding_name,
+    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, CenterWatch, Encoding, Foveation,
+    Framebuffer, InputWriter, Session, StatsSnapshot, UploadArea, encoding_name,
 };
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -30,7 +30,7 @@ use ui::{
     Box2, Canvas, Compression, Config, Field, Quality, ServeRequest, ServerPhase, ServerView, Tab,
     UiState, WindowMode,
 };
-use window::{Draw, Layer, Presenter, Ui, UiEvent};
+use window::{Draw, Layer, Presenter, Ui, UiEvent, Waker};
 
 fn encoding(config: &Config) -> Encoding {
     match config.compression {
@@ -104,15 +104,6 @@ struct Rect {
 }
 
 impl Rect {
-    fn union(self, other: Self) -> Self {
-        Self {
-            x0: self.x0.min(other.x0),
-            y0: self.y0.min(other.y0),
-            x1: self.x1.max(other.x1),
-            y1: self.y1.max(other.y1),
-        }
-    }
-
     fn width(self) -> usize {
         self.x1 - self.x0
     }
@@ -1059,33 +1050,327 @@ fn show_landing(
 /// How often the title bar's statistics refresh.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
-/// When the oldest update the window thread has not yet presented finished
-/// uploading; set by the network thread.
+/// When the oldest update the presenter thread has not yet shown finished
+/// uploading; set by the network thread, which also wakes that thread.
 #[derive(Default)]
-struct Arrival(Mutex<Option<Instant>>);
+struct Arrival {
+    pending: Mutex<Option<Instant>>,
+    ready: Condvar,
+}
 
 impl Arrival {
     fn mark(&self) {
-        if let Ok(mut pending) = self.0.lock() {
+        if let Ok(mut pending) = self.pending.lock() {
             pending.get_or_insert_with(Instant::now);
+            self.ready.notify_one();
         }
     }
 
-    fn pending(&self) -> bool {
-        self.0.lock().is_ok_and(|pending| pending.is_some())
-    }
-
     fn take(&self) -> Option<Instant> {
-        self.0.lock().ok().and_then(|mut pending| pending.take())
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
     }
 
     /// Put back an arrival that could not be presented, keeping the older
     /// of it and any newer one.
     fn restore(&self, arrived: Option<Instant>) {
-        if let (Ok(mut pending), Some(arrived)) = (self.0.lock(), arrived) {
+        if let (Ok(mut pending), Some(arrived)) = (self.pending.lock(), arrived) {
             *pending = Some(pending.map_or(arrived, |newer| newer.min(arrived)));
         }
     }
+
+    /// Wait for an update and take when it arrived; `None` once `stop` is set.
+    fn wait(&self, stop: &AtomicBool) -> Option<Instant> {
+        let mut pending = self.pending.lock().ok()?;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(arrived) = pending.take() {
+                return Some(arrived);
+            }
+            pending = self.ready.wait(pending).ok()?;
+        }
+    }
+
+    /// Wake a thread in [`Arrival::wait`] after setting its stop flag.
+    fn wake(&self) {
+        drop(self.pending.lock());
+        self.ready.notify_all();
+    }
+}
+
+/// Lock `mutex`, going on after a thread panicked while holding it.
+fn acquire<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One layer of a frame: where it goes in the window, in physical pixels, and
+/// which part of it shows.
+#[derive(Clone)]
+struct LayerDraw<L = Arc<Layer>> {
+    layer: L,
+    target: [f64; 4],
+    source: [f64; 4],
+    smooth: bool,
+}
+
+/// The window's physical size and the layers drawn in it, in order.
+#[derive(Clone)]
+struct FrameLayout {
+    size: (u32, u32),
+    draws: Vec<LayerDraw>,
+}
+
+impl FrameLayout {
+    fn draw(&self, presenter: &mut Presenter) -> Result<bool, Box<dyn Error>> {
+        let draws: Vec<Draw<'_>> = self
+            .draws
+            .iter()
+            .map(|draw| Draw {
+                layer: &draw.layer,
+                target: draw.target,
+                source: draw.source,
+                smooth: draw.smooth,
+            })
+            .collect();
+        presenter.draw_at(self.size, &draws)
+    }
+}
+
+/// The layers of a frame for a window of `logical` size at `scale`: the
+/// remote image, placed by `mode`, and the settings overlay in its `Box2`.
+fn frame_layers<L: Clone>(
+    image: &L,
+    smooth_image: bool,
+    overlay: Option<(&L, Box2)>,
+    mode: WindowMode,
+    remote: (usize, usize),
+    logical: (usize, usize),
+    scale: f64,
+) -> Vec<LayerDraw<L>> {
+    let physical = |x: usize, y: usize, w: usize, h: usize| {
+        [
+            x as f64 * scale,
+            y as f64 * scale,
+            w as f64 * scale,
+            h as f64 * scale,
+        ]
+    };
+    let mut draws = Vec::with_capacity(2);
+    if let Some((target, source)) = placement(mode, remote, logical) {
+        draws.push(LayerDraw {
+            layer: image.clone(),
+            target: physical(target.x0, target.y0, target.width(), target.height()),
+            source: [
+                source.x0 as f64,
+                source.y0 as f64,
+                source.width() as f64,
+                source.height() as f64,
+            ],
+            smooth: smooth_image,
+        });
+    }
+    if let Some((layer, area)) = overlay {
+        draws.push(LayerDraw {
+            layer: layer.clone(),
+            target: physical(area.x, area.y, area.w, area.h),
+            source: [area.x as f64, area.y as f64, area.w as f64, area.h as f64],
+            smooth: scale.fract() != 0.0,
+        });
+    }
+    draws
+}
+
+/// State the window thread shares with the presenter thread, which shows
+/// each update as the network thread uploads it instead of when the window
+/// thread's event loop next runs. On macOS that loop returns no more often
+/// than the display refreshes, which is less often than an update's center
+/// and the rest of it need presenting.
+struct PresentShared {
+    arrival: Arrival,
+    /// Ends the presenter thread.
+    stop: AtomicBool,
+    /// The window is minimized or fully covered.
+    occluded: AtomicBool,
+    /// The FPS limit, or 0 for none.
+    fps: AtomicUsize,
+    /// Whether the network thread may upload the center of an update before
+    /// the rest of it has arrived.
+    early: AtomicBool,
+    /// What to draw, set by the window thread whenever it changes.
+    layout: Mutex<Option<FrameLayout>>,
+    /// Time from an update's upload to its presentation, summed since the
+    /// title last changed, and the number of presentations.
+    to_present: Mutex<(Duration, u32)>,
+}
+
+impl PresentShared {
+    fn new(fps: usize) -> Self {
+        Self {
+            arrival: Arrival::default(),
+            stop: AtomicBool::new(false),
+            occluded: AtomicBool::new(false),
+            fps: AtomicUsize::new(fps),
+            // With a frame limit, presentation waits for the next slot
+            // whichever part of an update arrived, so showing the center
+            // early would only leave the rest of the update a frame behind.
+            early: AtomicBool::new(fps == 0),
+            layout: Mutex::new(None),
+            to_present: Mutex::new((Duration::ZERO, 0)),
+        }
+    }
+}
+
+/// Show each update as the network thread uploads it, until `shared.stop` is
+/// set. `draw` draws a layout and says whether the window could take the
+/// frame; its error ends the loop.
+fn present_frames(
+    shared: &PresentShared,
+    mut draw: impl FnMut(&FrameLayout) -> Result<bool, String>,
+) -> Result<(), String> {
+    let mut last_present: Option<Instant> = None;
+    // No drawing before this, after the window could not take a frame.
+    let mut retry_at = Instant::now();
+    while let Some(arrived) = shared.arrival.wait(&shared.stop) {
+        let interval = match shared.fps.load(Ordering::Relaxed) {
+            0 => Duration::ZERO,
+            fps => Duration::from_secs_f64(1.0 / fps as f64),
+        };
+        let due = last_present.map_or(retry_at, |at| (at + interval).max(retry_at));
+        let now = Instant::now();
+        if due > now {
+            thread::sleep(due - now);
+            if shared.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+        }
+        // Updates that arrived meanwhile are part of this frame.
+        shared.arrival.take();
+        let layout = if shared.occluded.load(Ordering::Relaxed) {
+            None
+        } else {
+            acquire(&shared.layout).clone()
+        };
+        let shown = match layout {
+            Some(layout) => draw(&layout)?,
+            None => false,
+        };
+        let now = Instant::now();
+        if shown {
+            last_present = Some(now);
+            let mut total = acquire(&shared.to_present);
+            total.0 += now.saturating_duration_since(arrived);
+            total.1 += 1;
+        } else {
+            shared.arrival.restore(Some(arrived));
+            retry_at = now + RETRY_INTERVAL;
+        }
+    }
+    Ok(())
+}
+
+/// The presenter thread. Dropping it stops and joins the thread, so drop it
+/// before the window and presenter it uses.
+struct PresentThread {
+    shared: Arc<PresentShared>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PresentThread {
+    /// An error in presenting goes to `errors`, and `waker` wakes the window
+    /// thread to read it.
+    fn spawn(
+        presenter: Arc<Mutex<Presenter>>,
+        shared: Arc<PresentShared>,
+        errors: mpsc::Sender<String>,
+        waker: Waker,
+    ) -> std::io::Result<Self> {
+        let thread_shared = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("topvnc-present".into())
+            .spawn(move || {
+                let result = present_frames(&thread_shared, |layout| {
+                    layout
+                        .draw(&mut acquire(&presenter))
+                        .map_err(|error| error.to_string())
+                });
+                if let Err(message) = result {
+                    let _ = errors.send(message);
+                    waker.wake();
+                }
+            })?;
+        Ok(Self {
+            shared,
+            handle: Some(handle),
+        })
+    }
+
+    /// Whether the thread has ended, as after a panic.
+    fn stopped(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+    }
+}
+
+impl Drop for PresentThread {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        self.shared.arrival.wake();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// How far ahead of the rest of their updates centers reached the GPU,
+/// summed since the title last changed, and the number of updates; set by
+/// the network thread.
+#[derive(Default)]
+struct CenterLead(Mutex<(Duration, u32)>);
+
+impl CenterLead {
+    fn add(&self, lead: Duration) {
+        if let Ok(mut total) = self.0.lock() {
+            total.0 += lead;
+            total.1 += 1;
+        }
+    }
+
+    fn take(&self) -> (Duration, u32) {
+        self.0
+            .lock()
+            .map(|mut total| std::mem::take(&mut *total))
+            .unwrap_or_default()
+    }
+}
+
+/// The title's note on how early centers were presented, for the updates
+/// that had one, or nothing.
+fn center_status((total, updates): (Duration, u32)) -> Option<String> {
+    (updates > 0).then(|| {
+        format!(
+            " · center {:.1} ms early",
+            (total / updates).as_secs_f64() * 1e3
+        )
+    })
+}
+
+/// Upload `area` of `framebuffer` to the image.
+fn upload(image: &Layer, framebuffer: &Framebuffer, area: UploadArea) {
+    image.upload(
+        framebuffer.pixels(),
+        framebuffer.width(),
+        area.x,
+        area.y,
+        area.width,
+        area.height,
+    );
 }
 
 /// How long to wait before drawing again when the window could not take a
@@ -1096,7 +1381,7 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(16);
 struct Overlay {
     pixels: Vec<u32>,
     size: (usize, usize),
-    layer: Layer,
+    layer: Arc<Layer>,
 }
 
 /// The window's size in logical pixels, which the settings overlay, Fit and
@@ -1178,13 +1463,16 @@ fn run_session_inner(
             .with_inner_size(LogicalSize::new(initial.0 as f64, initial.1 as f64))
             .with_resizable(true),
     )?;
-    let mut presenter = Presenter::new(ui, Arc::clone(&window))?;
-    let image = Arc::new(presenter.layer(u32::from(info.width), u32::from(info.height)));
-    let arrival = Arc::new(Arrival::default());
+    let presenter = Arc::new(Mutex::new(Presenter::new(ui, Arc::clone(&window))?));
+    let image = Arc::new(acquire(&presenter).layer(u32::from(info.width), u32::from(info.height)));
+    let shared = Arc::new(PresentShared::new(config.fps));
+    let center_lead = Arc::new(CenterLead::default());
     let (error_tx, error_rx) = mpsc::channel();
+    let (present_error_tx, present_error_rx) = mpsc::channel();
     {
         let image = Arc::clone(&image);
-        let arrival = Arc::clone(&arrival);
+        let shared = Arc::clone(&shared);
+        let center_lead = Arc::clone(&center_lead);
         let writer = writer.clone();
         let waker = ui.waker();
         let (width, height) = (info.width, info.height);
@@ -1193,35 +1481,33 @@ fn run_session_inner(
             .spawn(move || {
                 let result: std::io::Result<()> = (|| {
                     // Updates are decoded into this thread's own framebuffer
-                    // and uploaded whole, so the window thread never copies
-                    // or scales pixels, and never shows half an update.
+                    // and uploaded from it, so the window thread never copies
+                    // or scales pixels. An update goes up whole, except that
+                    // a server that sends the screen center first (spec 008)
+                    // has the center uploaded and presented as soon as it is
+                    // complete, ahead of the rest of the update.
                     let mut framebuffer = Framebuffer::new(width, height)?;
+                    let mut watch = CenterWatch::new(width, height);
                     let mut scratch = Vec::new();
                     writer.request_update(false, width, height)?;
                     loop {
-                        let mut changed: Option<Rect> = None;
+                        watch.begin(shared.early.load(Ordering::Relaxed));
+                        let mut early = None;
                         session.read_update_pipelined(&mut scratch, |x, y, w, h, bytes| {
                             framebuffer.apply_raw(x, y, w, h, bytes)?;
-                            let rect = Rect {
-                                x0: usize::from(x),
-                                y0: usize::from(y),
-                                x1: usize::from(x) + usize::from(w),
-                                y1: usize::from(y) + usize::from(h),
-                            };
-                            changed = Some(changed.map_or(rect, |area| area.union(rect)));
+                            if let Some(area) = watch.rectangle(x, y, w, h) {
+                                upload(&image, &framebuffer, area);
+                                early = Some(Instant::now());
+                                shared.arrival.mark();
+                            }
                             Ok(())
                         })?;
-                        if let Some(area) = changed {
-                            image.upload(
-                                framebuffer.pixels(),
-                                framebuffer.width(),
-                                area.x0,
-                                area.y0,
-                                area.width(),
-                                area.height(),
-                            );
-                            arrival.mark();
-                            waker.wake();
+                        if let Some(area) = watch.finish() {
+                            upload(&image, &framebuffer, area);
+                            if let Some(early) = early {
+                                center_lead.add(early.elapsed());
+                            }
+                            shared.arrival.mark();
                         }
                     }
                 })();
@@ -1229,6 +1515,14 @@ fn run_session_inner(
                 waker.wake();
             })?;
     }
+    // Shows each update as it is uploaded. Declared after the window and the
+    // presenter so that it stops before they drop.
+    let present = PresentThread::spawn(
+        Arc::clone(&presenter),
+        Arc::clone(&shared),
+        present_error_tx,
+        ui.waker(),
+    )?;
 
     let mut overlay: Option<Overlay> = None;
     let mut overlay_changed = true;
@@ -1250,28 +1544,19 @@ fn run_session_inner(
     // A minimized or fully covered window draws nothing until it is shown.
     let mut occluded = false;
     let mut redraw = true;
-    let mut last_present = Instant::now()
-        .checked_sub(STATS_INTERVAL)
-        .unwrap_or_else(Instant::now);
     // No drawing before this, after the window could not take a frame.
     let mut retry_at = Instant::now();
     let mut last_stats = (Instant::now(), stats.snapshot());
-    // Time from an update's upload to its presentation, summed since the
-    // title last changed, and the number of updates.
-    let mut to_present = (Duration::ZERO, 0u32);
     loop {
-        let frame_interval = if config.fps == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs_f64(1.0 / config.fps as f64)
-        };
+        // The presenter thread paces and shows updates; this thread draws
+        // when the window, the overlay, or the layout changes.
+        shared.fps.store(config.fps, Ordering::Relaxed);
+        shared.early.store(config.fps == 0, Ordering::Relaxed);
         let now = Instant::now();
-        // Sleep until input arrives, a frame arrives, the frame limit allows
-        // a waiting frame, or the statistics are due.
-        let timeout = if (arrival.pending() || redraw) && !occluded {
-            (last_present + frame_interval)
-                .max(retry_at)
-                .saturating_duration_since(now)
+        // Sleep until input arrives, a redraw is due, or the statistics are
+        // due. Frames do not wake this thread.
+        let timeout = if redraw && !occluded {
+            retry_at.saturating_duration_since(now)
         } else {
             (last_stats.0 + STATS_INTERVAL).saturating_duration_since(now)
         };
@@ -1301,6 +1586,7 @@ fn run_session_inner(
                         }
                         WindowEvent::Occluded(now_occluded) => {
                             occluded = now_occluded;
+                            shared.occluded.store(now_occluded, Ordering::Relaxed);
                             redraw = true;
                             overlay_changed = true;
                         }
@@ -1547,6 +1833,12 @@ fn run_session_inner(
         if let Ok(result) = error_rx.try_recv() {
             return Ok(result.err().map(|error| error.to_string()));
         }
+        if let Ok(message) = present_error_rx.try_recv() {
+            return Err(message.into());
+        }
+        if present.stopped() {
+            return Err("the presenter thread stopped".into());
+        }
         // Games that turn the camera with the mouse hide the host's cursor;
         // the host then asks for relative motion, and the pointer locks.
         let lock = config.relative_mouse && focused && !settings_open && writer.relative_pointer();
@@ -1565,28 +1857,26 @@ fn run_session_inner(
                 "{title} — {}",
                 throughput(last_stats.1, now.1, now.0 - last_stats.0)
             );
-            if to_present.1 > 0 {
+            let (spent, presented) = std::mem::take(&mut *acquire(&shared.to_present));
+            if presented > 0 {
                 status += &format!(
                     " · {:.1} ms to present",
-                    (to_present.0 / to_present.1).as_secs_f64() * 1e3
+                    (spent / presented).as_secs_f64() * 1e3
                 );
             }
+            status += &center_status(center_lead.take()).unwrap_or_default();
             if locked {
                 status += " · mouse locked, F8 releases";
             }
             window.set_title(&status);
             last_stats = now;
-            to_present = (Duration::ZERO, 0);
         }
-        if !(arrival.pending() || redraw)
-            || occluded
-            || Instant::now() < (last_present + frame_interval).max(retry_at)
-        {
+        if !redraw || occluded || Instant::now() < retry_at {
             continue;
         }
-        let arrived = arrival.take();
         let logical = logical_size(&window);
         let scale = window.scale_factor();
+        let physical = window.inner_size();
         if overlay
             .as_ref()
             .is_some_and(|overlay| overlay.size != logical)
@@ -1598,7 +1888,7 @@ fn run_session_inner(
             Overlay {
                 pixels: vec![0; logical.0 * logical.1],
                 size: logical,
-                layer: presenter.layer(logical.0 as u32, logical.1 as u32),
+                layer: Arc::new(acquire(&presenter).layer(logical.0 as u32, logical.1 as u32)),
             }
         });
         // The settings button hides while the pointer is locked, so it never
@@ -1622,46 +1912,24 @@ fn run_session_inner(
                 .upload(&overlay.pixels, logical.0, area.x, area.y, area.w, area.h);
         }
         overlay_changed = false;
-        let physical = |x: usize, y: usize, w: usize, h: usize| {
-            [
-                x as f64 * scale,
-                y as f64 * scale,
-                w as f64 * scale,
-                h as f64 * scale,
-            ]
+        let layout = FrameLayout {
+            size: (physical.width, physical.height),
+            draws: frame_layers(
+                &image,
+                config.quality == Quality::Smooth,
+                area.map(|area| (&overlay.layer, area)),
+                config.window_mode,
+                remote,
+                logical,
+                scale,
+            ),
         };
-        let mut draws = Vec::with_capacity(2);
-        if let Some((target, source)) = placement(config.window_mode, remote, logical) {
-            draws.push(Draw {
-                layer: &image,
-                target: physical(target.x0, target.y0, target.width(), target.height()),
-                source: [
-                    source.x0 as f64,
-                    source.y0 as f64,
-                    source.width() as f64,
-                    source.height() as f64,
-                ],
-                smooth: config.quality == Quality::Smooth,
-            });
-        }
-        if let Some(area) = area {
-            draws.push(Draw {
-                layer: &overlay.layer,
-                target: physical(area.x, area.y, area.w, area.h),
-                source: [area.x as f64, area.y as f64, area.w as f64, area.h as f64],
-                smooth: scale.fract() != 0.0,
-            });
-        }
-        if !presenter.draw(&draws)? {
-            arrival.restore(arrived);
-            redraw = true;
+        let shown = layout.draw(&mut acquire(&presenter))?;
+        // The presenter thread draws this layout for every update from now on.
+        *acquire(&shared.layout) = Some(layout);
+        if !shown {
             retry_at = Instant::now() + RETRY_INTERVAL;
             continue;
-        }
-        last_present = Instant::now();
-        if let Some(arrived) = arrived {
-            to_present.0 += last_present.saturating_duration_since(arrived);
-            to_present.1 += 1;
         }
         redraw = false;
     }
@@ -1819,6 +2087,252 @@ mod tests {
             throughput(before, before, std::time::Duration::from_secs(1)),
             "0 fps · 0 KB/frame · 0 Mbit/s · waiting"
         );
+    }
+
+    #[test]
+    fn title_reports_how_early_centers_were_presented() {
+        // Nothing is said while no update had its center shown early.
+        assert_eq!(center_status((Duration::ZERO, 0)), None);
+        // Three updates whose centers went up 8.1 ms before the rest, together.
+        assert_eq!(
+            center_status((Duration::from_micros(8_100), 3)),
+            Some(" · center 2.7 ms early".to_string())
+        );
+        let lead = CenterLead::default();
+        lead.add(Duration::from_millis(2));
+        lead.add(Duration::from_millis(4));
+        assert_eq!(lead.take(), (Duration::from_millis(6), 2));
+        assert_eq!(lead.take(), (Duration::ZERO, 0));
+    }
+
+    #[test]
+    fn frame_layers_scale_the_image_and_the_overlay_to_the_window() {
+        // A 1920x1080 remote fitted to a 960x540 point window on a 2x
+        // display: the image fills the 1920x1080 pixel surface.
+        let overlay = Box2 {
+            x: 10,
+            y: 20,
+            w: 100,
+            h: 40,
+        };
+        let draws = frame_layers(
+            &'i',
+            true,
+            Some((&'o', overlay)),
+            WindowMode::Fit,
+            (1920, 1080),
+            (960, 540),
+            2.0,
+        );
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].layer, 'i');
+        assert_eq!(draws[0].target, [0.0, 0.0, 1920.0, 1080.0]);
+        assert_eq!(draws[0].source, [0.0, 0.0, 1920.0, 1080.0]);
+        assert!(draws[0].smooth);
+        assert_eq!(draws[1].layer, 'o');
+        assert_eq!(draws[1].target, [20.0, 40.0, 200.0, 80.0]);
+        assert_eq!(draws[1].source, [10.0, 20.0, 100.0, 40.0]);
+        // Whole-number scales sample the overlay without filtering.
+        assert!(!draws[1].smooth);
+        // A fractional scale filters it; no overlay leaves the image alone.
+        let draws = frame_layers(
+            &'i',
+            false,
+            Some((&'o', overlay)),
+            WindowMode::Fit,
+            (1920, 1080),
+            (960, 540),
+            1.5,
+        );
+        assert!(!draws[0].smooth && draws[1].smooth);
+        let draws = frame_layers(&'i', true, None, WindowMode::Fit, (4, 2), (400, 400), 1.0);
+        assert_eq!(draws.len(), 1);
+        // Letterboxed: the image is centered with its aspect.
+        assert_eq!(draws[0].target, [0.0, 100.0, 400.0, 200.0]);
+        // Native size crops around the center instead of scaling.
+        let draws = frame_layers(
+            &'i',
+            true,
+            None,
+            WindowMode::Native,
+            (200, 100),
+            (100, 100),
+            2.0,
+        );
+        assert_eq!(draws[0].target, [0.0, 0.0, 200.0, 200.0]);
+        assert_eq!(draws[0].source, [50.0, 0.0, 100.0, 100.0]);
+    }
+
+    #[test]
+    fn arrival_keeps_the_oldest_time_and_wakes_a_waiter_to_stop() {
+        let arrival = Arrival::default();
+        assert_eq!(arrival.take(), None);
+        arrival.mark();
+        let first = arrival.take().unwrap();
+        arrival.mark();
+        let second = arrival.take().unwrap();
+        assert!(second >= first);
+        // A put-back arrival keeps the older of it and a newer one.
+        arrival.mark();
+        arrival.restore(Some(first));
+        assert_eq!(arrival.take(), Some(first));
+        // A waiter returns the arrival, and `None` after stop.
+        let arrival = Arc::new(Arrival::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (arrival, stop) = (Arc::clone(&arrival), Arc::clone(&stop));
+            thread::spawn(move || (arrival.wait(&stop), arrival.wait(&stop)))
+        };
+        thread::sleep(Duration::from_millis(20));
+        arrival.mark();
+        thread::sleep(Duration::from_millis(20));
+        stop.store(true, Ordering::Release);
+        arrival.wake();
+        let (arrived, stopped) = waiter.join().unwrap();
+        assert!(arrived.is_some());
+        assert_eq!(stopped, None);
+    }
+
+    fn test_layout() -> FrameLayout {
+        FrameLayout {
+            size: (100, 50),
+            draws: Vec::new(),
+        }
+    }
+
+    /// Run the presenter loop on a thread with `draw`.
+    fn run_presenter(
+        shared: &Arc<PresentShared>,
+        draw: impl FnMut(&FrameLayout) -> Result<bool, String> + Send + 'static,
+    ) -> thread::JoinHandle<Result<(), String>> {
+        let shared = Arc::clone(shared);
+        thread::spawn(move || present_frames(&shared, draw))
+    }
+
+    fn stop_presenter(shared: &PresentShared) {
+        shared.stop.store(true, Ordering::Release);
+        shared.arrival.wake();
+    }
+
+    fn wait_for(condition: impl Fn() -> bool) -> bool {
+        for _ in 0..500 {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        false
+    }
+
+    /// Instants at which a presenter loop drew, for `run_presenter`.
+    fn drawn_at(
+        times: &Arc<Mutex<Vec<Instant>>>,
+        result: bool,
+    ) -> impl FnMut(&FrameLayout) -> Result<bool, String> + Send + 'static {
+        let times = Arc::clone(times);
+        move |_| {
+            times.lock().unwrap().push(Instant::now());
+            Ok(result)
+        }
+    }
+
+    #[test]
+    fn presenter_shows_each_upload_at_once_without_a_limit() {
+        let shared = Arc::new(PresentShared::new(0));
+        *acquire(&shared.layout) = Some(test_layout());
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let handle = run_presenter(&shared, drawn_at(&times, true));
+        // The center of an update, then the rest of it 4 ms later: each one
+        // is shown at once, not at a frame boundary.
+        shared.arrival.mark();
+        assert!(wait_for(|| times.lock().unwrap().len() == 1));
+        thread::sleep(Duration::from_millis(4));
+        let marked = Instant::now();
+        shared.arrival.mark();
+        assert!(wait_for(|| times.lock().unwrap().len() == 2));
+        let second = times.lock().unwrap()[1];
+        assert!(second.duration_since(marked) < Duration::from_millis(10));
+        assert_eq!(acquire(&shared.to_present).1, 2);
+        stop_presenter(&shared);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn presenter_keeps_to_the_frame_limit_and_merges_updates() {
+        // 50 fps: one frame per 20 ms.
+        let shared = Arc::new(PresentShared::new(50));
+        *acquire(&shared.layout) = Some(test_layout());
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let handle = run_presenter(&shared, drawn_at(&times, true));
+        shared.arrival.mark();
+        assert!(wait_for(|| times.lock().unwrap().len() == 1));
+        // Five uploads inside the first interval make one more frame.
+        for _ in 0..5 {
+            shared.arrival.mark();
+            thread::sleep(Duration::from_millis(2));
+        }
+        thread::sleep(Duration::from_millis(60));
+        let times = times.lock().unwrap().clone();
+        assert_eq!(times.len(), 2, "{times:?}");
+        assert!(times[1].duration_since(times[0]) >= Duration::from_millis(19));
+        stop_presenter(&shared);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn presenter_tries_again_after_a_frame_the_window_could_not_take() {
+        let shared = Arc::new(PresentShared::new(0));
+        *acquire(&shared.layout) = Some(test_layout());
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let handle = {
+            let times = Arc::clone(&times);
+            run_presenter(&shared, move |_| {
+                let mut times = times.lock().unwrap();
+                times.push(Instant::now());
+                // The window cannot take the first frame.
+                Ok(times.len() > 1)
+            })
+        };
+        shared.arrival.mark();
+        assert!(wait_for(|| times.lock().unwrap().len() == 2));
+        let times = times.lock().unwrap().clone();
+        assert!(times[1].duration_since(times[0]) >= RETRY_INTERVAL);
+        // Only the frame that was shown counts toward the statistic, and it
+        // is timed from the upload.
+        assert!(wait_for(|| acquire(&shared.to_present).1 == 1));
+        assert!(acquire(&shared.to_present).0 >= RETRY_INTERVAL);
+        stop_presenter(&shared);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn presenter_waits_for_a_layout_and_for_the_window_to_be_visible() {
+        let shared = Arc::new(PresentShared::new(0));
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let handle = run_presenter(&shared, drawn_at(&times, true));
+        // Nothing to draw yet.
+        shared.arrival.mark();
+        thread::sleep(Duration::from_millis(50));
+        assert!(times.lock().unwrap().is_empty());
+        // A covered window gets nothing either.
+        shared.occluded.store(true, Ordering::Relaxed);
+        *acquire(&shared.layout) = Some(test_layout());
+        thread::sleep(Duration::from_millis(50));
+        assert!(times.lock().unwrap().is_empty());
+        // Once visible, the update that waited is shown.
+        shared.occluded.store(false, Ordering::Relaxed);
+        assert!(wait_for(|| times.lock().unwrap().len() == 1));
+        stop_presenter(&shared);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn presenter_stops_on_a_drawing_error() {
+        let shared = Arc::new(PresentShared::new(0));
+        *acquire(&shared.layout) = Some(test_layout());
+        let handle = run_presenter(&shared, |_| Err("no surface".to_string()));
+        shared.arrival.mark();
+        assert_eq!(handle.join().unwrap(), Err("no surface".to_string()));
     }
 
     #[test]

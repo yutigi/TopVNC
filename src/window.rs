@@ -326,7 +326,12 @@ impl Presenter {
             // Present at once instead of at the next vertical blank: tearing
             // where the platform allows it, never a queue of finished frames.
             present_mode: wgpu::PresentMode::AutoNoVsync,
-            // Two drawables on Metal; one queued frame on DX12.
+            // Two drawables on Metal; one queued frame on DX12. Not three on
+            // Metal: unless something is capturing the window, Core Animation
+            // then paces presents to the display's refresh, so acquiring a
+            // frame waits about 8 ms, and a viewer that presents twice per
+            // update, the center and then the rest, is held to the refresh
+            // rate.
             desired_maximum_frame_latency: 1,
             alpha_mode: if capabilities
                 .alpha_modes
@@ -484,24 +489,38 @@ impl Presenter {
         }
     }
 
-    /// Match the surface to the window's current size.
-    pub fn resize(&mut self) {
-        let size = self.window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        if (size.width, size.height) != (self.config.width, self.config.height) {
-            self.config.width = size.width;
-            self.config.height = size.height;
+    /// Match the surface to a window of `width` by `height` physical pixels.
+    fn resize(&mut self, width: u32, height: u32) {
+        if (width, height) != (self.config.width, self.config.height) {
+            self.config.width = width;
+            self.config.height = height;
             self.surface.configure(&self.gpu.device, &self.config);
         }
     }
 
     /// Clear the window to black, draw `draws` in order, and present.
     /// Returns false when the window could not take a frame, as when it is
-    /// not yet on screen, minimized, or occluded; draw again later.
+    /// not yet on screen, minimized, or occluded; draw again later. Call it
+    /// on the thread that owns the window.
     pub fn draw(&mut self, draws: &[Draw<'_>]) -> Result<bool, Box<dyn Error>> {
-        self.resize();
+        let size = self.window.inner_size();
+        self.draw_at((size.width, size.height), draws)
+    }
+
+    /// Like [`Presenter::draw`] for a window of `size` physical pixels that
+    /// the caller knows. It calls no window method, so another thread can
+    /// present: on macOS a window method called elsewhere waits for the main
+    /// thread's event loop, which runs no more often than the display
+    /// refreshes.
+    pub fn draw_at(
+        &mut self,
+        (width, height): (u32, u32),
+        draws: &[Draw<'_>],
+    ) -> Result<bool, Box<dyn Error>> {
+        if width == 0 || height == 0 {
+            return Ok(false);
+        }
+        self.resize(width, height);
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -566,6 +585,10 @@ impl Presenter {
             }
         }
         self.gpu.queue.submit([encoder.finish()]);
+        // Lets Wayland schedule the next frame callback; a no-op elsewhere,
+        // and on macOS a call from another thread would wait for the main
+        // thread.
+        #[cfg(not(target_os = "macos"))]
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
         Ok(true)

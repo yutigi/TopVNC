@@ -12,10 +12,10 @@ This feature makes the server encode Tight updates **foveated**:
 
 The output is standard Tight: every JPEG rectangle carries its own quantization tables. Viewers need no change.
 
-The work lands in steps. This document records all of them, and the acceptance criteria below cover Step 1.
+The work lands in steps. This document records all of them, and the acceptance criteria below cover Steps 1 and 2.
 
 1. **Server (this change).** Zones, center-first order, rungs with throughput adaptation, periphery skipping, and the host options. On 2026-10-03 the user chose to bring the adaptive rungs and periphery skipping forward from Step 3 into Step 1.
-2. **Viewer early present.** The viewer presents the center as soon as its rectangles are decoded, instead of after the whole update. See [Next steps](#next-steps).
+2. **Viewer early present (done on 2026-10-03).** The viewer uploads and presents the center as soon as its rectangles are applied, instead of after the whole update, from a presenter thread. See [Viewer early present](#viewer-early-present).
 3. Merged into Step 1.
 4. **Codec.** Upgrade zune-jpeg, then reconsider optimized Huffman tables; measure a NEON JPEG encoder on macOS hosts.
 
@@ -132,6 +132,24 @@ An R&D session prototyped the feature (`prototype.patch` in this folder applies 
 - `topvnc --serve --foveate auto|on|off` chooses the mode. The default is `auto`. Missing, unknown, and repeated values are rejected.
 - The Server tab adds a **Foveation** row with **Auto**, **On**, and **Off** (default Auto). Like the other server settings, it is locked while the server runs and is not saved.
 
+### Viewer early present
+
+The viewer decodes each update into its own framebuffer on the network thread. It used to upload the update when it ended and wake the window thread, which presented it. For an update that starts with the center it now uploads the center earlier and a presenter thread shows each upload at once. Nothing changes on the wire.
+
+- **Tracker.** `CenterWatch` (`src/fovea.rs`) follows the rectangles of one update as the network thread applies them, in wire order.
+  - **Center box.** The fovea box of the framebuffer, which the server's zones define: the tiles `zone` puts in the fovea (x 640–1280, y 320–704 at 1080p).
+  - **Center-first.** An update counts as center-first when its first rectangle lies entirely inside the box. Bands sent from the top, one full-screen rectangle, and a rectangle that crosses the box's edge do not, so those updates are uploaded whole, as before.
+  - **Complete.** The center is complete when the rectangles inside the box cover its area, or, for an update that changes only part of the center, when the first rectangle outside the box arrives. A requested update can send a rectangle twice; once two rectangles in the box overlap, the area count is not trusted and only the second condition applies.
+  - **What goes up.** At that moment the viewer uploads the bounding box of what it has applied, and marks an arrival. When the update ends it uploads the bounding box of everything applied since, and marks another. Every applied rectangle is uploaded at least once after it was applied. An update that is only the center, or that never completes it, makes no second upload.
+- **No limit only.** With a frame limit, presentation waits for the next slot whichever part of an update arrived, so uploading the center early would only leave the rest a frame behind it. The viewer uploads whole updates while the limit is 60 or 120 FPS.
+- **Presenter thread.** A thread waits for arrivals and shows each at once, with the layout (surface size and layers) the window thread last published. The window thread draws, and publishes a layout, only when the window, the overlay, or the layout changes. Frames no longer wake it.
+  - **Why.** On macOS winit's `pump_app_events` completes at most once per display refresh: a probe of winit 0.30.13 made 119 calls a second on a 120 Hz display with a zero timeout, and wakes sent in pairs 4.3 ms apart waited 4 ms on average to be handled, with or without a window. A window thread woken twice per update by a 97 fps stream presented on 8.3 ms ticks, and `ms to present` rose from 0.7–0.9 to 5.2–5.7 ms, about as much as the center's lead. A presenter thread keeps it at 0.3–0.8 ms.
+  - **No window calls.** `Presenter::draw_at` takes the surface size and calls no window method, because on macOS a window method called from another thread waits for the main thread's event loop.
+  - **Pacing and retries.** It keeps the FPS limit, the 16 ms retry after a frame the window could not take, and the wait while the window is covered or no layout exists yet. Updates that arrive while it waits are part of the next frame.
+  - **Errors.** A presenting error, or the thread stopping, ends the session like a network error. Dropping the thread stops and joins it before the window and presenter are dropped.
+- **Two drawables.** `desired_maximum_frame_latency` stays 1, which is two drawables on Metal. With three, Core Animation paced presents to the display's refresh unless something was capturing the window: acquiring a frame waited about 8 ms, the viewer presented 120 times a second instead of 194, and `ms to present` read 13 ms.
+- **Title bar.** `center 4.2 ms early` is the mean time between an update's center being uploaded and the rest of it, over the updates since the title last changed that had both. It is absent without early uploads.
+
 ### Measurement
 
 - **`examples/fovea_latency.rs`** measures end to end, through the real server, an unmodified `Session`, and a local proxy that emulates a link. The proxy paces 8 KB slices with one-way delay.
@@ -146,6 +164,9 @@ An R&D session prototyped the feature (`prototype.patch` in this folder applies 
     - **input → full**: the same, to the end of the update that first shows it;
     - **periphery age**: how old the periphery is when an update completes.
   - It excludes the game, capture, the viewer's GPU upload and present (0.3–0.9 ms per spec 007), and display scan-out.
+- **`fovea_latency --serve HOST:PORT`** serves the panning frame to a real viewer, with foveation on (`--foveate auto|on|off`) and optionally through the same link emulation (`--link MBPS:DELAY_MS`, one viewer). The frame number is also drawn at the bottom-left, clear of the viewer's settings button. On macOS `--publish-log PATH` records each frame's publish time.
+- **`tools/center_lead.swift`** (macOS) captures a viewer's window with ScreenCaptureKit and reads the frame number at the center and at the bottom-left edge of every display frame. It reports how often the center is ahead and, with the publish log, the time from publishing to each being on screen. Use a frame rate that is not a divisor of the display's refresh rate (97 fps on 120 Hz) so the phases drift.
+- **`latency_bench --serve --foveate auto|on|off`** serves its synthetic scene with foveation, for the same purpose.
 - **`tight_codec_timing`** adds a foveated row for the synthetic frame.
 - `specs/008-foveated-tight/rnd/fetch_frames.py` downloads the five Wikimedia screenshots the R&D used and writes 1920×1080 `.rgb` files.
 
@@ -221,11 +242,43 @@ Recorded on 2026-10-03 on an M3 Max MacBook Pro (12 performance and 4 efficiency
    - Real networks: every link above is emulated.
    - The Server tab's Foveation row, clicked live.
 
+5. **Step 2: viewer early present.** Recorded on 2026-10-03 on the same Mac (built-in 120 Hz display). OBS Studio and its helpers used about half a core and WindowServer about a third throughout.
+   - **Checks.**
+     - `cargo test --workspace` passes: 92 library and 69 binary tests, plus 2 ignored timing tests. `cargo clippy --workspace --all-targets -- -D warnings` passes, as does the Windows-target clippy.
+     - **New tests** cover:
+       - the fovea box: its tiles at five frame sizes, and a frame too flat to have one;
+       - the tracker: a full center-first update (the center goes up after the sixth fovea rectangle, the rest at the end), bands from the top, a partial center, a center-only update, one rectangle completing the center, a rectangle crossing the box's edge, early presentation turned off, overlapping center rectangles, and reuse across updates;
+       - a TopVNC `Session` reading a foveated update from the server against a simulated texture: after the two fovea rectangles of a 640×384 frame the texture holds the center and nothing else, and it ends up equal to the frame;
+       - the viewer's layout geometry (fit, 1:1, the overlay at whole and fractional scales), the arrival time stamp and its stop, the presenter loop (prompt presentation without a limit, the frame limit and merging, retry, waiting for a layout and for a visible window, a drawing error), and the title note.
+   - **On screen** (`fovea_latency --serve` through its emulated link to a real viewer window of 1436×839 points, measured with `tools/center_lead.swift` over 10–12 s per row; the baseline viewer is the committed `6a2be31`, and the two alternate back to back). Foveation on, viewer at quality 6; the ladder settled near Balanced.
+
+     | Scene, link | Viewer | Published → center on screen | Published → edge on screen | Center ahead of the edge | Title: upload → present |
+     | --- | --- | --- | --- | --- | --- |
+     | 97 fps, 300 Mbit/s (4 ms), two pairs | baseline | 20.5 ms (p95 24.9), 20.2 ms (24.4) | the same as the center | never | 0.8 ms |
+     | | this change | 16.7 ms (21.0), 16.8 ms (21.4) | 21.2 ms (25.8), 21.2 ms (25.7) | 47% of display frames, by 4.5 ms | 0.6–0.8 ms, `center 4.2–4.3 ms early` |
+     | 144 fps, 1 Gbit/s (2 ms), two pairs | baseline | 16.7 ms (21.2), 16.2 ms (20.6) | the same as the center | never | 4.2 ms |
+     | | this change | 15.0 ms (20.2), 15.2 ms (20.3) | 16.8 ms (21.8), 16.9 ms (22.0) | 29–30% of display frames, by 1.8 ms | 2.8–3.6 ms, `center 2.4 ms early` |
+
+     - Three more pairs at 97 fps and 300 Mbit/s, on the build before it learned to notice a stopped presenter thread, agree: the center was 3.8–4.3 ms sooner (20.3, 19.7, 19.8 against 16.0, 15.9, 16.0 ms) and the edge 0.2–0.7 ms later. Across all five pairs the center is 3.4–4.3 ms (17–21%) sooner and the edge 0.2–1.0 ms later.
+     - Whole-frame numbers move a little between runs (the baseline's mean was 19.7–20.5 ms at 97 fps) while the machine's other load changes, so only pairs measured back to back are compared.
+     - At 144 fps the baseline's window thread is the limit: it presents in batches, so upload to present is 4.2 ms. The new viewer's center gains less because the update arrives sooner at 1 Gbit/s, and its second present sometimes waits for a drawable (see Found while testing).
+   - **In the app** (macOS, with real clicks): the settings panel stays visible over the streaming image; **60 FPS** turned the `center … early` note off and made `ms to present` read the limiter's wait (13.8 ms), and **No limit** brought both back; closing the panel restored the F8 button. Resizing the window from 1436×839 to 900×560 points and choosing **1:1 pixels** kept the image correct and the stream going.
+   - **A seam.** A still capture shows the center a frame ahead of the edges for part of the time. With the scene panning 23 pixels per frame the discontinuity at the fovea's edge is visible in a still, about 5 ms at a time at 97 fps. It is the cost of showing the center first, and a frame limit removes it.
+   - **Found while testing.**
+     - **The window thread cannot present twice per update.** On macOS winit's `pump_app_events` completes at most once per display refresh (119 calls a second at 120 Hz), so the first version, which woke the window thread for the center and again for the rest, presented on 8.3 ms ticks: `ms to present` read 5.4 ms against 0.8 ms, about as much as the center's lead. That is why presenting moved to its own thread.
+     - **Three drawables are slower in normal use.** With a ScreenCaptureKit stream of the viewer's window running, three drawables looked best (acquiring a frame took 0.02 ms). Without a capture, Core Animation paced presents to the refresh: acquiring waited 8 ms, 120 presents a second were made instead of 194, and `ms to present` read 13 ms. Two drawables acquire in 0.1–0.4 ms on average with and without a capture, with occasional waits of 3–6 ms.
+     - **A capture changes what it measures.** The on-screen tool needs a ScreenCaptureKit stream of the viewer, which changes how drawables are recycled. Check `ms to present` in the title with no capture running before trusting a capture-based number.
+   - **Not yet checked.**
+     - Windows and Linux viewers: the presenter thread and the changed surface calls are compiled and linted only.
+     - A 60 Hz display, other display scales, full screen, and a live game.
+     - Viewers on other servers: the first-rectangle rule should keep their updates whole, but only top-down bands were checked on screen (foveation off).
+
 ## Next steps
 
-1. **Viewer early present (Step 2).** Track the applied area during `read_update_pipelined`. Once the central box is covered, upload it and wake the window thread; upload the rest at the end of the update. Add center latency to the title bar, and verify live on macOS. A brief seam between new center and old periphery is inherent; `AutoNoVsync` already tears.
-2. **Codec (Step 4).** Upgrade zune-jpeg to 0.5.16 once it is stable, add a regression test that decodes a non-interleaved 4:2:0 JPEG, and only then consider optimized Huffman tables. Measure a NEON JPEG encoder (libjpeg-turbo) on macOS hosts.
-3. **Third-party viewers.** Test TigerVNC, TurboVNC, and noVNC with foveated updates before claiming support.
-4. **Pacing from arrival times.** Fence acknowledgements now carry the time they arrived, but pacing still uses the time the writer thread handled them, which can be milliseconds later. Switching would sharpen pacing, but it would change the latency numbers of specs 006 and 007.
-5. **The benches' link emulator** (Background item 6). Ask before changing it. It also credits up to 2 ms of idle time, which makes the delivery estimate read high near saturation (Validation status, item 3).
-6. **Encode-bound hosts.** Adaptation watches the link, not the encoder. A host too slow to encode every frame drops frames at any rung. The two most compact rungs encode a little less, but nothing steps down for that reason yet.
+1. **Drawable waits at high update rates.** With two drawables, acquiring a frame waits 3–6 ms now and then at 97 fps, and more often at 144 fps, where upload to present is 2.8–3.6 ms. Skipping the center's present while acquiring stalls would trade some of the gain for steadier edges. Measure before adding it.
+2. **Input through the same event loop.** The window thread's event loop is what delivers keyboard and mouse events, and it returns at most once per refresh on macOS (see Found while testing). That may batch mouse motion for up to one refresh. Not measured; if it holds, reading raw input off that loop would cut up to 8 ms.
+3. **Codec (Step 4).** Upgrade zune-jpeg to 0.5.16 once it is stable, add a regression test that decodes a non-interleaved 4:2:0 JPEG, and only then consider optimized Huffman tables. Measure a NEON JPEG encoder (libjpeg-turbo) on macOS hosts.
+4. **Third-party viewers.** Test TigerVNC, TurboVNC, and noVNC with foveated updates before claiming support.
+5. **Pacing from arrival times.** Fence acknowledgements now carry the time they arrived, but pacing still uses the time the writer thread handled them, which can be milliseconds later. Switching would sharpen pacing, but it would change the latency numbers of specs 006 and 007.
+6. **The benches' link emulator** (Background item 6). Ask before changing it. It also credits up to 2 ms of idle time, which makes the delivery estimate read high near saturation (Validation status, item 3).
+7. **Encode-bound hosts.** Adaptation watches the link, not the encoder. A host too slow to encode every frame drops frames at any rung. The two most compact rungs encode a little less, but nothing steps down for that reason yet.
