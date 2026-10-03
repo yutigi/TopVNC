@@ -1,4 +1,5 @@
 use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, normalize_serve_scale};
+use topvnc::Foveation;
 use winit::keyboard::KeyCode;
 
 pub const BG: u32 = 0x0b1020;
@@ -106,6 +107,9 @@ pub struct ServeForm {
     pub allow_insecure: bool,
     /// Served size as a fraction of the display's pixel size.
     pub scale: f32,
+    /// When to send the screen center sharper and first, for first-person
+    /// games.
+    pub foveation: Foveation,
 }
 
 impl Default for ServeForm {
@@ -117,6 +121,7 @@ impl Default for ServeForm {
             display: String::new(),
             allow_insecure: false,
             scale: 1.0,
+            foveation: Foveation::Auto,
         }
     }
 }
@@ -132,6 +137,7 @@ pub struct ServeRequest {
     pub allow_insecure: bool,
     /// Served size as a fraction of the display's pixel size.
     pub scale: f32,
+    pub foveation: Foveation,
 }
 
 impl ServeForm {
@@ -163,6 +169,7 @@ impl ServeForm {
             password,
             allow_insecure: self.allow_insecure,
             scale: normalize_serve_scale(self.scale),
+            foveation: self.foveation,
         })
     }
 }
@@ -583,10 +590,28 @@ pub const TAB_SERVER: Box2 = Box2 {
     w: 110,
     h: 36,
 };
-pub const SERVE_DISPLAY: Box2 = Box2 {
+pub const SERVE_FOVEATE_AUTO: Box2 = Box2 {
+    x: 400,
+    y: 280,
+    w: 76,
+    h: 36,
+};
+pub const SERVE_FOVEATE_ON: Box2 = Box2 {
+    x: 484,
+    y: 280,
+    w: 56,
+    h: 36,
+};
+pub const SERVE_FOVEATE_OFF: Box2 = Box2 {
     x: 548,
     y: 280,
-    w: 210,
+    w: 68,
+    h: 36,
+};
+pub const SERVE_DISPLAY: Box2 = Box2 {
+    x: 634,
+    y: 280,
+    w: 124,
     h: 36,
 };
 pub const LOCAL_ONLY: Box2 = Box2 {
@@ -795,7 +820,15 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
         canvas.text(45, 296, "X", BG, 2);
     }
     canvas.text(76, 296, "ALLOW NONE AUTHENTICATION", TEXT, 2);
-    canvas.label(548, 258, "DISPLAY");
+    canvas.label(SERVE_FOVEATE_AUTO.x, 258, "FOVEATION");
+    for (area, label, mode) in [
+        (SERVE_FOVEATE_AUTO, "AUTO", Foveation::Auto),
+        (SERVE_FOVEATE_ON, "ON", Foveation::On),
+        (SERVE_FOVEATE_OFF, "OFF", Foveation::Off),
+    ] {
+        canvas.button(area, label, form.foveation == mode);
+    }
+    canvas.label(SERVE_DISPLAY.x, 258, "DISPLAY");
     canvas.field(
         SERVE_DISPLAY,
         &form.display,
@@ -1381,6 +1414,50 @@ mod tests {
         assert_eq!(form.request().unwrap().address, "[::]:5900");
         form.port = "0".into();
         assert!(form.request().is_err());
+        form.port = "5900".into();
+        assert_eq!(form.request().unwrap().foveation, Foveation::Auto);
+        form.foveation = Foveation::Off;
+        assert_eq!(form.request().unwrap().foveation, Foveation::Off);
+    }
+
+    #[test]
+    fn server_tab_controls_fit_the_form_without_overlapping() {
+        let controls = [
+            HOST,
+            PORT,
+            PASSWORD,
+            INSECURE,
+            SERVE_FOVEATE_AUTO,
+            SERVE_FOVEATE_ON,
+            SERVE_FOVEATE_OFF,
+            SERVE_DISPLAY,
+            LOCAL_ONLY,
+            ALL_NETWORKS,
+            SERVE_SCALE_SLIDER,
+            SERVE_FULL_SIZE,
+            SERVE_HALF_SIZE,
+            SERVER_STATUS,
+            CONNECT,
+        ];
+        let overlap = |a: Box2, b: Box2| {
+            a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+        };
+        for (index, a) in controls.iter().enumerate() {
+            assert!(a.x + a.w <= 800 - 40 && a.y + a.h <= 640, "control {index}");
+            for (other, b) in controls.iter().enumerate().skip(index + 1) {
+                assert!(!overlap(*a, *b), "controls {index} and {other} overlap");
+            }
+        }
+        // Button labels fit inside their buttons, and the display field
+        // shows its placeholder.
+        for (area, label) in [
+            (SERVE_FOVEATE_AUTO, "AUTO"),
+            (SERVE_FOVEATE_ON, "ON"),
+            (SERVE_FOVEATE_OFF, "OFF"),
+        ] {
+            assert!(12 + label.len() * 12 <= area.w, "{label}");
+        }
+        assert!("PRIMARY".len() <= SERVE_DISPLAY.w.saturating_sub(28) / 12);
     }
 
     #[test]

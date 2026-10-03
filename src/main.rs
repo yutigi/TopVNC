@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
-    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, Encoding, Framebuffer, InputWriter,
-    Session, StatsSnapshot, encoding_name,
+    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, Encoding, Foveation, Framebuffer,
+    InputWriter, Session, StatsSnapshot, encoding_name,
 };
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -641,6 +641,7 @@ impl HostedServer {
             allow_insecure: request.allow_insecure,
             scale: request.scale,
             mouse: MouseMode::Auto,
+            foveation: request.foveation,
         };
         self.authenticated = request.password.is_some();
         let password = request.password;
@@ -946,6 +947,15 @@ fn show_landing(
                         }
                         if editable && ui::SERVE_HALF_SIZE.contains(x, y) {
                             serve.scale = 0.5;
+                        }
+                        for (area, foveation) in [
+                            (ui::SERVE_FOVEATE_AUTO, Foveation::Auto),
+                            (ui::SERVE_FOVEATE_ON, Foveation::On),
+                            (ui::SERVE_FOVEATE_OFF, Foveation::Off),
+                        ] {
+                            if editable && area.contains(x, y) {
+                                serve.foveation = foveation;
+                            }
                         }
                         if ui::CONNECT.contains(x, y) {
                             server_clicked = true;
@@ -1935,6 +1945,7 @@ mod tests {
             password: Some("secret".into()),
             allow_insecure: false,
             scale: 1.0,
+            foveation: Foveation::Auto,
         });
         assert_eq!(server.view.phase, ServerPhase::Starting);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

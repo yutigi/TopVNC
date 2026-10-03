@@ -219,6 +219,7 @@ pub fn serve(
         allow_insecure,
         scale,
         mouse,
+        foveation,
     } = options;
     require_supported_macos()?;
     require_screen_recording()?;
@@ -247,6 +248,7 @@ pub fn serve(
         allow_insecure,
         // Session, input, and encoder threads do not inherit QoS.
         thread_setup: Some(interactive_qos),
+        foveation,
     };
     let server = VncServer::bind(&address, framebuffer.clone(), config)
         .map_err(|error| bind_error(error, &address))?;

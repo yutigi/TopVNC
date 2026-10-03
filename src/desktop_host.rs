@@ -10,7 +10,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
-    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, MAX_FRAMEBUFFER_DIMENSION,
+    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, Foveation, MAX_FRAMEBUFFER_DIMENSION,
     MAX_FRAMEBUFFER_PIXELS,
 };
 
@@ -23,7 +23,7 @@ pub const WHEEL_DELTA: i32 = 120;
 pub const CAPTURE_RETRY_MIN: Duration = Duration::from_millis(250);
 pub const CAPTURE_RETRY_MAX: Duration = Duration::from_secs(2);
 
-pub const SERVE_USAGE: &str = "usage: topvnc --serve [HOST:PORT] [--display NUMBER] [--scale 0.25-1] [--mouse auto|relative|absolute] [--allow-insecure]";
+pub const SERVE_USAGE: &str = "usage: topvnc --serve [HOST:PORT] [--display NUMBER] [--scale 0.25-1] [--mouse auto|relative|absolute] [--foveate auto|on|off] [--allow-insecure]";
 
 /// The smallest served size, as a fraction of the display's pixel size.
 pub const MIN_SERVE_SCALE: f32 = 0.25;
@@ -40,6 +40,10 @@ pub struct ServeOptions {
     /// size in points.
     pub scale: f32,
     pub mouse: MouseMode,
+    /// When to encode Tight updates foveated around the screen center, for
+    /// first-person games. `Auto` follows relative pointer motion, which
+    /// Mac hosts ask for only with [`MouseMode::Relative`].
+    pub foveation: Foveation,
 }
 
 /// When the host asks viewers for relative pointer motion.
@@ -236,10 +240,12 @@ pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'sta
         allow_insecure: false,
         scale: 1.0,
         mouse: MouseMode::Auto,
+        foveation: Foveation::Auto,
     };
     let mut address_set = false;
     let mut scale_set = false;
     let mut mouse_set = false;
+    let mut foveation_set = false;
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -269,6 +275,15 @@ pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'sta
                     _ => return Err(SERVE_USAGE),
                 };
                 mouse_set = true;
+            }
+            "--foveate" if !foveation_set => {
+                options.foveation = match arguments.next().map(String::as_str) {
+                    Some("auto") => Foveation::Auto,
+                    Some("on") => Foveation::On,
+                    Some("off") => Foveation::Off,
+                    _ => return Err(SERVE_USAGE),
+                };
+                foveation_set = true;
             }
             _ if argument.starts_with('-') || address_set => return Err(SERVE_USAGE),
             _ => {
@@ -1457,6 +1472,7 @@ mod tests {
                 allow_insecure: false,
                 scale: 1.0,
                 mouse: MouseMode::Auto,
+                foveation: Foveation::Auto,
             })
         );
         assert_eq!(
@@ -1472,6 +1488,7 @@ mod tests {
                 allow_insecure: true,
                 scale: 1.0,
                 mouse: MouseMode::Auto,
+                foveation: Foveation::Auto,
             })
         );
         assert_eq!(
@@ -1492,6 +1509,17 @@ mod tests {
                 Ok(mode)
             );
         }
+        for (value, foveation) in [
+            ("auto", Foveation::Auto),
+            ("on", Foveation::On),
+            ("off", Foveation::Off),
+        ] {
+            assert_eq!(
+                parse_serve_arguments(&arguments(&["--foveate", value]))
+                    .map(|options| options.foveation),
+                Ok(foveation)
+            );
+        }
         for invalid in [
             &["--display"][..],
             &["--display", "0"],
@@ -1505,6 +1533,9 @@ mod tests {
             &["--mouse"],
             &["--mouse", "locked"],
             &["--mouse", "auto", "--mouse", "auto"],
+            &["--foveate"],
+            &["--foveate", "yes"],
+            &["--foveate", "on", "--foveate", "off"],
             &["a:1", "b:2"],
             &["--unknown"],
         ] {

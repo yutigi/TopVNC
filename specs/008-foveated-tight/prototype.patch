@@ -1,0 +1,2251 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,7 +12,7 @@
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+-mod tight;
++pub mod tight;
+ use tight::{TightDecoder, TightSettings};
+ 
+ pub const MAX_FRAMEBUFFER_DIMENSION: u16 = 8192;
+@@ -645,6 +645,9 @@
+     /// session, input reader, and encoder threads. Hosts use it to set a
+     /// scheduling class, which new threads do not inherit on every platform.
+     pub thread_setup: Option<fn()>,
++    /// Foveated Tight for first-person games: JPEG quality falls with
++    /// distance from the screen center, and the center is sent first.
++    pub foveation: Option<Foveation>,
+ }
+ 
+ impl Default for ServerConfig {
+@@ -654,6 +657,66 @@
+             password: None,
+             allow_insecure: false,
+             thread_setup: None,
++            foveation: None,
++        }
++    }
++}
++
++/// Zones around the framebuffer center, where a shooter's crosshair is.
++/// Each 64x64 tile belongs to the zone its center falls in.
++#[derive(Clone, Copy, Debug)]
++pub struct Foveation {
++    /// Half-width and half-height of the fovea box, as fractions of the
++    /// framebuffer height.
++    pub fovea: (f32, f32),
++    /// Half-width and half-height of the mid box.
++    pub mid: (f32, f32),
++    /// JPEG quality (1-100) and chroma subsampling for the fovea, mid, and
++    /// periphery.
++    pub zones: [(u8, tight::SamplingFactor); 3],
++    /// Most rows per rectangle in each zone.
++    pub band_rows: [usize; 3],
++    /// Send the zones in this order: fovea first, nearest the center first.
++    /// Otherwise row-major, as without foveation.
++    pub center_first: bool,
++    /// Send periphery tiles with every Nth update only; 1 sends them always.
++    pub periphery_interval: u32,
++    /// Step through [`ADAPTIVE_PRESETS`] so a frame's bytes stay within 80%
++    /// of what the link carries in one host frame interval, measured by
++    /// continuous-update flow control. Starts at the second preset.
++    pub adaptive: bool,
++}
++
++/// Presets for adaptive foveation, sharpest first: zone qualities and the
++/// periphery interval.
++pub const ADAPTIVE_PRESETS: [([(u8, tight::SamplingFactor); 3], u32); 5] = {
++    use tight::SamplingFactor::{R_4_2_0, R_4_2_2, R_4_4_4};
++    [
++        ([(92, R_4_4_4), (77, R_4_2_2), (41, R_4_2_0)], 1),
++        ([(79, R_4_4_4), (62, R_4_2_2), (29, R_4_2_0)], 1),
++        ([(77, R_4_2_2), (42, R_4_2_2), (15, R_4_2_0)], 1),
++        ([(77, R_4_2_2), (42, R_4_2_2), (15, R_4_2_0)], 2),
++        ([(62, R_4_2_2), (29, R_4_2_0), (15, R_4_2_0)], 2),
++    ]
++};
++/// Approximate bytes of each preset relative to the next one, measured on
++/// five FPS screenshots; used to predict whether a sharper preset fits.
++const ADAPTIVE_GROWTH: [f64; 4] = [1.44, 1.31, 1.18, 1.3];
++
++impl Foveation {
++    /// Zone of the tile at (`x`, `y`) of `width` by `height` pixels in a
++    /// `frame_width` by `frame_height` framebuffer: 0 fovea, 1 mid,
++    /// 2 periphery.
++    fn zone(&self, (x, y, width, height): (usize, usize, usize, usize), frame: (usize, usize)) -> u8 {
++        let dx = ((x * 2 + width) as f32 - frame.0 as f32).abs() / 2.0;
++        let dy = ((y * 2 + height) as f32 - frame.1 as f32).abs() / 2.0;
++        let unit = frame.1 as f32;
++        if dx < self.fovea.0 * unit && dy < self.fovea.1 * unit {
++            0
++        } else if dx < self.mid.0 * unit && dy < self.mid.1 * unit {
++            1
++        } else {
++            2
+         }
+     }
+ }
+@@ -829,6 +892,8 @@
+     tile_columns: usize,
+     /// Incremented whenever the framebuffer dimensions change.
+     generation: u64,
++    /// Frames published by the host.
++    frames: u64,
+ }
+ 
+ impl ServerFramebuffer {
+@@ -841,6 +906,7 @@
+             revision: 0,
+             tile_columns,
+             generation: 0,
++            frames: 0,
+         }
+     }
+ 
+@@ -1089,6 +1155,7 @@
+                 relative_pointer: Arc::clone(&self.relative_pointer),
+                 clipboard: Arc::clone(&self.clipboard),
+                 thread_setup: self.config.thread_setup,
++                foveation: self.config.foveation,
+             };
+             let events = self.events.clone();
+             let config = self.config.clone();
+@@ -1182,6 +1249,7 @@
+     }) {
+         return Err(invalid("damage rectangle is outside framebuffer"));
+     }
++    current.frames += 1;
+     let mut visited = vec![false; current.tile_revisions.len()];
+     for rect in damage {
+         if rect.width == 0 || rect.height == 0 {
+@@ -1234,6 +1302,7 @@
+     clipboard: Arc<Mutex<ServerClipboard>>,
+     /// See [`ServerConfig::thread_setup`].
+     thread_setup: Option<fn()>,
++    foveation: Option<Foveation>,
+ }
+ 
+ fn serve_client(
+@@ -1624,6 +1693,7 @@
+             result.tight = Some(TightSettings {
+                 quality,
+                 compression: compression.unwrap_or(defaults.compression),
++                ..defaults
+             });
+         }
+         result
+@@ -1830,17 +1900,33 @@
+     let mut encoder = SessionEncoder {
+         pool: None,
+         thread_setup: session.thread_setup,
++        foveation: session.foveation.map(|foveation| {
++            if foveation.adaptive {
++                let (zones, interval) = ADAPTIVE_PRESETS[1];
++                Foveation {
++                    zones,
++                    periphery_interval: interval,
++                    ..foveation
++                }
++            } else {
++                foveation
++            }
++        }),
++        updates_since_periphery: 0,
++        periphery_sent_at: None,
++        adaptive: Adaptive::default(),
+     };
+     // Pseudo-encoding rectangles waiting to be sent.
+     let mut pseudo: Vec<PseudoRect> = Vec::new();
+     loop {
+         send_pending_clipboard(stream, &session.clipboard, &mut clipboard_revision)?;
+-        let (current_generation, width, height) = {
++        let (current_generation, width, height, frames) = {
+             let fb = shared
+                 .lock()
+                 .map_err(|_| invalid("framebuffer lock is poisoned"))?;
+-            (fb.generation, fb.framebuffer.width, fb.framebuffer.height)
++            (fb.generation, fb.framebuffer.width, fb.framebuffer.height, fb.frames)
+         };
++        encoder.observe_frames(frames, Instant::now());
+         if encodings.pointer_motion_change {
+             let relative = session.relative_pointer.load(Ordering::Acquire);
+             if pointer_mode != Some(relative) {
+@@ -1932,9 +2018,17 @@
+                 SendWindow::OpensAt(at) => Instant::now() >= at,
+                 SendWindow::Closed => false,
+             };
+-            if open
+-                && let Some(update) =
+-                    prepare_update(shared, &seen_revisions, region, true, generation)?
++            let mut prepared = if open {
++                prepare_update(shared, &seen_revisions, region, true, generation)?
++            } else {
++                None
++            };
++            if let Some(update) = &mut prepared
++                && tight.is_some()
++            {
++                skip_periphery(shared, update, &mut encoder)?;
++            }
++            if let Some(update) = prepared
+                 && !update.rectangles.is_empty()
+             {
+                 let bytes = write_prepared_update(
+@@ -1952,6 +2046,7 @@
+                 let payload = flow.sent(bytes, Instant::now());
+                 stream.write_all(&fence_message(FENCE_REQUEST | FENCE_BLOCK_BEFORE, &payload))?;
+                 window = flow.window();
++                encoder.adapt(bytes, flow.throughput());
+             }
+         }
+         let now = Instant::now();
+@@ -2531,8 +2626,127 @@
+         }
+     }
+     result
++}
++
++/// With a periphery interval N, periphery tiles ride along with every Nth
++/// update that carries fovea or mid tiles, and stay pending otherwise. An
++/// update with only periphery changes goes out once N host frame intervals
++/// passed since the periphery was last sent.
++fn skip_periphery(
++    shared: &Arc<Mutex<ServerFramebuffer>>,
++    update: &mut PreparedUpdate,
++    encoder: &mut SessionEncoder,
++) -> io::Result<()> {
++    let Some(foveation) = encoder.foveation.filter(|f| f.periphery_interval > 1) else {
++        return Ok(());
++    };
++    let fb = shared
++        .lock()
++        .map_err(|_| invalid("framebuffer lock is poisoned"))?;
++    let frame = (fb.framebuffer.width(), fb.framebuffer.height());
++    let periphery = |index: usize| foveation.zone(fb.tile_rect(index), frame) == 2;
++    let has_center = update
++        .rectangles
++        .iter()
++        .any(|rect| !rect.tile_index.is_some_and(periphery));
++    let due = if has_center {
++        encoder.updates_since_periphery + 1 >= foveation.periphery_interval
++    } else {
++        let wait = Duration::from_secs_f64(
++            encoder.adaptive.frame_interval.max(1.0 / 240.0)
++                * f64::from(foveation.periphery_interval),
++        );
++        encoder
++            .periphery_sent_at
++            .is_none_or(|at| at.elapsed() >= wait)
++    };
++    if due {
++        encoder.updates_since_periphery = 0;
++        encoder.periphery_sent_at = Some(Instant::now());
++        return Ok(());
++    }
++    if has_center {
++        encoder.updates_since_periphery += 1;
++    }
++    update
++        .rectangles
++        .retain(|rect| !rect.tile_index.is_some_and(periphery));
++    update.acknowledged.retain(|(index, _)| !periphery(*index));
++    Ok(())
+ }
+ 
++/// Split changed rectangles at the 64-pixel tile grid, give each piece its
++/// tile's zone, and merge pieces only within a zone: horizontally along a
++/// tile row, then vertically up to the zone's band height. Returns
++/// rectangles with their zones, fovea first and nearest the center first
++/// when `center_first` is set.
++fn foveated_rects(
++    rects: &[ServerRect],
++    frame: (usize, usize),
++    foveation: &Foveation,
++) -> Vec<(usize, usize, usize, usize, u8)> {
++    let mut pieces: Vec<(usize, usize, usize, usize, u8)> = Vec::new();
++    for rect in rects {
++        let (x0, y0) = (usize::from(rect.x), usize::from(rect.y));
++        let (x1, y1) = (x0 + usize::from(rect.width), y0 + usize::from(rect.height));
++        for tile_y in (y0 / SERVER_TILE_SIZE)..y1.div_ceil(SERVER_TILE_SIZE) {
++            for tile_x in (x0 / SERVER_TILE_SIZE)..x1.div_ceil(SERVER_TILE_SIZE) {
++                let (tx, ty) = (tile_x * SERVER_TILE_SIZE, tile_y * SERVER_TILE_SIZE);
++                let tile = (
++                    tx,
++                    ty,
++                    SERVER_TILE_SIZE.min(frame.0 - tx),
++                    SERVER_TILE_SIZE.min(frame.1 - ty),
++                );
++                let (px0, py0) = (tx.max(x0), ty.max(y0));
++                let (px1, py1) = ((tx + tile.2).min(x1), (ty + tile.3).min(y1));
++                if px0 < px1 && py0 < py1 {
++                    pieces.push((px0, py0, px1 - px0, py1 - py0, foveation.zone(tile, frame)));
++                }
++            }
++        }
++    }
++    pieces.sort_by_key(|&(x, y, ..)| (y, x));
++    let mut runs: Vec<(usize, usize, usize, usize, u8)> = Vec::new();
++    for piece in pieces {
++        if let Some(last) = runs.last_mut()
++            && last.1 == piece.1
++            && last.3 == piece.3
++            && last.4 == piece.4
++            && last.0 + last.2 == piece.0
++            && last.2 + piece.2 <= tight::MAX_RECT_WIDTH
++        {
++            last.2 += piece.2;
++        } else {
++            runs.push(piece);
++        }
++    }
++    let mut merged: Vec<(usize, usize, usize, usize, u8)> = Vec::with_capacity(runs.len());
++    let mut open = std::collections::HashMap::new();
++    for (x, y, width, height, zone) in runs {
++        let limit = foveation.band_rows[usize::from(zone)].clamp(1, tight::MAX_RECT_HEIGHT);
++        if let Some(index) = open.remove(&(x, width, y, zone)) {
++            let above: &mut (usize, usize, usize, usize, u8) = &mut merged[index];
++            if above.3 + height <= limit {
++                above.3 += height;
++                open.insert((x, width, y + height, zone), index);
++                continue;
++            }
++        }
++        open.insert((x, width, y + height, zone), merged.len());
++        merged.push((x, y, width, height, zone));
++    }
++    if foveation.center_first {
++        let distance = |&(x, y, w, h, _): &(usize, usize, usize, usize, u8)| {
++            let dx = (x * 2 + w) as i64 - frame.0 as i64;
++            let dy = (y * 2 + h) as i64 - frame.1 as i64;
++            dx * dx + dy * dy
++        };
++        merged.sort_by_key(|rect| (rect.4, distance(rect)));
++    }
++    merged
++}
++
+ /// A rectangle's pixels, copied out of the framebuffer, with its size.
+ type Snapshot = (Vec<u32>, usize, usize);
+ 
+@@ -2540,7 +2754,7 @@
+ /// order through `next`.
+ struct EncodeBatch {
+     snapshots: Arc<Vec<Snapshot>>,
+-    settings: TightSettings,
++    settings: Arc<Vec<TightSettings>>,
+     next: Arc<std::sync::atomic::AtomicUsize>,
+     results: std::sync::mpsc::Sender<(usize, io::Result<Vec<u8>>)>,
+ }
+@@ -2579,7 +2793,7 @@
+                                     pixels,
+                                     *width,
+                                     *height,
+-                                    batch.settings,
++                                    batch.settings[index],
+                                     &mut body,
+                                 )
+                                 .map(|_| body);
+@@ -2602,19 +2816,20 @@
+     fn encode(
+         &self,
+         snapshots: Vec<Snapshot>,
+-        settings: TightSettings,
++        settings: Vec<TightSettings>,
+         mut ready: impl FnMut(usize, &[u8]) -> io::Result<()>,
+     ) -> io::Result<()> {
+         let stopped = || io::Error::other("a Tight encoder thread stopped");
+         let count = snapshots.len();
+         let snapshots = Arc::new(snapshots);
++        let settings = Arc::new(settings);
+         let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+         let (results, receiver) = std::sync::mpsc::channel();
+         for batch in &self.batches {
+             batch
+                 .send(EncodeBatch {
+                     snapshots: Arc::clone(&snapshots),
+-                    settings,
++                    settings: Arc::clone(&settings),
+                     next: Arc::clone(&next),
+                     results: results.clone(),
+                 })
+@@ -2656,8 +2871,81 @@
+     pool: Option<EncodePool>,
+     /// Runs first on every encoder thread; see [`ServerConfig::thread_setup`].
+     thread_setup: Option<fn()>,
++    foveation: Option<Foveation>,
++    /// Updates with fovea or mid tiles sent since the periphery was last
++    /// sent, and when that was.
++    updates_since_periphery: u32,
++    periphery_sent_at: Option<Instant>,
++    /// Adaptive foveation state.
++    adaptive: Adaptive,
+ }
+ 
++#[derive(Default)]
++struct Adaptive {
++    preset: usize,
++    /// Updates sent since the preset changed.
++    updates: u32,
++    /// Bytes per update at the current preset, smoothed.
++    bytes: f64,
++    /// Seconds between host frames, smoothed, and the last frame count seen.
++    frame_interval: f64,
++    last_frames: Option<(u64, Instant)>,
++}
++
++impl SessionEncoder {
++    /// Track the host's frame rate from its frame counter.
++    fn observe_frames(&mut self, frames: u64, now: Instant) {
++        let adaptive = &mut self.adaptive;
++        match adaptive.last_frames {
++            Some((last, at)) if frames > last => {
++                let sample = now.saturating_duration_since(at).as_secs_f64() / (frames - last) as f64;
++                adaptive.frame_interval = if adaptive.frame_interval == 0.0 {
++                    sample
++                } else {
++                    0.9 * adaptive.frame_interval + 0.1 * sample
++                };
++                adaptive.last_frames = Some((frames, now));
++            }
++            None => adaptive.last_frames = Some((frames, now)),
++            _ => {}
++        }
++    }
++
++    /// After an update of `bytes`, move to a more compact preset when frames
++    /// outgrow the link, or a sharper one when it clearly fits.
++    fn adapt(&mut self, bytes: usize, throughput: Option<f64>) {
++        let Some(foveation) = self.foveation.as_mut().filter(|f| f.adaptive) else {
++            return;
++        };
++        let state = &mut self.adaptive;
++        if state.updates == 0 && state.bytes == 0.0 {
++            state.preset = 1;
++        }
++        state.bytes = if state.updates == 0 {
++            bytes as f64
++        } else {
++            0.8 * state.bytes + 0.2 * bytes as f64
++        };
++        state.updates += 1;
++        if let (Some(rate), true) = (throughput, state.frame_interval > 0.0) {
++            let budget = rate * state.frame_interval.max(1.0 / 480.0) * 0.8;
++            if state.bytes > budget && state.preset + 1 < ADAPTIVE_PRESETS.len() && state.updates >= 4 {
++                state.preset += 1;
++                state.updates = 0;
++            } else if state.preset > 0
++                && state.updates >= 60
++                && state.bytes * ADAPTIVE_GROWTH[state.preset - 1] < budget * 0.85
++            {
++                state.preset -= 1;
++                state.updates = 0;
++            }
++        }
++        let (zones, interval) = ADAPTIVE_PRESETS[state.preset];
++        foveation.zones = zones;
++        foveation.periphery_interval = interval;
++    }
++}
++
+ /// Write a prepared update with Tight encoding. The rectangles are copied
+ /// under one framebuffer lock, so every update shows a single captured frame,
+ /// then encoded without holding the lock. Large updates are encoded on
+@@ -2676,22 +2964,44 @@
+     pseudo: &[PseudoRect],
+ ) -> io::Result<usize> {
+     let workers = encoder_threads();
+-    let rows = update
+-        .rectangles
+-        .iter()
+-        .map(|rect| usize::from(rect.y)..usize::from(rect.y) + usize::from(rect.height))
+-        .reduce(|all, rows| all.start.min(rows.start)..all.end.max(rows.end))
+-        .map_or(0, |rows| rows.len());
+-    let rects = tight_rects(&update.rectangles, band_rows(rows, workers));
+-    if rects.len() > usize::from(u16::MAX) {
+-        return Err(invalid("too many changed framebuffer rectangles"));
+-    }
+-    let snapshots = {
++    let foveation = encoder.foveation.filter(|_| settings.quality.is_some());
++    let (rects, rect_settings, snapshots) = {
+         let fb = shared
+             .lock()
+             .map_err(|_| invalid("framebuffer lock is poisoned"))?;
++        let frame = (fb.framebuffer.width(), fb.framebuffer.height());
++        let (rects, rect_settings) = match foveation {
++            Some(foveation) => {
++                let zoned = foveated_rects(&update.rectangles, frame, &foveation);
++                let settings = zoned
++                    .iter()
++                    .map(|&(.., zone)| TightSettings {
++                        jpeg: Some(foveation.zones[usize::from(zone)]),
++                        ..settings
++                    })
++                    .collect::<Vec<_>>();
++                (
++                    zoned.into_iter().map(|(x, y, w, h, _)| (x, y, w, h)).collect::<Vec<_>>(),
++                    settings,
++                )
++            }
++            None => {
++                let rows = update
++                    .rectangles
++                    .iter()
++                    .map(|rect| usize::from(rect.y)..usize::from(rect.y) + usize::from(rect.height))
++                    .reduce(|all, rows| all.start.min(rows.start)..all.end.max(rows.end))
++                    .map_or(0, |rows| rows.len());
++                let rects = tight_rects(&update.rectangles, band_rows(rows, workers));
++                let count = rects.len();
++                (rects, vec![settings; count])
++            }
++        };
++        if rects.len() > usize::from(u16::MAX) {
++            return Err(invalid("too many changed framebuffer rectangles"));
++        }
+         let stride = fb.framebuffer.width();
+-        rects
++        let snapshots = rects
+             .iter()
+             .map(|&(x, y, width, height)| {
+                 // After a resize the remaining area is sent black; the client
+@@ -2708,7 +3018,8 @@
+                 };
+                 (pixels, width, height)
+             })
+-            .collect::<Vec<_>>()
++            .collect::<Vec<_>>();
++        (rects, rect_settings, snapshots)
+     };
+     let mut written = 0;
+     output.clear();
+@@ -2738,11 +3049,11 @@
+                     .pool
+                     .insert(EncodePool::new(workers, encoder.thread_setup)?),
+             };
+-            pool.encode(snapshots, settings, &mut ready)?;
++            pool.encode(snapshots, rect_settings, &mut ready)?;
+         } else {
+             for (index, (pixels, width, height)) in snapshots.iter().enumerate() {
+                 let mut body = Vec::new();
+-                tight::encode_rect(pixels, *width, *height, settings, &mut body)?;
++                tight::encode_rect(pixels, *width, *height, rect_settings[index], &mut body)?;
+                 ready(index, &body)?;
+             }
+         }
+@@ -3747,6 +4058,7 @@
+             relative_pointer: Arc::new(AtomicBool::new(false)),
+             clipboard: Arc::new(Mutex::new(ServerClipboard::default())),
+             thread_setup: None,
++            foveation: None,
+         }
+     }
+ 
+@@ -4556,6 +4868,7 @@
+         let settings = TightSettings {
+             quality: Some(9),
+             compression: 1,
++            ..TightSettings::default()
+         };
+         let mut jpeg = Vec::new();
+         tight::encode_rect(
+@@ -4751,6 +5064,7 @@
+             Some(TightSettings {
+                 quality: Some(2),
+                 compression: 6,
++                ..TightSettings::default()
+             })
+         );
+         assert_eq!(parse(&[7]).tight, Some(TightSettings::default()));
+@@ -4875,6 +5189,7 @@
+                 let settings = TightSettings {
+                     quality: Some(quality),
+                     compression: 1,
++                    ..TightSettings::default()
+                 };
+                 // Warm the threads and allocator, then time the second run.
+                 let mut bodies = Vec::new();
+@@ -4882,7 +5197,7 @@
+                 for _ in 0..2 {
+                     bodies.clear();
+                     let started = Instant::now();
+-                    pool.encode(snapshots.clone(), settings, |index, body| {
++                    pool.encode(snapshots.clone(), vec![settings; snapshots.len()], |index, body| {
+                         if index == 0 {
+                             first = started.elapsed();
+                         }
+@@ -4892,7 +5207,7 @@
+                     .unwrap();
+                 }
+                 let started = Instant::now();
+-                pool.encode(snapshots.clone(), settings, |_, _| Ok(()))
++                pool.encode(snapshots.clone(), vec![settings; snapshots.len()], |_, _| Ok(()))
+                     .unwrap();
+                 let encoded = started.elapsed();
+                 let sequential = Instant::now();
+@@ -4954,6 +5269,54 @@
+     }
+ 
+     #[test]
++    fn foveated_rects_cover_changes_once_and_send_the_center_first() {
++        let foveation = Foveation {
++            fovea: (0.30, 0.18),
++            mid: (0.60, 0.36),
++            zones: [(79, tight::SamplingFactor::R_4_4_4); 3],
++            band_rows: [64, 256, 256],
++            center_first: true,
++            periphery_interval: 1,
++            adaptive: false,
++        };
++        for (width, height) in [(1920usize, 1080usize), (1512, 982), (100, 70), (3024, 1964)] {
++            // Every tile changed, plus a partial request rectangle.
++            let mut changed = Vec::new();
++            for y in (0..height).step_by(64) {
++                for x in (0..width).step_by(64) {
++                    changed.push(ServerRect {
++                        x: x as u16,
++                        y: y as u16,
++                        width: 64.min(width - x) as u16,
++                        height: 64.min(height - y) as u16,
++                        tile_index: None,
++                        revision: 0,
++                    });
++                }
++            }
++            let rects = foveated_rects(&changed, (width, height), &foveation);
++            let mut covered = vec![0u8; width * height];
++            for &(x, y, w, h, _) in &rects {
++                assert!(w <= tight::MAX_RECT_WIDTH && h <= tight::MAX_RECT_HEIGHT);
++                for row in y..y + h {
++                    for value in &mut covered[row * width + x..row * width + x + w] {
++                        *value += 1;
++                    }
++                }
++            }
++            assert!(covered.iter().all(|count| *count == 1), "{width}x{height}");
++            // Zones never increase going back toward the front.
++            assert!(rects.windows(2).all(|pair| pair[0].4 <= pair[1].4));
++            if width >= 1000 {
++                // The first rectangle holds the center.
++                let (x, y, w, h, zone) = rects[0];
++                assert_eq!(zone, 0);
++                assert!(x <= width / 2 && width / 2 < x + w + 64 && y <= height / 2 + 64 && height / 2 < y + h + 64);
++            }
++        }
++    }
++
++    #[test]
+     fn bands_follow_the_encoder_thread_count() {
+         assert_eq!(band_rows(1080, 16), 64);
+         assert_eq!(band_rows(1080, 8), 128);
+@@ -4979,7 +5342,7 @@
+             })
+             .collect::<Vec<Snapshot>>();
+         let mut order = Vec::new();
+-        pool.encode(snapshots.clone(), settings, |index, body| {
++        pool.encode(snapshots.clone(), vec![settings; snapshots.len()], |index, body| {
+             let (pixels, width, height) = &snapshots[index];
+             let mut expected = Vec::new();
+             tight::encode_rect(pixels, *width, *height, settings, &mut expected).unwrap();
+@@ -4990,12 +5353,12 @@
+         .unwrap();
+         assert_eq!(order, (0..12).collect::<Vec<_>>());
+         // An error from the writer ends the update; the pool stays usable.
+-        let failed = pool.encode(snapshots.clone(), settings, |_, _| {
++        let failed = pool.encode(snapshots.clone(), vec![settings; snapshots.len()], |_, _| {
+             Err(io::Error::other("link closed"))
+         });
+         assert!(failed.is_err());
+         let mut count = 0;
+-        pool.encode(snapshots, settings, |_, _| {
++        pool.encode(snapshots.clone(), vec![settings; snapshots.len()], |_, _| {
+             count += 1;
+             Ok(())
+         })
+--- a/src/tight.rs
++++ b/src/tight.rs
+@@ -6,23 +6,24 @@
+ //! whose pixel format has three 8-bit channels in a 32-bit pixel.
+ 
+ use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+-use jpeg_encoder::{ColorType, Encoder as JpegEncoder, SamplingFactor};
++use jpeg_encoder::{ColorType, Encoder as JpegEncoder};
++pub use jpeg_encoder::SamplingFactor;
+ use std::io::{self, Read};
+ use zune_jpeg::JpegDecoder;
+ use zune_jpeg::zune_core::bytestream::ZCursor;
+ use zune_jpeg::zune_core::colorspace::ColorSpace;
+ use zune_jpeg::zune_core::options::DecoderOptions;
+ 
+-pub(crate) const TIGHT_ENCODING: i32 = 7;
++pub const TIGHT_ENCODING: i32 = 7;
+ /// Pseudo-encodings -32..=-23 select a JPEG quality level from 0 to 9.
+-pub(crate) const QUALITY_LEVEL_0: i32 = -32;
++pub const QUALITY_LEVEL_0: i32 = -32;
+ /// Pseudo-encodings -256..=-247 select a compression level from 0 to 9.
+-pub(crate) const COMPRESS_LEVEL_0: i32 = -256;
++pub const COMPRESS_LEVEL_0: i32 = -256;
+ /// Tight decoders, including TigerVNC's, reject wider rectangles.
+-pub(crate) const MAX_RECT_WIDTH: usize = 2048;
++pub const MAX_RECT_WIDTH: usize = 2048;
+ /// Rectangles are split into bands this tall so they can be encoded in
+ /// parallel and every compressed length fits the 22-bit compact length.
+-pub(crate) const MAX_RECT_HEIGHT: usize = 256;
++pub const MAX_RECT_HEIGHT: usize = 256;
+ /// Basic-compression data shorter than this is sent without zlib.
+ const MIN_TO_COMPRESS: usize = 12;
+ /// The largest palette the encoder uses; more colors are sent as JPEG or as
+@@ -40,7 +41,7 @@
+ 
+ /// JPEG quality and chroma subsampling for each RFB quality level, the same
+ /// mapping TigerVNC uses.
+-const JPEG_LEVELS: [(u8, SamplingFactor); 10] = [
++pub const JPEG_LEVELS: [(u8, SamplingFactor); 10] = [
+     (15, SamplingFactor::R_4_2_0),
+     (29, SamplingFactor::R_4_2_0),
+     (41, SamplingFactor::R_4_2_0),
+@@ -55,11 +56,16 @@
+ 
+ /// How the server encodes Tight rectangles for one client.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub(crate) struct TightSettings {
++pub struct TightSettings {
+     /// RFB quality level 0-9. JPEG is used only when the client sent one.
+     pub quality: Option<u8>,
+     /// RFB compression level 0-9, used as the zlib level.
+     pub compression: u8,
++    /// JPEG quality (1-100) and chroma subsampling to use instead of the
++    /// quality level's own, for per-rectangle (foveated) quality.
++    pub jpeg: Option<(u8, SamplingFactor)>,
++    /// Write Huffman tables optimized for each rectangle (two passes).
++    pub optimize_huffman: bool,
+ }
+ 
+ impl Default for TightSettings {
+@@ -69,6 +75,8 @@
+             // Fast compression keeps encoding latency low; clients that want
+             // smaller updates ask for a higher level.
+             compression: 1,
++            jpeg: None,
++            optimize_huffman: false,
+         }
+     }
+ }
+@@ -117,7 +125,7 @@
+ ///
+ /// Every zlib-compressed rectangle resets and uses stream 0, so rectangles
+ /// can be encoded independently and in parallel.
+-pub(crate) fn encode_rect(
++pub fn encode_rect(
+     pixels: &[u32],
+     width: usize,
+     height: usize,
+@@ -149,7 +157,18 @@
+         return encode_palette(pixels, width, height, &palette, settings, output);
+     }
+     if let Some(level) = settings.quality {
+-        return encode_jpeg(pixels, width, height, level, output);
++        let (quality, sampling) = settings
++            .jpeg
++            .unwrap_or(JPEG_LEVELS[usize::from(level.min(9))]);
++        return encode_jpeg(
++            pixels,
++            width,
++            height,
++            quality,
++            sampling,
++            settings.optimize_huffman,
++            output,
++        );
+     }
+     output.push(EXPLICIT_FILTER << 4 | 1);
+     output.push(FILTER_COPY);
+@@ -225,14 +244,15 @@
+     Ok(())
+ }
+ 
+-fn encode_jpeg(
++pub fn encode_jpeg(
+     pixels: &[u32],
+     width: usize,
+     height: usize,
+-    level: u8,
++    quality: u8,
++    sampling: SamplingFactor,
++    optimize_huffman: bool,
+     output: &mut Vec<u8>,
+ ) -> io::Result<()> {
+-    let (quality, sampling) = JPEG_LEVELS[usize::from(level.min(9))];
+     let mut bgra = Vec::with_capacity(pixels.len() * 4);
+     for pixel in pixels {
+         bgra.extend_from_slice(&pixel.to_le_bytes());
+@@ -240,6 +260,7 @@
+     let mut jpeg = Vec::with_capacity(pixels.len() / 4);
+     let mut encoder = JpegEncoder::new(&mut jpeg, quality);
+     encoder.set_sampling_factor(sampling);
++    encoder.set_optimized_huffman_tables(optimize_huffman);
+     encoder
+         .encode(&bgra, width as u16, height as u16, ColorType::Bgra)
+         .map_err(|error| io::Error::other(format!("JPEG encoding failed: {error}")))?;
+@@ -253,14 +274,14 @@
+ }
+ 
+ /// Client-side Tight state: four persistent zlib streams.
+-pub(crate) struct TightDecoder {
++pub struct TightDecoder {
+     streams: [Decompress; 4],
+     compressed: Vec<u8>,
+     data: Vec<u8>,
+ }
+ 
+ impl TightDecoder {
+-    pub(crate) fn new() -> Self {
++    pub fn new() -> Self {
+         Self {
+             streams: std::array::from_fn(|_| Decompress::new(true)),
+             compressed: Vec::new(),
+@@ -270,8 +291,7 @@
+ 
+     /// Read one Tight rectangle body and write its pixels to `output` as
+     /// 32-bit B, G, R, X bytes, the layout Raw rectangles use.
+-    #[cfg(test)]
+-    pub(crate) fn read_rect(
++    pub fn read_rect(
+         &mut self,
+         reader: &mut impl Read,
+         width: usize,
+@@ -291,7 +311,7 @@
+     /// is read into `jpeg` and left for [`decode_jpeg_rect`], which needs no
+     /// decoder state and so can run on another thread. Returns whether it
+     /// did that; otherwise `output` holds the pixels.
+-    pub(crate) fn read_rect_deferred(
++    pub fn read_rect_deferred(
+         &mut self,
+         reader: &mut impl Read,
+         width: usize,
+@@ -475,7 +495,7 @@
+ /// Decode a Tight JPEG rectangle's data to 32-bit B, G, R, X bytes in
+ /// `output`, which is resized to fit. Rejects data whose size is not
+ /// `width` by `height`.
+-pub(crate) fn decode_jpeg_rect(
++pub fn decode_jpeg_rect(
+     jpeg: &[u8],
+     width: usize,
+     height: usize,
+@@ -568,6 +588,7 @@
+         let jpeg = TightSettings {
+             quality: Some(0),
+             compression: 1,
++            ..TightSettings::default()
+         };
+         // Two colors: one bit per pixel with a row width that is not a
+         // multiple of eight.
+@@ -604,6 +625,7 @@
+         let settings = TightSettings {
+             quality: Some(8),
+             compression: 1,
++            ..TightSettings::default()
+         };
+         let (body, decoded) = roundtrip(&pixels, width, settings);
+         assert_eq!(body[0], 0x90);
+@@ -702,7 +724,7 @@
+         assert!(rejected(&body, 4, 1));
+         // A JPEG whose size does not match its rectangle.
+         let mut jpeg = Vec::new();
+-        encode_jpeg(&noise(16 * 16), 16, 16, 5, &mut jpeg).unwrap();
++        encode_jpeg(&noise(16 * 16), 16, 16, 77, SamplingFactor::R_4_2_2, false, &mut jpeg).unwrap();
+         assert!(rejected(&jpeg, 16, 8));
+         assert!(rejected(&[0x90, 4, 1, 2, 3, 4], 16, 16));
+     }
+--- /dev/null
++++ b/examples/fovea_study.rs
+@@ -0,0 +1,837 @@
++//! R&D: foveated Tight encoding for first-person shooters.
++//!
++//! For each test frame and strategy, this encodes one full-screen update the
++//! way TopVNC's server would (Fill / palette / JPEG per rectangle, on the
++//! session's encoder threads, bands emitted in order), decodes it the way the
++//! viewer would (JPEG on decoder threads, applied in wire order), and reports
++//! bytes, encode and decode time, the time until the center (fovea) region
++//! is ready, and CPU cost. Decoded frames are written for quality scoring.
++//!
++//! cargo run --release --example fovea_study -- FRAMES_DIR OUT_DIR [NAMES...]
++
++use std::collections::HashMap;
++use std::io::{Cursor, Write};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, mpsc};
++use std::time::{Duration, Instant};
++use topvnc::tight::{self, SamplingFactor, TightDecoder, TightSettings};
++
++const TILE: usize = 64;
++const WIDTH: usize = 1920;
++const HEIGHT: usize = 1080;
++const RUNS: usize = 25;
++const WARMUP: usize = 4;
++const DECODE_THREADS: usize = 8;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Transform {
++    None,
++    /// Low-pass the rectangle (2x2 box down, bilinear up) before JPEG.
++    /// Standard Tight: any viewer decodes it.
++    Prefilter,
++    /// Send the rectangle at half width and height; the viewer upscales.
++    /// Needs a TopVNC-specific encoding.
++    HalfRes,
++}
++
++#[derive(Clone, Copy)]
++struct ZoneSpec {
++    quality: u8,
++    sampling: SamplingFactor,
++    transform: Transform,
++    optimize_huffman: bool,
++}
++
++const fn zone(quality: u8, sampling: SamplingFactor) -> ZoneSpec {
++    ZoneSpec {
++        quality,
++        sampling,
++        transform: Transform::None,
++        optimize_huffman: false,
++    }
++}
++
++#[derive(Clone, Copy)]
++enum Layout {
++    /// TopVNC 0.2 + spec 007: full-width bands of this many rows, top to
++    /// bottom.
++    Bands(usize),
++    /// 64x64 tiles merged only within a zone, at most `band_rows` rows per
++    /// zone, sent fovea first (or row-major).
++    Zoned {
++        band_rows: [usize; 3],
++        order: Order,
++    },
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Order {
++    RowMajor,
++    /// Fovea, then mid, then periphery, each nearest the center first.
++    CenterFirst,
++    /// Fovea nearest the center first, then the rest largest first, which
++    /// balances the encoder threads.
++    FoveaThenLargest,
++}
++
++struct Strategy {
++    name: &'static str,
++    layout: Layout,
++    zones: [ZoneSpec; 3],
++    /// Zone half-sizes as fractions of the frame height: fovea, mid.
++    boxes: [(f64, f64); 2],
++}
++
++const STANDARD: [(f64, f64); 2] = [(0.30, 0.18), (0.60, 0.36)];
++
++/// Zone boxes as half-sizes in pixels around the frame center.
++#[derive(Clone, Copy)]
++struct Geometry {
++    width: usize,
++    height: usize,
++    fovea: (f64, f64),
++    mid: (f64, f64),
++}
++
++impl Geometry {
++    /// The zone of a tile, from its center: 0 fovea, 1 mid, 2 periphery.
++    fn zone(&self, x: usize, y: usize, w: usize, h: usize) -> u8 {
++        let dx = ((x as f64 + w as f64 / 2.0) - self.width as f64 / 2.0).abs();
++        let dy = ((y as f64 + h as f64 / 2.0) - self.height as f64 / 2.0).abs();
++        if dx < self.fovea.0 && dy < self.fovea.1 {
++            0
++        } else if dx < self.mid.0 && dy < self.mid.1 {
++            1
++        } else {
++            2
++        }
++    }
++
++    fn tile_zones(&self) -> Vec<u8> {
++        let mut zones = Vec::new();
++        for ty in 0..self.height.div_ceil(TILE) {
++            for tx in 0..self.width.div_ceil(TILE) {
++                let (x, y) = (tx * TILE, ty * TILE);
++                zones.push(self.zone(x, y, TILE.min(self.width - x), TILE.min(self.height - y)));
++            }
++        }
++        zones
++    }
++}
++
++#[derive(Clone, Copy, Debug)]
++struct Rect {
++    x: usize,
++    y: usize,
++    w: usize,
++    h: usize,
++    zone: u8,
++    /// Whether the rectangle overlaps a fovea tile.
++    touches_fovea: bool,
++}
++
++fn rects_for(layout: Layout, g: &Geometry, standard: &Geometry) -> Vec<Rect> {
++    let zones = g.tile_zones();
++    let standard_zones = standard.tile_zones();
++    let columns = g.width.div_ceil(TILE);
++    let overlaps_fovea = |x: usize, y: usize, w: usize, h: usize| {
++        (y / TILE..(y + h).div_ceil(TILE))
++            .any(|ty| {
++                (x / TILE..(x + w).div_ceil(TILE)).any(|tx| standard_zones[ty * columns + tx] == 0)
++            })
++    };
++    match layout {
++        Layout::Bands(rows) => (0..g.height)
++            .step_by(rows)
++            .map(|y| {
++                let h = rows.min(g.height - y);
++                Rect {
++                    x: 0,
++                    y,
++                    w: g.width,
++                    h,
++                    zone: 2,
++                    touches_fovea: overlaps_fovea(0, y, g.width, h),
++                }
++            })
++            .collect(),
++        Layout::Zoned { band_rows, order } => {
++            let mut runs: Vec<Rect> = Vec::new();
++            for ty in 0..g.height.div_ceil(TILE) {
++                for tx in 0..columns {
++                    let (x, y) = (tx * TILE, ty * TILE);
++                    let (w, h) = (TILE.min(g.width - x), TILE.min(g.height - y));
++                    let zone = zones[ty * columns + tx];
++                    if let Some(last) = runs.last_mut()
++                        && last.y == y
++                        && last.zone == zone
++                        && last.x + last.w == x
++                        && last.w + w <= tight::MAX_RECT_WIDTH
++                    {
++                        last.w += w;
++                        last.touches_fovea |= standard_zones[ty * columns + tx] == 0;
++                    } else {
++                        runs.push(Rect {
++                            x,
++                            y,
++                            w,
++                            h,
++                            zone,
++                            touches_fovea: standard_zones[ty * columns + tx] == 0,
++                        });
++                    }
++                }
++            }
++            let mut merged: Vec<Rect> = Vec::new();
++            let mut open: HashMap<(usize, usize, usize, u8), usize> = HashMap::new();
++            for run in runs {
++                if let Some(index) = open.remove(&(run.x, run.w, run.y, run.zone))
++                    && merged[index].h + run.h <= band_rows[usize::from(run.zone)]
++                {
++                    merged[index].h += run.h;
++                    merged[index].touches_fovea |= run.touches_fovea;
++                    open.insert((run.x, run.w, run.y + run.h, run.zone), index);
++                    continue;
++                }
++                open.insert((run.x, run.w, run.y + run.h, run.zone), merged.len());
++                merged.push(run);
++            }
++            let distance = |r: &Rect| {
++                let dx = (r.x * 2 + r.w) as i64 - g.width as i64;
++                let dy = (r.y * 2 + r.h) as i64 - g.height as i64;
++                dx * dx + dy * dy
++            };
++            match order {
++                Order::RowMajor => {}
++                Order::CenterFirst => merged.sort_by_key(|r| (r.zone, distance(r))),
++                Order::FoveaThenLargest => merged.sort_by_key(|r| {
++                    if r.zone == 0 {
++                        (0, distance(r))
++                    } else {
++                        (1, -((r.w * r.h) as i64))
++                    }
++                }),
++            }
++            merged
++        }
++    }
++}
++
++fn copy_rect(frame: &[u32], stride: usize, r: &Rect) -> Vec<u32> {
++    let mut pixels = Vec::with_capacity(r.w * r.h);
++    for row in r.y..r.y + r.h {
++        pixels.extend_from_slice(&frame[row * stride + r.x..row * stride + r.x + r.w]);
++    }
++    pixels
++}
++
++fn channels(p: u32) -> [u32; 3] {
++    [p >> 16 & 0xff, p >> 8 & 0xff, p & 0xff]
++}
++
++/// 2x2 box average to ceil(w/2) x ceil(h/2).
++fn down2(pixels: &[u32], w: usize, h: usize) -> (Vec<u32>, usize, usize) {
++    let (w2, h2) = (w.div_ceil(2), h.div_ceil(2));
++    let mut out = Vec::with_capacity(w2 * h2);
++    for y in 0..h2 {
++        let (y0, y1) = (2 * y, (2 * y + 1).min(h - 1));
++        for x in 0..w2 {
++            let (x0, x1) = (2 * x, (2 * x + 1).min(w - 1));
++            let mut sum = [0u32; 3];
++            for p in [
++                pixels[y0 * w + x0],
++                pixels[y0 * w + x1],
++                pixels[y1 * w + x0],
++                pixels[y1 * w + x1],
++            ] {
++                let c = channels(p);
++                for i in 0..3 {
++                    sum[i] += c[i];
++                }
++            }
++            out.push((sum[0] + 2) / 4 << 16 | (sum[1] + 2) / 4 << 8 | (sum[2] + 2) / 4);
++        }
++    }
++    (out, w2, h2)
++}
++
++/// Bilinear 2x upscale of a `w2` x `h2` image to `w` x `h`, pixel-center aligned.
++fn up2(small: &[u32], w2: usize, h2: usize, w: usize, h: usize) -> Vec<u32> {
++    // Source index pairs and weights (in quarters) per output coordinate.
++    let taps = |n: usize, n2: usize| -> Vec<(usize, usize)> {
++        (0..n)
++            .map(|i| {
++                let k = i / 2;
++                if i % 2 == 0 {
++                    // Between k-1 (1/4) and k (3/4).
++                    (k.saturating_sub(1), k.min(n2 - 1))
++                } else {
++                    // Between k (3/4) and k+1 (1/4).
++                    ((k + 1).min(n2 - 1), k.min(n2 - 1))
++                }
++            })
++            .collect()
++    };
++    let xs = taps(w, w2);
++    let ys = taps(h, h2);
++    let mut out = Vec::with_capacity(w * h);
++    for &(ya, yb) in &ys {
++        for &(xa, xb) in &xs {
++            // (a, b): a weighted 1/4, b weighted 3/4.
++            let p = |yy: usize, xx: usize| channels(small[yy * w2 + xx]);
++            let (aa, ab, ba, bb) = (p(ya, xa), p(ya, xb), p(yb, xa), p(yb, xb));
++            let mut c = [0u32; 3];
++            for i in 0..3 {
++                // Weights: (1/4,1/4)=1, (1/4,3/4)=3, (3/4,1/4)=3, (3/4,3/4)=9; sum 16.
++                c[i] = (aa[i] + 3 * ab[i] + 3 * ba[i] + 9 * bb[i] + 8) / 16;
++            }
++            out.push(c[0] << 16 | c[1] << 8 | c[2]);
++        }
++    }
++    out
++}
++
++struct Job {
++    rect: Rect,
++    settings: TightSettings,
++    transform: Transform,
++}
++
++/// Encode one rectangle: returns the Tight body and the encoded size.
++fn encode_job(frame: &[u32], stride: usize, job: &Job) -> (Vec<u8>, usize, usize) {
++    let r = &job.rect;
++    let pixels = copy_rect(frame, stride, r);
++    let mut body = Vec::new();
++    match job.transform {
++        Transform::None => {
++            tight::encode_rect(&pixels, r.w, r.h, job.settings, &mut body).unwrap();
++            (body, r.w, r.h)
++        }
++        Transform::Prefilter => {
++            let (small, w2, h2) = down2(&pixels, r.w, r.h);
++            let smooth = up2(&small, w2, h2, r.w, r.h);
++            tight::encode_rect(&smooth, r.w, r.h, job.settings, &mut body).unwrap();
++            (body, r.w, r.h)
++        }
++        Transform::HalfRes => {
++            let (small, w2, h2) = down2(&pixels, r.w, r.h);
++            tight::encode_rect(&small, w2, h2, job.settings, &mut body).unwrap();
++            (body, w2, h2)
++        }
++    }
++}
++
++type Task = Arc<dyn Fn() + Send + Sync>;
++
++/// Persistent worker threads, like TopVNC's encoder and decoder pools, so
++/// no thread starts inside a timed region.
++struct Pool {
++    senders: Vec<mpsc::Sender<Task>>,
++    workers: Vec<std::thread::JoinHandle<()>>,
++}
++
++impl Pool {
++    fn new(threads: usize) -> Self {
++        let mut pool = Pool {
++            senders: Vec::new(),
++            workers: Vec::new(),
++        };
++        for _ in 0..threads {
++            let (sender, receiver) = mpsc::channel::<Task>();
++            pool.workers.push(std::thread::spawn(move || {
++                for task in receiver {
++                    task();
++                }
++            }));
++            pool.senders.push(sender);
++        }
++        pool
++    }
++
++    /// Run `task` once on every worker.
++    fn run(&self, task: Task) {
++        for sender in &self.senders {
++            sender.send(Arc::clone(&task)).unwrap();
++        }
++    }
++}
++
++impl Drop for Pool {
++    fn drop(&mut self) {
++        self.senders.clear();
++        for worker in self.workers.drain(..) {
++            let _ = worker.join();
++        }
++    }
++}
++
++struct EncodeRun {
++    bodies: Vec<(Vec<u8>, usize, usize)>,
++    total: Duration,
++    /// When every rectangle touching the fovea, and every one before it in
++    /// wire order, was ready to send.
++    fovea_ready: Duration,
++    first_ready: Duration,
++}
++
++/// Encode on the pool's workers, which claim rectangles in order, emitting
++/// bodies in order as TopVNC's encoder pool does.
++fn encode_parallel(pool: &Pool, frame: &Arc<Vec<u32>>, jobs: &Arc<Vec<Job>>) -> EncodeRun {
++    let next = Arc::new(AtomicUsize::new(0));
++    let (sender, receiver) = mpsc::channel();
++    let started = Instant::now();
++    {
++        let (frame, jobs, next) = (Arc::clone(frame), Arc::clone(jobs), Arc::clone(&next));
++        pool.run(Arc::new(move || {
++            loop {
++                let index = next.fetch_add(1, Ordering::Relaxed);
++                let Some(job) = jobs.get(index) else { break };
++                let result = encode_job(&frame, WIDTH, job);
++                if sender.send((index, result)).is_err() {
++                    break;
++                }
++            }
++        }));
++    }
++    let count = jobs.len();
++    let last_fovea = jobs.iter().rposition(|job| job.rect.touches_fovea).unwrap_or(0);
++    let mut done: Vec<Option<(Vec<u8>, usize, usize)>> = (0..count).map(|_| None).collect();
++    let mut bodies = Vec::with_capacity(count);
++    let (mut fovea_ready, mut first_ready) = (Duration::ZERO, Duration::ZERO);
++    while bodies.len() < count {
++        let (index, body) = receiver.recv().unwrap();
++        done[index] = Some(body);
++        while let Some(body) = done.get_mut(bodies.len()).and_then(Option::take) {
++            if bodies.is_empty() {
++                first_ready = started.elapsed();
++            }
++            if bodies.len() == last_fovea {
++                fovea_ready = started.elapsed();
++            }
++            bodies.push(body);
++        }
++    }
++    EncodeRun {
++        bodies,
++        total: started.elapsed(),
++        fovea_ready,
++        first_ready,
++    }
++}
++
++struct DecodeRun {
++    frame: Vec<u32>,
++    total: Duration,
++    fovea_applied: Duration,
++}
++
++thread_local! {
++    static DECODER: std::cell::RefCell<TightDecoder> = std::cell::RefCell::new(TightDecoder::new());
++}
++
++fn decode_body(body: &[u8], w: usize, h: usize, full: (usize, usize)) -> Vec<u32> {
++    let mut bgrx = Vec::new();
++    DECODER.with(|decoder| {
++        decoder
++            .borrow_mut()
++            .read_rect(&mut Cursor::new(body), w, h, &mut bgrx)
++            .unwrap()
++    });
++    let pixels: Vec<u32> = bgrx
++        .chunks_exact(4)
++        .map(|p| u32::from(p[2]) << 16 | u32::from(p[1]) << 8 | u32::from(p[0]))
++        .collect();
++    if (w, h) == full {
++        pixels
++    } else {
++        up2(&pixels, w, h, full.0, full.1)
++    }
++}
++
++/// Decode on the pool's workers and apply in wire order, as the viewer does.
++fn decode_parallel(pool: &Pool, run: &EncodeRun, jobs: &[Job]) -> DecodeRun {
++    let bodies = Arc::new(run.bodies.clone());
++    let rects: Arc<Vec<Rect>> = Arc::new(jobs.iter().map(|job| job.rect).collect());
++    let next = Arc::new(AtomicUsize::new(0));
++    let (sender, receiver) = mpsc::channel();
++    let mut frame = vec![0u32; WIDTH * HEIGHT];
++    let started = Instant::now();
++    {
++        let (bodies, rects, next) = (Arc::clone(&bodies), Arc::clone(&rects), Arc::clone(&next));
++        pool.run(Arc::new(move || {
++            loop {
++                let index = next.fetch_add(1, Ordering::Relaxed);
++                let Some((body, w, h)) = bodies.get(index) else { break };
++                let r = rects[index];
++                let pixels = decode_body(body, *w, *h, (r.w, r.h));
++                if sender.send((index, pixels)).is_err() {
++                    break;
++                }
++            }
++        }));
++    }
++    let count = jobs.len();
++    let last_fovea = jobs.iter().rposition(|job| job.rect.touches_fovea).unwrap_or(0);
++    let mut done: Vec<Option<Vec<u32>>> = (0..count).map(|_| None).collect();
++    let mut applied = 0;
++    let mut fovea_applied = Duration::ZERO;
++    while applied < count {
++        let (index, pixels) = receiver.recv().unwrap();
++        done[index] = Some(pixels);
++        while let Some(pixels) = done.get_mut(applied).and_then(Option::take) {
++            let r = rects[applied];
++            for row in 0..r.h {
++                frame[(r.y + row) * WIDTH + r.x..(r.y + row) * WIDTH + r.x + r.w]
++                    .copy_from_slice(&pixels[row * r.w..(row + 1) * r.w]);
++            }
++            if applied == last_fovea {
++                fovea_applied = started.elapsed();
++            }
++            applied += 1;
++        }
++    }
++    DecodeRun {
++        frame,
++        total: started.elapsed(),
++        fovea_applied,
++    }
++}
++
++/// Bytes of JPEG headers and tables in a Tight JPEG body (everything except
++/// the entropy-coded scan), or 0 for other subencodings.
++fn jpeg_overhead(body: &[u8]) -> usize {
++    if body.first().map(|c| c >> 4) != Some(0x09) {
++        return 0;
++    }
++    // Skip the control byte and the compact length.
++    let mut start = 1;
++    while body[start] & 0x80 != 0 && start < 3 {
++        start += 1;
++    }
++    start += 1;
++    let jpeg = &body[start..];
++    let sos = jpeg.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
++    let sos_length = usize::from(jpeg[sos + 2]) << 8 | usize::from(jpeg[sos + 3]);
++    start + sos + 2 + sos_length + 2
++}
++
++fn median(mut values: Vec<Duration>) -> f64 {
++    values.sort();
++    values[values.len() / 2].as_secs_f64() * 1000.0
++}
++
++fn load(dir: &str, name: &str) -> Vec<u32> {
++    let bytes = std::fs::read(format!("{dir}/{name}.rgb")).unwrap();
++    assert_eq!(bytes.len(), WIDTH * HEIGHT * 3, "{name} must be 1920x1080 RGB");
++    bytes
++        .chunks_exact(3)
++        .map(|p| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]))
++        .collect()
++}
++
++/// The panning grainy landscape from `latency_bench`, frame 1.
++fn synthetic() -> Vec<u32> {
++    let (width, height) = (WIDTH, HEIGHT);
++    let texture_width = width * 2;
++    let mut seed = 0x9e37_79b9u32;
++    let mut texture = Vec::with_capacity(texture_width * height);
++    for y in 0..height {
++        for x in 0..texture_width {
++            let (fx, fy) = (x as f32, y as f32);
++            let horizon = height as f32 * (0.45 + 0.08 * (fx * 0.004).sin());
++            seed ^= seed << 13;
++            seed ^= seed >> 17;
++            seed ^= seed << 5;
++            let grain = (seed % 13) as f32 - 6.0;
++            let (red, green, blue) = if fy < horizon {
++                let t = fy / horizon;
++                let cloud = 18.0 * ((fx * 0.011).sin() * (fy * 0.03).cos());
++                (90.0 + 60.0 * t + cloud, 140.0 + 50.0 * t + cloud, 230.0 - 20.0 * t)
++            } else {
++                let t = (fy - horizon) / (height as f32 - horizon);
++                let rows = 25.0 * ((fx * 0.05 + fy * 0.21).sin() * (fy * 0.07).cos());
++                (70.0 + 40.0 * t + rows, 120.0 + 30.0 * t + rows, 50.0 + 20.0 * t + rows * 0.5)
++            };
++            let channel = |value: f32| (value + grain).clamp(0.0, 255.0) as u32;
++            texture.push(channel(red) << 16 | channel(green) << 8 | channel(blue));
++        }
++    }
++    let offset = 7;
++    let mut frame = Vec::with_capacity(width * height);
++    for y in 0..height {
++        frame.extend_from_slice(&texture[y * texture_width + offset..y * texture_width + offset + width]);
++    }
++    frame
++}
++
++fn strategies() -> Vec<Strategy> {
++    use SamplingFactor::{R_4_2_0, R_4_2_2, R_4_4_4};
++    let level = |l: usize| {
++        let (quality, sampling) = tight::JPEG_LEVELS[l];
++        zone(quality, sampling)
++    };
++    // The prototype server's layout: 64-row fovea rectangles, 128 elsewhere.
++    let zoned = Layout::Zoned {
++        band_rows: [64, 128, 128],
++        order: Order::CenterFirst,
++    };
++    let with = |mut spec: ZoneSpec, transform| {
++        spec.transform = transform;
++        spec
++    };
++    let optimized = |mut spec: ZoneSpec| {
++        spec.optimize_huffman = true;
++        spec
++    };
++    let balanced = [level(6), level(4), level(1)];
++    let s = |name, layout, zones| Strategy {
++        name,
++        layout,
++        zones,
++        boxes: STANDARD,
++    };
++    vec![
++        s("U6 bands (today)", Layout::Bands(64), [level(6); 3]),
++        s("U3 bands", Layout::Bands(64), [level(3); 3]),
++        s("U6 4:2:2 bands", Layout::Bands(64), [zone(79, R_4_2_2); 3]),
++        s("U6 zoned, center first", zoned, [level(6); 3]),
++        s("F balanced 6/4/1", zoned, balanced),
++        s("F sharp 8/5/2", zoned, [level(8), level(5), level(2)]),
++        s("F wifi 5/3/0", zoned, [level(5), level(3), level(0)]),
++        s(
++            "F 4:2:0 everywhere 6/4/1",
++            zoned,
++            [zone(79, R_4_2_0), zone(62, R_4_2_0), zone(29, R_4_2_0)],
++        ),
++        s(
++            "F balanced + prefilter",
++            zoned,
++            [level(6), level(4), with(level(1), Transform::Prefilter)],
++        ),
++        s(
++            "F balanced + half-res periph",
++            zoned,
++            [level(6), level(4), with(level(1), Transform::HalfRes)],
++        ),
++        s(
++            "F sharp + half-res mid/periph",
++            zoned,
++            [
++                level(8),
++                with(zone(86, R_4_4_4), Transform::HalfRes),
++                with(zone(62, R_4_2_0), Transform::HalfRes),
++            ],
++        ),
++        s(
++            "F balanced, optimized Huffman",
++            zoned,
++            balanced.map(optimized),
++        ),
++        s(
++            "F balanced, opt. Huffman periph",
++            zoned,
++            [level(6), level(4), optimized(level(1))],
++        ),
++        s(
++            "U6 bands, optimized Huffman",
++            Layout::Bands(64),
++            [optimized(level(6)); 3],
++        ),
++        s(
++            "F balanced, row-major order",
++            Layout::Zoned {
++                band_rows: [64, 128, 128],
++                order: Order::RowMajor,
++            },
++            balanced,
++        ),
++        s(
++            "F balanced, large rects 128/256/256",
++            Layout::Zoned {
++                band_rows: [128, 256, 256],
++                order: Order::CenterFirst,
++            },
++            balanced,
++        ),
++        s(
++            "F balanced, fovea 64 + largest first",
++            Layout::Zoned {
++                band_rows: [64, 256, 256],
++                order: Order::FoveaThenLargest,
++            },
++            balanced,
++        ),
++        Strategy {
++            name: "F balanced, small zones",
++            layout: zoned,
++            zones: balanced,
++            boxes: [(0.20, 0.12), (0.45, 0.27)],
++        },
++        Strategy {
++            name: "F balanced, large zones",
++            layout: zoned,
++            zones: balanced,
++            boxes: [(0.40, 0.25), (0.75, 0.45)],
++        },
++        s(
++            "F 2-zone 6/1",
++            zoned,
++            [level(6), level(1), level(1)],
++        ),
++    ]
++}
++
++fn main() {
++    let args: Vec<String> = std::env::args().skip(1).collect();
++    let frames_dir = args.first().expect("FRAMES_DIR").clone();
++    let out_dir = args.get(1).expect("OUT_DIR").clone();
++    let mut names: Vec<String> = args[2..].to_vec();
++    if names.is_empty() {
++        names = ["xonotic", "redeclipse_v2", "redeclipse_edge", "unvanquished", "assaultcube", "synthetic"]
++            .map(String::from)
++            .to_vec();
++    }
++    std::fs::create_dir_all(format!("{out_dir}/decoded")).unwrap();
++    let threads = std::thread::available_parallelism().map_or(1, usize::from);
++    let encoders = Pool::new(threads);
++    let decoders = Pool::new(DECODE_THREADS);
++    let geometry_for = |boxes: [(f64, f64); 2]| Geometry {
++        width: WIDTH,
++        height: HEIGHT,
++        fovea: (boxes[0].0 * HEIGHT as f64, boxes[0].1 * HEIGHT as f64),
++        mid: (boxes[1].0 * HEIGHT as f64, boxes[1].1 * HEIGHT as f64),
++    };
++    let geometry = geometry_for(STANDARD);
++    // Zone map for the scoring script.
++    let zones = geometry.tile_zones();
++    std::fs::write(
++        format!("{out_dir}/zones.json"),
++        format!(
++            "{{\"tile\":{TILE},\"columns\":{},\"rows\":{},\"zones\":{:?}}}",
++            WIDTH.div_ceil(TILE),
++            HEIGHT.div_ceil(TILE),
++            zones
++        ),
++    )
++    .unwrap();
++    let mut results = std::fs::File::create(format!("{out_dir}/results.jsonl")).unwrap();
++    eprintln!("{threads} encoder threads, {DECODE_THREADS} decoder threads");
++    for name in &names {
++        let frame = Arc::new(if name == "synthetic" {
++            let frame = synthetic();
++            let mut rgb = Vec::with_capacity(WIDTH * HEIGHT * 3);
++            for p in &frame {
++                rgb.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
++            }
++            std::fs::write(format!("{out_dir}/synthetic_source.rgb"), rgb).unwrap();
++            frame
++        } else {
++            load(&frames_dir, name)
++        });
++        for (index, strategy) in strategies().iter().enumerate() {
++            let rects = rects_for(strategy.layout, &geometry_for(strategy.boxes), &geometry);
++            let jobs: Arc<Vec<Job>> = Arc::new(
++                rects
++                    .iter()
++                    .map(|rect| {
++                        // Bands span zones; they use the fovea's settings.
++                        let spec = strategy.zones[usize::from(match strategy.layout {
++                            Layout::Bands(_) => 0,
++                            Layout::Zoned { .. } => rect.zone,
++                        })];
++                        Job {
++                            rect: *rect,
++                            settings: TightSettings {
++                                quality: Some(6),
++                                compression: 1,
++                                jpeg: Some((spec.quality, spec.sampling)),
++                                optimize_huffman: spec.optimize_huffman,
++                            },
++                            transform: spec.transform,
++                        }
++                    })
++                    .collect(),
++            );
++            let mut encode_totals = Vec::new();
++            let mut encode_fovea = Vec::new();
++            let mut encode_first = Vec::new();
++            let mut last = None;
++            for run in 0..WARMUP + RUNS {
++                let result = encode_parallel(&encoders, &frame, &jobs);
++                if run >= WARMUP {
++                    encode_totals.push(result.total);
++                    encode_fovea.push(result.fovea_ready);
++                    encode_first.push(result.first_ready);
++                }
++                last = Some(result);
++            }
++            let encoded = last.unwrap();
++            // CPU cost: every rectangle encoded on one thread.
++            let mut cpu = Vec::new();
++            for _ in 0..5 {
++                let started = Instant::now();
++                for job in jobs.iter() {
++                    std::hint::black_box(encode_job(&frame, WIDTH, job));
++                }
++                cpu.push(started.elapsed());
++            }
++            let mut decode_totals = Vec::new();
++            let mut decode_fovea = Vec::new();
++            let mut decoded = None;
++            for run in 0..WARMUP + RUNS {
++                let result = decode_parallel(&decoders, &encoded, &jobs);
++                if run >= WARMUP {
++                    decode_totals.push(result.total);
++                    decode_fovea.push(result.fovea_applied);
++                }
++                decoded = Some(result);
++            }
++            let decoded = decoded.unwrap();
++            let mut decode_cpu = Vec::new();
++            for _ in 0..5 {
++                let started = Instant::now();
++                for ((body, w, h), job) in encoded.bodies.iter().zip(jobs.iter()) {
++                    std::hint::black_box(decode_body(body, *w, *h, (job.rect.w, job.rect.h)));
++                }
++                decode_cpu.push(started.elapsed());
++            }
++            // Wire bytes: a 12-byte rectangle header plus the body.
++            let mut bytes_by_zone = [0usize; 3];
++            let mut rects_by_zone = [0usize; 3];
++            let mut fovea_prefix_bytes = 0;
++            let last_fovea = jobs.iter().rposition(|job| job.rect.touches_fovea).unwrap_or(0);
++            let mut overhead = 0;
++            for (i, ((body, ..), job)) in encoded.bodies.iter().zip(jobs.iter()).enumerate() {
++                let z = usize::from(job.rect.zone);
++                bytes_by_zone[z] += body.len() + 12;
++                rects_by_zone[z] += 1;
++                overhead += jpeg_overhead(body) + 12;
++                if i <= last_fovea {
++                    fovea_prefix_bytes += body.len() + 12;
++                }
++            }
++            let total_bytes: usize = 4 + bytes_by_zone.iter().sum::<usize>();
++            let mut rgb = Vec::with_capacity(WIDTH * HEIGHT * 3);
++            for p in &decoded.frame {
++                rgb.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
++            }
++            std::fs::write(format!("{out_dir}/decoded/{name}__{index:02}.rgb"), &rgb).unwrap();
++            let line = format!(
++                "{{\"frame\":\"{name}\",\"strategy\":{index},\"name\":\"{}\",\"rects\":{},\"rects_by_zone\":{:?},\"bytes\":{total_bytes},\"bytes_by_zone\":{:?},\"fovea_prefix_bytes\":{fovea_prefix_bytes},\"overhead_bytes\":{overhead},\"encode_ms\":{:.3},\"encode_first_ms\":{:.3},\"encode_fovea_ms\":{:.3},\"encode_cpu_ms\":{:.3},\"decode_ms\":{:.3},\"decode_fovea_ms\":{:.3},\"decode_cpu_ms\":{:.3}}}",
++                strategy.name,
++                jobs.len(),
++                rects_by_zone,
++                bytes_by_zone,
++                median(encode_totals),
++                median(encode_first),
++                median(encode_fovea),
++                median(cpu),
++                median(decode_totals),
++                median(decode_fovea),
++                median(decode_cpu),
++            );
++            eprintln!("{line}");
++            writeln!(results, "{line}").unwrap();
++        }
++    }
++}
+--- /dev/null
++++ b/examples/fovea_latency.rs
+@@ -0,0 +1,550 @@
++//! End-to-end latency of foveated Tight between TopVNC's server and viewer
++//! session, through a local proxy that emulates a link (as latency_bench).
++//!
++//! A producer pans a real game frame like a turning camera, at a fixed
++//! rate. Each frame carries, in 16-pixel blocks that survive JPEG:
++//! - its frame number in the tile left of the screen center (crosshair);
++//! - the latest input sequence number the host received, right of center;
++//! - its frame number again in the top-left (periphery) tile.
++//!
++//! The viewer side sends a pointer event every 4 ms whose position encodes
++//! a sequence number, and records:
++//! - center: publish -> the crosshair tiles decoded on the viewer;
++//! - full: publish -> the whole update decoded;
++//! - input: pointer event sent -> its sequence number visible at the
++//!   crosshair, including the uplink and the wait for the next host frame;
++//! - periphery age: how old the periphery is when an update completes.
++//!
++//! cargo run --release --example fovea_latency -- --frame PATH.rgb
++//!   [--fps 120] [--seconds 5] [--links 1000:2,300:4,150:8,75:8]
++//!   [--modes NAME,NAME] [--json OUT.jsonl] [--label TEXT]
++
++use std::error::Error;
++use std::io::{self, Read, Write};
++use std::net::{Shutdown, TcpListener, TcpStream};
++use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, mpsc};
++use std::thread;
++use std::time::{Duration, Instant};
++use topvnc::tight::SamplingFactor::{R_4_2_0, R_4_2_2, R_4_4_4};
++use topvnc::{ClientEvent, Encoding, Foveation, Framebuffer, ServerConfig, Session, VncServer};
++
++const WIDTH: usize = 1920;
++const HEIGHT: usize = 1080;
++/// Camera turn per frame, in pixels of the panorama.
++const PAN: usize = 23;
++const CENTER_FRAME: (usize, usize) = (896, 512);
++const CENTER_INPUT: (usize, usize) = (960, 512);
++const PERIPHERY_FRAME: (usize, usize) = (0, 0);
++const INPUT_INTERVAL: Duration = Duration::from_millis(4);
++/// Link emulation granularity: about six full-size Ethernet frames.
++const SLICE_BYTES: usize = 8 * 1024;
++
++struct Scene {
++    panorama: Vec<u32>,
++}
++
++impl Scene {
++    /// The frame and its mirror side by side, so panning wraps seamlessly.
++    fn new(frame: &[u32]) -> Self {
++        let mut panorama = Vec::with_capacity(WIDTH * 2 * HEIGHT);
++        for y in 0..HEIGHT {
++            let row = &frame[y * WIDTH..(y + 1) * WIDTH];
++            panorama.extend_from_slice(row);
++            panorama.extend(row.iter().rev());
++        }
++        Self { panorama }
++    }
++
++    fn render(&self, frame: u32, input: u32, framebuffer: &mut Framebuffer) {
++        let offset = frame as usize * PAN % (WIDTH * 2);
++        let pixels = framebuffer.pixels_mut();
++        for y in 0..HEIGHT {
++            let source = &self.panorama[y * WIDTH * 2..(y + 1) * WIDTH * 2];
++            let first = (WIDTH * 2 - offset).min(WIDTH);
++            let target = &mut pixels[y * WIDTH..(y + 1) * WIDTH];
++            target[..first].copy_from_slice(&source[offset..offset + first]);
++            target[first..].copy_from_slice(&source[..WIDTH - first]);
++        }
++        marker(frame, pixels, CENTER_FRAME);
++        marker(input, pixels, CENTER_INPUT);
++        marker(frame, pixels, PERIPHERY_FRAME);
++    }
++}
++
++/// `value` as a 4x4 grid of black and white 16-pixel blocks, least
++/// significant bit first.
++fn marker(value: u32, pixels: &mut [u32], (x, y): (usize, usize)) {
++    for bit in 0..16 {
++        let color = if value >> bit & 1 != 0 { 0xffffff } else { 0 };
++        let (bx, by) = (x + bit % 4 * 16, y + bit / 4 * 16);
++        for row in by..by + 16 {
++            pixels[row * WIDTH + bx..row * WIDTH + bx + 16].fill(color);
++        }
++    }
++}
++
++fn read_marker(framebuffer: &Framebuffer, (x, y): (usize, usize)) -> u32 {
++    let pixels = framebuffer.pixels();
++    (0..16)
++        .map(|bit| {
++            let (px, py) = (x + bit % 4 * 16 + 8, y + bit / 4 * 16 + 8);
++            u32::from(pixels[py * WIDTH + px] >> 8 & 0xff >= 128) << bit
++        })
++        .sum()
++}
++
++fn covers(rect: (usize, usize, usize, usize), (x, y): (usize, usize)) -> bool {
++    rect.0 <= x && x + 64 <= rect.0 + rect.2 && rect.1 <= y && y + 64 <= rect.1 + rect.3
++}
++
++/// Forward `from` to `to`, delaying each chunk by `delay` and pacing the
++/// stream to `bits_per_second` when given (from latency_bench).
++fn pipe(
++    mut from: TcpStream,
++    mut to: TcpStream,
++    delay: Duration,
++    bits_per_second: Option<f64>,
++    counter: Arc<AtomicU64>,
++) {
++    let (sender, receiver) = mpsc::channel::<(Instant, Vec<u8>)>();
++    let reader = thread::spawn(move || {
++        let mut buffer = vec![0; 64 * 1024];
++        while let Ok(count) = from.read(&mut buffer) {
++            if count == 0
++                || sender
++                    .send((Instant::now(), buffer[..count].to_vec()))
++                    .is_err()
++            {
++                break;
++            }
++        }
++    });
++    let mut busy_until = Instant::now();
++    'chunks: for (arrived, chunk) in receiver {
++        let due = arrived + delay;
++        let now = Instant::now();
++        if due > now {
++            thread::sleep(due - now);
++        }
++        // Forward in slices, each when its last byte has crossed the link,
++        // so the first bytes of a large read are not held back until the
++        // whole read has (latency_bench forwards whole reads of up to 64 KB).
++        for slice in chunk.chunks(SLICE_BYTES) {
++            if let Some(rate) = bits_per_second {
++                let now = Instant::now();
++                if now > busy_until + Duration::from_millis(2) {
++                    busy_until = now;
++                }
++                busy_until += Duration::from_secs_f64(slice.len() as f64 * 8.0 / rate);
++                if busy_until > now + Duration::from_micros(150) {
++                    thread::sleep(busy_until - now);
++                }
++            }
++            if to.write_all(slice).is_err() {
++                break 'chunks;
++            }
++            counter.fetch_add(slice.len() as u64, Ordering::Relaxed);
++        }
++    }
++    let _ = to.shutdown(Shutdown::Write);
++    let _ = reader.join();
++}
++
++fn start_link(
++    server: std::net::SocketAddr,
++    delay: Duration,
++    mbps: f64,
++) -> io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
++    let listener = TcpListener::bind("127.0.0.1:0")?;
++    let address = listener.local_addr()?;
++    let downstream = Arc::new(AtomicU64::new(0));
++    let counter = Arc::clone(&downstream);
++    thread::spawn(move || {
++        let Ok((client, _)) = listener.accept() else {
++            return;
++        };
++        let Ok(upstream) = TcpStream::connect(server) else {
++            return;
++        };
++        let _ = client.set_nodelay(true);
++        let _ = upstream.set_nodelay(true);
++        let (client_read, upstream_write) =
++            (client.try_clone().unwrap(), upstream.try_clone().unwrap());
++        thread::spawn(move || {
++            pipe(client_read, upstream_write, delay, None, Arc::new(AtomicU64::new(0)))
++        });
++        pipe(upstream, client, delay, Some(mbps * 1e6), counter);
++    });
++    Ok((address, downstream))
++}
++
++#[derive(Clone)]
++struct Mode {
++    name: &'static str,
++    quality: u8,
++    foveation: Option<Foveation>,
++}
++
++fn foveation(zones: [(u8, topvnc::tight::SamplingFactor); 3]) -> Foveation {
++    Foveation {
++        fovea: (0.30, 0.18),
++        mid: (0.60, 0.36),
++        zones,
++        band_rows: [64, 128, 128],
++        center_first: true,
++        periphery_interval: 1,
++        adaptive: false,
++    }
++}
++
++fn modes() -> Vec<Mode> {
++    let balanced = [(79, R_4_4_4), (62, R_4_2_2), (29, R_4_2_0)];
++    vec![
++        Mode {
++            name: "U6 bands (today)",
++            quality: 6,
++            foveation: None,
++        },
++        Mode {
++            name: "U3 bands",
++            quality: 3,
++            foveation: None,
++        },
++        Mode {
++            name: "U6 center-first",
++            quality: 6,
++            foveation: Some(foveation([(79, R_4_4_4); 3])),
++        },
++        Mode {
++            name: "F balanced",
++            quality: 6,
++            foveation: Some(foveation(balanced)),
++        },
++        Mode {
++            name: "F wifi",
++            quality: 6,
++            foveation: Some(foveation([(77, R_4_2_2), (42, R_4_2_2), (15, R_4_2_0)])),
++        },
++        Mode {
++            name: "F adaptive",
++            quality: 6,
++            foveation: Some(Foveation {
++                adaptive: true,
++                ..foveation(balanced)
++            }),
++        },
++        Mode {
++            name: "F balanced periph/2",
++            quality: 6,
++            foveation: Some(Foveation {
++                periphery_interval: 2,
++                ..foveation(balanced)
++            }),
++        },
++    ]
++}
++
++#[derive(Default)]
++struct Stats {
++    center: Vec<f64>,
++    full: Vec<f64>,
++    input: Vec<f64>,
++    /// Input to the end of the update that first showed it: when today's
++    /// viewer presents.
++    input_full: Vec<f64>,
++    periphery_age: Vec<f64>,
++    frames: usize,
++    bytes: u64,
++}
++
++fn percentile(values: &mut [f64], p: f64) -> f64 {
++    if values.is_empty() {
++        return f64::NAN;
++    }
++    values.sort_by(f64::total_cmp);
++    values[((values.len() - 1) as f64 * p).round() as usize]
++}
++
++fn mean(values: &[f64]) -> f64 {
++    values.iter().sum::<f64>() / values.len().max(1) as f64
++}
++
++fn run(
++    scene: &Arc<Scene>,
++    mode: &Mode,
++    fps: f64,
++    seconds: f64,
++    mbps: f64,
++    delay: Duration,
++) -> Result<Stats, Box<dyn Error>> {
++    let mut initial = Framebuffer::new(WIDTH as u16, HEIGHT as u16)?;
++    scene.render(1, 0, &mut initial);
++    let server = Arc::new(VncServer::bind(
++        "127.0.0.1:0",
++        initial.clone(),
++        ServerConfig {
++            allow_insecure: true,
++            foveation: mode.foveation,
++            ..ServerConfig::default()
++        },
++    )?);
++    let runner = Arc::clone(&server);
++    thread::spawn(move || runner.run());
++    let (link, downstream) = start_link(server.local_addr()?, delay, mbps)?;
++
++    let published = Arc::new(Mutex::new(vec![Instant::now(); 2]));
++    let stop = Arc::new(AtomicBool::new(false));
++    let producer = {
++        let (server, scene, published, stop) = (
++            Arc::clone(&server),
++            Arc::clone(scene),
++            Arc::clone(&published),
++            Arc::clone(&stop),
++        );
++        let interval = Duration::from_secs_f64(1.0 / fps);
++        let mut framebuffer = initial;
++        thread::spawn(move || {
++            let start = Instant::now();
++            let mut frame = 2u32;
++            let mut input = 0u32;
++            while !stop.load(Ordering::Acquire) {
++                // Like a game reading input at the start of its frame.
++                while let Ok(event) = server.try_event() {
++                    if let ClientEvent::Pointer { x, y, .. } = event {
++                        input = input.max(u32::from(y) * WIDTH as u32 + u32::from(x));
++                    }
++                }
++                scene.render(frame, input & 0xffff, &mut framebuffer);
++                published.lock().unwrap().push(Instant::now());
++                let _ = server.update_framebuffer(&framebuffer);
++                let next = start + interval * (frame - 1);
++                let now = Instant::now();
++                if next > now {
++                    thread::sleep(next - now);
++                }
++                frame += 1;
++            }
++        })
++    };
++
++    let mut session = Session::connect_with_encoding(
++        &link.to_string(),
++        true,
++        Encoding::Tight {
++            quality: mode.quality,
++        },
++        || unreachable!("no authentication"),
++    )?;
++    session.set_continuous_updates(true);
++    let writer = session.writer();
++    // Pointer events whose position encodes a sequence number.
++    let sends = Arc::new(Mutex::new(vec![Instant::now()]));
++    let sender_stop = Arc::new(AtomicBool::new(false));
++    let next_sequence = Arc::new(AtomicU32::new(1));
++    let input_thread = {
++        let (writer, sends, stop, next_sequence) = (
++            writer.clone(),
++            Arc::clone(&sends),
++            Arc::clone(&sender_stop),
++            Arc::clone(&next_sequence),
++        );
++        thread::spawn(move || {
++            let start = Instant::now();
++            let mut sequence = 1u32;
++            while !stop.load(Ordering::Acquire) && sequence < 0xffff {
++                sends.lock().unwrap().push(Instant::now());
++                next_sequence.store(sequence + 1, Ordering::Release);
++                let (x, y) = (sequence as usize % WIDTH, sequence as usize / WIDTH);
++                if writer.pointer(0, x as u16, y as u16).is_err() {
++                    break;
++                }
++                sequence += 1;
++                let next = start + INPUT_INTERVAL * sequence;
++                let now = Instant::now();
++                if next > now {
++                    thread::sleep(next - now);
++                }
++            }
++        })
++    };
++
++    let mut received = Framebuffer::new(WIDTH as u16, HEIGHT as u16)?;
++    let mut scratch = Vec::new();
++    let mut stats = Stats::default();
++    let warmup = Instant::now() + Duration::from_secs(1);
++    let end = warmup + Duration::from_secs_f64(seconds);
++    let mut bytes_at_warmup = None;
++    let mut last_frame = 0;
++    let mut last_input = 0u32;
++    // The newest frame the viewer's periphery shows.
++    let mut periphery_frame = 0u32;
++    writer.request_update(false, WIDTH as u16, HEIGHT as u16)?;
++    while Instant::now() < end {
++        let mut center_frame: Option<Instant> = None;
++        let mut center_input: Option<Instant> = None;
++        let mut periphery: Option<u32> = None;
++        session.read_update_pipelined(&mut scratch, |x, y, w, h, bytes| {
++            received.apply_raw(x, y, w, h, bytes)?;
++            let rect = (usize::from(x), usize::from(y), usize::from(w), usize::from(h));
++            if covers(rect, CENTER_FRAME) {
++                center_frame = Some(Instant::now());
++            }
++            if covers(rect, CENTER_INPUT) {
++                center_input = Some(Instant::now());
++            }
++            if covers(rect, PERIPHERY_FRAME) {
++                periphery = Some(read_marker(&received, PERIPHERY_FRAME));
++            }
++            Ok(())
++        })?;
++        let now = Instant::now();
++        if let Some(shown) = periphery {
++            periphery_frame = periphery_frame.max(shown);
++        }
++        let (Some(center_frame), Some(center_input)) = (center_frame, center_input) else {
++            continue;
++        };
++        let center = center_frame.max(center_input);
++        let frame = read_marker(&received, CENTER_FRAME);
++        let input = read_marker(&received, CENTER_INPUT);
++        if now < warmup {
++            last_frame = frame;
++            last_input = input;
++            continue;
++        }
++        bytes_at_warmup.get_or_insert_with(|| downstream.load(Ordering::Relaxed));
++        if frame == last_frame {
++            continue;
++        }
++        last_frame = frame;
++        stats.frames += 1;
++        let published = published.lock().unwrap();
++        if let Some(at) = published.get(frame as usize) {
++            stats.center.push((center - *at).as_secs_f64() * 1000.0);
++            stats.full.push((now - *at).as_secs_f64() * 1000.0);
++        }
++        if let Some(at) = published.get(periphery_frame as usize) {
++            stats.periphery_age.push((now - *at).as_secs_f64() * 1000.0);
++        }
++        drop(published);
++        // Every input sequence shown for the first time.
++        if input > last_input && input < next_sequence.load(Ordering::Acquire) {
++            let sends = sends.lock().unwrap();
++            for sequence in last_input + 1..=input {
++                if let Some(at) = sends.get(sequence as usize) {
++                    stats.input.push((center - *at).as_secs_f64() * 1000.0);
++                    stats.input_full.push((now - *at).as_secs_f64() * 1000.0);
++                }
++            }
++            last_input = input;
++        }
++    }
++    stats.bytes = downstream.load(Ordering::Relaxed) - bytes_at_warmup.unwrap_or(0);
++    sender_stop.store(true, Ordering::Release);
++    stop.store(true, Ordering::Release);
++    input_thread.join().unwrap();
++    producer.join().unwrap();
++    let _ = writer.shutdown();
++    server.stop();
++    Ok(stats)
++}
++
++fn main() -> Result<(), Box<dyn Error>> {
++    let mut frame_path = None;
++    let mut fps = 120.0;
++    let mut seconds = 5.0;
++    let mut links = vec![(1000.0, 2u64), (300.0, 4), (150.0, 8), (75.0, 8)];
++    let mut selected: Option<Vec<String>> = None;
++    let mut json = None;
++    let mut label = String::new();
++    let mut args = std::env::args().skip(1);
++    while let Some(arg) = args.next() {
++        let mut value = || args.next().ok_or(format!("{arg} needs a value"));
++        match arg.as_str() {
++            "--frame" => frame_path = Some(value()?),
++            "--fps" => fps = value()?.parse()?,
++            "--seconds" => seconds = value()?.parse()?,
++            "--links" => {
++                links = value()?
++                    .split(',')
++                    .map(|link| {
++                        let (mbps, delay) = link.split_once(':').expect("MBPS:DELAY_MS");
++                        (mbps.parse().unwrap(), delay.parse().unwrap())
++                    })
++                    .collect()
++            }
++            "--modes" => selected = Some(value()?.split(',').map(String::from).collect()),
++            "--json" => json = Some(value()?),
++            "--label" => label = value()?,
++            _ => return Err(format!("unknown argument {arg}").into()),
++        }
++    }
++    let path = frame_path.ok_or("--frame PATH.rgb is required")?;
++    let bytes = std::fs::read(&path)?;
++    let frame: Vec<u32> = bytes
++        .chunks_exact(3)
++        .map(|p| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]))
++        .collect();
++    assert_eq!(frame.len(), WIDTH * HEIGHT);
++    let scene = Arc::new(Scene::new(&frame));
++    let mut out = json
++        .map(|path| std::fs::OpenOptions::new().create(true).append(true).open(path))
++        .transpose()?;
++    println!("{path}: {fps} fps, {seconds} s per row, pan {PAN} px/frame");
++    for (mbps, delay_ms) in links {
++        println!("Link {mbps} Mbit/s, {delay_ms} ms each way");
++        println!(
++            "  {:<24} {:>7} {:>8} | {:>14} | {:>14} | {:>14} | {:>9}",
++            "mode", "fps", "KB/frm", "center mean/95", "full mean/95", "input mean/95", "periph age"
++        );
++        for mode in modes() {
++            if selected
++                .as_ref()
++                .is_some_and(|names| !names.iter().any(|name| name == mode.name))
++            {
++                continue;
++            }
++            let mut stats = run(&scene, &mode, fps, seconds, mbps, Duration::from_millis(delay_ms))?;
++            let frames = stats.frames.max(1) as f64;
++            let (c, f, i, p) = (
++                mean(&stats.center),
++                mean(&stats.full),
++                mean(&stats.input),
++                mean(&stats.periphery_age),
++            );
++            let i_full = mean(&stats.input_full);
++            let i_full95 = percentile(&mut stats.input_full, 0.95);
++            let (c95, f95, i95) = (
++                percentile(&mut stats.center, 0.95),
++                percentile(&mut stats.full, 0.95),
++                percentile(&mut stats.input, 0.95),
++            );
++            let i50 = percentile(&mut stats.input, 0.5);
++            let kb = stats.bytes as f64 / frames / 1000.0;
++            println!(
++                "  {:<24} {:>7.1} {:>8.1} | {:>6.1} {:>7.1} | {:>6.1} {:>7.1} | {:>6.1} {:>7.1} | {:>9.1}",
++                mode.name,
++                frames / seconds,
++                kb,
++                c,
++                c95,
++                f,
++                f95,
++                i,
++                i95,
++                p
++            );
++            if let Some(out) = &mut out {
++                writeln!(
++                    out,
++                    "{{\"label\":\"{label}\",\"frame\":\"{path}\",\"fps_source\":{fps},\"mbps\":{mbps},\"delay_ms\":{delay_ms},\"mode\":\"{}\",\"fps\":{:.2},\"kb_per_frame\":{kb:.1},\"mbit_s\":{:.1},\"center_mean\":{c:.2},\"center_p95\":{c95:.2},\"full_mean\":{f:.2},\"full_p95\":{f95:.2},\"input_mean\":{i:.2},\"input_p50\":{i50:.2},\"input_p95\":{i95:.2},\"input_full_mean\":{i_full:.2},\"input_full_p95\":{i_full95:.2},\"periphery_age\":{p:.2}}}",
++                    mode.name,
++                    frames / seconds,
++                    stats.bytes as f64 * 8.0 / seconds / 1e6,
++                )?;
++            }
++        }
++    }
++    Ok(())
++}
