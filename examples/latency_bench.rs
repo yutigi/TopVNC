@@ -19,7 +19,14 @@
 //!
 //! `--serve HOST:PORT` instead serves the scene without authentication until
 //! interrupted, for trying a viewer against moving content:
-//! `topvnc HOST:PORT --allow-insecure`.
+//! `topvnc HOST:PORT --allow-insecure`. With `--relative-mouse` it asks
+//! viewers for relative pointer motion, as a host does while a game hides its
+//! cursor, and `--print-input` prints the input events viewers send. Served
+//! frames also carry their number in 32-pixel blocks at the bottom-left, where
+//! the viewer's settings button does not cover it, and on macOS
+//! `--publish-log PATH` records when each frame was published, in
+//! `CLOCK_UPTIME_RAW` nanoseconds, so a screen capture of the viewer can
+//! measure the time until each frame is on screen.
 
 use std::error::Error;
 use std::io::{self, Read, Write};
@@ -39,6 +46,12 @@ struct Options {
     links_mbps: Vec<f64>,
     /// Serve the scene at this address for a viewer instead of measuring.
     serve: Option<String>,
+    /// While serving, ask viewers for relative pointer motion.
+    relative_mouse: bool,
+    /// While serving, print the input events viewers send.
+    print_input: bool,
+    /// While serving, log each frame's publish time to this file.
+    publish_log: Option<String>,
 }
 
 fn options() -> Result<Options, Box<dyn Error>> {
@@ -50,6 +63,9 @@ fn options() -> Result<Options, Box<dyn Error>> {
         delay: Duration::from_millis(2),
         links_mbps: vec![100.0, 1000.0],
         serve: None,
+        relative_mouse: false,
+        print_input: false,
+        publish_log: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -65,6 +81,9 @@ fn options() -> Result<Options, Box<dyn Error>> {
             "--fps" => options.fps = value()?.parse()?,
             "--delay-ms" => options.delay = Duration::from_millis(value()?.parse()?),
             "--serve" => options.serve = Some(value()?),
+            "--relative-mouse" => options.relative_mouse = true,
+            "--print-input" => options.print_input = true,
+            "--publish-log" => options.publish_log = Some(value()?),
             "--mbps" => {
                 options.links_mbps = value()?
                     .split(',')
@@ -137,14 +156,33 @@ impl Scene {
         }
         // The frame number as a 4x4 grid of black and white 16x16 blocks,
         // which survives JPEG, so the client can read it back.
+        self.marker(frame, pixels, 0, 0, 16);
+    }
+
+    /// Draw `frame` as a 4x4 grid of black and white `block`-pixel blocks
+    /// with its top-left corner at (`x`, `y`), least significant bit first.
+    fn marker(&self, frame: u32, pixels: &mut [u32], x: usize, y: usize, block: usize) {
         for bit in 0..FRAME_BITS {
             let color = if frame >> bit & 1 != 0 { 0xffffff } else { 0 };
-            let (block_x, block_y) = (bit % 4 * 16, bit / 4 * 16);
-            for y in block_y..block_y + 16 {
-                pixels[y * self.width + block_x..y * self.width + block_x + 16].fill(color);
+            let (block_x, block_y) = (x + bit % 4 * block, y + bit / 4 * block);
+            for row in block_y..block_y + block {
+                pixels[row * self.width + block_x..row * self.width + block_x + block].fill(color);
             }
         }
     }
+}
+
+/// `CLOCK_UPTIME_RAW` in nanoseconds: the clock of macOS display and capture
+/// timestamps.
+#[cfg(target_os = "macos")]
+fn uptime_nanos() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: writes only to `time`.
+    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut time) };
+    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
 }
 
 const FRAME_BITS: usize = 16;
@@ -396,20 +434,53 @@ fn serve_scene(options: &Options, scene: &Scene, address: &str) -> Result<(), Bo
     )?);
     let runner = Arc::clone(&server);
     thread::spawn(move || runner.run());
+    server.set_relative_pointer(options.relative_mouse);
     println!(
-        "Serving a {}x{} scene at {} fps on {} without authentication.",
+        "Serving a {}x{} scene at {} fps on {} without authentication{}.",
         options.width,
         options.height,
         options.fps,
-        server.local_addr()?
+        server.local_addr()?,
+        if options.relative_mouse {
+            ", asking for relative mouse motion"
+        } else {
+            ""
+        }
     );
+    #[cfg(target_os = "macos")]
+    let mut publish_log = options
+        .publish_log
+        .as_ref()
+        .map(|path| std::fs::File::create(path).map(io::LineWriter::new))
+        .transpose()?;
+    #[cfg(not(target_os = "macos"))]
+    if options.publish_log.is_some() {
+        return Err("--publish-log is available on macOS only".into());
+    }
     let interval = Duration::from_secs_f64(1.0 / options.fps);
     let start = Instant::now();
     for frame in 2u32.. {
         scene.render(frame, &mut framebuffer);
+        // A large copy of the frame number, clear of the settings button.
+        let block = 32;
+        scene.marker(
+            frame,
+            framebuffer.pixels_mut(),
+            0,
+            usize::from(options.height) - 4 * block,
+            block,
+        );
+        #[cfg(target_os = "macos")]
+        if let Some(log) = &mut publish_log {
+            writeln!(log, "{} {}", frame & 0xffff, uptime_nanos())?;
+        }
         server.update_framebuffer(&framebuffer)?;
         // Drain input so viewers never stall on a full event queue.
-        while server.try_event().is_ok() {}
+        while let Ok(event) = server.try_event() {
+            if options.print_input {
+                println!("{event:?}");
+            }
+        }
         let next = start + interval * (frame - 1);
         let now = Instant::now();
         if next > now {

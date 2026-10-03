@@ -45,6 +45,24 @@ const FENCE_SYNC_NEXT: u32 = 1 << 2;
 const FENCE_REQUEST: u32 = 1 << 31;
 const FENCE_SUPPORTED_FLAGS: u32 = FENCE_BLOCK_BEFORE | FENCE_BLOCK_AFTER | FENCE_SYNC_NEXT;
 const MAX_FENCE_PAYLOAD: usize = 64;
+/// Pseudo-encoding (QEMU Pointer Motion Change): the client can send
+/// relative pointer motion when the server asks for it.
+const POINTER_MOTION_CHANGE_ENCODING: i32 = -257;
+/// Pseudo-encoding: the client can send extended PointerEvents with the
+/// back and forward buttons.
+const EXTENDED_MOUSE_BUTTONS_ENCODING: i32 = -316;
+/// Relative PointerEvent coordinates are deltas offset by this value.
+const RELATIVE_POINTER_ORIGIN: i32 = 0x7fff;
+/// Largest delta one relative PointerEvent carries; larger motion is split.
+/// Relative coordinates therefore lie in 0x4000..=0xbffe, and absolute ones
+/// below `MAX_FRAMEBUFFER_DIMENSION`, so the server can tell which mode a
+/// client used for every event, including ones in flight at a mode change.
+const MAX_RELATIVE_DELTA: i32 = 0x3fff;
+const _: () =
+    assert!((MAX_FRAMEBUFFER_DIMENSION as i32) < RELATIVE_POINTER_ORIGIN - MAX_RELATIVE_DELTA);
+/// Marks an extended PointerEvent in *button-mask* once ExtendedMouseButtons
+/// is negotiated; otherwise the bit is the back button.
+const EXTENDED_POINTER_MARKER: u8 = 0x80;
 /// Continuous updates keep at most this many unacknowledged updates on the
 /// wire, so a slow link cannot build up a queue of stale frames.
 const MAX_UPDATES_IN_FLIGHT: usize = 3;
@@ -55,9 +73,20 @@ const CLIENT_READ_BUFFER_BYTES: usize = 256 * 1024;
 /// When the client waited longer than this for one update's data, the link
 /// is the bottleneck: requesting the next update early would only queue a
 /// second frame behind the first, so it is requested after the update.
-const PIPELINE_MAX_NETWORK_WAIT: Duration = Duration::from_millis(6);
+/// JPEG decoding runs on other threads, so the wait is about the update's
+/// transmission time; below a 60 Hz frame interval, the link carries every
+/// frame of a 60 fps source and requesting early only removes idle gaps.
+const PIPELINE_MAX_NETWORK_WAIT: Duration = Duration::from_millis(14);
+/// At most this many threads decode JPEG rectangles.
+const MAX_JPEG_THREADS: usize = 8;
+/// Bytes of buffers kept for reuse between rectangles: enough for every band
+/// of a large update in flight, without holding on to a burst of big ones.
+const MAX_SPARE_BYTES: usize = 32 * 1024 * 1024;
 /// Updates with fewer pixels than this are encoded on the session thread.
 const SERVER_PARALLEL_ENCODE_PIXELS: usize = 128 * 1024;
+/// Encoded Tight bands are written once this much is waiting, so the link
+/// carries the first bands while later ones are still being encoded.
+const SERVER_STREAM_FLUSH_BYTES: usize = 4 * 1024;
 /// The compression level the client requests with Tight: fast zlib, since
 /// most gaming content is sent as JPEG anyway.
 const CLIENT_TIGHT_COMPRESS_LEVEL: u8 = 1;
@@ -290,6 +319,12 @@ impl Encoding {
         // Servers that support them push updates without a request per
         // frame, with fences for flow control.
         encodings.extend([FENCE_ENCODING, CONTINUOUS_UPDATES_ENCODING]);
+        // Relative motion for games that capture the mouse, and the back
+        // and forward buttons.
+        encodings.extend([
+            POINTER_MOTION_CHANGE_ENCODING,
+            EXTENDED_MOUSE_BUTTONS_ENCODING,
+        ]);
         encodings
     }
 
@@ -303,11 +338,17 @@ impl Encoding {
     }
 }
 
-/// Decoder state that persists across framebuffer updates: the Zlib stream
-/// and Tight's four zlib streams.
+/// Decoder state that persists across framebuffer updates: the Zlib stream,
+/// Tight's four zlib streams, and the threads that decode JPEG rectangles.
 pub struct UpdateDecoder {
     zlib: Decompress,
     tight: TightDecoder,
+    /// Started with the first JPEG rectangle.
+    jpeg: Option<JpegPool>,
+    /// Buffers returned by finished rectangles, for reuse, and their total
+    /// capacity.
+    spare: Vec<Vec<u8>>,
+    spare_bytes: usize,
 }
 
 impl UpdateDecoder {
@@ -315,6 +356,223 @@ impl UpdateDecoder {
         Self {
             zlib: Decompress::new(true),
             tight: TightDecoder::new(),
+            jpeg: None,
+            spare: Vec::new(),
+            spare_bytes: 0,
+        }
+    }
+
+    fn buffer(&mut self) -> Vec<u8> {
+        let buffer = self.spare.pop().unwrap_or_default();
+        self.spare_bytes -= buffer.capacity();
+        buffer
+    }
+
+    fn recycle(&mut self, buffer: Vec<u8>) {
+        if self.spare_bytes + buffer.capacity() <= MAX_SPARE_BYTES {
+            self.spare_bytes += buffer.capacity();
+            self.spare.push(buffer);
+        }
+    }
+}
+
+/// A Tight JPEG rectangle to decode: its index in the update, data, size,
+/// and a buffer for the pixels.
+struct JpegJob {
+    index: usize,
+    jpeg: Vec<u8>,
+    width: usize,
+    height: usize,
+    output: Vec<u8>,
+    done: std::sync::mpsc::Sender<JpegDone>,
+}
+
+struct JpegDone {
+    index: usize,
+    /// The data buffer, for reuse.
+    jpeg: Vec<u8>,
+    pixels: io::Result<Vec<u8>>,
+}
+
+/// Threads that decode JPEG rectangles while the network thread reads the
+/// rest of the update.
+struct JpegPool {
+    jobs: Option<std::sync::mpsc::Sender<JpegJob>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl JpegPool {
+    fn new(threads: usize) -> io::Result<Self> {
+        let (jobs, receiver) = std::sync::mpsc::channel::<JpegJob>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut pool = Self {
+            jobs: Some(jobs),
+            workers: Vec::with_capacity(threads),
+        };
+        for _ in 0..threads {
+            let receiver = Arc::clone(&receiver);
+            pool.workers.push(
+                std::thread::Builder::new()
+                    .name("topvnc-jpeg".into())
+                    .spawn(move || {
+                        loop {
+                            let job = match receiver.lock() {
+                                Ok(receiver) => receiver.recv(),
+                                Err(_) => return,
+                            };
+                            let Ok(mut job) = job else {
+                                return;
+                            };
+                            let pixels = tight::decode_jpeg_rect(
+                                &job.jpeg,
+                                job.width,
+                                job.height,
+                                &mut job.output,
+                            )
+                            .map(|_| job.output);
+                            // The update was abandoned after an error.
+                            let _ = job.done.send(JpegDone {
+                                index: job.index,
+                                jpeg: job.jpeg,
+                                pixels,
+                            });
+                        }
+                    })?,
+            );
+        }
+        Ok(pool)
+    }
+}
+
+impl Drop for JpegPool {
+    fn drop(&mut self) {
+        // Closing the channel ends the threads.
+        self.jobs = None;
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// A rectangle's x, y, width, and height.
+type RectArea = (u16, u16, u16, u16);
+
+/// Rectangles of one update in wire order that are not yet applied, while
+/// JPEG rectangles decode on the pool. They are applied strictly in order,
+/// so overlapping rectangles behave as if decoded one after another.
+struct PendingRects {
+    /// Position and size, and the pixels once decoded.
+    queue: std::collections::VecDeque<(RectArea, Option<Vec<u8>>)>,
+    /// The update index of `queue[0]`.
+    first: usize,
+    /// Rectangles decoding on the pool.
+    decoding: usize,
+    done: (
+        std::sync::mpsc::Sender<JpegDone>,
+        std::sync::mpsc::Receiver<JpegDone>,
+    ),
+}
+
+type Apply<'a> = dyn FnMut(u16, u16, u16, u16, &[u8]) -> io::Result<()> + 'a;
+
+impl PendingRects {
+    fn new() -> Self {
+        Self {
+            queue: std::collections::VecDeque::new(),
+            first: 0,
+            decoding: 0,
+            done: std::sync::mpsc::channel(),
+        }
+    }
+
+    /// A rectangle decoded on the network thread: applied at once unless an
+    /// earlier one is still decoding.
+    fn decoded(
+        &mut self,
+        rect: RectArea,
+        pixels: &[u8],
+        decoder: &mut UpdateDecoder,
+        apply: &mut Apply<'_>,
+    ) -> io::Result<()> {
+        if self.queue.is_empty() {
+            self.first += 1;
+            return apply(rect.0, rect.1, rect.2, rect.3, pixels);
+        }
+        let mut copy = decoder.buffer();
+        copy.clear();
+        copy.extend_from_slice(pixels);
+        self.queue.push_back((rect, Some(copy)));
+        Ok(())
+    }
+
+    /// Decode a JPEG rectangle on the pool.
+    fn decode_jpeg(
+        &mut self,
+        rect: RectArea,
+        jpeg: Vec<u8>,
+        decoder: &mut UpdateDecoder,
+    ) -> io::Result<()> {
+        if decoder.jpeg.is_none() {
+            let threads = std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(MAX_JPEG_THREADS);
+            decoder.jpeg = Some(JpegPool::new(threads)?);
+        }
+        let output = decoder.buffer();
+        let index = self.first + self.queue.len();
+        let job = JpegJob {
+            index,
+            jpeg,
+            width: usize::from(rect.2),
+            height: usize::from(rect.3),
+            output,
+            done: self.done.0.clone(),
+        };
+        decoder
+            .jpeg
+            .as_ref()
+            .and_then(|pool| pool.jobs.as_ref())
+            .ok_or_else(|| io::Error::other("JPEG decoder threads stopped"))?
+            .send(job)
+            .map_err(|_| io::Error::other("JPEG decoder threads stopped"))?;
+        self.queue.push_back((rect, None));
+        self.decoding += 1;
+        Ok(())
+    }
+
+    /// Apply every rectangle whose pixels are ready, in order. With `wait`,
+    /// wait for all of them.
+    fn apply_ready(
+        &mut self,
+        wait: bool,
+        decoder: &mut UpdateDecoder,
+        apply: &mut Apply<'_>,
+    ) -> io::Result<()> {
+        loop {
+            while let Some((_, Some(_))) = self.queue.front() {
+                let (rect, pixels) = self.queue.pop_front().unwrap();
+                let pixels = pixels.unwrap();
+                self.first += 1;
+                apply(rect.0, rect.1, rect.2, rect.3, &pixels)?;
+                decoder.recycle(pixels);
+            }
+            if self.decoding == 0 {
+                return Ok(());
+            }
+            let finished = if wait {
+                self.done
+                    .1
+                    .recv()
+                    .map_err(|_| io::Error::other("JPEG decoder threads stopped"))?
+            } else {
+                match self.done.1.try_recv() {
+                    Ok(finished) => finished,
+                    Err(_) => return Ok(()),
+                }
+            };
+            self.decoding -= 1;
+            decoder.recycle(finished.jpeg);
+            self.queue[finished.index - self.first].1 = Some(finished.pixels?);
         }
     }
 }
@@ -325,6 +583,18 @@ impl Default for UpdateDecoder {
     }
 }
 
+/// Pointer buttons as [`ClientEvent`] and [`InputWriter`] carry them: bits
+/// 0-6 as in RFB's *button-mask*, then back and forward.
+pub const BUTTON_LEFT: u16 = 1 << 0;
+pub const BUTTON_MIDDLE: u16 = 1 << 1;
+pub const BUTTON_RIGHT: u16 = 1 << 2;
+pub const BUTTON_WHEEL_UP: u16 = 1 << 3;
+pub const BUTTON_WHEEL_DOWN: u16 = 1 << 4;
+pub const BUTTON_WHEEL_LEFT: u16 = 1 << 5;
+pub const BUTTON_WHEEL_RIGHT: u16 = 1 << 6;
+pub const BUTTON_BACK: u16 = 1 << 7;
+pub const BUTTON_FORWARD: u16 = 1 << 8;
+
 /// Events received from a remote RFB client connected to a [`VncServer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientEvent {
@@ -333,11 +603,21 @@ pub enum ClientEvent {
         keysym: u32,
         down: bool,
     },
+    /// The pointer is at (`x`, `y`) with `buttons` (`BUTTON_*` bits) held.
     Pointer {
         client_id: u64,
-        buttons: u8,
+        buttons: u16,
         x: u16,
         y: u16,
+    },
+    /// The pointer moved by (`dx`, `dy`) device units with `buttons` held.
+    /// Sent only while the server asks for relative motion; see
+    /// [`VncServer::set_relative_pointer`].
+    RelativePointer {
+        client_id: u64,
+        buttons: u16,
+        dx: i32,
+        dy: i32,
     },
     /// Text copied by a remote client, encoded as RFB Latin-1 bytes.
     ClipboardText { client_id: u64, text: Vec<u8> },
@@ -361,6 +641,10 @@ pub struct ServerConfig {
     pub name: String,
     pub password: Option<String>,
     pub allow_insecure: bool,
+    /// Runs first on every thread the server starts for a client: its
+    /// session, input reader, and encoder threads. Hosts use it to set a
+    /// scheduling class, which new threads do not inherit on every platform.
+    pub thread_setup: Option<fn()>,
 }
 
 impl Default for ServerConfig {
@@ -369,6 +653,7 @@ impl Default for ServerConfig {
             name: "TopVNC".into(),
             password: None,
             allow_insecure: false,
+            thread_setup: None,
         }
     }
 }
@@ -380,6 +665,10 @@ impl Default for ServerConfig {
 pub struct VncServer {
     listener: std::net::TcpListener,
     framebuffer: Arc<Mutex<ServerFramebuffer>>,
+    /// The framebuffer's generation and size, readable without its lock.
+    geometry: Arc<Geometry>,
+    /// The host wants relative pointer motion from clients that support it.
+    relative_pointer: Arc<AtomicBool>,
     events: std::sync::mpsc::SyncSender<ClientEvent>,
     event_receiver: Mutex<std::sync::mpsc::Receiver<ClientEvent>>,
     config: ServerConfig,
@@ -512,6 +801,27 @@ impl ServerSessions {
     }
 }
 
+/// The server framebuffer's generation, width, and height in one atomic, so
+/// input readers can check pointer bounds without the framebuffer lock,
+/// which capture and encoding hold for milliseconds at a time.
+#[derive(Default)]
+struct Geometry(std::sync::atomic::AtomicU64);
+
+impl Geometry {
+    fn store(&self, generation: u64, width: u16, height: u16) {
+        self.0.store(
+            (generation << 32) | (u64::from(width) << 16) | u64::from(height),
+            Ordering::Release,
+        );
+    }
+
+    /// The low 32 bits of the generation, the width, and the height.
+    fn load(&self) -> (u32, u16, u16) {
+        let value = self.0.load(Ordering::Acquire);
+        ((value >> 32) as u32, (value >> 16) as u16, value as u16)
+    }
+}
+
 struct ServerFramebuffer {
     framebuffer: Framebuffer,
     tile_revisions: Vec<u64>,
@@ -606,9 +916,13 @@ impl VncServer {
         }
         let listener = std::net::TcpListener::bind(address)?;
         let (events, event_receiver) = std::sync::mpsc::sync_channel(SERVER_EVENT_QUEUE_CAPACITY);
+        let geometry = Geometry::default();
+        geometry.store(0, framebuffer.width, framebuffer.height);
         Ok(Self {
             listener,
             framebuffer: Arc::new(Mutex::new(ServerFramebuffer::new(framebuffer))),
+            geometry: Arc::new(geometry),
+            relative_pointer: Arc::new(AtomicBool::new(false)),
             events,
             event_receiver: Mutex::new(event_receiver),
             config,
@@ -650,7 +964,7 @@ impl VncServer {
     /// that advertised the DesktopSize pseudo-encoding receive the new size;
     /// other clients are disconnected because they cannot follow the change.
     pub fn update_framebuffer(&self, framebuffer: &Framebuffer) -> io::Result<()> {
-        update_server_framebuffer(&self.framebuffer, framebuffer)?;
+        update_server_framebuffer(&self.framebuffer, &self.geometry, framebuffer)?;
         self.wake_sessions();
         Ok(())
     }
@@ -663,9 +977,20 @@ impl VncServer {
         framebuffer: &Framebuffer,
         damage: &[DamageRect],
     ) -> io::Result<()> {
-        update_server_framebuffer_regions(&self.framebuffer, framebuffer, damage)?;
+        update_server_framebuffer_regions(&self.framebuffer, &self.geometry, framebuffer, damage)?;
         self.wake_sessions();
         Ok(())
+    }
+
+    /// Ask clients that support the QEMU Pointer Motion Change extension to
+    /// send relative pointer motion (`true`), as games that capture the mouse
+    /// expect, or absolute positions (`false`, the default). Their motion
+    /// then arrives as [`ClientEvent::RelativePointer`]. Other clients keep
+    /// sending absolute positions.
+    pub fn set_relative_pointer(&self, relative: bool) {
+        if self.relative_pointer.swap(relative, Ordering::AcqRel) != relative {
+            self.wake_sessions();
+        }
     }
 
     fn wake_sessions(&self) {
@@ -758,12 +1083,17 @@ impl VncServer {
                 drop(stream);
                 continue;
             }
-            let framebuffer = Arc::clone(&self.framebuffer);
+            let shared = SessionShared {
+                framebuffer: Arc::clone(&self.framebuffer),
+                geometry: Arc::clone(&self.geometry),
+                relative_pointer: Arc::clone(&self.relative_pointer),
+                clipboard: Arc::clone(&self.clipboard),
+                thread_setup: self.config.thread_setup,
+            };
             let events = self.events.clone();
             let config = self.config.clone();
             let active_clients = Arc::clone(&self.active_clients);
             let client_sessions = Arc::clone(&self.sessions);
-            let clipboard = Arc::clone(&self.clipboard);
             let result = std::thread::Builder::new()
                 .name("topvnc-rfb-client".into())
                 .spawn(move || {
@@ -786,15 +1116,17 @@ impl VncServer {
                         sessions: client_sessions.clone(),
                         client_id,
                     };
+                    if let Some(setup) = shared.thread_setup {
+                        setup();
+                    }
                     let mut stream = stream;
                     let _ = stream.set_nodelay(true);
                     let _ = serve_client(
                         &mut stream,
-                        &framebuffer,
+                        &shared,
                         &events,
                         &config,
                         &client_sessions,
-                        &clipboard,
                         client_id,
                     );
                     let _ = events.send(ClientEvent::ClientDisconnected { client_id });
@@ -811,10 +1143,12 @@ impl VncServer {
 
 fn update_server_framebuffer(
     shared: &Arc<Mutex<ServerFramebuffer>>,
+    geometry: &Geometry,
     framebuffer: &Framebuffer,
 ) -> io::Result<()> {
     update_server_framebuffer_regions(
         shared,
+        geometry,
         framebuffer,
         &[DamageRect {
             x: 0,
@@ -827,6 +1161,7 @@ fn update_server_framebuffer(
 
 fn update_server_framebuffer_regions(
     shared: &Arc<Mutex<ServerFramebuffer>>,
+    geometry: &Geometry,
     framebuffer: &Framebuffer,
     damage: &[DamageRect],
 ) -> io::Result<()> {
@@ -837,6 +1172,8 @@ fn update_server_framebuffer_regions(
         || current.framebuffer.height != framebuffer.height
     {
         current.resize(framebuffer.clone());
+        // Under the framebuffer lock, so readers see sizes in order.
+        geometry.store(current.generation, framebuffer.width, framebuffer.height);
         return Ok(());
     }
     if damage.iter().any(|rect| {
@@ -889,13 +1226,22 @@ fn send_pending_clipboard(
     Ok(())
 }
 
+/// Server state every client session uses.
+struct SessionShared {
+    framebuffer: Arc<Mutex<ServerFramebuffer>>,
+    geometry: Arc<Geometry>,
+    relative_pointer: Arc<AtomicBool>,
+    clipboard: Arc<Mutex<ServerClipboard>>,
+    /// See [`ServerConfig::thread_setup`].
+    thread_setup: Option<fn()>,
+}
+
 fn serve_client(
     stream: &mut TcpStream,
-    framebuffer: &Arc<Mutex<ServerFramebuffer>>,
+    shared: &SessionShared,
     events: &SyncSender<ClientEvent>,
     config: &ServerConfig,
     sessions: &Arc<Mutex<ServerSessions>>,
-    clipboard: &Arc<Mutex<ServerClipboard>>,
     client_id: u64,
 ) -> io::Result<()> {
     // Bound the whole handshake, not each read, so a client that trickles
@@ -940,15 +1286,15 @@ fn serve_client(
         }
     }
     handshake.write_all(&0u32.to_be_bytes())?;
-    let mut shared = [0];
-    handshake.read_exact(&mut shared)?;
-    if shared[0] > 1 {
+    let mut share_flag = [0];
+    handshake.read_exact(&mut share_flag)?;
+    if share_flag[0] > 1 {
         return Err(invalid("invalid ClientInit shared flag"));
     }
     sessions
         .lock()
         .map_err(|_| invalid("session registry lock is poisoned"))?
-        .admit(client_id, shared[0] != 0)?;
+        .admit(client_id, share_flag[0] != 0)?;
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     let name = config.name.as_bytes();
@@ -956,7 +1302,8 @@ fn serve_client(
         return Err(invalid("server name is too long"));
     }
     let (generation, tile_count) = {
-        let fb = framebuffer
+        let fb = shared
+            .framebuffer
             .lock()
             .map_err(|_| invalid("framebuffer lock is poisoned"))?;
         stream.write_all(&fb.framebuffer.width.to_be_bytes())?;
@@ -983,22 +1330,30 @@ fn serve_client(
                 queued: Arc::clone(&wake_queued),
             },
         );
+    // The pointer mode last announced to the client, which its reader uses.
+    let announced_relative = Arc::new(AtomicBool::new(false));
     let reader = {
         let mut stream = stream.try_clone()?;
-        let framebuffer = Arc::clone(framebuffer);
+        let mut state = ClientReader {
+            client_id,
+            initial_generation: generation as u32,
+            geometry: Arc::clone(&shared.geometry),
+            announced_relative: Arc::clone(&announced_relative),
+            encodings: ClientEncodings::default(),
+            position: None,
+        };
         let events = events.clone();
+        let thread_setup = shared.thread_setup;
         std::thread::Builder::new()
             .name("topvnc-rfb-reader".into())
             .spawn(move || {
+                if let Some(setup) = thread_setup {
+                    setup();
+                }
                 let error = loop {
-                    if let Err(error) = read_client_message(
-                        &mut stream,
-                        &session_sender,
-                        &events,
-                        &framebuffer,
-                        generation,
-                        client_id,
-                    ) {
+                    if let Err(error) =
+                        read_client_message(&mut stream, &session_sender, &events, &mut state)
+                    {
                         break error;
                     }
                 };
@@ -1007,8 +1362,8 @@ fn serve_client(
     };
     let result = write_client_updates(
         stream,
-        framebuffer,
-        clipboard,
+        shared,
+        &announced_relative,
         &session_receiver,
         &wake_queued,
         generation,
@@ -1022,16 +1377,99 @@ fn serve_client(
     result
 }
 
+/// Input state of one client on its reader thread, which sees the client's
+/// messages in the order they were sent.
+struct ClientReader {
+    client_id: u64,
+    /// The low 32 bits of the framebuffer generation at the handshake.
+    initial_generation: u32,
+    geometry: Arc<Geometry>,
+    /// The pointer mode the writer last announced to this client.
+    announced_relative: Arc<AtomicBool>,
+    encodings: ClientEncodings,
+    /// The last absolute position, where a stale relative event's buttons
+    /// are applied.
+    position: Option<(u16, u16)>,
+}
+
+impl ClientReader {
+    /// Interpret a PointerEvent: `mask` is its *button-mask*, `extended`
+    /// the extended byte of an extended PointerEvent (else 0). Returns the
+    /// event to deliver, if any.
+    ///
+    /// Events sent before the client learned of a mode change are still in
+    /// flight when the mode changes. Their coordinates show which mode they
+    /// use, and their motion is dropped while their buttons apply.
+    fn pointer(
+        &mut self,
+        mask: u8,
+        extended: u8,
+        x: u16,
+        y: u16,
+    ) -> io::Result<Option<ClientEvent>> {
+        let client_id = self.client_id;
+        let buttons = if self.encodings.extended_mouse_buttons {
+            // The high bit only marks an extended event.
+            u16::from(mask & !EXTENDED_POINTER_MARKER)
+                | (u16::from(extended & 1) * BUTTON_BACK)
+                | (u16::from(extended >> 1 & 1) * BUTTON_FORWARD)
+        } else {
+            u16::from(mask)
+        };
+        if self.encodings.pointer_motion_change && self.announced_relative.load(Ordering::Acquire) {
+            let (mut dx, mut dy) = (
+                i32::from(x) - RELATIVE_POINTER_ORIGIN,
+                i32::from(y) - RELATIVE_POINTER_ORIGIN,
+            );
+            if dx.abs() > MAX_RELATIVE_DELTA || dy.abs() > MAX_RELATIVE_DELTA {
+                // An absolute position sent before the client switched.
+                (dx, dy) = (0, 0);
+            }
+            return Ok(Some(ClientEvent::RelativePointer {
+                client_id,
+                buttons,
+                dx,
+                dy,
+            }));
+        }
+        let (generation, width, height) = self.geometry.load();
+        if x < width && y < height {
+            self.position = Some((x, y));
+            return Ok(Some(ClientEvent::Pointer {
+                client_id,
+                buttons,
+                x,
+                y,
+            }));
+        }
+        if generation != self.initial_generation {
+            // After a resize, pointer events sent for the old size may still
+            // be in flight; drop them instead of ending the session.
+            return Ok(None);
+        }
+        if self.encodings.pointer_motion_change {
+            // A relative event sent before the client switched to absolute
+            // positions: keep its buttons, without the motion.
+            return Ok(self.position.map(|(x, y)| ClientEvent::Pointer {
+                client_id,
+                buttons,
+                x,
+                y,
+            }));
+        }
+        Err(invalid("pointer outside framebuffer"))
+    }
+}
+
 fn read_client_message(
     stream: &mut TcpStream,
     session: &SyncSender<SessionInput>,
     events: &SyncSender<ClientEvent>,
-    framebuffer: &Arc<Mutex<ServerFramebuffer>>,
-    initial_generation: u64,
-    client_id: u64,
+    state: &mut ClientReader,
 ) -> io::Result<()> {
     let session_closed = || io::Error::new(io::ErrorKind::BrokenPipe, "session writer closed");
     let input_closed = || io::Error::new(io::ErrorKind::BrokenPipe, "input receiver closed");
+    let client_id = state.client_id;
     let mut kind = [0];
     stream.read_exact(&mut kind)?;
     match kind[0] {
@@ -1059,6 +1497,7 @@ fn read_client_message(
                     .chunks_exact(4)
                     .map(|encoding| i32::from_be_bytes(encoding.try_into().unwrap())),
             );
+            state.encodings = encodings;
             session
                 .send(SessionInput::Encodings(encodings))
                 .map_err(|_| session_closed())?;
@@ -1088,35 +1527,17 @@ fn read_client_message(
         5 => {
             let mut data = [0; 5];
             stream.read_exact(&mut data)?;
+            let mut extended = [0];
+            if state.encodings.extended_mouse_buttons && data[0] & EXTENDED_POINTER_MARKER != 0 {
+                stream.read_exact(&mut extended)?;
+            }
             let x = u16::from_be_bytes([data[1], data[2]]);
             let y = u16::from_be_bytes([data[3], data[4]]);
-            let (in_bounds, resized) = {
-                let fb = framebuffer
-                    .lock()
-                    .map_err(|_| invalid("framebuffer lock is poisoned"))?;
-                (
-                    x < fb.framebuffer.width && y < fb.framebuffer.height,
-                    fb.generation != initial_generation,
-                )
-            };
-            if !in_bounds {
-                // After a resize, pointer events sent for the old size may
-                // still be in flight; drop them instead of ending the session.
-                // This checks the framebuffer itself, not the writer, which
-                // may not have noticed the resize yet.
-                if resized {
-                    return Ok(());
-                }
-                return Err(invalid("pointer outside framebuffer"));
+            // Checked against the framebuffer geometry itself, not the
+            // writer's, which may not have noticed a resize yet.
+            if let Some(event) = state.pointer(data[0], extended[0], x, y)? {
+                events.send(event).map_err(|_| input_closed())?;
             }
-            events
-                .send(ClientEvent::Pointer {
-                    client_id,
-                    buttons: data[0],
-                    x,
-                    y,
-                })
-                .map_err(|_| input_closed())?;
         }
         6 => {
             let mut header = [0; 7];
@@ -1165,6 +1586,10 @@ struct ClientEncodings {
     desktop_size: bool,
     fence: bool,
     continuous_updates: bool,
+    /// QEMU Pointer Motion Change: the client sends relative motion on request.
+    pointer_motion_change: bool,
+    /// The client sends extended PointerEvents once acknowledged.
+    extended_mouse_buttons: bool,
     /// Set when the client prefers Tight over Raw.
     tight: Option<TightSettings>,
 }
@@ -1183,6 +1608,8 @@ impl ClientEncodings {
                 DESKTOP_SIZE_ENCODING => result.desktop_size = true,
                 FENCE_ENCODING => result.fence = true,
                 CONTINUOUS_UPDATES_ENCODING => result.continuous_updates = true,
+                POINTER_MOTION_CHANGE_ENCODING => result.pointer_motion_change = true,
+                EXTENDED_MOUSE_BUTTONS_ENCODING => result.extended_mouse_buttons = true,
                 level @ tight::QUALITY_LEVEL_0..=-23 => {
                     quality.get_or_insert((level - tight::QUALITY_LEVEL_0) as u8);
                 }
@@ -1374,16 +1801,16 @@ impl FlowControl {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn write_client_updates(
     stream: &mut TcpStream,
-    shared: &Arc<Mutex<ServerFramebuffer>>,
-    clipboard: &Arc<Mutex<ServerClipboard>>,
+    session: &SessionShared,
+    announced_relative: &AtomicBool,
     receiver: &std::sync::mpsc::Receiver<SessionInput>,
     wake_queued: &AtomicBool,
     mut generation: u64,
     tile_count: usize,
 ) -> io::Result<()> {
+    let shared = &session.framebuffer;
     let mut seen_revisions = vec![u64::MAX; tile_count];
     let mut pixel_format = ServerPixelFormat::DEFAULT;
     let mut encodings = ClientEncodings::default();
@@ -1397,14 +1824,46 @@ fn write_client_updates(
     let mut continuous: Option<UpdateRequest> = None;
     let mut announced_continuous = false;
     let mut flow = FlowControl::default();
+    // The pointer mode announced since the client last set its encodings:
+    // `Some(true)` for relative motion.
+    let mut pointer_mode: Option<bool> = None;
+    let mut encoder = SessionEncoder {
+        pool: None,
+        thread_setup: session.thread_setup,
+    };
+    // Pseudo-encoding rectangles waiting to be sent.
+    let mut pseudo: Vec<PseudoRect> = Vec::new();
     loop {
-        send_pending_clipboard(stream, clipboard, &mut clipboard_revision)?;
+        send_pending_clipboard(stream, &session.clipboard, &mut clipboard_revision)?;
         let (current_generation, width, height) = {
             let fb = shared
                 .lock()
                 .map_err(|_| invalid("framebuffer lock is poisoned"))?;
             (fb.generation, fb.framebuffer.width, fb.framebuffer.height)
         };
+        if encodings.pointer_motion_change {
+            let relative = session.relative_pointer.load(Ordering::Acquire);
+            if pointer_mode != Some(relative) {
+                pseudo.retain(|rect| rect.encoding != POINTER_MOTION_CHANGE_ENCODING);
+                // QEMU's layout: x is 1 for absolute and 0 for relative, and
+                // the rectangle spans the framebuffer.
+                pseudo.push(PseudoRect {
+                    encoding: POINTER_MOTION_CHANGE_ENCODING,
+                    x: u16::from(!relative),
+                    y: 0,
+                    width,
+                    height,
+                });
+                pointer_mode = Some(relative);
+            }
+        }
+        // Clients receiving continuous updates take them at once; others
+        // with their next requested update, so no update arrives that they
+        // did not ask for.
+        if continuous.is_some() && !pseudo.is_empty() {
+            write_pseudo_update(stream, &pseudo, announced_relative)?;
+            pseudo.clear();
+        }
         let tight = encodings.tight.filter(|_| pixel_format.has_tight_pixels());
         let mut window = flow.window();
         if current_generation != generation {
@@ -1435,7 +1894,9 @@ fn write_client_updates(
                 generation,
             )?;
             if let Some(update) = update
-                && (!update.rectangles.is_empty() || Instant::now() >= waiting.deadline)
+                && (!update.rectangles.is_empty()
+                    || !pseudo.is_empty()
+                    || Instant::now() >= waiting.deadline)
             {
                 let bytes = write_prepared_update(
                     stream,
@@ -1446,7 +1907,11 @@ fn write_client_updates(
                     tight,
                     update,
                     generation,
+                    &mut encoder,
+                    &pseudo,
                 )?;
+                note_pseudo_sent(&pseudo, announced_relative);
+                pseudo.clear();
                 // Track requested updates too, so flow control knows what is
                 // still on the wire when continuous updates start.
                 if encodings.fence {
@@ -1481,6 +1946,8 @@ fn write_client_updates(
                     tight,
                     update,
                     generation,
+                    &mut encoder,
+                    &[],
                 )?;
                 let payload = flow.sent(bytes, Instant::now());
                 stream.write_all(&fence_message(FENCE_REQUEST | FENCE_BLOCK_BEFORE, &payload))?;
@@ -1502,6 +1969,22 @@ fn write_client_updates(
         match receiver.recv_timeout(timeout.max(Duration::from_millis(1))) {
             Ok(SessionInput::PixelFormat(format)) => pixel_format = format,
             Ok(SessionInput::Encodings(advertised)) => {
+                if advertised.extended_mouse_buttons && !encodings.extended_mouse_buttons {
+                    // An empty rectangle acknowledges extended PointerEvents.
+                    pseudo.push(PseudoRect {
+                        encoding: EXTENDED_MOUSE_BUTTONS_ENCODING,
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                    });
+                }
+                // Announce the pointer mode again: a client that set its
+                // encodings may have reset its own.
+                pointer_mode = None;
+                if !advertised.pointer_motion_change {
+                    announced_relative.store(false, Ordering::Release);
+                }
                 encodings = advertised;
                 // Continuous updates rely on fences for flow control.
                 if encodings.continuous_updates && encodings.fence && !announced_continuous {
@@ -1567,6 +2050,8 @@ fn write_prepared_update(
     tight: Option<TightSettings>,
     update: PreparedUpdate,
     generation: u64,
+    encoder: &mut SessionEncoder,
+    pseudo: &[PseudoRect],
 ) -> io::Result<usize> {
     match tight {
         Some(settings) => write_tight_update(
@@ -1577,6 +2062,8 @@ fn write_prepared_update(
             settings,
             update,
             generation,
+            encoder,
+            pseudo,
         ),
         None => write_update(
             stream,
@@ -1586,17 +2073,81 @@ fn write_prepared_update(
             pixel_format,
             update,
             generation,
+            pseudo,
         ),
     }
 }
 
 fn write_desktop_size(stream: &mut TcpStream, width: u16, height: u16) -> io::Result<()> {
-    let mut message = [0; 16];
-    message[3] = 1;
-    message[8..10].copy_from_slice(&width.to_be_bytes());
-    message[10..12].copy_from_slice(&height.to_be_bytes());
-    message[12..16].copy_from_slice(&DESKTOP_SIZE_ENCODING.to_be_bytes());
-    stream.write_all(&message)
+    write_pseudo_update(
+        stream,
+        &[PseudoRect {
+            encoding: DESKTOP_SIZE_ENCODING,
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }],
+        &AtomicBool::new(false),
+    )
+}
+
+/// A rectangle that carries a pseudo-encoding instead of pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PseudoRect {
+    encoding: i32,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+impl PseudoRect {
+    fn header(&self, output: &mut Vec<u8>) {
+        for value in [self.x, self.y, self.width, self.height] {
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        output.extend_from_slice(&self.encoding.to_be_bytes());
+    }
+}
+
+/// The FramebufferUpdate header for `count` rectangles after `pseudo`.
+fn update_header(output: &mut Vec<u8>, pseudo: &[PseudoRect], count: usize) -> io::Result<()> {
+    let total = u16::try_from(pseudo.len() + count)
+        .map_err(|_| invalid("too many changed framebuffer rectangles"))?;
+    output.extend_from_slice(&[0, 0]);
+    output.extend_from_slice(&total.to_be_bytes());
+    for rect in pseudo {
+        rect.header(output);
+    }
+    Ok(())
+}
+
+/// After `pseudo` went out, record the pointer mode it announced: the
+/// client's reader interprets pointer events in that mode from now on.
+fn note_pseudo_sent(pseudo: &[PseudoRect], announced_relative: &AtomicBool) {
+    if let Some(rect) = pseudo
+        .iter()
+        .rev()
+        .find(|rect| rect.encoding == POINTER_MOTION_CHANGE_ENCODING)
+    {
+        // Events already in flight still use the old mode; the reader
+        // recognizes them by their coordinates.
+        announced_relative.store(rect.x == 0, Ordering::Release);
+    }
+}
+
+/// Write a FramebufferUpdate holding only pseudo-encoding rectangles.
+fn write_pseudo_update(
+    stream: &mut impl Write,
+    pseudo: &[PseudoRect],
+    announced_relative: &AtomicBool,
+) -> io::Result<()> {
+    let mut message = Vec::with_capacity(4 + 12 * pseudo.len());
+    update_header(&mut message, pseudo, 0)?;
+    stream.write_all(&message)?;
+    note_pseudo_sent(pseudo, announced_relative);
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1862,6 +2413,7 @@ fn prepare_update(
 /// is never blocked on the network. If the framebuffer is resized while the
 /// update is being written, the remaining rows are sent black; the client
 /// receives the new size in its next update.
+#[allow(clippy::too_many_arguments)]
 fn write_update(
     stream: &mut TcpStream,
     shared: &Arc<Mutex<ServerFramebuffer>>,
@@ -1870,11 +2422,11 @@ fn write_update(
     pixel_format: ServerPixelFormat,
     update: PreparedUpdate,
     generation: u64,
+    pseudo: &[PseudoRect],
 ) -> io::Result<usize> {
     let mut written = 0;
     output.clear();
-    output.extend_from_slice(&[0, 0]);
-    output.extend_from_slice(&(update.rectangles.len() as u16).to_be_bytes());
+    update_header(output, pseudo, update.rectangles.len())?;
     for rect in &update.rectangles {
         output.extend_from_slice(&rect.x.to_be_bytes());
         output.extend_from_slice(&rect.y.to_be_bytes());
@@ -1914,10 +2466,21 @@ fn write_update(
     Ok(written)
 }
 
-/// Merge changed tiles into larger rectangles and split them to Tight's size
-/// limits. Merging only joins rectangles that share a full edge, so the
-/// result covers exactly the same pixels.
-fn tight_rects(rects: &[ServerRect]) -> Vec<(usize, usize, usize, usize)> {
+/// Rows per Tight band when `workers` threads encode an update spanning
+/// `rows` rows: about one band per thread, in whole tiles, between one tile
+/// and Tight's height limit. Fewer, larger bands compress a little better;
+/// more bands encode, travel, and decode in parallel.
+fn band_rows(rows: usize, workers: usize) -> usize {
+    (rows / workers.max(1) / SERVER_TILE_SIZE * SERVER_TILE_SIZE)
+        .clamp(SERVER_TILE_SIZE, tight::MAX_RECT_HEIGHT)
+}
+
+/// Merge changed tiles into larger rectangles and split them into bands at
+/// most `band_rows` tall and Tight's width limit wide. Merging only joins
+/// rectangles that share a full edge, so the result covers exactly the same
+/// pixels.
+fn tight_rects(rects: &[ServerRect], band_rows: usize) -> Vec<(usize, usize, usize, usize)> {
+    let band_rows = band_rows.clamp(1, tight::MAX_RECT_HEIGHT);
     // Rectangles arrive in row-major tile order, so horizontal neighbors are
     // consecutive.
     let mut runs: Vec<(usize, usize, usize, usize)> = Vec::new();
@@ -1945,7 +2508,7 @@ fn tight_rects(rects: &[ServerRect]) -> Vec<(usize, usize, usize, usize)> {
     for (x, y, width, height) in runs {
         if let Some(index) = open.remove(&(x, width, y)) {
             let above: &mut (usize, usize, usize, usize) = &mut merged[index];
-            if above.3 + height <= tight::MAX_RECT_HEIGHT {
+            if above.3 + height <= band_rows {
                 above.3 += height;
                 open.insert((x, width, y + height), index);
                 continue;
@@ -1956,13 +2519,13 @@ fn tight_rects(rects: &[ServerRect]) -> Vec<(usize, usize, usize, usize)> {
     }
     let mut result = Vec::with_capacity(merged.len());
     for (x, y, width, height) in merged {
-        for band_y in (y..y + height).step_by(tight::MAX_RECT_HEIGHT) {
+        for band_y in (y..y + height).step_by(band_rows) {
             for band_x in (x..x + width).step_by(tight::MAX_RECT_WIDTH) {
                 result.push((
                     band_x,
                     band_y,
                     tight::MAX_RECT_WIDTH.min(x + width - band_x),
-                    tight::MAX_RECT_HEIGHT.min(y + height - band_y),
+                    band_rows.min(y + height - band_y),
                 ));
             }
         }
@@ -1970,56 +2533,137 @@ fn tight_rects(rects: &[ServerRect]) -> Vec<(usize, usize, usize, usize)> {
     result
 }
 
-/// Encode each rectangle's pixels as a Tight body, in parallel when the
-/// update is large.
-fn encode_tight_rects(
-    snapshots: &[(Vec<u32>, usize, usize)],
+/// A rectangle's pixels, copied out of the framebuffer, with its size.
+type Snapshot = (Vec<u32>, usize, usize);
+
+/// One update's rectangles for the encoder threads, which claim them in
+/// order through `next`.
+struct EncodeBatch {
+    snapshots: Arc<Vec<Snapshot>>,
     settings: TightSettings,
-) -> io::Result<Vec<Vec<u8>>> {
-    let encode = |(pixels, width, height): &(Vec<u32>, usize, usize)| {
-        let mut body = Vec::new();
-        tight::encode_rect(pixels, *width, *height, settings, &mut body).map(|_| body)
-    };
-    let pixels: usize = snapshots.iter().map(|(pixels, ..)| pixels.len()).sum();
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(snapshots.len());
-    if workers <= 1 || pixels < SERVER_PARALLEL_ENCODE_PIXELS {
-        return snapshots.iter().map(encode).collect();
+    next: Arc<std::sync::atomic::AtomicUsize>,
+    results: std::sync::mpsc::Sender<(usize, io::Result<Vec<u8>>)>,
+}
+
+/// Encoder threads for one client session. They start with its first large
+/// update and stay, so later updates start no threads.
+struct EncodePool {
+    batches: Vec<std::sync::mpsc::Sender<EncodeBatch>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl EncodePool {
+    fn new(threads: usize, thread_setup: Option<fn()>) -> io::Result<Self> {
+        let mut pool = Self {
+            batches: Vec::with_capacity(threads),
+            workers: Vec::with_capacity(threads),
+        };
+        for _ in 0..threads {
+            let (sender, receiver) = std::sync::mpsc::channel::<EncodeBatch>();
+            pool.workers.push(
+                std::thread::Builder::new()
+                    .name("topvnc-encoder".into())
+                    .spawn(move || {
+                        if let Some(setup) = thread_setup {
+                            setup();
+                        }
+                        for batch in receiver {
+                            loop {
+                                let index = batch.next.fetch_add(1, Ordering::Relaxed);
+                                let Some((pixels, width, height)) = batch.snapshots.get(index)
+                                else {
+                                    break;
+                                };
+                                let mut body = Vec::new();
+                                let result = tight::encode_rect(
+                                    pixels,
+                                    *width,
+                                    *height,
+                                    batch.settings,
+                                    &mut body,
+                                )
+                                .map(|_| body);
+                                // The session stopped waiting after an error.
+                                if batch.results.send((index, result)).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    })?,
+            );
+            pool.batches.push(sender);
+        }
+        Ok(pool)
     }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut bodies: Vec<Option<io::Result<Vec<u8>>>> = Vec::new();
-    bodies.resize_with(snapshots.len(), || None);
-    std::thread::scope(|scope| {
-        let handles = (0..workers)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut done = Vec::new();
-                    loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(snapshot) = snapshots.get(index) else {
-                            return done;
-                        };
-                        done.push((index, encode(snapshot)));
-                    }
+
+    /// Encode `snapshots` and pass each body to `ready` in order, as soon as
+    /// it and every body before it are done, so the first bands can be sent
+    /// while later ones are still being encoded.
+    fn encode(
+        &self,
+        snapshots: Vec<Snapshot>,
+        settings: TightSettings,
+        mut ready: impl FnMut(usize, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let stopped = || io::Error::other("a Tight encoder thread stopped");
+        let count = snapshots.len();
+        let snapshots = Arc::new(snapshots);
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (results, receiver) = std::sync::mpsc::channel();
+        for batch in &self.batches {
+            batch
+                .send(EncodeBatch {
+                    snapshots: Arc::clone(&snapshots),
+                    settings,
+                    next: Arc::clone(&next),
+                    results: results.clone(),
                 })
-            })
-            .collect::<Vec<_>>();
-        for handle in handles {
-            for (index, body) in handle.join().expect("Tight encoder thread panicked") {
-                bodies[index] = Some(body);
+                .map_err(|_| stopped())?;
+        }
+        // Once every thread finishes the batch, a missing body ends the wait.
+        drop(results);
+        let mut done: Vec<Option<Vec<u8>>> = (0..count).map(|_| None).collect();
+        let mut next_ready = 0;
+        while next_ready < count {
+            let (index, body) = receiver.recv().map_err(|_| stopped())?;
+            done[index] = Some(body?);
+            while let Some(body) = done.get_mut(next_ready).and_then(Option::take) {
+                ready(next_ready, &body)?;
+                next_ready += 1;
             }
         }
-    });
-    bodies
-        .into_iter()
-        .map(|body| body.expect("every rectangle was encoded"))
-        .collect()
+        Ok(())
+    }
+}
+
+impl Drop for EncodePool {
+    fn drop(&mut self) {
+        // Closing the channels ends the threads.
+        self.batches.clear();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// How many threads encode a large update.
+fn encoder_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+/// A session's encoder threads, started on first use.
+struct SessionEncoder {
+    pool: Option<EncodePool>,
+    /// Runs first on every encoder thread; see [`ServerConfig::thread_setup`].
+    thread_setup: Option<fn()>,
 }
 
 /// Write a prepared update with Tight encoding. The rectangles are copied
 /// under one framebuffer lock, so every update shows a single captured frame,
-/// then encoded without holding the lock.
+/// then encoded without holding the lock. Large updates are encoded on
+/// `pool`, which starts on first use, and each band is written as soon as it
+/// is ready.
+#[allow(clippy::too_many_arguments)]
 fn write_tight_update(
     stream: &mut TcpStream,
     shared: &Arc<Mutex<ServerFramebuffer>>,
@@ -2028,9 +2672,17 @@ fn write_tight_update(
     settings: TightSettings,
     update: PreparedUpdate,
     generation: u64,
+    encoder: &mut SessionEncoder,
+    pseudo: &[PseudoRect],
 ) -> io::Result<usize> {
-    let mut written = 0;
-    let rects = tight_rects(&update.rectangles);
+    let workers = encoder_threads();
+    let rows = update
+        .rectangles
+        .iter()
+        .map(|rect| usize::from(rect.y)..usize::from(rect.y) + usize::from(rect.height))
+        .reduce(|all, rows| all.start.min(rows.start)..all.end.max(rows.end))
+        .map_or(0, |rows| rows.len());
+    let rects = tight_rects(&update.rectangles, band_rows(rows, workers));
     if rects.len() > usize::from(u16::MAX) {
         return Err(invalid("too many changed framebuffer rectangles"));
     }
@@ -2058,20 +2710,41 @@ fn write_tight_update(
             })
             .collect::<Vec<_>>()
     };
-    let bodies = encode_tight_rects(&snapshots, settings)?;
+    let mut written = 0;
     output.clear();
-    output.extend_from_slice(&[0, 0]);
-    output.extend_from_slice(&(rects.len() as u16).to_be_bytes());
-    for (&(x, y, width, height), body) in rects.iter().zip(&bodies) {
-        for value in [x, y, width, height] {
-            output.extend_from_slice(&(value as u16).to_be_bytes());
-        }
-        output.extend_from_slice(&tight::TIGHT_ENCODING.to_be_bytes());
-        output.extend_from_slice(body);
-        if output.len() >= SERVER_WRITE_CHUNK_BYTES {
-            stream.write_all(output)?;
-            written += output.len();
-            output.clear();
+    update_header(output, pseudo, rects.len())?;
+    {
+        let mut ready = |index: usize, body: &[u8]| -> io::Result<()> {
+            let (x, y, width, height) = rects[index];
+            for value in [x, y, width, height] {
+                output.extend_from_slice(&(value as u16).to_be_bytes());
+            }
+            output.extend_from_slice(&tight::TIGHT_ENCODING.to_be_bytes());
+            output.extend_from_slice(body);
+            // Send bands as they become ready, so transmission overlaps the
+            // encoding of the rest.
+            if output.len() >= SERVER_STREAM_FLUSH_BYTES {
+                stream.write_all(output)?;
+                written += output.len();
+                output.clear();
+            }
+            Ok(())
+        };
+        let pixels: usize = snapshots.iter().map(|(pixels, ..)| pixels.len()).sum();
+        if workers > 1 && snapshots.len() > 1 && pixels >= SERVER_PARALLEL_ENCODE_PIXELS {
+            let pool = match &mut encoder.pool {
+                Some(pool) => pool,
+                None => encoder
+                    .pool
+                    .insert(EncodePool::new(workers, encoder.thread_setup)?),
+            };
+            pool.encode(snapshots, settings, &mut ready)?;
+        } else {
+            for (index, (pixels, width, height)) in snapshots.iter().enumerate() {
+                let mut body = Vec::new();
+                tight::encode_rect(pixels, *width, *height, settings, &mut body)?;
+                ready(index, &body)?;
+            }
         }
     }
     stream.write_all(output)?;
@@ -2254,13 +2927,7 @@ pub fn negotiate_with_encoding(
     stream.write_all(&[
         0, 0, 0, 0, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0,
     ])?;
-    let advertised = encoding.advertised();
-    let mut message = vec![2, 0];
-    message.extend_from_slice(&(advertised.len() as u16).to_be_bytes());
-    for encoding_id in advertised {
-        message.extend_from_slice(&encoding_id.to_be_bytes());
-    }
-    stream.write_all(&message)?;
+    stream.write_all(&set_encodings_message(&encoding.advertised()))?;
     Ok(ServerInfo {
         width,
         height,
@@ -2394,6 +3061,12 @@ enum ServerControl<'a> {
         flags: u32,
         payload: &'a [u8],
     },
+    /// The server asks for relative pointer motion, or absolute positions.
+    PointerMode {
+        relative: bool,
+    },
+    /// The server accepts extended PointerEvents.
+    ExtendedMouseButtons,
 }
 
 /// `started` runs once the FramebufferUpdate header arrives, before any
@@ -2421,6 +3094,7 @@ fn read_update_inner(
                 reader.read_exact(&mut header)?;
                 started()?;
                 let count = u16::from_be_bytes([header[1], header[2]]);
+                let mut pending = PendingRects::new();
                 for _ in 0..count {
                     let mut rect = [0; 12];
                     reader.read_exact(&mut rect)?;
@@ -2429,6 +3103,19 @@ fn read_update_inner(
                     let width = u16::from_be_bytes([rect[4], rect[5]]);
                     let height = u16::from_be_bytes([rect[6], rect[7]]);
                     let wire_encoding = i32::from_be_bytes(rect[8..12].try_into().unwrap());
+                    // Pseudo-rectangles carry no pixels and need not lie
+                    // inside the framebuffer.
+                    match wire_encoding {
+                        POINTER_MOTION_CHANGE_ENCODING => {
+                            control(ServerControl::PointerMode { relative: x == 0 })?;
+                            continue;
+                        }
+                        EXTENDED_MOUSE_BUTTONS_ENCODING => {
+                            control(ServerControl::ExtendedMouseButtons)?;
+                            continue;
+                        }
+                        _ => {}
+                    }
                     if !selected_encoding.accepts(wire_encoding) {
                         return Err(invalid("server sent an unsupported encoding"));
                     }
@@ -2440,6 +3127,7 @@ fn read_update_inner(
                     {
                         return Err(invalid("server sent an out-of-bounds rectangle"));
                     }
+                    let rect = (x, y, width, height);
                     let length = usize::from(width) * usize::from(height) * 4;
                     match wire_encoding {
                         0 => {
@@ -2467,16 +3155,26 @@ fn read_update_inner(
                                 return Err(invalid("zlib rectangle has incorrect decoded length"));
                             }
                         }
-                        _ => decoder.tight.read_rect(
-                            reader,
-                            usize::from(width),
-                            usize::from(height),
-                            scratch,
-                        )?,
+                        _ => {
+                            let mut jpeg = decoder.buffer();
+                            if decoder.tight.read_rect_deferred(
+                                reader,
+                                usize::from(width),
+                                usize::from(height),
+                                scratch,
+                                &mut jpeg,
+                            )? {
+                                pending.decode_jpeg(rect, jpeg, decoder)?;
+                                pending.apply_ready(false, decoder, &mut apply)?;
+                                continue;
+                            }
+                            decoder.recycle(jpeg);
+                        }
                     }
-                    apply(x, y, width, height, scratch)?;
+                    pending.decoded(rect, scratch, decoder, &mut apply)?;
+                    pending.apply_ready(false, decoder, &mut apply)?;
                 }
-                return Ok(());
+                return pending.apply_ready(true, decoder, &mut apply);
             }
             2 => {} // Bell.
             3 => {
@@ -2518,22 +3216,77 @@ pub fn read_update(
     )
 }
 
+/// Sends input and control messages to the server. Clones share one
+/// connection and one pointer mode, so a mode change and the input events
+/// around it are ordered.
 #[derive(Clone)]
-pub struct InputWriter(Arc<Mutex<TcpStream>>);
+pub struct InputWriter(Arc<Mutex<WriterState>>);
+
+struct WriterState {
+    stream: TcpStream,
+    /// The encodings advertised at the handshake.
+    encodings: Vec<i32>,
+    /// The client advertises relative pointer motion.
+    relative_allowed: bool,
+    /// The server asked for relative pointer motion.
+    relative: bool,
+    /// The server acknowledged extended PointerEvents.
+    extended_buttons: bool,
+    /// The last absolute position sent.
+    position: (u16, u16),
+    /// The buttons last sent.
+    buttons: u16,
+}
+
+impl WriterState {
+    fn send_pointer(&mut self, buttons: u16, x: u16, y: u16) -> io::Result<()> {
+        let (message, length) = pointer_packet(buttons, x, y, self.extended_buttons);
+        self.buttons = buttons;
+        self.stream.write_all(&message[..length])
+    }
+
+    /// Send `buttons` without motion, if they changed.
+    fn send_buttons(&mut self, buttons: u16) -> io::Result<()> {
+        if buttons == self.buttons {
+            return Ok(());
+        }
+        let (x, y) = if self.relative {
+            (
+                RELATIVE_POINTER_ORIGIN as u16,
+                RELATIVE_POINTER_ORIGIN as u16,
+            )
+        } else {
+            self.position
+        };
+        self.send_pointer(buttons, x, y)
+    }
+}
 
 impl InputWriter {
-    pub fn shutdown(&self) -> io::Result<()> {
+    fn new(stream: TcpStream, encodings: Vec<i32>) -> Self {
+        Self(Arc::new(Mutex::new(WriterState {
+            stream,
+            relative_allowed: encodings.contains(&POINTER_MOTION_CHANGE_ENCODING),
+            encodings,
+            relative: false,
+            extended_buttons: false,
+            position: (0, 0),
+            buttons: 0,
+        })))
+    }
+
+    fn state(&self) -> io::Result<std::sync::MutexGuard<'_, WriterState>> {
         self.0
             .lock()
-            .map_err(|_| invalid("connection lock is poisoned"))?
-            .shutdown(std::net::Shutdown::Both)
+            .map_err(|_| invalid("connection lock is poisoned"))
+    }
+
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.state()?.stream.shutdown(std::net::Shutdown::Both)
     }
 
     fn send(&self, bytes: &[u8]) -> io::Result<()> {
-        self.0
-            .lock()
-            .map_err(|_| invalid("connection lock is poisoned"))?
-            .write_all(bytes)
+        self.state()?.stream.write_all(bytes)
     }
 
     pub fn request_update(&self, incremental: bool, width: u16, height: u16) -> io::Result<()> {
@@ -2569,8 +3322,79 @@ impl InputWriter {
         self.send(&fence_message(flags, payload))
     }
 
-    pub fn pointer(&self, buttons: u8, x: u16, y: u16) -> io::Result<()> {
-        self.send(&pointer_packet(buttons, x, y))
+    /// The pointer is at (`x`, `y`) with `buttons` (`BUTTON_*` bits) held.
+    /// While the server asks for relative motion, only button changes are
+    /// sent.
+    pub fn pointer(&self, buttons: u16, x: u16, y: u16) -> io::Result<()> {
+        let mut state = self.state()?;
+        if state.relative {
+            return state.send_buttons(buttons);
+        }
+        state.position = (x, y);
+        state.send_pointer(buttons, x, y)
+    }
+
+    /// The pointer moved by (`dx`, `dy`) device units with `buttons` held.
+    /// While the server asks for absolute positions, only button changes
+    /// are sent, at the last position.
+    pub fn pointer_motion(&self, buttons: u16, dx: i32, dy: i32) -> io::Result<()> {
+        let mut state = self.state()?;
+        if !state.relative {
+            return state.send_buttons(buttons);
+        }
+        let (mut dx, mut dy) = (dx, dy);
+        loop {
+            let step_x = dx.clamp(-MAX_RELATIVE_DELTA, MAX_RELATIVE_DELTA);
+            let step_y = dy.clamp(-MAX_RELATIVE_DELTA, MAX_RELATIVE_DELTA);
+            state.send_pointer(
+                buttons,
+                (RELATIVE_POINTER_ORIGIN + step_x) as u16,
+                (RELATIVE_POINTER_ORIGIN + step_y) as u16,
+            )?;
+            (dx, dy) = (dx - step_x, dy - step_y);
+            if (dx, dy) == (0, 0) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Whether the server asks for relative motion: the viewer should lock
+    /// and hide its pointer and send [`InputWriter::pointer_motion`].
+    pub fn relative_pointer(&self) -> bool {
+        self.state().is_ok_and(|state| state.relative)
+    }
+
+    /// Advertise relative pointer motion (the default) or stop. Declining
+    /// switches to absolute positions at once.
+    pub fn set_relative_pointer_allowed(&self, allowed: bool) -> io::Result<()> {
+        let mut state = self.state()?;
+        if state.relative_allowed == allowed {
+            return Ok(());
+        }
+        state.relative_allowed = allowed;
+        state.relative = false;
+        let encodings = state
+            .encodings
+            .iter()
+            .copied()
+            .filter(|encoding| allowed || *encoding != POINTER_MOTION_CHANGE_ENCODING)
+            .collect::<Vec<_>>();
+        state.stream.write_all(&set_encodings_message(&encodings))
+    }
+
+    /// The server switched pointer modes. Input sent after this uses the
+    /// new mode, so it happens before the following fence is answered.
+    fn server_pointer_mode(&self, relative: bool) {
+        if let Ok(mut state) = self.state() {
+            // A switch announced before the client declined is ignored.
+            state.relative = relative && state.relative_allowed;
+        }
+    }
+
+    fn server_extended_buttons(&self) {
+        if let Ok(mut state) = self.state() {
+            state.extended_buttons = true;
+        }
     }
 }
 
@@ -2580,10 +3404,28 @@ fn key_packet(keysym: u32, down: bool) -> [u8; 8] {
     message
 }
 
-fn pointer_packet(buttons: u8, x: u16, y: u16) -> [u8; 6] {
-    let mut message = [5, buttons, 0, 0, 0, 0];
+/// A PointerEvent and its length: extended (seven bytes) when the server
+/// accepts extended events and back or forward is held. Without extended
+/// events, back and forward are not sent, since the client advertised them.
+fn pointer_packet(buttons: u16, x: u16, y: u16, extended: bool) -> ([u8; 7], usize) {
+    let mut message = [5, (buttons & 0x7f) as u8, 0, 0, 0, 0, 0];
     message[2..4].copy_from_slice(&x.to_be_bytes());
     message[4..6].copy_from_slice(&y.to_be_bytes());
+    if extended && buttons & (BUTTON_BACK | BUTTON_FORWARD) != 0 {
+        message[1] |= EXTENDED_POINTER_MARKER;
+        message[6] =
+            u8::from(buttons & BUTTON_BACK != 0) | (u8::from(buttons & BUTTON_FORWARD != 0) << 1);
+        return (message, 7);
+    }
+    (message, 6)
+}
+
+fn set_encodings_message(encodings: &[i32]) -> Vec<u8> {
+    let mut message = vec![2, 0];
+    message.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
+    for encoding in encodings {
+        message.extend_from_slice(&encoding.to_be_bytes());
+    }
     message
 }
 
@@ -2687,7 +3529,7 @@ impl Session {
             pipeline: true,
             want_continuous: true,
             continuous: false,
-            writer: InputWriter(Arc::new(Mutex::new(stream))),
+            writer: InputWriter::new(stream, encoding.advertised()),
             encoding,
             decoder: UpdateDecoder::new(),
         })
@@ -2803,6 +3645,14 @@ impl Session {
                     writer.fence(flags & FENCE_SUPPORTED_FLAGS, payload)
                 }
                 ServerControl::Fence { .. } => Ok(()),
+                ServerControl::PointerMode { relative } => {
+                    writer.server_pointer_mode(relative);
+                    Ok(())
+                }
+                ServerControl::ExtendedMouseButtons => {
+                    writer.server_extended_buttons();
+                    Ok(())
+                }
             },
             |x, y, w, h, bytes| apply(x, y, w, h, bytes),
         );
@@ -2851,8 +3701,64 @@ mod tests {
             pixel_format,
             update,
             generation,
+            &[],
         )
         .map(|_| ())
+    }
+
+    /// Read updates until one carries pixels. TopVNC's server first sends
+    /// updates without any: the extended-button acknowledgement and the
+    /// pointer mode.
+    fn read_until_pixels(
+        session: &mut Session,
+        scratch: &mut Vec<u8>,
+        framebuffer: &mut Framebuffer,
+        pipelined: bool,
+    ) {
+        for _ in 0..8 {
+            let mut changed = false;
+            let apply = |x, y, width, height, bytes: &[u8]| {
+                changed = true;
+                framebuffer.apply_raw(x, y, width, height, bytes)
+            };
+            if pipelined {
+                session.read_update_pipelined(scratch, apply)
+            } else {
+                session.read_update_with(scratch, apply)
+            }
+            .unwrap();
+            if changed {
+                return;
+            }
+        }
+        panic!("no update with pixels arrived");
+    }
+
+    /// Session state around `framebuffer`, with its geometry current.
+    fn session_shared(framebuffer: &Arc<Mutex<ServerFramebuffer>>) -> SessionShared {
+        let geometry = Geometry::default();
+        {
+            let fb = framebuffer.lock().unwrap();
+            geometry.store(fb.generation, fb.framebuffer.width, fb.framebuffer.height);
+        }
+        SessionShared {
+            framebuffer: Arc::clone(framebuffer),
+            geometry: Arc::new(geometry),
+            relative_pointer: Arc::new(AtomicBool::new(false)),
+            clipboard: Arc::new(Mutex::new(ServerClipboard::default())),
+            thread_setup: None,
+        }
+    }
+
+    fn client_reader(session: &SessionShared, client_id: u64) -> ClientReader {
+        ClientReader {
+            client_id,
+            initial_generation: session.geometry.load().0,
+            geometry: Arc::clone(&session.geometry),
+            announced_relative: Arc::new(AtomicBool::new(false)),
+            encodings: ClientEncodings::default(),
+            position: None,
+        }
     }
 
     fn tcp_pair() -> (TcpStream, TcpStream) {
@@ -2999,7 +3905,7 @@ mod tests {
         let mut raw = vec![0; 64 * 4];
         raw[40 * 4 + 2] = 255;
         changed.apply_raw(0, 0, 64, 1, &raw).unwrap();
-        update_server_framebuffer(&shared, &changed).unwrap();
+        update_server_framebuffer(&shared, &Geometry::default(), &changed).unwrap();
 
         let (mut server_stream, mut client_stream) = tcp_pair();
         let mut seen_revisions = [0];
@@ -3178,18 +4084,25 @@ mod tests {
         let shared = Arc::new(Mutex::new(ServerFramebuffer::new(
             Framebuffer::new(4, 4).unwrap(),
         )));
+        let session_state = session_shared(&shared);
+        let mut reader = client_reader(&session_state, 1);
         let (session, _session_receiver) = std::sync::mpsc::sync_channel(1);
         let (events, event_receiver) = std::sync::mpsc::sync_channel(1);
         let (mut server_stream, mut client_stream) = tcp_pair();
         let mut read_pointer = |x: u8, y: u8| {
             client_stream.write_all(&[5, 0, 0, x, 0, y]).unwrap();
-            read_client_message(&mut server_stream, &session, &events, &shared, 0, 1)
+            read_client_message(&mut server_stream, &session, &events, &mut reader)
         };
 
         // Out of bounds without a resize is a protocol error.
         assert!(read_pointer(9, 0).is_err());
         // The writer has not run, so only the framebuffer knows it shrank.
-        update_server_framebuffer(&shared, &Framebuffer::new(2, 2).unwrap()).unwrap();
+        update_server_framebuffer(
+            &shared,
+            &session_state.geometry,
+            &Framebuffer::new(2, 2).unwrap(),
+        )
+        .unwrap();
         read_pointer(3, 3).unwrap();
         assert!(event_receiver.try_recv().is_err());
         read_pointer(1, 1).unwrap();
@@ -3267,7 +4180,8 @@ mod tests {
             width: 2,
             height: 1,
         };
-        update_server_framebuffer_regions(&shared, &changed, &[damage]).unwrap();
+        update_server_framebuffer_regions(&shared, &Geometry::default(), &changed, &[damage])
+            .unwrap();
         {
             let fb = shared.lock().unwrap();
             assert_eq!(fb.tile_revisions, [0, 0, 1]);
@@ -3280,7 +4194,8 @@ mod tests {
             width: 1,
             height: 1,
         };
-        update_server_framebuffer_regions(&shared, &changed, &[damage]).unwrap();
+        update_server_framebuffer_regions(&shared, &Geometry::default(), &changed, &[damage])
+            .unwrap();
         {
             let fb = shared.lock().unwrap();
             assert_eq!(fb.tile_revisions, [2, 0, 1]);
@@ -3292,7 +4207,10 @@ mod tests {
             width: 2,
             height: 1,
         };
-        assert!(update_server_framebuffer_regions(&shared, &changed, &[outside]).is_err());
+        assert!(
+            update_server_framebuffer_regions(&shared, &Geometry::default(), &changed, &[outside])
+                .is_err()
+        );
     }
 
     #[test]
@@ -3380,11 +4298,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (tx, events_rx) = std::sync::mpsc::sync_channel(1024);
         let shared = Arc::new(Mutex::new(ServerFramebuffer::new(framebuffer)));
-        let server_fb = Arc::clone(&shared);
+        let session = session_shared(&shared);
         let sessions = Arc::new(Mutex::new(ServerSessions::default()));
         let server_sessions = Arc::clone(&sessions);
-        let clipboard = Arc::new(Mutex::new(ServerClipboard::default()));
-        let server_clipboard = Arc::clone(&clipboard);
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -3393,15 +4309,7 @@ mod tests {
                 .unwrap()
                 .register(44, stream.try_clone().unwrap())
                 .unwrap();
-            let result = serve_client(
-                &mut stream,
-                &server_fb,
-                &tx,
-                &config,
-                &server_sessions,
-                &server_clipboard,
-                44,
-            );
+            let result = serve_client(&mut stream, &session, &tx, &config, &server_sessions, 44);
             let _ = tx.send(ClientEvent::ClientDisconnected { client_id: 44 });
             result
         });
@@ -3456,7 +4364,7 @@ mod tests {
         changed_framebuffer
             .apply_raw(0, 0, 2, 1, &[0, 0, 255, 0, 255, 0, 0, 0])
             .unwrap();
-        update_server_framebuffer(&shared, &changed_framebuffer).unwrap();
+        update_server_framebuffer(&shared, &Geometry::default(), &changed_framebuffer).unwrap();
         client.write_all(&[3, 1, 0, 0, 0, 0, 0, 2, 0, 1]).unwrap();
         let mut changed_update = [0; 4];
         client.read_exact(&mut changed_update).unwrap();
@@ -3541,7 +4449,7 @@ mod tests {
         let mut received = Framebuffer::new(2, 1).unwrap();
         let mut scratch = Vec::new();
         writer.request_update(false, 2, 1).unwrap();
-        session.read_update(&mut received, &mut scratch).unwrap();
+        read_until_pixels(&mut session, &mut scratch, &mut received, false);
         assert_eq!(received.pixels(), &[0xff0000, 0x00ff00]);
 
         let mut changed = Framebuffer::new(2, 1).unwrap();
@@ -3550,7 +4458,7 @@ mod tests {
             .unwrap();
         server.update_framebuffer(&changed).unwrap();
         writer.request_update(true, 2, 1).unwrap();
-        session.read_update(&mut received, &mut scratch).unwrap();
+        read_until_pixels(&mut session, &mut scratch, &mut received, false);
         assert_eq!(received.pixels(), &[0xff0000, 0x0000ff]);
 
         writer.key(0x61, true).unwrap();
@@ -3634,6 +4542,125 @@ mod tests {
     }
 
     #[test]
+    fn parallel_jpeg_rectangles_apply_in_wire_order() {
+        let (width, height) = (128u16, 64u16);
+        let mut source = mixed_content(width, height);
+        // Noise, so the encoder picks JPEG rather than a palette.
+        let mut seed = 5u32;
+        for pixel in source.pixels_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *pixel = seed & 0x00ff_ffff;
+        }
+        let settings = TightSettings {
+            quality: Some(9),
+            compression: 1,
+        };
+        let mut jpeg = Vec::new();
+        tight::encode_rect(
+            source.pixels(),
+            usize::from(width),
+            usize::from(height),
+            settings,
+            &mut jpeg,
+        )
+        .unwrap();
+        assert_eq!(jpeg[0] >> 4, 0x09, "the rectangle is JPEG");
+        let rect = |message: &mut Vec<u8>, x: u16, y: u16, w: u16, h: u16| {
+            for value in [x, y, w, h] {
+                message.extend_from_slice(&value.to_be_bytes());
+            }
+            message.extend_from_slice(&tight::TIGHT_ENCODING.to_be_bytes());
+        };
+        // A JPEG rectangle, a fill over part of it, then a second JPEG.
+        let mut message = vec![0, 0, 0, 3];
+        rect(&mut message, 0, 0, width, height);
+        message.extend_from_slice(&jpeg);
+        rect(&mut message, 8, 8, 4, 4);
+        message.extend_from_slice(&[0x80, 0x12, 0x34, 0x56]);
+        rect(&mut message, 0, height, width, height);
+        message.extend_from_slice(&jpeg);
+        let mut decoder = UpdateDecoder::new();
+        let mut framebuffer = Framebuffer::new(width, height * 2).unwrap();
+        let mut order = Vec::new();
+        read_update_with_encoding(
+            &mut Cursor::new(&message),
+            width,
+            height * 2,
+            &mut Vec::new(),
+            Encoding::Tight { quality: 9 },
+            &mut decoder,
+            |x, y, w, h, bytes| {
+                order.push(y);
+                framebuffer.apply_raw(x, y, w, h, bytes)
+            },
+        )
+        .unwrap();
+        assert_eq!(order, [0, 8, height]);
+        let pixels = framebuffer.pixels();
+        let stride = usize::from(width);
+        assert_eq!(pixels[9 * stride + 9], 0x123456);
+        // The JPEG content arrived around the fill and in the second band.
+        let close = |a: u32, b: u32| {
+            [0, 8, 16]
+                .iter()
+                .all(|shift| ((a >> shift & 0xff) as i32 - (b >> shift & 0xff) as i32).abs() <= 24)
+        };
+        assert!(close(pixels[0], source.pixels()[0]));
+        assert!(close(
+            pixels[usize::from(height) * stride + 5],
+            source.pixels()[5]
+        ));
+
+        // Data that is not JPEG, and JPEG of the wrong size, fail the update
+        // after earlier rectangles were applied in order.
+        let mut broken = jpeg.clone();
+        let start = broken
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xd8])
+            .unwrap();
+        broken[start + 1] = 0;
+        let mut corrupt = vec![0, 0, 0, 2];
+        rect(&mut corrupt, 8, 8, 4, 4);
+        corrupt.extend_from_slice(&[0x80, 1, 2, 3]);
+        rect(&mut corrupt, 0, 0, width, height);
+        corrupt.extend_from_slice(&broken);
+        let mut applied = 0;
+        assert!(
+            read_update_with_encoding(
+                &mut Cursor::new(&corrupt),
+                width,
+                height * 2,
+                &mut Vec::new(),
+                Encoding::Tight { quality: 9 },
+                &mut decoder,
+                |_, _, _, _, _| {
+                    applied += 1;
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(applied, 1);
+        let mut wrong_size = vec![0, 0, 0, 1];
+        rect(&mut wrong_size, 0, 0, width / 2, height);
+        wrong_size.extend_from_slice(&jpeg);
+        assert!(
+            read_update_with_encoding(
+                &mut Cursor::new(&wrong_size),
+                width,
+                height * 2,
+                &mut Vec::new(),
+                Encoding::Tight { quality: 9 },
+                &mut decoder,
+                |_, _, _, _, _| Ok(()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn tight_without_a_quality_level_is_lossless() {
         let source = mixed_content(300, 140);
         let (server, address) = start_insecure_server(source.clone());
@@ -3669,11 +4696,7 @@ mod tests {
         let mut received = Framebuffer::new(300, 140).unwrap();
         let mut scratch = Vec::new();
         writer.request_update(false, 300, 140).unwrap();
-        session
-            .read_update_pipelined(&mut scratch, |x, y, width, height, bytes| {
-                received.apply_raw(x, y, width, height, bytes)
-            })
-            .unwrap();
+        read_until_pixels(&mut session, &mut scratch, &mut received, true);
         for (expected, actual) in source.pixels().iter().zip(received.pixels()) {
             for shift in [0, 8, 16] {
                 let difference =
@@ -3756,8 +4779,13 @@ mod tests {
         }
         rects.push(tile(64, 128, 64, 20));
         assert_eq!(
-            tight_rects(&rects),
+            tight_rects(&rects, tight::MAX_RECT_HEIGHT),
             vec![(0, 0, 192, 128), (64, 128, 64, 20)]
+        );
+        // One-tile bands keep the block apart row by row.
+        assert_eq!(
+            tight_rects(&rects, 64),
+            vec![(0, 0, 192, 64), (0, 64, 192, 64), (64, 128, 64, 20)]
         );
 
         // A full 2560x320 area: 2048-pixel-wide and 256-pixel-tall pieces.
@@ -3765,7 +4793,7 @@ mod tests {
             .flat_map(|row| (0..40).map(move |column| tile(column * 64, row * 64, 64, 64)))
             .collect::<Vec<_>>();
         assert_eq!(
-            tight_rects(&rects),
+            tight_rects(&rects, tight::MAX_RECT_HEIGHT),
             vec![
                 (0, 0, 2048, 256),
                 (2048, 0, 512, 256),
@@ -3775,7 +4803,11 @@ mod tests {
         );
         // A non-incremental request is a single rectangle; it is split too.
         assert_eq!(
-            tight_rects(&[tile(0, 0, 2100, 300)]),
+            tight_rects(&[tile(0, 0, 100, 300)], 128),
+            vec![(0, 0, 100, 128), (0, 128, 100, 128), (0, 256, 100, 44)]
+        );
+        assert_eq!(
+            tight_rects(&[tile(0, 0, 2100, 300)], tight::MAX_RECT_HEIGHT),
             vec![
                 (0, 0, 2048, 256),
                 (2048, 0, 52, 256),
@@ -3824,49 +4856,151 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let rects = tight_rects(&tiles);
-        let snapshots = rects
-            .iter()
-            .map(|&(x, y, w, h)| {
-                let mut copy = Vec::with_capacity(w * h);
-                for row in y..y + h {
-                    copy.extend_from_slice(&pixels[row * width + x..row * width + x + w]);
-                }
-                (copy, w, h)
-            })
-            .collect::<Vec<_>>();
-        for quality in [3, 6, 9] {
-            let settings = TightSettings {
-                quality: Some(quality),
-                compression: 1,
-            };
-            let started = Instant::now();
-            let bodies = encode_tight_rects(&snapshots, settings).unwrap();
-            let encoded = started.elapsed();
-            let sequential = Instant::now();
-            for (pixels, w, h) in &snapshots {
-                tight::encode_rect(pixels, *w, *h, settings, &mut Vec::new()).unwrap();
-            }
-            let sequential = sequential.elapsed();
-            let mut decoder = tight::TightDecoder::new();
-            let mut output = Vec::new();
-            let started = Instant::now();
-            for (body, &(_, _, w, h)) in bodies.iter().zip(&rects) {
-                decoder
-                    .read_rect(&mut Cursor::new(body), w, h, &mut output)
+        let workers = encoder_threads();
+        let pool = EncodePool::new(workers, None).unwrap();
+        // 0.2's bands, then bands sized for this machine's threads.
+        for rows in [tight::MAX_RECT_HEIGHT, band_rows(height, workers)] {
+            let rects = tight_rects(&tiles, rows);
+            let snapshots = rects
+                .iter()
+                .map(|&(x, y, w, h)| {
+                    let mut copy = Vec::with_capacity(w * h);
+                    for row in y..y + h {
+                        copy.extend_from_slice(&pixels[row * width + x..row * width + x + w]);
+                    }
+                    (copy, w, h)
+                })
+                .collect::<Vec<_>>();
+            for quality in [3, 6, 9] {
+                let settings = TightSettings {
+                    quality: Some(quality),
+                    compression: 1,
+                };
+                // Warm the threads and allocator, then time the second run.
+                let mut bodies = Vec::new();
+                let mut first = Duration::ZERO;
+                for _ in 0..2 {
+                    bodies.clear();
+                    let started = Instant::now();
+                    pool.encode(snapshots.clone(), settings, |index, body| {
+                        if index == 0 {
+                            first = started.elapsed();
+                        }
+                        bodies.push(body.to_vec());
+                        Ok(())
+                    })
                     .unwrap();
+                }
+                let started = Instant::now();
+                pool.encode(snapshots.clone(), settings, |_, _| Ok(()))
+                    .unwrap();
+                let encoded = started.elapsed();
+                let sequential = Instant::now();
+                for (pixels, w, h) in &snapshots {
+                    tight::encode_rect(pixels, *w, *h, settings, &mut Vec::new()).unwrap();
+                }
+                let sequential = sequential.elapsed();
+                let mut decoder = tight::TightDecoder::new();
+                let mut output = Vec::new();
+                let started = Instant::now();
+                for (body, &(_, _, w, h)) in bodies.iter().zip(&rects) {
+                    decoder
+                        .read_rect(&mut Cursor::new(body), w, h, &mut output)
+                        .unwrap();
+                }
+                let decoded = started.elapsed();
+                // The same bands as one update, decoded the way a session
+                // does, with JPEG on the decoder threads.
+                let mut update = vec![0, 0];
+                update.extend_from_slice(&(rects.len() as u16).to_be_bytes());
+                for (body, &(x, y, w, h)) in bodies.iter().zip(&rects) {
+                    for value in [x, y, w, h] {
+                        update.extend_from_slice(&(value as u16).to_be_bytes());
+                    }
+                    update.extend_from_slice(&tight::TIGHT_ENCODING.to_be_bytes());
+                    update.extend_from_slice(body);
+                }
+                let mut update_decoder = UpdateDecoder::new();
+                let mut framebuffer = Framebuffer::new(width as u16, height as u16).unwrap();
+                let mut pooled = Duration::ZERO;
+                // The first run starts the threads.
+                for _ in 0..2 {
+                    let started = Instant::now();
+                    read_update_with_encoding(
+                        &mut Cursor::new(&update),
+                        width as u16,
+                        height as u16,
+                        &mut Vec::new(),
+                        Encoding::Tight { quality },
+                        &mut update_decoder,
+                        |x, y, w, h, bytes| framebuffer.apply_raw(x, y, w, h, bytes),
+                    )
+                    .unwrap();
+                    pooled = started.elapsed();
+                }
+                let bytes: usize = bodies.iter().map(Vec::len).sum();
+                println!(
+                    "{rows}-row bands, quality {quality}: {} rects, {:.0} KB, encode {:.1} ms on {workers} threads (first band {:.1} ms) / {:.1} ms one thread, decode {:.1} ms one thread / {:.1} ms with decoder threads, including framebuffer writes",
+                    rects.len(),
+                    bytes as f64 / 1000.0,
+                    encoded.as_secs_f64() * 1000.0,
+                    first.as_secs_f64() * 1000.0,
+                    sequential.as_secs_f64() * 1000.0,
+                    decoded.as_secs_f64() * 1000.0,
+                    pooled.as_secs_f64() * 1000.0
+                );
             }
-            let decoded = started.elapsed();
-            let bytes: usize = bodies.iter().map(Vec::len).sum();
-            println!(
-                "quality {quality}: {} rects, {:.0} KB, encode {:.1} ms parallel / {:.1} ms one thread, decode {:.1} ms",
-                rects.len(),
-                bytes as f64 / 1000.0,
-                encoded.as_secs_f64() * 1000.0,
-                sequential.as_secs_f64() * 1000.0,
-                decoded.as_secs_f64() * 1000.0
-            );
         }
+    }
+
+    #[test]
+    fn bands_follow_the_encoder_thread_count() {
+        assert_eq!(band_rows(1080, 16), 64);
+        assert_eq!(band_rows(1080, 8), 128);
+        assert_eq!(band_rows(1080, 4), 256);
+        assert_eq!(band_rows(1080, 1), tight::MAX_RECT_HEIGHT);
+        assert_eq!(band_rows(40, 16), 64);
+        assert_eq!(band_rows(0, 0), 64);
+    }
+
+    #[test]
+    fn encoder_pool_returns_bands_in_order() {
+        let pool = EncodePool::new(4, None).unwrap();
+        let settings = TightSettings::default();
+        // Bands of different sizes finish out of order.
+        let snapshots = (0..12)
+            .map(|index| {
+                let side = if index % 3 == 0 { 96 } else { 8 };
+                (
+                    (0..side * side).map(|pixel| pixel * 7 + index).collect(),
+                    side as usize,
+                    side as usize,
+                )
+            })
+            .collect::<Vec<Snapshot>>();
+        let mut order = Vec::new();
+        pool.encode(snapshots.clone(), settings, |index, body| {
+            let (pixels, width, height) = &snapshots[index];
+            let mut expected = Vec::new();
+            tight::encode_rect(pixels, *width, *height, settings, &mut expected).unwrap();
+            assert_eq!(body, expected);
+            order.push(index);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(order, (0..12).collect::<Vec<_>>());
+        // An error from the writer ends the update; the pool stays usable.
+        let failed = pool.encode(snapshots.clone(), settings, |_, _| {
+            Err(io::Error::other("link closed"))
+        });
+        assert!(failed.is_err());
+        let mut count = 0;
+        pool.encode(snapshots, settings, |_, _| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 12);
     }
 
     /// Read one server message: (type, body). Updates return their raw
@@ -4067,24 +5201,15 @@ mod tests {
         )));
         let (events, _receiver) = std::sync::mpsc::sync_channel(8);
         let sessions = Arc::new(Mutex::new(ServerSessions::default()));
-        let clipboard = Arc::new(Mutex::new(ServerClipboard::default()));
         let config = ServerConfig {
             password: Some("secret".into()),
             ..ServerConfig::default()
         };
-        let server_framebuffer = Arc::clone(&framebuffer);
+        let session = session_shared(&framebuffer);
         let server_thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-            serve_client(
-                &mut stream,
-                &server_framebuffer,
-                &events,
-                &config,
-                &sessions,
-                &clipboard,
-                7,
-            )
+            serve_client(&mut stream, &session, &events, &config, &sessions, 7)
         });
 
         let mut client = TcpStream::connect(address).unwrap();
@@ -4220,7 +5345,7 @@ mod tests {
         let (client, mut server) = socket_pair();
         let worker = std::thread::spawn(move || {
             server.write_all(mock_server().input.get_ref()).unwrap();
-            let mut handshake = [0; 50];
+            let mut handshake = vec![0; 12 + 1 + 1 + 20 + set_encodings(&[0]).len()];
             server.read_exact(&mut handshake).unwrap();
             let mut request = [0; 10];
             server.read_exact(&mut request).unwrap();
@@ -4325,10 +5450,19 @@ mod tests {
         assert_eq!(&server.output[34..], &set_encodings(&[6]));
     }
 
-    /// SetEncodings for `encodings`, followed by the fence and
-    /// continuous-updates pseudo-encodings every mode advertises.
+    /// SetEncodings for `encodings`, followed by the fence, continuous-update,
+    /// and pointer pseudo-encodings every mode advertises.
     fn set_encodings(encodings: &[i32]) -> Vec<u8> {
-        let all = [encodings, &[FENCE_ENCODING, CONTINUOUS_UPDATES_ENCODING]].concat();
+        let all = [
+            encodings,
+            &[
+                FENCE_ENCODING,
+                CONTINUOUS_UPDATES_ENCODING,
+                POINTER_MOTION_CHANGE_ENCODING,
+                EXTENDED_MOUSE_BUTTONS_ENCODING,
+            ],
+        ]
+        .concat();
         let mut message = vec![2, 0];
         message.extend_from_slice(&(all.len() as u16).to_be_bytes());
         for encoding in all {
@@ -4494,7 +5628,10 @@ mod tests {
         assert_eq!(info.security, Security::VncPassword);
         assert_eq!(&server.output[..12], b"RFB 003.008\n");
         assert_eq!(server.output[12], 2);
-        assert_eq!(server.output.len(), 12 + 1 + 16 + 1 + 20 + 16);
+        assert_eq!(
+            server.output.len(),
+            12 + 1 + 16 + 1 + 20 + set_encodings(&[0]).len()
+        );
     }
 
     #[test]
@@ -4577,9 +5714,297 @@ mod tests {
     #[test]
     fn input_packets_use_network_byte_order() {
         assert_eq!(key_packet(0xff51, true), [4, 1, 0, 0, 0, 0, 0xff, 0x51]);
-        assert_eq!(
-            pointer_packet(5, 0x1234, 0xabcd),
-            [5, 5, 0x12, 0x34, 0xab, 0xcd]
+        let (packet, length) = pointer_packet(5, 0x1234, 0xabcd, false);
+        assert_eq!(&packet[..length], [5, 5, 0x12, 0x34, 0xab, 0xcd]);
+    }
+
+    /// A relative PointerEvent for (`dx`, `dy`).
+    fn relative_event(mask: u8, dx: i32, dy: i32) -> [u8; 6] {
+        let (x, y) = (
+            (RELATIVE_POINTER_ORIGIN + dx) as u16,
+            (RELATIVE_POINTER_ORIGIN + dy) as u16,
         );
+        let mut message = [5, mask, 0, 0, 0, 0];
+        message[2..4].copy_from_slice(&x.to_be_bytes());
+        message[4..6].copy_from_slice(&y.to_be_bytes());
+        message
+    }
+
+    fn pointer_event(server: &VncServer) -> ClientEvent {
+        server.recv_event_timeout(Duration::from_secs(2)).unwrap()
+    }
+
+    #[test]
+    fn server_switches_pointer_modes_and_drops_stale_motion() {
+        let (server, address) = start_insecure_server(Framebuffer::new(64, 32).unwrap());
+        let (mut client, width, height) = raw_client(address, &[0, POINTER_MOTION_CHANGE_ENCODING]);
+        // The mode is announced with the first update the client requests:
+        // absolute, QEMU's x = 1, spanning the framebuffer.
+        request(&mut client, false, width, height);
+        let update = read_rectangles(&mut client);
+        assert_eq!(
+            update[0],
+            (
+                1,
+                0,
+                width,
+                height,
+                POINTER_MOTION_CHANGE_ENCODING,
+                Vec::new()
+            )
+        );
+        assert_eq!(update[1].4, 0);
+        client.write_all(&[5, 0, 0, 7, 0, 8]).unwrap();
+        let absolute = |buttons, x, y| ClientEvent::Pointer {
+            client_id: 1,
+            buttons,
+            x,
+            y,
+        };
+        let relative = |buttons, dx, dy| ClientEvent::RelativePointer {
+            client_id: 1,
+            buttons,
+            dx,
+            dy,
+        };
+        assert_eq!(pointer_event(&server), absolute(0, 7, 8));
+
+        // A mode change answers a waiting request at once, without pixels.
+        request(&mut client, true, width, height);
+        server.set_relative_pointer(true);
+        assert_eq!(
+            read_rectangles(&mut client),
+            [(
+                0,
+                0,
+                width,
+                height,
+                POINTER_MOTION_CHANGE_ENCODING,
+                Vec::new()
+            )]
+        );
+        // An absolute event sent before the client switched keeps its
+        // button but not its motion.
+        client.write_all(&[5, 1, 0, 3, 0, 4]).unwrap();
+        assert_eq!(pointer_event(&server), relative(BUTTON_LEFT, 0, 0));
+        client.write_all(&relative_event(1, 10, -3)).unwrap();
+        assert_eq!(pointer_event(&server), relative(BUTTON_LEFT, 10, -3));
+        client
+            .write_all(&relative_event(0, MAX_RELATIVE_DELTA, -MAX_RELATIVE_DELTA))
+            .unwrap();
+        assert_eq!(
+            pointer_event(&server),
+            relative(0, MAX_RELATIVE_DELTA, -MAX_RELATIVE_DELTA)
+        );
+
+        server.set_relative_pointer(false);
+        request(&mut client, true, width, height);
+        assert_eq!(
+            read_rectangles(&mut client),
+            [(
+                1,
+                0,
+                width,
+                height,
+                POINTER_MOTION_CHANGE_ENCODING,
+                Vec::new()
+            )]
+        );
+        // A relative event still in flight presses its button where the
+        // pointer was, instead of ending the session.
+        client.write_all(&relative_event(4, 5, 5)).unwrap();
+        assert_eq!(pointer_event(&server), absolute(BUTTON_RIGHT, 7, 8));
+        client.write_all(&[5, 0, 0, 9, 0, 9]).unwrap();
+        assert_eq!(pointer_event(&server), absolute(0, 9, 9));
+
+        // A client that stops advertising the extension is absolute again,
+        // whatever the host wants.
+        server.set_relative_pointer(true);
+        request(&mut client, true, width, height);
+        read_rectangles(&mut client);
+        client.write_all(&set_encodings_message(&[0])).unwrap();
+        client.write_all(&[5, 0, 0, 1, 0, 2]).unwrap();
+        assert_eq!(pointer_event(&server), absolute(0, 1, 2));
+        server.stop();
+    }
+
+    #[test]
+    fn clients_without_the_extension_never_switch_to_relative_motion() {
+        let (server, address) = start_insecure_server(Framebuffer::new(8, 8).unwrap());
+        let (mut client, _, _) = raw_client(address, &[0]);
+        server.set_relative_pointer(true);
+        client.write_all(&[5, 0, 0, 2, 0, 3]).unwrap();
+        assert_eq!(
+            pointer_event(&server),
+            ClientEvent::Pointer {
+                client_id: 1,
+                buttons: 0,
+                x: 2,
+                y: 3,
+            }
+        );
+        // Bit 7 is the back button for clients without extended events.
+        client.write_all(&[5, 0x80, 0, 2, 0, 3]).unwrap();
+        assert_eq!(
+            pointer_event(&server),
+            ClientEvent::Pointer {
+                client_id: 1,
+                buttons: BUTTON_BACK,
+                x: 2,
+                y: 3,
+            }
+        );
+        server.stop();
+    }
+
+    #[test]
+    fn extended_pointer_events_carry_back_and_forward() {
+        let (server, address) = start_insecure_server(Framebuffer::new(8, 8).unwrap());
+        let (mut client, width, height) =
+            raw_client(address, &[0, EXTENDED_MOUSE_BUTTONS_ENCODING]);
+        // An empty rectangle at the start of the next requested update
+        // acknowledges the extension.
+        request(&mut client, false, width, height);
+        let update = read_rectangles(&mut client);
+        assert_eq!(
+            update[0],
+            (0, 0, 0, 0, EXTENDED_MOUSE_BUTTONS_ENCODING, Vec::new())
+        );
+        assert_eq!(update.len(), 2);
+        let pointer = |buttons| ClientEvent::Pointer {
+            client_id: 1,
+            buttons,
+            x: 1,
+            y: 2,
+        };
+        // The high bit marks an extended event with one more byte.
+        client.write_all(&[5, 0x80 | 4, 0, 1, 0, 2, 0b01]).unwrap();
+        assert_eq!(pointer_event(&server), pointer(BUTTON_RIGHT | BUTTON_BACK));
+        client.write_all(&[5, 0x80, 0, 1, 0, 2, 0b10]).unwrap();
+        assert_eq!(pointer_event(&server), pointer(BUTTON_FORWARD));
+        // A normal event releases both.
+        client.write_all(&[5, 1, 0, 1, 0, 2]).unwrap();
+        assert_eq!(pointer_event(&server), pointer(BUTTON_LEFT));
+        server.stop();
+    }
+
+    #[test]
+    fn input_writer_follows_the_server_pointer_mode() {
+        let (local, mut remote) = tcp_pair();
+        remote
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let writer = InputWriter::new(local, Encoding::Raw.advertised());
+        let mut expect = |bytes: &[u8]| {
+            let mut received = vec![0; bytes.len()];
+            remote.read_exact(&mut received).unwrap();
+            assert_eq!(received, bytes);
+        };
+        writer.pointer(BUTTON_LEFT, 10, 20).unwrap();
+        expect(&[5, 1, 0, 10, 0, 20]);
+        // Relative motion in absolute mode sends only button changes.
+        writer.pointer_motion(BUTTON_LEFT, 5, 5).unwrap();
+        writer.pointer_motion(0, 5, 5).unwrap();
+        expect(&[5, 0, 0, 10, 0, 20]);
+
+        writer.server_pointer_mode(true);
+        assert!(writer.relative_pointer());
+        // Absolute positions in relative mode send only button changes.
+        writer.pointer(0, 30, 40).unwrap();
+        writer.pointer(BUTTON_MIDDLE, 30, 40).unwrap();
+        expect(&relative_event(2, 0, 0));
+        // Large motion is split into deltas the server accepts.
+        writer
+            .pointer_motion(BUTTON_MIDDLE, MAX_RELATIVE_DELTA + 7, -2)
+            .unwrap();
+        expect(&relative_event(2, MAX_RELATIVE_DELTA, -2));
+        expect(&relative_event(2, 7, 0));
+        // Back and forward need the server's acknowledgement.
+        writer.pointer_motion(BUTTON_BACK, 1, 0).unwrap();
+        expect(&relative_event(0, 1, 0));
+        writer.server_extended_buttons();
+        writer
+            .pointer_motion(BUTTON_BACK | BUTTON_FORWARD, 0, 1)
+            .unwrap();
+        let mut extended = relative_event(0x80, 0, 1).to_vec();
+        extended.push(0b11);
+        expect(&extended);
+
+        // Declining resends SetEncodings without the extension and ignores
+        // a switch the server announced before it saw that.
+        writer.set_relative_pointer_allowed(false).unwrap();
+        assert!(!writer.relative_pointer());
+        let declined = Encoding::Raw
+            .advertised()
+            .into_iter()
+            .filter(|encoding| *encoding != POINTER_MOTION_CHANGE_ENCODING)
+            .collect::<Vec<_>>();
+        expect(&set_encodings_message(&declined));
+        writer.server_pointer_mode(true);
+        assert!(!writer.relative_pointer());
+        writer.pointer(0, 1, 2).unwrap();
+        expect(&[5, 0, 0, 1, 0, 2]);
+        writer.set_relative_pointer_allowed(true).unwrap();
+        expect(&set_encodings_message(&Encoding::Raw.advertised()));
+    }
+
+    #[test]
+    fn topvnc_session_sends_relative_motion_when_the_server_asks() {
+        let (server, address) = start_insecure_server(Framebuffer::new(16, 16).unwrap());
+        let mut session = Session::connect(&address.to_string(), true, || unreachable!()).unwrap();
+        let writer = session.writer();
+        writer.request_update(false, 16, 16).unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut scratch = Vec::new();
+            // Runs until the server stops.
+            while session
+                .read_update_pipelined(&mut scratch, |_, _, _, _, _| Ok(()))
+                .is_ok()
+            {}
+        });
+        let wait_for = |relative: bool| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while writer.relative_pointer() != relative {
+                assert!(Instant::now() < deadline, "the pointer mode never changed");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        server.set_relative_pointer(true);
+        wait_for(true);
+        writer.pointer_motion(0, 7, -4).unwrap();
+        assert_eq!(
+            pointer_event(&server),
+            ClientEvent::RelativePointer {
+                client_id: 1,
+                buttons: 0,
+                dx: 7,
+                dy: -4,
+            }
+        );
+        // TopVNC's server acknowledges extended buttons at once.
+        writer.pointer_motion(BUTTON_FORWARD, 0, 0).unwrap();
+        assert_eq!(
+            pointer_event(&server),
+            ClientEvent::RelativePointer {
+                client_id: 1,
+                buttons: BUTTON_FORWARD,
+                dx: 0,
+                dy: 0,
+            }
+        );
+        server.set_relative_pointer(false);
+        wait_for(false);
+        writer.pointer(0, 3, 4).unwrap();
+        assert_eq!(
+            pointer_event(&server),
+            ClientEvent::Pointer {
+                client_id: 1,
+                buttons: 0,
+                x: 3,
+                y: 4,
+            }
+        );
+        server.stop();
+        reader.join().unwrap();
     }
 }
