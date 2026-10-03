@@ -32,7 +32,7 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 - **Foveated encoding for first-person games.** While a game has captured the mouse, the server encodes the center of the screen, where the crosshair is, first and at the viewer's quality. It lowers quality toward the edges as far as the link needs. On an emulated 150 Mbit/s link at 120 fps, frames arrive at about 106 fps instead of 50, and the time from input to a decoded frame that shows it falls from 57 to 37 ms. The updates are standard Tight. TopVNC's viewer is tested with them; other viewers are not yet.
 - **Keyboard and mouse input** for interacting with the remote desktop. Keys are sent by their position on a US keyboard, as games expect.
 - **Adjustable display** with fit-to-window or native pixels, smooth or sharp scaling, full screen, and 60 FPS, 120 FPS, or no presentation limit.
-- **In-session settings** accessible through **F8**, including disconnect and a resizable on-screen settings button.
+- **In-session settings** accessible through **F8**, including the encoding and JPEG quality, disconnect, and a resizable on-screen settings button.
 - **Saved connection details** with platform-specific password storage.
 - **Experimental Windows and macOS server modes**, started from the app's Server tab or with `--serve`, with display capture, resolution-change handling, remote keyboard/mouse input, clipboard sync, and password authentication; live validation is pending.
 
@@ -51,7 +51,7 @@ cargo run --release
 1. Enter the server address and port (usually `5900`). Use brackets around IPv6 addresses, such as `[::1]`.
 2. Enter the server's VNC password.
 3. Choose the compression (Tight JPEG for games and video, Raw for a lossless image on a fast link), the initial window size, presentation rate, and scaling mode.
-4. Click **Connect**. Press **F8** during the session to adjust display settings or disconnect.
+4. Click **Connect**. Press **F8** during the session to adjust display and encoding settings or disconnect.
 
 > **Transport security:** TopVNC currently uses unencrypted TCP. VNC password authentication does not encrypt the framebuffer or input traffic. Use an isolated network or a separately secured tunnel for sensitive sessions. See [Security and saved settings](#security-and-saved-settings).
 
@@ -71,7 +71,7 @@ cargo run --release -- 127.0.0.1:5900 --window 1280x720
 | `--native-size` | Show native pixels; center and crop if the image is larger than the window. |
 | `--window WIDTHxHEIGHT` | Set a custom initial window size, such as `1280x720`. |
 | `--allow-insecure` | Explicitly allow a server offering unauthenticated `None` security. |
-| `--quality LEVEL` | JPEG quality level for Tight, from 0 (smallest) to 9 (best); default 6. Lower it on a slow link. |
+| `--quality LEVEL` | JPEG quality level for Tight, from 0 (smallest) to 9 (best); default 6. Lower it on a slow link. **F8** changes it during a session. |
 | `--input-debug` | Log outgoing key and pointer events for troubleshooting. |
 
 Do not use `--input-debug` while typing passwords: it logs key events.
@@ -130,6 +130,8 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 | Full screen | Switch the viewer to full screen and back. |
 | 60 FPS / 120 FPS / No limit | Cap local presentation. **No limit**, the default, presents every frame as it arrives. This does not set the server's frame rate. |
 | Smooth / Sharp | Choose the scaling appearance. |
+| Encoding: Raw / Zlib / Tight JPEG | Switch the encoding without reconnecting; the server uses it from its next update. Servers without Zlib, including TopVNC's, send Raw instead. |
+| JPEG quality 0–9 | With Tight JPEG, trade image quality for bandwidth: 0 sends the least data, 9 looks best. Raw and Zlib are lossless and ignore it. |
 | Game mouse: Auto lock / Off | **Off** never locks the pointer: the viewer stops offering relative motion and the server sends absolute positions. |
 | F8 button size | Adjust the on-screen settings button from 0.5× to 2.0×. |
 | Disconnect | Return to the connection form. |
