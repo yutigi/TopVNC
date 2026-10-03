@@ -270,6 +270,7 @@ impl TightDecoder {
 
     /// Read one Tight rectangle body and write its pixels to `output` as
     /// 32-bit B, G, R, X bytes, the layout Raw rectangles use.
+    #[cfg(test)]
     pub(crate) fn read_rect(
         &mut self,
         reader: &mut impl Read,
@@ -277,8 +278,27 @@ impl TightDecoder {
         height: usize,
         output: &mut Vec<u8>,
     ) -> io::Result<()> {
-        let pixels = width * height;
-        output.resize(pixels * 4, 0);
+        let mut jpeg = std::mem::take(&mut self.compressed);
+        let result = match self.read_rect_deferred(reader, width, height, output, &mut jpeg) {
+            Ok(true) => decode_jpeg_rect(&jpeg, width, height, output),
+            other => other.map(|_| ()),
+        };
+        self.compressed = jpeg;
+        result
+    }
+
+    /// Like [`TightDecoder::read_rect`], except that a JPEG rectangle's data
+    /// is read into `jpeg` and left for [`decode_jpeg_rect`], which needs no
+    /// decoder state and so can run on another thread. Returns whether it
+    /// did that; otherwise `output` holds the pixels.
+    pub(crate) fn read_rect_deferred(
+        &mut self,
+        reader: &mut impl Read,
+        width: usize,
+        height: usize,
+        output: &mut Vec<u8>,
+        jpeg: &mut Vec<u8>,
+    ) -> io::Result<bool> {
         let mut control = [0];
         reader.read_exact(&mut control)?;
         let control = control[0];
@@ -288,6 +308,13 @@ impl TightDecoder {
             }
         }
         let kind = control >> 4;
+        if kind == JPEG {
+            let length = read_compact_length(reader)?;
+            jpeg.resize(length, 0);
+            reader.read_exact(jpeg)?;
+            return Ok(true);
+        }
+        output.resize(width * height * 4, 0);
         match kind {
             FILL => {
                 let mut color = [0; 3];
@@ -296,17 +323,11 @@ impl TightDecoder {
                 for target in output.chunks_exact_mut(4) {
                     target.copy_from_slice(&pixel);
                 }
-                Ok(())
             }
-            JPEG => {
-                let length = read_compact_length(reader)?;
-                self.compressed.resize(length, 0);
-                reader.read_exact(&mut self.compressed)?;
-                decode_jpeg(&self.compressed, width, height, output)
-            }
-            kind if kind > JPEG => Err(invalid("unsupported Tight compression type")),
-            kind => self.read_basic(reader, kind, width, height, output),
+            kind if kind > JPEG => return Err(invalid("unsupported Tight compression type")),
+            kind => self.read_basic(reader, kind, width, height, output)?,
         }
+        Ok(false)
     }
 
     fn read_basic(
@@ -449,6 +470,19 @@ fn inflate_exact(stream: &mut Decompress, compressed: &[u8], output: &mut [u8]) 
         return Err(invalid("Tight zlib data has an incorrect length"));
     }
     Ok(())
+}
+
+/// Decode a Tight JPEG rectangle's data to 32-bit B, G, R, X bytes in
+/// `output`, which is resized to fit. Rejects data whose size is not
+/// `width` by `height`.
+pub(crate) fn decode_jpeg_rect(
+    jpeg: &[u8],
+    width: usize,
+    height: usize,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    output.resize(width * height * 4, 0);
+    decode_jpeg(jpeg, width, height, output)
 }
 
 fn decode_jpeg(jpeg: &[u8], width: usize, height: usize, output: &mut [u8]) -> io::Result<()> {

@@ -1,5 +1,5 @@
 use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, normalize_serve_scale};
-use minifb::Key;
+use winit::keyboard::KeyCode;
 
 pub const BG: u32 = 0x0b1020;
 const PANEL: u32 = 0x172238;
@@ -43,12 +43,17 @@ pub struct Config {
     pub allow_insecure: bool,
     pub window_mode: WindowMode,
     pub window_size: String,
+    /// Presentation limit in frames per second; 0 presents every frame as
+    /// it arrives.
     pub fps: usize,
     pub quality: Quality,
     pub compression: Compression,
     /// RFB JPEG quality level, 0 (smallest) to 9 (best), used with Tight.
     pub jpeg_quality: u8,
     pub ui_scale: f32,
+    /// Lock the pointer and send relative motion when the host asks, as it
+    /// does while a game hides the cursor.
+    pub relative_mouse: bool,
     pub serve: ServeForm,
 }
 
@@ -61,11 +66,12 @@ impl Default for Config {
             allow_insecure: false,
             window_mode: WindowMode::Fit,
             window_size: "1280x720".into(),
-            fps: 60,
+            fps: 0,
             quality: Quality::Smooth,
             compression: Compression::Tight,
             jpeg_quality: DEFAULT_JPEG_QUALITY,
             ui_scale: 1.0,
+            relative_mouse: true,
             serve: ServeForm::default(),
         }
     }
@@ -253,19 +259,13 @@ pub struct UiState {
     pub tab: Tab,
     pub focus: Option<Field>,
     pub error: Option<String>,
-    mouse_was_down: bool,
 }
 
 impl UiState {
-    pub fn click(&mut self, down: bool) -> bool {
-        let pressed = down && !self.mouse_was_down;
-        self.mouse_was_down = down;
-        pressed
-    }
-
-    pub fn key(&mut self, config: &mut Config, key: Key) -> bool {
+    /// Handle an editing key; returns whether it was one.
+    pub fn key(&mut self, config: &mut Config, key: KeyCode) -> bool {
         match key {
-            Key::Tab => {
+            KeyCode::Tab => {
                 let fields = self.tab.fields();
                 let next = self
                     .focus
@@ -274,7 +274,7 @@ impl UiState {
                 self.focus = Some(fields[next]);
                 true
             }
-            Key::Backspace => {
+            KeyCode::Backspace => {
                 if let Some(value) = self.value_mut(config) {
                     value.pop();
                 }
@@ -534,22 +534,22 @@ pub const SIZE: Box2 = Box2 {
     w: 180,
     h: 36,
 };
-pub const FPS30: Box2 = Box2 {
+pub const FPS60: Box2 = Box2 {
     x: 40,
     y: 483,
     w: 90,
     h: 36,
 };
-pub const FPS60: Box2 = Box2 {
+pub const FPS120: Box2 = Box2 {
     x: 142,
     y: 483,
-    w: 90,
+    w: 100,
     h: 36,
 };
-pub const FPS120: Box2 = Box2 {
-    x: 244,
+pub const FPS_NO_LIMIT: Box2 = Box2 {
+    x: 254,
     y: 483,
-    w: 100,
+    w: 122,
     h: 36,
 };
 pub const SMOOTH: Box2 = Box2 {
@@ -735,11 +735,11 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
         state.focus == Some(Field::WindowSize),
         false,
     );
-    canvas.label(40, 456, "UPDATE RATE");
+    canvas.label(40, 456, "FRAME LIMIT");
     canvas.label(420, 456, "SCALING");
-    canvas.button(FPS30, "30 FPS", config.fps == 30);
     canvas.button(FPS60, "60 FPS", config.fps == 60);
     canvas.button(FPS120, "120 FPS", config.fps == 120);
+    canvas.button(FPS_NO_LIMIT, "NO LIMIT", config.fps == 0);
     canvas.button(SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(SHARP, "SHARP", config.quality == Quality::Sharp);
     if let Some(error) = &state.error {
@@ -1034,57 +1034,75 @@ pub const CLOSE_SETTINGS: Box2 = Box2 {
 };
 pub const LIVE_FIT: Box2 = Box2 {
     x: 24,
-    y: 142,
+    y: 108,
     w: 190,
     h: 38,
 };
 pub const LIVE_NATIVE: Box2 = Box2 {
     x: 226,
-    y: 142,
+    y: 108,
     w: 190,
     h: 38,
 };
-pub const LIVE_30: Box2 = Box2 {
+pub const LIVE_FULLSCREEN: Box2 = Box2 {
     x: 24,
-    y: 228,
-    w: 110,
+    y: 154,
+    w: 392,
     h: 38,
 };
 pub const LIVE_60: Box2 = Box2 {
-    x: 146,
-    y: 228,
+    x: 24,
+    y: 236,
     w: 110,
     h: 38,
 };
 pub const LIVE_120: Box2 = Box2 {
-    x: 268,
-    y: 228,
-    w: 148,
+    x: 146,
+    y: 236,
+    w: 124,
+    h: 38,
+};
+pub const LIVE_NO_LIMIT: Box2 = Box2 {
+    x: 282,
+    y: 236,
+    w: 134,
     h: 38,
 };
 pub const LIVE_SMOOTH: Box2 = Box2 {
     x: 24,
-    y: 314,
+    y: 318,
     w: 190,
     h: 38,
 };
 pub const LIVE_SHARP: Box2 = Box2 {
     x: 226,
-    y: 314,
+    y: 318,
     w: 190,
     h: 38,
 };
-pub const DISCONNECT: Box2 = Box2 {
+pub const LIVE_MOUSE_AUTO: Box2 = Box2 {
     x: 24,
-    y: 493,
-    w: 392,
-    h: 42,
+    y: 400,
+    w: 190,
+    h: 38,
+};
+pub const LIVE_MOUSE_OFF: Box2 = Box2 {
+    x: 226,
+    y: 400,
+    w: 190,
+    h: 38,
 };
 pub const SCALE_SLIDER: Box2 = Box2 {
     x: 24,
-    y: 399,
+    y: 477,
     w: 392,
     h: 48,
+};
+pub const DISCONNECT: Box2 = Box2 {
+    x: 24,
+    y: 566,
+    w: 392,
+    h: 42,
 };
 const SLIDER_LEFT: usize = 36;
 const SLIDER_RIGHT: usize = 404;
@@ -1104,7 +1122,7 @@ pub const SETTINGS_PANEL: Box2 = Box2 {
     x: 8,
     y: 8,
     w: 432,
-    h: 542,
+    h: 612,
 };
 
 pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
@@ -1128,7 +1146,6 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     canvas.text(24, 28, "SESSION SETTINGS", TEXT, 3);
     canvas.button(CLOSE_SETTINGS, "CLOSE", false);
     canvas.text(24, 83, "WINDOW", ACCENT, 2);
-    canvas.text(24, 107, "DRAG WINDOW EDGES TO RESIZE", MUTED, 2);
     canvas.button(
         LIVE_FIT,
         "FIT IMAGE",
@@ -1139,19 +1156,24 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
         "1:1 PIXELS",
         config.window_mode == WindowMode::Native,
     );
-    canvas.text(24, 199, "UPDATE RATE", ACCENT, 2);
-    canvas.button(LIVE_30, "30 FPS", config.fps == 30);
+    canvas.button(LIVE_FULLSCREEN, "FULL SCREEN ON / OFF", false);
+    canvas.text(24, 210, "FRAME LIMIT", ACCENT, 2);
     canvas.button(LIVE_60, "60 FPS", config.fps == 60);
     canvas.button(LIVE_120, "120 FPS", config.fps == 120);
-    canvas.text(24, 285, "SCALING", ACCENT, 2);
+    canvas.button(LIVE_NO_LIMIT, "NO LIMIT", config.fps == 0);
+    canvas.text(24, 292, "SCALING", ACCENT, 2);
     canvas.button(LIVE_SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(LIVE_SHARP, "SHARP", config.quality == Quality::Sharp);
-    canvas.text(24, 376, "F8 BUTTON SIZE", ACCENT, 2);
-    canvas.text(330, 376, &format!("{:.2}X", config.ui_scale), TEXT, 2);
+    canvas.text(24, 374, "GAME MOUSE", ACCENT, 2);
+    canvas.button(LIVE_MOUSE_AUTO, "AUTO LOCK", config.relative_mouse);
+    canvas.button(LIVE_MOUSE_OFF, "OFF", !config.relative_mouse);
+    canvas.text(24, 458, "F8 BUTTON SIZE", ACCENT, 2);
+    canvas.text(330, 458, &format!("{:.2}X", config.ui_scale), TEXT, 2);
+    let track_y = SCALE_SLIDER.y + 19;
     canvas.fill(
         Box2 {
             x: SLIDER_LEFT,
-            y: 418,
+            y: track_y,
             w: SLIDER_RIGHT - SLIDER_LEFT,
             h: 6,
         },
@@ -1161,7 +1183,7 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     canvas.fill(
         Box2 {
             x: SLIDER_LEFT,
-            y: 418,
+            y: track_y,
             w: thumb - SLIDER_LEFT,
             h: 6,
         },
@@ -1170,15 +1192,15 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     canvas.fill(
         Box2 {
             x: thumb.saturating_sub(6),
-            y: 408,
+            y: track_y - 10,
             w: 12,
             h: 26,
         },
         ACCENT,
     );
-    canvas.text(24, 444, "0.5X", MUTED, 1);
-    canvas.text(384, 444, "2X", MUTED, 1);
-    canvas.text(24, 466, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
+    canvas.text(24, track_y + 26, "0.5X", MUTED, 1);
+    canvas.text(384, track_y + 26, "2X", MUTED, 1);
+    canvas.text(24, 544, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
     canvas.button(DISCONNECT, "DISCONNECT", false);
 }
 
@@ -1271,7 +1293,7 @@ mod tests {
         let mut state = UiState::default();
         let mut config = Config::default();
         for expected in [Field::Host, Field::Port, Field::Password, Field::WindowSize] {
-            state.key(&mut config, Key::Tab);
+            state.key(&mut config, KeyCode::Tab);
             assert!(state.focus == Some(expected));
         }
         let small = open_settings_box(0.5);
@@ -1288,7 +1310,7 @@ mod tests {
     fn server_tab_cycles_its_own_fields_and_switching_clears_focus() {
         let mut state = UiState::default();
         let mut config = Config::default();
-        state.key(&mut config, Key::Tab);
+        state.key(&mut config, KeyCode::Tab);
         state.switch_tab(Tab::Server);
         assert_eq!(state.focus, None);
         for expected in [
@@ -1298,10 +1320,10 @@ mod tests {
             Field::ServeDisplay,
             Field::ServeHost,
         ] {
-            state.key(&mut config, Key::Tab);
+            state.key(&mut config, KeyCode::Tab);
             assert_eq!(state.focus, Some(expected));
         }
-        state.key(&mut config, Key::Tab);
+        state.key(&mut config, KeyCode::Tab);
         state.character(&mut config, '7');
         assert_eq!(config.serve.port, "59007");
         assert_eq!(config.port, "5900");
