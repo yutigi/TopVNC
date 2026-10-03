@@ -1440,6 +1440,20 @@ fn run_session_inner(
                                         config.quality = Quality::Smooth;
                                     } else if ui::LIVE_SHARP.contains(x, y) {
                                         config.quality = Quality::Sharp;
+                                    } else if ui::LIVE_RAW.contains(x, y) {
+                                        config.compression = Compression::Raw;
+                                        writer.set_encoding(encoding(config))?;
+                                    } else if ui::LIVE_ZLIB.contains(x, y) {
+                                        config.compression = Compression::Zlib;
+                                        writer.set_encoding(encoding(config))?;
+                                    } else if ui::LIVE_TIGHT.contains(x, y) {
+                                        config.compression = Compression::Tight;
+                                        writer.set_encoding(encoding(config))?;
+                                    } else if let Some(level) = ui::live_quality_at(x, y)
+                                        && config.compression == Compression::Tight
+                                    {
+                                        config.jpeg_quality = level;
+                                        writer.set_encoding(encoding(config))?;
                                     } else if ui::LIVE_MOUSE_AUTO.contains(x, y) {
                                         config.relative_mouse = true;
                                         writer.set_relative_pointer_allowed(true)?;

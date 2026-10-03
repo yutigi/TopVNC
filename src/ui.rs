@@ -473,6 +473,19 @@ impl<'a> Canvas<'a> {
             2,
         );
     }
+
+    /// A button that does nothing with the current settings.
+    pub fn inactive_button(&mut self, area: Box2, label: &str) {
+        self.fill(area, BG);
+        self.frame(area, PANEL);
+        self.text(
+            area.x + 12,
+            area.y + (area.h.saturating_sub(14)) / 2,
+            label,
+            BORDER,
+            2,
+        );
+    }
 }
 
 pub const HOST: Box2 = Box2 {
@@ -1067,75 +1080,109 @@ pub const CLOSE_SETTINGS: Box2 = Box2 {
 };
 pub const LIVE_FIT: Box2 = Box2 {
     x: 24,
-    y: 108,
+    y: 88,
     w: 190,
-    h: 38,
+    h: 34,
 };
 pub const LIVE_NATIVE: Box2 = Box2 {
     x: 226,
-    y: 108,
+    y: 88,
     w: 190,
-    h: 38,
+    h: 34,
 };
 pub const LIVE_FULLSCREEN: Box2 = Box2 {
     x: 24,
-    y: 154,
+    y: 128,
     w: 392,
-    h: 38,
+    h: 34,
 };
 pub const LIVE_60: Box2 = Box2 {
     x: 24,
-    y: 236,
+    y: 198,
     w: 110,
-    h: 38,
+    h: 34,
 };
 pub const LIVE_120: Box2 = Box2 {
     x: 146,
-    y: 236,
+    y: 198,
     w: 124,
-    h: 38,
+    h: 34,
 };
 pub const LIVE_NO_LIMIT: Box2 = Box2 {
     x: 282,
-    y: 236,
+    y: 198,
     w: 134,
-    h: 38,
+    h: 34,
 };
 pub const LIVE_SMOOTH: Box2 = Box2 {
     x: 24,
-    y: 318,
+    y: 268,
     w: 190,
-    h: 38,
+    h: 34,
 };
 pub const LIVE_SHARP: Box2 = Box2 {
     x: 226,
-    y: 318,
+    y: 268,
     w: 190,
-    h: 38,
+    h: 34,
 };
+pub const LIVE_RAW: Box2 = Box2 {
+    x: 24,
+    y: 338,
+    w: 110,
+    h: 34,
+};
+pub const LIVE_ZLIB: Box2 = Box2 {
+    x: 146,
+    y: 338,
+    w: 110,
+    h: 34,
+};
+pub const LIVE_TIGHT: Box2 = Box2 {
+    x: 268,
+    y: 338,
+    w: 148,
+    h: 34,
+};
+
+/// The JPEG quality button for `level`, from 0 to 9.
+pub fn live_quality_box(level: u8) -> Box2 {
+    Box2 {
+        x: 24 + usize::from(level) * 40,
+        y: 408,
+        w: 32,
+        h: 34,
+    }
+}
+
+/// The JPEG quality level whose button contains (`x`, `y`).
+pub fn live_quality_at(x: usize, y: usize) -> Option<u8> {
+    (0..=9).find(|&level| live_quality_box(level).contains(x, y))
+}
+
 pub const LIVE_MOUSE_AUTO: Box2 = Box2 {
     x: 24,
-    y: 400,
+    y: 478,
     w: 190,
-    h: 38,
+    h: 34,
 };
 pub const LIVE_MOUSE_OFF: Box2 = Box2 {
     x: 226,
-    y: 400,
+    y: 478,
     w: 190,
-    h: 38,
+    h: 34,
 };
 pub const SCALE_SLIDER: Box2 = Box2 {
     x: 24,
-    y: 477,
+    y: 545,
     w: 392,
     h: 48,
 };
 pub const DISCONNECT: Box2 = Box2 {
     x: 24,
-    y: 566,
+    y: 634,
     w: 392,
-    h: 42,
+    h: 38,
 };
 const SLIDER_LEFT: usize = 36;
 const SLIDER_RIGHT: usize = 404;
@@ -1151,11 +1198,12 @@ fn slider_x(scale: f32) -> usize {
         + (((scale.clamp(0.5, 2.0) - 0.5) / 1.5) * (SLIDER_RIGHT - SLIDER_LEFT) as f32).round()
             as usize
 }
+/// Short enough for a 1280x720 window.
 pub const SETTINGS_PANEL: Box2 = Box2 {
     x: 8,
     y: 8,
     w: 432,
-    h: 612,
+    h: 676,
 };
 
 pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
@@ -1178,7 +1226,7 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     canvas.frame(SETTINGS_PANEL, ACCENT);
     canvas.text(24, 28, "SESSION SETTINGS", TEXT, 3);
     canvas.button(CLOSE_SETTINGS, "CLOSE", false);
-    canvas.text(24, 83, "WINDOW", ACCENT, 2);
+    canvas.text(24, 66, "WINDOW", ACCENT, 2);
     canvas.button(
         LIVE_FIT,
         "FIT IMAGE",
@@ -1190,18 +1238,44 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
         config.window_mode == WindowMode::Native,
     );
     canvas.button(LIVE_FULLSCREEN, "FULL SCREEN ON / OFF", false);
-    canvas.text(24, 210, "FRAME LIMIT", ACCENT, 2);
+    canvas.text(24, 176, "FRAME LIMIT", ACCENT, 2);
     canvas.button(LIVE_60, "60 FPS", config.fps == 60);
     canvas.button(LIVE_120, "120 FPS", config.fps == 120);
     canvas.button(LIVE_NO_LIMIT, "NO LIMIT", config.fps == 0);
-    canvas.text(24, 292, "SCALING", ACCENT, 2);
+    canvas.text(24, 246, "SCALING", ACCENT, 2);
     canvas.button(LIVE_SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(LIVE_SHARP, "SHARP", config.quality == Quality::Sharp);
-    canvas.text(24, 374, "GAME MOUSE", ACCENT, 2);
+    canvas.text(24, 316, "ENCODING", ACCENT, 2);
+    canvas.button(LIVE_RAW, "RAW", config.compression == Compression::Raw);
+    canvas.button(LIVE_ZLIB, "ZLIB", config.compression == Compression::Zlib);
+    canvas.button(
+        LIVE_TIGHT,
+        "TIGHT JPEG",
+        config.compression == Compression::Tight,
+    );
+    // The quality applies only to Tight; its buttons rest otherwise.
+    let tight = config.compression == Compression::Tight;
+    canvas.text(24, 386, "JPEG QUALITY", ACCENT, 2);
+    let hint = if tight {
+        "0 SMALLEST  9 BEST"
+    } else {
+        "TIGHT JPEG ONLY"
+    };
+    canvas.text(416 - hint.len() * 12, 386, hint, MUTED, 2);
+    for level in 0..=9 {
+        let area = live_quality_box(level);
+        let label = level.to_string();
+        if tight {
+            canvas.button(area, &label, level == config.jpeg_quality);
+        } else {
+            canvas.inactive_button(area, &label);
+        }
+    }
+    canvas.text(24, 456, "GAME MOUSE", ACCENT, 2);
     canvas.button(LIVE_MOUSE_AUTO, "AUTO LOCK", config.relative_mouse);
     canvas.button(LIVE_MOUSE_OFF, "OFF", !config.relative_mouse);
-    canvas.text(24, 458, "F8 BUTTON SIZE", ACCENT, 2);
-    canvas.text(330, 458, &format!("{:.2}X", config.ui_scale), TEXT, 2);
+    canvas.text(24, 526, "F8 BUTTON SIZE", ACCENT, 2);
+    canvas.text(330, 526, &format!("{:.2}X", config.ui_scale), TEXT, 2);
     let track_y = SCALE_SLIDER.y + 19;
     canvas.fill(
         Box2 {
@@ -1233,7 +1307,7 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     );
     canvas.text(24, track_y + 26, "0.5X", MUTED, 1);
     canvas.text(384, track_y + 26, "2X", MUTED, 1);
-    canvas.text(24, 544, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
+    canvas.text(24, 610, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
     canvas.button(DISCONNECT, "DISCONNECT", false);
 }
 
@@ -1458,6 +1532,54 @@ mod tests {
             assert!(12 + label.len() * 12 <= area.w, "{label}");
         }
         assert!("PRIMARY".len() <= SERVE_DISPLAY.w.saturating_sub(28) / 12);
+    }
+
+    #[test]
+    fn settings_panel_controls_fit_the_panel_without_overlapping() {
+        let levels = (0..=9u8).map(|level| level.to_string()).collect::<Vec<_>>();
+        let mut controls = vec![
+            (CLOSE_SETTINGS, "CLOSE"),
+            (LIVE_FIT, "FIT IMAGE"),
+            (LIVE_NATIVE, "1:1 PIXELS"),
+            (LIVE_FULLSCREEN, "FULL SCREEN ON / OFF"),
+            (LIVE_60, "60 FPS"),
+            (LIVE_120, "120 FPS"),
+            (LIVE_NO_LIMIT, "NO LIMIT"),
+            (LIVE_SMOOTH, "SMOOTH"),
+            (LIVE_SHARP, "SHARP"),
+            (LIVE_RAW, "RAW"),
+            (LIVE_ZLIB, "ZLIB"),
+            (LIVE_TIGHT, "TIGHT JPEG"),
+            (LIVE_MOUSE_AUTO, "AUTO LOCK"),
+            (LIVE_MOUSE_OFF, "OFF"),
+            (SCALE_SLIDER, ""),
+            (DISCONNECT, "DISCONNECT"),
+        ];
+        for (level, label) in levels.iter().enumerate() {
+            controls.push((live_quality_box(level as u8), label.as_str()));
+        }
+        let overlap = |a: Box2, b: Box2| {
+            a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+        };
+        let panel = SETTINGS_PANEL;
+        for (index, (a, label)) in controls.iter().enumerate() {
+            assert!(
+                a.x > panel.x
+                    && a.y > panel.y
+                    && a.x + a.w < panel.x + panel.w
+                    && a.y + a.h < panel.y + panel.h,
+                "{label} leaves the panel"
+            );
+            assert!(12 + label.len() * 12 <= a.w, "{label}");
+            for (b, other) in &controls[index + 1..] {
+                assert!(!overlap(*a, *b), "{label} and {other} overlap");
+            }
+        }
+        // The panel fits a 1280x720 window.
+        assert!(panel.y + panel.h <= 720);
+        let three = live_quality_box(3);
+        assert_eq!(live_quality_at(three.x, three.y + three.h - 1), Some(3));
+        assert_eq!(live_quality_at(three.x + three.w, three.y), None);
     }
 
     #[test]

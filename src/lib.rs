@@ -7,7 +7,7 @@ use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use flate2::{Decompress, FlushDecompress};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -337,7 +337,20 @@ impl Encoding {
                 | (Self::Tight { .. }, tight::TIGHT_ENCODING)
         )
     }
+
+    /// [`Encoding::accepts`] as flags: bit `n` stands for
+    /// `DECODED_ENCODINGS[n]`.
+    fn accepted_flags(self) -> u8 {
+        DECODED_ENCODINGS
+            .iter()
+            .enumerate()
+            .filter(|(_, wire_encoding)| self.accepts(**wire_encoding))
+            .fold(0, |flags, (bit, _)| flags | 1 << bit)
+    }
 }
+
+/// Every pixel encoding the client decodes.
+const DECODED_ENCODINGS: [i32; 3] = [0, 6, tight::TIGHT_ENCODING];
 
 /// Decoder state that persists across framebuffer updates: the Zlib stream,
 /// Tight's four zlib streams, and the threads that decode JPEG rectangles.
@@ -3288,7 +3301,7 @@ pub fn read_update_with_encoding(
         reader,
         (frame_width, frame_height),
         scratch,
-        selected_encoding,
+        |wire_encoding| selected_encoding.accepts(wire_encoding),
         decoder,
         || Ok(()),
         |_| {},
@@ -3313,7 +3326,8 @@ enum ServerControl<'a> {
     ExtendedMouseButtons,
 }
 
-/// `started` runs once the FramebufferUpdate header arrives, before any
+/// `accepts` says whether a rectangle's encoding is one the client asked
+/// for. `started` runs once the FramebufferUpdate header arrives, before any
 /// rectangle data is read, `rectangle` once per rectangle with its
 /// encoding, and `control` for continuous-update and fence messages that
 /// arrive before the update.
@@ -3322,7 +3336,7 @@ fn read_update_inner(
     reader: &mut impl Read,
     (frame_width, frame_height): (u16, u16),
     scratch: &mut Vec<u8>,
-    selected_encoding: Encoding,
+    accepts: impl Fn(i32) -> bool,
     decoder: &mut UpdateDecoder,
     mut started: impl FnMut() -> io::Result<()>,
     mut rectangle: impl FnMut(i32),
@@ -3360,7 +3374,7 @@ fn read_update_inner(
                         }
                         _ => {}
                     }
-                    if !selected_encoding.accepts(wire_encoding) {
+                    if !accepts(wire_encoding) {
                         return Err(invalid("server sent an unsupported encoding"));
                     }
                     rectangle(wire_encoding);
@@ -3461,15 +3475,21 @@ pub fn read_update(
 }
 
 /// Sends input and control messages to the server. Clones share one
-/// connection and one pointer mode, so a mode change and the input events
-/// around it are ordered.
+/// connection, one pointer mode, and one encoding, so a mode change and the
+/// input events around it are ordered.
 #[derive(Clone)]
-pub struct InputWriter(Arc<Mutex<WriterState>>);
+pub struct InputWriter {
+    state: Arc<Mutex<WriterState>>,
+    /// [`Encoding::accepted_flags`] of every encoding asked for since the
+    /// handshake, which the session's reader checks without the lock:
+    /// updates the server began before a switch still use the old encoding.
+    accepted: Arc<AtomicU8>,
+}
 
 struct WriterState {
     stream: TcpStream,
-    /// The encodings advertised at the handshake.
-    encodings: Vec<i32>,
+    /// The encoding the client asks for.
+    encoding: Encoding,
     /// The client advertises relative pointer motion.
     relative_allowed: bool,
     /// The server asked for relative pointer motion.
@@ -3504,23 +3524,39 @@ impl WriterState {
         };
         self.send_pointer(buttons, x, y)
     }
+
+    /// Send SetEncodings for the chosen encoding and pointer motion.
+    fn send_encodings(&mut self) -> io::Result<()> {
+        let relative_allowed = self.relative_allowed;
+        let encodings = self
+            .encoding
+            .advertised()
+            .into_iter()
+            .filter(|encoding| relative_allowed || *encoding != POINTER_MOTION_CHANGE_ENCODING)
+            .collect::<Vec<_>>();
+        self.stream.write_all(&set_encodings_message(&encodings))
+    }
 }
 
 impl InputWriter {
-    fn new(stream: TcpStream, encodings: Vec<i32>) -> Self {
-        Self(Arc::new(Mutex::new(WriterState {
-            stream,
-            relative_allowed: encodings.contains(&POINTER_MOTION_CHANGE_ENCODING),
-            encodings,
-            relative: false,
-            extended_buttons: false,
-            position: (0, 0),
-            buttons: 0,
-        })))
+    /// A writer for a connection whose handshake advertised `encoding`.
+    fn new(stream: TcpStream, encoding: Encoding) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(WriterState {
+                stream,
+                encoding,
+                relative_allowed: true,
+                relative: false,
+                extended_buttons: false,
+                position: (0, 0),
+                buttons: 0,
+            })),
+            accepted: Arc::new(AtomicU8::new(encoding.accepted_flags())),
+        }
     }
 
     fn state(&self) -> io::Result<std::sync::MutexGuard<'_, WriterState>> {
-        self.0
+        self.state
             .lock()
             .map_err(|_| invalid("connection lock is poisoned"))
     }
@@ -3617,13 +3653,31 @@ impl InputWriter {
         }
         state.relative_allowed = allowed;
         state.relative = false;
-        let encodings = state
-            .encodings
+        state.send_encodings()
+    }
+
+    /// Ask for `encoding` from the server's next update on, on the same
+    /// connection. Rectangles in the encodings asked for before stay
+    /// accepted, since the server may have begun them before the switch.
+    pub fn set_encoding(&self, encoding: Encoding) -> io::Result<()> {
+        let mut state = self.state()?;
+        if state.encoding == encoding {
+            return Ok(());
+        }
+        // Accept the new encoding before the server can send it.
+        self.accepted
+            .fetch_or(encoding.accepted_flags(), Ordering::Release);
+        state.encoding = encoding;
+        state.send_encodings()
+    }
+
+    /// Whether the client asked for rectangles in `wire_encoding`.
+    fn accepts(&self, wire_encoding: i32) -> bool {
+        let accepted = self.accepted.load(Ordering::Acquire);
+        DECODED_ENCODINGS
             .iter()
-            .copied()
-            .filter(|encoding| allowed || *encoding != POINTER_MOTION_CHANGE_ENCODING)
-            .collect::<Vec<_>>();
-        state.stream.write_all(&set_encodings_message(&encodings))
+            .position(|decoded| *decoded == wire_encoding)
+            .is_some_and(|bit| accepted & 1 << bit != 0)
     }
 
     /// The server switched pointer modes. Input sent after this uses the
@@ -3684,8 +3738,8 @@ pub struct Session {
     want_continuous: bool,
     /// The server pushes updates; no requests are needed.
     continuous: bool,
+    /// Also says which encodings the client has asked for.
     writer: InputWriter,
-    encoding: Encoding,
     decoder: UpdateDecoder,
 }
 
@@ -3773,8 +3827,7 @@ impl Session {
             pipeline: true,
             want_continuous: true,
             continuous: false,
-            writer: InputWriter::new(stream, encoding.advertised()),
-            encoding,
+            writer: InputWriter::new(stream, encoding),
             decoder: UpdateDecoder::new(),
         })
     }
@@ -3854,7 +3907,7 @@ impl Session {
             &mut reader,
             (width, height),
             scratch,
-            self.encoding,
+            |wire_encoding| writer.accepts(wire_encoding),
             &mut self.decoder,
             || {
                 wait_before_body = Some(network_wait.load(Ordering::Relaxed));
@@ -4968,6 +5021,50 @@ mod tests {
                     received.apply_raw(x, y, width, height, bytes)
                 })
                 .unwrap();
+        }
+        server.stop();
+    }
+
+    #[test]
+    fn session_switches_encodings_without_reconnecting() {
+        let source = mixed_content(300, 140);
+        let (server, address) = start_insecure_server(source.clone());
+        let mut session = Session::connect_with_encoding(
+            &address.to_string(),
+            true,
+            Encoding::Raw,
+            || unreachable!(),
+        )
+        .unwrap();
+        let writer = session.writer();
+        let stats = session.stats();
+        let mut received = Framebuffer::new(300, 140).unwrap();
+        let mut scratch = Vec::new();
+        writer.request_update(false, 300, 140).unwrap();
+        read_until_pixels(&mut session, &mut scratch, &mut received, true);
+        assert_eq!(stats.snapshot().encoding, Some(0));
+
+        // Each switch reaches the server's next updates; ones already on the
+        // wire in the old encoding are still decoded.
+        let mut changed = source;
+        let mut serial = 0;
+        for (encoding, wire_encoding) in [
+            (Encoding::Tight { quality: 6 }, tight::TIGHT_ENCODING),
+            (Encoding::Raw, 0),
+        ] {
+            writer.set_encoding(encoding).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while stats.snapshot().encoding != Some(wire_encoding) {
+                assert!(Instant::now() < deadline, "{encoding:?} never arrived");
+                serial += 1;
+                changed.pixels_mut()[0] = serial;
+                server.update_framebuffer(&changed).unwrap();
+                session
+                    .read_update_pipelined(&mut scratch, |x, y, width, height, bytes| {
+                        received.apply_raw(x, y, width, height, bytes)
+                    })
+                    .unwrap();
+            }
         }
         server.stop();
     }
@@ -6630,7 +6727,7 @@ mod tests {
         remote
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let writer = InputWriter::new(local, Encoding::Raw.advertised());
+        let writer = InputWriter::new(local, Encoding::Raw);
         let mut expect = |bytes: &[u8]| {
             let mut received = vec![0; bytes.len()];
             remote.read_exact(&mut received).unwrap();
@@ -6682,6 +6779,51 @@ mod tests {
         expect(&[5, 0, 0, 1, 0, 2]);
         writer.set_relative_pointer_allowed(true).unwrap();
         expect(&set_encodings_message(&Encoding::Raw.advertised()));
+    }
+
+    #[test]
+    fn input_writer_switches_encodings_on_the_same_connection() {
+        let (local, mut remote) = tcp_pair();
+        remote
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let writer = InputWriter::new(local, Encoding::Raw);
+        let mut expect = |encodings: &[i32]| {
+            let bytes = set_encodings_message(encodings);
+            let mut received = vec![0; bytes.len()];
+            remote.read_exact(&mut received).unwrap();
+            assert_eq!(received, bytes);
+        };
+        assert!(writer.accepts(0));
+        assert!(!writer.accepts(6) && !writer.accepts(tight::TIGHT_ENCODING));
+        let tight = Encoding::Tight { quality: 3 };
+        writer.set_encoding(tight).unwrap();
+        expect(&tight.advertised());
+        assert!(writer.accepts(6) && writer.accepts(tight::TIGHT_ENCODING));
+        // Another quality level is another SetEncodings.
+        let sharper = Encoding::Tight { quality: 8 };
+        writer.set_encoding(sharper).unwrap();
+        expect(&sharper.advertised());
+        // Updates the server began before the switch back may still be Tight.
+        writer.set_encoding(Encoding::Raw).unwrap();
+        expect(&Encoding::Raw.advertised());
+        assert!(writer.accepts(tight::TIGHT_ENCODING));
+        assert!(!writer.accepts(16));
+
+        // Choosing the current encoding sends nothing, and declined relative
+        // motion stays declined across a switch.
+        writer.set_encoding(Encoding::Raw).unwrap();
+        writer.set_relative_pointer_allowed(false).unwrap();
+        let without_motion = |encoding: Encoding| {
+            encoding
+                .advertised()
+                .into_iter()
+                .filter(|encoding| *encoding != POINTER_MOTION_CHANGE_ENCODING)
+                .collect::<Vec<_>>()
+        };
+        expect(&without_motion(Encoding::Raw));
+        writer.set_encoding(Encoding::Zlib).unwrap();
+        expect(&without_motion(Encoding::Zlib));
     }
 
     #[test]
