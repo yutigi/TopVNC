@@ -6,6 +6,13 @@ configure a VPN, or automatically elevate. No dependency installation is needed.
 The separate work-server launcher starts the existing debug executable. All
 addresses below are fictional examples; replace them with your own configuration.
 
+The app's **Work**, **Network**, and **Firewall** tabs expose these helpers.
+Work opens an independent terminal for the launcher's password prompt. Network
+shows a read-only report; Firewall previews the exact scope and prints commands
+for manual use in an existing administrator PowerShell. Reports have Previous /
+Next pages and a Copy report button. Review deployment details before sharing
+copied output. Neither diagnostic tab changes policy or automatically elevates.
+
 ## Work/home startup order
 
 1. Connect your private VPN on both computers and allow remote access from the
@@ -164,11 +171,6 @@ policy blocks scripts, follow your organization's policy; the helpers do not
 change or bypass it. Review local paths, process IDs, and addresses before sharing
 diagnostic output.
 
-The work-server launcher's `/check` mode was verified without starting another
-server; an extra `--allow-insecure` option was rejected. On 2026-10-25,
-`cargo fmt --all` passed and `cargo clippy --workspace --all-targets` completed
-with warnings in unchanged Rust code. Workspace library tests had 36 passes and
-one timeout in `clients_without_desktop_size_are_disconnected_on_resize`, also
-on a single-threaded retry. The separately run binary tests had 47 passes;
-documentation tests completed with none defined. No Rust source was modified
-for this startup runbook or launcher.
+The work-server launcher's `/check` mode is covered by a Rust integration test
+using loopback; the test does not start a server. Current helper-tab validation
+and remaining environment limits are recorded in `specs/006-script-tabs/spec.md`.

@@ -21,6 +21,7 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 - **In-session settings** accessible through **F8**, including disconnect and a resizable on-screen settings button.
 - **Saved connection details** with platform-specific password storage.
 - **Experimental Windows and macOS server modes**, started from the app's Server tab or with `--serve`, with display capture, resolution-change handling, remote keyboard/mouse input, clipboard sync, and password authentication; live validation is pending.
+- **Windows helper tabs** for the work-server launcher, read-only network diagnostics, and scoped firewall previews, with paged reports and copyable commands.
 
 The protocol implementation handles RFB 3.3, 3.7, and 3.8. Apple's `RFB 003.889` banner is handled through a standard RFB 3.8 fallback; Apple-specific authentication is not implemented.
 
@@ -137,6 +138,20 @@ See the [startup guide](docs/windows-private-network.md#workhome-startup-order)
 for generic examples and diagnostic limits. Replace example addresses locally;
 keep deployment details out of shared documentation.
 
+The **Work** tab accepts your local VPN IPv4 address and port. **Check launcher**
+checks the existing debug executable; **Start in terminal** opens a separate
+password prompt. Stop hosting with Ctrl+C or by closing that terminal; closing
+the viewer leaves this separate server running. The **Network** tab runs the
+listener/firewall report. The **Firewall** tab accepts the exact peer, local
+address, executable, interface, profile, and port, and previews the rule. Use
+**Copy report** to copy the generated apply/rollback commands for manual review
+in an existing administrator PowerShell. The tab never applies a rule.
+
+These helpers need Windows PowerShell and permission to run the scripts under
+your existing execution policy. Keep `scripts/` beside a distributed executable;
+source builds also find the checkout's scripts. The launcher still uses the
+checkout's `target/debug/topvnc.exe`. Runtime helper values are not saved.
+
 ### Connecting to a Mac
 
 The VNC password opens the screen-sharing connection. The macOS lock screen asks for that Mac user's login password, which may be different. Apple-specific authentication is not available, and the unlock transition still needs live verification.
@@ -166,7 +181,8 @@ cargo run
 | --- | --- |
 | [`src/lib.rs`](src/lib.rs) | Reusable RFB protocol handling, authentication, decoding, framebuffer state, and session logic. |
 | [`src/main.rs`](src/main.rs) | Native application, session worker, input handling, and software presentation. |
-| [`src/ui.rs`](src/ui.rs) | Connect and Server tabs and in-session settings UI. |
+| [`src/ui.rs`](src/ui.rs) | Connect, Server, Work, Network, and Firewall tabs and in-session settings UI. |
+| [`src/helpers.rs`](src/helpers.rs) | Windows helper forms, script resolution, bounded background execution, and reports. |
 | [`src/settings.rs`](src/settings.rs) | Saved connection details and platform-specific password storage. |
 | [`src/desktop_host.rs`](src/desktop_host.rs) | Platform-neutral server host logic: input ownership, Windows and macOS key mapping, capture and pointer geometry, frame hand-off, and cursor compositing. |
 | [`src/windows_server.rs`](src/windows_server.rs) | Windows Desktop Duplication capture and remote keyboard/mouse injection for the Server tab and `--serve`. |
