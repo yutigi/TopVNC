@@ -116,6 +116,27 @@ The last successfully connected address and port are restored on the next launch
 
 ## Troubleshooting
 
+### Windows private-network server connections
+
+Use the [read-only Windows network helper](docs/windows-private-network.md) to inspect listener binds and distinguish unknown firewall state from an absent rule. It also documents a separate firewall helper that previews a rule scoped to one peer, executable, address, port, interface, and profile. Applying or rolling back that rule requires an explicit administrator-run command; neither helper automatically elevates or changes VPN settings. A timeout alone does not prove a firewall problem.
+
+For a work/home private-network setup, connect your VPN on both computers and
+ensure remote access and workplace-managed network policy permit the flow. Set
+`TOPVNC_BIND` to the server's local private IPv4 address and port before running
+`scripts/Start-TopVncWorkServer.cmd`; it defaults to `127.0.0.1:5900` for local-only
+access. Enter the VNC password locally and keep the terminal open. Build with
+`cargo build` if `target\debug\topvnc.exe` is missing; `/check` checks the launcher
+without starting a server.
+
+Test TCP reachability from the other computer using your configured address and
+port, then connect the viewer. The launcher does not change VPN or firewall
+settings. Review existing firewall scope separately and retain a trusted private
+transport because VNC traffic is unencrypted.
+
+See the [startup guide](docs/windows-private-network.md#workhome-startup-order)
+for generic examples and diagnostic limits. Replace example addresses locally;
+keep deployment details out of shared documentation.
+
 ### Connecting to a Mac
 
 The VNC password opens the screen-sharing connection. The macOS lock screen asks for that Mac user's login password, which may be different. Apple-specific authentication is not available, and the unlock transition still needs live verification.
