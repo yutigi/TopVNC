@@ -14,6 +14,7 @@ mod macos_server;
 #[cfg(windows)]
 mod windows_server;
 
+mod helpers;
 mod settings;
 mod ui;
 use desktop_host::{HostPermissions, ServeOptions, ServerNotice};
@@ -781,8 +782,10 @@ fn show_landing(
     window.set_input_callback(Box::new(KeyEvents(input_tx)));
     let (result_tx, result_rx) = mpsc::channel::<Result<Session, String>>();
     let mut connecting = false;
+    let mut helpers = helpers::HelperRuntime::default();
     let mut permissions_checked: Option<std::time::Instant> = None;
     while window.is_open() {
+        helpers.poll();
         // Permissions can change in System Settings while the window is open.
         if server.view.phase == ServerPhase::Stopped
             && permissions_checked.is_none_or(|checked| checked.elapsed().as_secs() >= 1)
@@ -800,6 +803,7 @@ fn show_landing(
             &state,
             connecting,
             &server.view,
+            &helpers,
         );
         window.update_with_buffer(&pixels, 800, 640)?;
         if let Ok(result) = result_rx.try_recv() {
@@ -816,6 +820,7 @@ fn show_landing(
         }
         let mut connect_clicked = false;
         let mut server_clicked = false;
+        let mut helper_action = None;
         for event in input_rx.try_iter() {
             match event {
                 InputEvent::Character(character) if !connecting => {
@@ -827,6 +832,9 @@ fn show_landing(
                     Tab::Server => {
                         server_clicked = server.view.phase == ServerPhase::Stopped;
                     }
+                    Tab::Work => helper_action = Some(helpers::Action::CheckWork),
+                    Tab::Network => helper_action = Some(helpers::Action::Network),
+                    Tab::Firewall => helper_action = Some(helpers::Action::Firewall),
                 },
                 InputEvent::Key(Key::Escape, true) => return Ok(None),
                 InputEvent::Key(key, true) if !connecting => {
@@ -840,10 +848,55 @@ fn show_landing(
             .unwrap_or((-1.0, -1.0));
         let click = state.click(window.get_mouse_down(MouseButton::Left)) && !connecting;
         let (x, y) = (mx as usize, my as usize);
-        if click && ui::TAB_CONNECT.contains(x, y) {
-            state.switch_tab(Tab::Connect);
-        } else if click && ui::TAB_SERVER.contains(x, y) {
-            state.switch_tab(Tab::Server);
+        if let Some((_, tab, _)) = ui::TABS
+            .iter()
+            .find(|(area, _, _)| click && area.contains(x, y))
+        {
+            state.switch_tab(*tab);
+            helper_action = None;
+        } else if click && let Some(helper) = state.tab.helper() {
+            state.focus = None;
+            for (area, field) in ui::helper_fields(state.tab) {
+                if area.contains(x, y) {
+                    state.focus = Some(*field);
+                }
+            }
+            if state.tab == Tab::Firewall {
+                for (area, profile) in ui::FW_PROFILES {
+                    if area.contains(x, y) {
+                        config.helpers.profile = profile.into();
+                    }
+                }
+            }
+            let report = helpers.report_mut(helper);
+            let pages = ui::report_lines(&report.text)
+                .len()
+                .div_ceil(ui::report_rows(state.tab))
+                .max(1);
+            if ui::REPORT_PREV.contains(x, y) {
+                report.page = report.page.saturating_sub(1);
+            }
+            if ui::REPORT_NEXT.contains(x, y) {
+                report.page = report.page.saturating_add(1).min(pages - 1);
+            }
+            if ui::REPORT_COPY.contains(x, y) {
+                helper_action = Some(helpers::Action::Copy(report.text.clone()));
+            }
+            match state.tab {
+                Tab::Work if ui::WORK_CHECK.contains(x, y) => {
+                    helper_action = Some(helpers::Action::CheckWork)
+                }
+                Tab::Work if ui::WORK_START.contains(x, y) => {
+                    helper_action = Some(helpers::Action::StartWork)
+                }
+                Tab::Network if ui::HELPER_RUN.contains(x, y) => {
+                    helper_action = Some(helpers::Action::Network)
+                }
+                Tab::Firewall if ui::HELPER_RUN.contains(x, y) => {
+                    helper_action = Some(helpers::Action::Firewall)
+                }
+                _ => {}
+            }
         } else if click && state.tab == Tab::Server {
             // The form describes the next start, so it is locked while serving.
             let editable = server.view.phase == ServerPhase::Stopped;
@@ -871,7 +924,7 @@ fn show_landing(
             if ui::CONNECT.contains(x, y) {
                 server_clicked = true;
             }
-        } else if click {
+        } else if click && state.tab == Tab::Connect {
             state.focus = None;
             for (area, field) in [
                 (ui::HOST, Field::Host),
@@ -919,6 +972,17 @@ fn show_landing(
             if ui::CONNECT.contains(x, y) {
                 connect_clicked = true;
             }
+        }
+        if let Some(action) = helper_action
+            && let Some(helper) = state.tab.helper()
+            && !helpers.busy()
+            && let Err(error) = helpers.start(helper, action, &config.helpers)
+        {
+            *helpers.report_mut(helper) = helpers::Report {
+                text: error,
+                failed: true,
+                ..helpers::Report::default()
+            };
         }
         if server_clicked {
             match server.view.phase {
