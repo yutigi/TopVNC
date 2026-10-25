@@ -1,4 +1,5 @@
 use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, normalize_serve_scale};
+use crate::helpers::{Helper, HelperForm, HelperRuntime};
 use winit::keyboard::KeyCode;
 
 pub const BG: u32 = 0x0b1020;
@@ -55,6 +56,7 @@ pub struct Config {
     /// does while a game hides the cursor.
     pub relative_mouse: bool,
     pub serve: ServeForm,
+    pub helpers: HelperForm,
 }
 
 impl Default for Config {
@@ -73,6 +75,7 @@ impl Default for Config {
             ui_scale: 1.0,
             relative_mouse: true,
             serve: ServeForm::default(),
+            helpers: HelperForm::default(),
         }
     }
 }
@@ -230,6 +233,14 @@ pub enum Field {
     ServePort,
     ServePassword,
     ServeDisplay,
+    WorkHost,
+    WorkPort,
+    NetworkPort,
+    FirewallPeer,
+    FirewallLocal,
+    FirewallProgram,
+    FirewallInterface,
+    FirewallPort,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -237,6 +248,9 @@ pub enum Tab {
     #[default]
     Connect,
     Server,
+    Work,
+    Network,
+    Firewall,
 }
 
 impl Tab {
@@ -250,6 +264,24 @@ impl Tab {
                 Field::ServePassword,
                 Field::ServeDisplay,
             ],
+            Self::Work => &[Field::WorkHost, Field::WorkPort],
+            Self::Network => &[Field::NetworkPort],
+            Self::Firewall => &[
+                Field::FirewallPeer,
+                Field::FirewallLocal,
+                Field::FirewallProgram,
+                Field::FirewallInterface,
+                Field::FirewallPort,
+            ],
+        }
+    }
+
+    pub fn helper(self) -> Option<Helper> {
+        match self {
+            Self::Work => Some(Helper::Work),
+            Self::Network => Some(Helper::Network),
+            Self::Firewall => Some(Helper::Firewall),
+            _ => None,
         }
     }
 }
@@ -297,7 +329,12 @@ impl UiState {
             return;
         }
         if let Some(value) = self.value_mut(config)
-            && value.chars().count() < 128
+            && value.chars().count()
+                < if self.focus == Some(Field::FirewallProgram) {
+                    1024
+                } else {
+                    128
+                }
         {
             value.push(character);
         }
@@ -313,6 +350,14 @@ impl UiState {
             Field::ServePort => Some(&mut config.serve.port),
             Field::ServePassword => Some(&mut config.serve.password),
             Field::ServeDisplay => Some(&mut config.serve.display),
+            Field::WorkHost => Some(&mut config.helpers.work_host),
+            Field::WorkPort => Some(&mut config.helpers.work_port),
+            Field::NetworkPort => Some(&mut config.helpers.network_port),
+            Field::FirewallPeer => Some(&mut config.helpers.peer),
+            Field::FirewallLocal => Some(&mut config.helpers.local),
+            Field::FirewallProgram => Some(&mut config.helpers.program),
+            Field::FirewallInterface => Some(&mut config.helpers.interface),
+            Field::FirewallPort => Some(&mut config.helpers.firewall_port),
         }
     }
 }
@@ -572,17 +617,177 @@ pub const CONNECT: Box2 = Box2 {
 };
 
 pub const TAB_CONNECT: Box2 = Box2 {
-    x: 528,
+    x: 178,
     y: 34,
     w: 110,
     h: 36,
 };
 pub const TAB_SERVER: Box2 = Box2 {
-    x: 648,
+    x: 296,
     y: 34,
-    w: 110,
+    w: 98,
     h: 36,
 };
+pub const TAB_WORK: Box2 = Box2 {
+    x: 402,
+    y: 34,
+    w: 100,
+    h: 36,
+};
+pub const TAB_NETWORK: Box2 = Box2 {
+    x: 510,
+    y: 34,
+    w: 112,
+    h: 36,
+};
+pub const TAB_FIREWALL: Box2 = Box2 {
+    x: 630,
+    y: 34,
+    w: 128,
+    h: 36,
+};
+pub const TABS: [(Box2, Tab, &str); 5] = [
+    (TAB_CONNECT, Tab::Connect, "CONNECT"),
+    (TAB_SERVER, Tab::Server, "SERVER"),
+    (TAB_WORK, Tab::Work, "WORK"),
+    (TAB_NETWORK, Tab::Network, "NETWORK"),
+    (TAB_FIREWALL, Tab::Firewall, "FIREWALL"),
+];
+
+pub const HELPER_RUN: Box2 = Box2 {
+    x: 40,
+    y: 574,
+    w: 718,
+    h: 40,
+};
+pub const FW_PREVIEW: Box2 = Box2 {
+    x: 40,
+    y: 574,
+    w: 230,
+    h: 40,
+};
+pub const FW_SET: Box2 = Box2 {
+    x: 284,
+    y: 574,
+    w: 230,
+    h: 40,
+};
+pub const FW_RESET: Box2 = Box2 {
+    x: 528,
+    y: 574,
+    w: 230,
+    h: 40,
+};
+pub const WORK_CHECK: Box2 = Box2 {
+    x: 40,
+    y: 574,
+    w: 350,
+    h: 40,
+};
+pub const WORK_START: Box2 = Box2 {
+    x: 408,
+    y: 574,
+    w: 350,
+    h: 40,
+};
+pub const REPORT_PREV: Box2 = Box2 {
+    x: 40,
+    y: 536,
+    w: 82,
+    h: 28,
+};
+pub const REPORT_NEXT: Box2 = Box2 {
+    x: 130,
+    y: 536,
+    w: 82,
+    h: 28,
+};
+pub const REPORT_COPY: Box2 = Box2 {
+    x: 548,
+    y: 536,
+    w: 210,
+    h: 28,
+};
+pub const NETWORK_PORT: Box2 = Box2 {
+    x: 40,
+    y: 130,
+    w: 210,
+    h: 40,
+};
+pub const FW_PEER: Box2 = Box2 {
+    x: 40,
+    y: 130,
+    w: 350,
+    h: 40,
+};
+pub const FW_LOCAL: Box2 = Box2 {
+    x: 408,
+    y: 130,
+    w: 350,
+    h: 40,
+};
+pub const FW_PROGRAM: Box2 = Box2 {
+    x: 40,
+    y: 200,
+    w: 718,
+    h: 40,
+};
+pub const FW_INTERFACE: Box2 = Box2 {
+    x: 40,
+    y: 270,
+    w: 350,
+    h: 40,
+};
+pub const FW_PORT: Box2 = Box2 {
+    x: 40,
+    y: 340,
+    w: 210,
+    h: 40,
+};
+pub const FW_PROFILES: [(Box2, &str); 3] = [
+    (
+        Box2 {
+            x: 408,
+            y: 270,
+            w: 110,
+            h: 40,
+        },
+        "Domain",
+    ),
+    (
+        Box2 {
+            x: 526,
+            y: 270,
+            w: 110,
+            h: 40,
+        },
+        "Private",
+    ),
+    (
+        Box2 {
+            x: 644,
+            y: 270,
+            w: 114,
+            h: 40,
+        },
+        "Public",
+    ),
+];
+
+pub fn helper_fields(tab: Tab) -> &'static [(Box2, Field)] {
+    match tab {
+        Tab::Work => &[(HOST, Field::WorkHost), (PORT, Field::WorkPort)],
+        Tab::Network => &[(NETWORK_PORT, Field::NetworkPort)],
+        Tab::Firewall => &[
+            (FW_PEER, Field::FirewallPeer),
+            (FW_LOCAL, Field::FirewallLocal),
+            (FW_PROGRAM, Field::FirewallProgram),
+            (FW_INTERFACE, Field::FirewallInterface),
+            (FW_PORT, Field::FirewallPort),
+        ],
+        _ => &[],
+    }
+}
 pub const SERVE_DISPLAY: Box2 = Box2 {
     x: 548,
     y: 280,
@@ -649,6 +854,7 @@ pub fn landing(
     state: &UiState,
     connecting: bool,
     server: &ServerView,
+    helpers: &HelperRuntime,
 ) {
     canvas.fill(
         Box2 {
@@ -668,13 +874,256 @@ pub fn landing(
         },
         ACCENT,
     );
-    canvas.text(40, 36, "TOPVNC", TEXT, 4);
-    canvas.button(TAB_CONNECT, "CONNECT", state.tab == Tab::Connect);
-    canvas.button(TAB_SERVER, "SERVER", state.tab == Tab::Server);
+    canvas.text(40, 40, "TOPVNC", TEXT, 3);
+    for (area, tab, label) in TABS {
+        canvas.button(area, label, state.tab == tab);
+    }
     match state.tab {
         Tab::Connect => connect_tab(canvas, config, state, connecting),
         Tab::Server => server_tab(canvas, &config.serve, state, server),
+        Tab::Work | Tab::Network | Tab::Firewall => {
+            helper_tab(canvas, &config.helpers, state, helpers)
+        }
     }
+}
+
+/// Preserve line breaks and wrap long commands without hiding their contents.
+pub fn report_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|line| {
+            let clean: String = line
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            if clean.trim().is_empty() {
+                vec![String::new()]
+            } else {
+                wrap(&clean, 57)
+            }
+        })
+        .collect()
+}
+
+pub fn report_rows(tab: Tab) -> usize {
+    match tab {
+        Tab::Firewall => 6,
+        Tab::Work => 12,
+        _ => 15,
+    }
+}
+
+fn helper_tab(
+    canvas: &mut Canvas<'_>,
+    form: &HelperForm,
+    state: &UiState,
+    helpers: &HelperRuntime,
+) {
+    let helper = state.tab.helper().expect("helper tab");
+    let enabled = cfg!(windows) && !helpers.busy();
+    let field = |canvas: &mut Canvas<'_>, area, value: &str, placeholder, focus| {
+        canvas.field(area, value, placeholder, state.focus == Some(focus), false);
+    };
+    let output_y = match state.tab {
+        Tab::Work => {
+            canvas.text(42, 76, "START A WORK SERVER IN ITS OWN TERMINAL", MUTED, 2);
+            canvas.label(40, 108, "LOCAL VPN IPV4");
+            canvas.label(548, 108, "PORT");
+            field(
+                canvas,
+                HOST,
+                &form.work_host,
+                "YOUR LOCAL VPN IP",
+                Field::WorkHost,
+            );
+            field(canvas, PORT, &form.work_port, "5900", Field::WorkPort);
+            canvas.text(
+                40,
+                192,
+                "Start-TopVncWorkServer.cmd / target/debug/topvnc.exe",
+                MUTED,
+                1,
+            );
+            canvas.text(
+                40,
+                218,
+                "ENTER THE PASSWORD IN THE SERVER TERMINAL.",
+                TEXT,
+                2,
+            );
+            canvas.text(
+                40,
+                244,
+                "UNENCRYPTED VNC. KEEP YOUR TRUSTED PRIVATE VPN READY.",
+                MUTED,
+                2,
+            );
+            canvas.button(WORK_CHECK, "CHECK LAUNCHER", enabled);
+            canvas.button(WORK_START, "START IN TERMINAL", false);
+            280
+        }
+        Tab::Network => {
+            canvas.text(
+                42,
+                76,
+                "INSPECT LOCAL LISTENERS AND FIREWALL POLICY",
+                MUTED,
+                2,
+            );
+            canvas.label(40, 108, "LISTENER PORT");
+            field(
+                canvas,
+                NETWORK_PORT,
+                &form.network_port,
+                "5900",
+                Field::NetworkPort,
+            );
+            canvas.text(276, 137, "Test-TopVncNetwork.ps1", MUTED, 1);
+            canvas.text(
+                40,
+                188,
+                "READ ONLY / NO PEER PROBE / NO NETWORK CHANGES",
+                MUTED,
+                2,
+            );
+            canvas.button(
+                HELPER_RUN,
+                if helpers.busy() {
+                    "RUNNING..."
+                } else {
+                    "RUN DIAGNOSTICS"
+                },
+                enabled,
+            );
+            220
+        }
+        Tab::Firewall => {
+            canvas.text(
+                42,
+                76,
+                "MANAGE A RULE FOR ONE PRIVATE NETWORK PEER",
+                MUTED,
+                2,
+            );
+            canvas.label(40, 108, "PEER IPV4");
+            canvas.label(408, 108, "LOCAL IPV4");
+            field(
+                canvas,
+                FW_PEER,
+                &form.peer,
+                "OTHER COMPUTER",
+                Field::FirewallPeer,
+            );
+            field(
+                canvas,
+                FW_LOCAL,
+                &form.local,
+                "THIS COMPUTER",
+                Field::FirewallLocal,
+            );
+            canvas.label(40, 178, "SERVER EXECUTABLE (ABSOLUTE .EXE PATH)");
+            field(
+                canvas,
+                FW_PROGRAM,
+                &form.program,
+                "C:\\TopVNC\\topvnc.exe",
+                Field::FirewallProgram,
+            );
+            canvas.label(40, 248, "INTERFACE ALIAS");
+            canvas.label(408, 248, "FIREWALL PROFILE");
+            field(
+                canvas,
+                FW_INTERFACE,
+                &form.interface,
+                "YOUR VPN INTERFACE",
+                Field::FirewallInterface,
+            );
+            for (area, profile) in FW_PROFILES {
+                canvas.button(area, profile, form.profile == profile);
+            }
+            canvas.label(40, 318, "TCP PORT");
+            field(
+                canvas,
+                FW_PORT,
+                &form.firewall_port,
+                "5900",
+                Field::FirewallPort,
+            );
+            canvas.text(
+                276,
+                343,
+                "SET / RESET REQUEST ADMINISTRATOR APPROVAL.",
+                MUTED,
+                1,
+            );
+            canvas.text(
+                276,
+                361,
+                "RESET REMOVES ONLY THIS EXACT TOPVNC RULE.",
+                MUTED,
+                1,
+            );
+            canvas.button(
+                FW_PREVIEW,
+                if helpers.busy() {
+                    "RUNNING..."
+                } else {
+                    "PREVIEW RULE"
+                },
+                enabled,
+            );
+            canvas.button(FW_SET, "SET RULE", enabled);
+            canvas.button(FW_RESET, "RESET RULE", enabled);
+            398
+        }
+        _ => unreachable!(),
+    };
+    let report = helpers.report(helper);
+    let area = Box2 {
+        x: 40,
+        y: output_y,
+        w: 718,
+        h: 524 - output_y,
+    };
+    canvas.fill(area, FIELD);
+    canvas.frame(area, BORDER);
+    let lines = report_lines(if cfg!(windows) {
+        &report.text
+    } else {
+        crate::helpers::WINDOWS_ONLY
+    });
+    let rows = report_rows(state.tab);
+    let pages = lines.len().div_ceil(rows).max(1);
+    let page = report.page.min(pages - 1);
+    for (index, line) in lines.iter().skip(page * rows).take(rows).enumerate() {
+        canvas.text(
+            52,
+            output_y + 10 + index * 18,
+            line,
+            if report.failed { ERROR } else { TEXT },
+            2,
+        );
+    }
+    canvas.button(REPORT_PREV, "PREV", false);
+    canvas.button(REPORT_NEXT, "NEXT", false);
+    canvas.text(
+        230,
+        544,
+        &format!(
+            "PAGE {} / {}{}",
+            page + 1,
+            pages,
+            if helpers.busy() {
+                " / BUSY"
+            } else if report.copied {
+                " / COPIED"
+            } else {
+                ""
+            }
+        ),
+        MUTED,
+        1,
+    );
+    canvas.button(REPORT_COPY, "COPY REPORT", false);
 }
 
 fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connecting: bool) {
@@ -1271,6 +1720,40 @@ fn glyph(c: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_tabs_keep_field_focus_and_values_separate() {
+        let mut state = UiState::default();
+        let mut config = Config::default();
+        for tab in [Tab::Work, Tab::Network, Tab::Firewall] {
+            state.switch_tab(tab);
+            assert_eq!(state.focus, None);
+            for &expected in tab.fields() {
+                state.key(&mut config, KeyCode::Tab);
+                assert_eq!(state.focus, Some(expected));
+            }
+            state.key(&mut config, KeyCode::Tab);
+            assert_eq!(state.focus, Some(tab.fields()[0]));
+        }
+        state.switch_tab(Tab::Network);
+        state.key(&mut config, KeyCode::Tab);
+        state.character(&mut config, '1');
+        assert_eq!(config.helpers.network_port, "59001");
+        assert_eq!(config.helpers.work_port, "5900");
+        assert_eq!(config.helpers.firewall_port, "5900");
+        assert_eq!(config.port, "5900");
+    }
+
+    #[test]
+    fn reports_preserve_blank_lines_and_page_long_unicode_commands() {
+        let text = format!("Status\n\n{}\nLast line", "é".repeat(400));
+        let lines = report_lines(&text);
+        assert_eq!(&lines[..2], &["Status", ""]);
+        assert_eq!(lines.last().unwrap(), "Last line");
+        assert!(lines.iter().all(|line| line.chars().count() <= 57));
+        assert_eq!(lines[2..lines.len() - 1].concat(), "é".repeat(400));
+        assert!(lines.len() > report_rows(Tab::Firewall));
+    }
 
     #[test]
     fn validates_connection_values() {
