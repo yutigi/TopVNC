@@ -639,6 +639,24 @@ pub const HELPER_RUN: Box2 = Box2 {
     w: 718,
     h: 40,
 };
+pub const FW_PREVIEW: Box2 = Box2 {
+    x: 40,
+    y: 574,
+    w: 230,
+    h: 40,
+};
+pub const FW_SET: Box2 = Box2 {
+    x: 284,
+    y: 574,
+    w: 230,
+    h: 40,
+};
+pub const FW_RESET: Box2 = Box2 {
+    x: 528,
+    y: 574,
+    w: 230,
+    h: 40,
+};
 pub const WORK_CHECK: Box2 = Box2 {
     x: 40,
     y: 574,
@@ -926,7 +944,7 @@ fn helper_tab(
             canvas.text(
                 42,
                 76,
-                "PREVIEW A RULE FOR ONE PRIVATE NETWORK PEER",
+                "MANAGE A RULE FOR ONE PRIVATE NETWORK PEER",
                 MUTED,
                 2,
             );
@@ -977,26 +995,28 @@ fn helper_tab(
             canvas.text(
                 276,
                 343,
-                "PREVIEW ONLY. APPLY / ROLLBACK MANUALLY",
+                "SET / RESET REQUEST ADMINISTRATOR APPROVAL.",
                 MUTED,
                 1,
             );
             canvas.text(
                 276,
                 361,
-                "IN AN EXISTING ADMINISTRATOR POWERSHELL.",
+                "RESET REMOVES ONLY THIS EXACT TOPVNC RULE.",
                 MUTED,
                 1,
             );
             canvas.button(
-                HELPER_RUN,
+                FW_PREVIEW,
                 if helpers.busy() {
                     "RUNNING..."
                 } else {
-                    "PREVIEW FIREWALL RULE"
+                    "PREVIEW RULE"
                 },
                 enabled,
             );
+            canvas.button(FW_SET, "SET RULE", enabled);
+            canvas.button(FW_RESET, "RESET RULE", enabled);
             398
         }
         _ => unreachable!(),

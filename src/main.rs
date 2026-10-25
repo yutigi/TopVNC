@@ -892,8 +892,14 @@ fn show_landing(
                 Tab::Network if ui::HELPER_RUN.contains(x, y) => {
                     helper_action = Some(helpers::Action::Network)
                 }
-                Tab::Firewall if ui::HELPER_RUN.contains(x, y) => {
+                Tab::Firewall if ui::FW_PREVIEW.contains(x, y) => {
                     helper_action = Some(helpers::Action::Firewall)
+                }
+                Tab::Firewall if ui::FW_SET.contains(x, y) => {
+                    helper_action = Some(helpers::Action::SetFirewall)
+                }
+                Tab::Firewall if ui::FW_RESET.contains(x, y) => {
+                    helper_action = Some(helpers::Action::ResetFirewall)
                 }
                 _ => {}
             }

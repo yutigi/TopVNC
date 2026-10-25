@@ -1,5 +1,6 @@
 //! Windows script integration. Only the explicit launcher action starts a
-//! server; diagnostics and firewall operations are always read-only.
+//! server. Firewall changes require an explicit Set/Reset click and administrator
+//! approval; diagnostics and firewall previews are read-only.
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -100,7 +101,15 @@ pub enum Action {
     StartWork,
     Network,
     Firewall,
+    SetFirewall,
+    ResetFirewall,
     Copy(String),
+}
+
+impl Action {
+    fn changes_firewall(&self) -> bool {
+        matches!(self, Self::SetFirewall | Self::ResetFirewall)
+    }
 }
 
 fn code(action: &Action, form: &HelperForm) -> Result<String, String> {
@@ -127,7 +136,7 @@ fn code(action: &Action, form: &HelperForm) -> Result<String, String> {
                 literal(&path.to_string_lossy())
             )
         }
-        Action::Firewall => {
+        Action::Firewall | Action::SetFirewall | Action::ResetFirewall => {
             let port = port(&form.firewall_port)?;
             if [&form.peer, &form.local, &form.program, &form.interface]
                 .iter()
@@ -147,10 +156,15 @@ fn code(action: &Action, form: &HelperForm) -> Result<String, String> {
                 literal(&form.interface),
                 literal(&form.profile)
             );
-            // Dot-source to suppress the CLI's duplicate host output, then call
-            // the same function without either mutation switch.
+            let switches = match action {
+                Action::SetFirewall => " -Apply -Confirm:$false",
+                Action::ResetFirewall => " -Remove -Apply -Confirm:$false",
+                _ => "",
+            };
+            // Dot-sourcing only defines functions. Mutation switches belong on
+            // the explicit invocation, never on the preview/default action.
             format!(
-                ". {path} {args}; $r=Invoke-TopVncPeerFirewall {args}; $r | Select-Object Status,Operation,RuleName,Existing,Note | Format-List | Out-String -Width 120; $r.Parameters | Format-Table -AutoSize | Out-String -Width 160; 'APPLY COMMAND (review in administrator PowerShell):'; $r.ApplyCommand; ''; 'ROLLBACK COMMAND:'; $r.RollbackCommand; ''; $r.AdministratorInstruction"
+                ". {path} {args}; $r=Invoke-TopVncPeerFirewall {args}{switches}; $r | Select-Object Status,Operation,RuleName,Existing,Note | Format-List | Out-String -Width 120; $r.Parameters | Format-Table -AutoSize | Out-String -Width 160; 'APPLY COMMAND (review in administrator PowerShell):'; $r.ApplyCommand; ''; 'ROLLBACK COMMAND:'; $r.RollbackCommand"
             )
         }
         Action::Copy(_) => "Set-Clipboard -Value ([Console]::In.ReadToEnd())".into(),
@@ -186,7 +200,7 @@ impl Default for HelperRuntime {
         Self {
             work: Report { text: "Check the launcher before starting. Start opens a separate terminal for password entry. Keep it open while hosting; close it or press Ctrl+C to stop. Closing the viewer does not stop this separate server.".into(), ..Report::default() },
             network: Report { text: "Run a read-only report of local listeners and firewall policy. No peer connection is attempted. Unknown means a query failed, not that a rule is absent. Review addresses before sharing output.".into(), ..Report::default() },
-            firewall: Report { text: "Preview only. Enter the exact scope, then review the generated apply and rollback commands. Copy the report to use a command in an existing administrator PowerShell. No rule is changed by this tab.".into(), ..Report::default() },
+            firewall: Report { text: "Enter the exact scope and preview the rule. Set rule creates this scoped allow rule; Reset rule removes only the exact matching TopVNC rule. Both request Windows administrator approval when needed. Reset does not clear the form or reset Windows Firewall.".into(), ..Report::default() },
             pending: None,
         }
     }
@@ -227,6 +241,7 @@ impl HelperRuntime {
         }
         let code = code(&action, form)?;
         let copying = matches!(action, Action::Copy(_));
+        let changing_firewall = action.changes_firewall();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -239,7 +254,11 @@ impl HelperRuntime {
         // Keep the report when copying so it remains available after success.
         if !copying {
             *self.report_mut(helper) = Report {
-                text: "Running...".into(),
+                text: if changing_firewall {
+                    "Waiting for Windows administrator approval and the rule operation...".into()
+                } else {
+                    "Running...".into()
+                },
                 ..Report::default()
             };
         }
@@ -294,6 +313,56 @@ impl Drop for HelperRuntime {
 
 const COPY_OK: &str = "Report copied.";
 
+/// The elevated worker returns text through a unique, pre-created file. Form
+/// values stay inside literals, including inside the encoded child command.
+#[cfg(windows)]
+fn elevation_code(body: &str, output: &std::path::Path) -> String {
+    let output = literal(&output.to_string_lossy());
+    let child = format!(
+        "$ErrorActionPreference='Stop'; try {{ $text = & {{ {body} }} | Out-String -Width 160; [IO.File]::WriteAllText({output}, $text, [Text.UTF8Encoding]::new($false)); exit 0 }} catch {{ [IO.File]::WriteAllText({output}, $_.Exception.Message, [Text.UTF8Encoding]::new($false)); exit 1 }}"
+    );
+    format!(
+        "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); \
+         $identity=[Security.Principal.WindowsIdentity]::GetCurrent(); \
+         try {{ $admin=([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }} finally {{ $identity.Dispose() }}; \
+         if ($admin) {{ & {{ {body} }} }} else {{ \
+         $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes({child})); \
+         try {{ $process=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand',$encoded) -Wait -PassThru -ErrorAction Stop }} \
+         catch {{ throw ('Windows administrator approval was cancelled or the helper could not start: ' + $_.Exception.Message) }}; \
+         $text=[IO.File]::ReadAllText({output}, [Text.Encoding]::UTF8); \
+         if ($process.ExitCode -ne 0) {{ throw ('Firewall operation failed: ' + $text) }}; \
+         if ([string]::IsNullOrWhiteSpace($text)) {{ throw 'The firewall worker returned no result. Preview the rule to check its current state.' }}; \
+         [Console]::Out.Write($text) }}",
+        child = literal(&child),
+    )
+}
+
+#[cfg(windows)]
+struct FirewallOutput(PathBuf);
+
+#[cfg(windows)]
+impl FirewallOutput {
+    fn create() -> Result<Self, String> {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|e| format!("Could not prepare rule report: {e}"))?;
+        let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let path = std::env::temp_dir().join(format!("topvnc-firewall-{name}.txt"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("Could not prepare rule report: {e}"))?;
+        Ok(Self(path))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FirewallOutput {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[cfg(not(windows))]
 fn run(_: &Action, _: &str, _: &AtomicBool) -> Result<String, String> {
     Err(WINDOWS_ONLY.into())
@@ -305,6 +374,14 @@ fn run(action: &Action, code: &str, cancel: &AtomicBool) -> Result<String, Strin
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+    let output = action
+        .changes_firewall()
+        .then(FirewallOutput::create)
+        .transpose()?;
+    let elevated = output
+        .as_ref()
+        .map(|output| elevation_code(code, &output.0));
+    let code = elevated.as_deref().unwrap_or(code);
     let mut command = Command::new("powershell.exe");
     command.args(["-NoProfile"]);
     if matches!(action, Action::StartWork) {
@@ -362,13 +439,16 @@ fn run(action: &Action, code: &str, cancel: &AtomicBool) -> Result<String, Strin
     let err = std::thread::spawn(move || capture(stderr));
     let began = Instant::now();
     let status = loop {
-        if cancel.load(Ordering::Acquire) || began.elapsed() >= Duration::from_secs(30) {
+        let timeout = if action.changes_firewall() { 120 } else { 30 };
+        if cancel.load(Ordering::Acquire) || began.elapsed() >= Duration::from_secs(timeout) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(
+            return Err(if action.changes_firewall() {
+                "Rule operation cancelled or timed out. An administrator worker may still finish. Preview the same scope to check the current rule state before retrying.".into()
+            } else {
                 "Helper cancelled or timed out after 30 seconds. No firewall change was requested."
-                    .into(),
-            );
+                    .into()
+            });
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -442,6 +522,72 @@ mod tests {
         assert!(!command.contains(" -Apply "));
         assert!(!command.contains("ExecutionPolicy"));
         assert!(!command.contains("RunAs"));
+    }
+
+    #[test]
+    fn firewall_changes_are_explicit_and_share_scope_validation() {
+        let mut form = HelperForm {
+            peer: "192.168.50.20".into(),
+            local: "192.168.50.10".into(),
+            program: "C:\\Team O'Brien\\topvnc.exe".into(),
+            interface: "Test VPN".into(),
+            ..HelperForm::default()
+        };
+        for (action, switches) in [
+            (Action::SetFirewall, " -Apply -Confirm:$false"),
+            (Action::ResetFirewall, " -Remove -Apply -Confirm:$false"),
+        ] {
+            let command = code(&action, &form).unwrap();
+            let (definition, invocation) = command.split_once("; $r=").unwrap();
+            assert!(!definition.contains(" -Apply"));
+            assert!(invocation.contains(switches));
+            assert!(invocation.contains("-ProgramPath 'C:\\Team O''Brien\\topvnc.exe'"));
+            assert!(action.changes_firewall());
+        }
+        assert!(!Action::Firewall.changes_firewall());
+        for action in [Action::Firewall, Action::SetFirewall, Action::ResetFirewall] {
+            form.firewall_port = "0".into();
+            assert!(code(&action, &form).is_err());
+            form.firewall_port = "5900".into();
+            form.profile = "Any".into();
+            assert!(code(&action, &form).is_err());
+            form.profile = "Public".into();
+            form.interface.clear();
+            assert!(code(&action, &form).is_err());
+            form.interface = "Test VPN".into();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_report_transport_handles_success_failure_and_cancel_without_uac() {
+        // Replace only the process launcher: execute harmless test bodies in a
+        // normal child PowerShell. Never elevate or invoke networking commands.
+        let mock = "function Start-Process { param($FilePath,$Verb,$WindowStyle,$ArgumentList,[switch]$Wait,[switch]$PassThru,$ErrorAction); & $FilePath @ArgumentList; [pscustomobject]@{ExitCode=$LASTEXITCODE} }; ";
+        for (body, expected, failed) in [
+            (
+                "'Rule result: O''Brien $(`test`)'",
+                "Rule result: O'Brien $(`test`)",
+                false,
+            ),
+            ("throw 'Test rule failure'", "Test rule failure", true),
+        ] {
+            let output = FirewallOutput::create().unwrap();
+            let command = format!("{mock}{}", elevation_code(body, &output.0))
+                .replace("if ($admin)", "if ($false)");
+            let result = run(&Action::Network, &command, &AtomicBool::new(false));
+            assert_eq!(result.is_err(), failed);
+            assert!(result.unwrap_or_else(|e| e).contains(expected));
+        }
+        let output = FirewallOutput::create().unwrap();
+        let command = format!(
+            "function Start-Process {{ throw 'Test cancellation' }}; {}",
+            elevation_code("throw 'Must not run'", &output.0)
+        )
+        .replace("if ($admin)", "if ($false)");
+        let error = run(&Action::Network, &command, &AtomicBool::new(false)).unwrap_err();
+        assert!(error.contains("administrator approval was cancelled"));
+        assert!(std::fs::read_to_string(&output.0).unwrap().is_empty());
     }
 
     #[cfg(windows)]
