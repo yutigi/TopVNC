@@ -21,7 +21,7 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 - **In-session settings** accessible through **F8**, including disconnect and a resizable on-screen settings button.
 - **Saved connection details** with platform-specific password storage.
 - **Experimental Windows and macOS server modes**, started from the app's Server tab or with `--serve`, with display capture, resolution-change handling, remote keyboard/mouse input, clipboard sync, and password authentication; live validation is pending.
-- **Windows helper tabs** for the work-server launcher, read-only network diagnostics, and scoped firewall previews, with paged reports and copyable commands.
+- **Windows helper tabs** for the work-server launcher, read-only network diagnostics, and scoped firewall preview, set, and reset actions, with paged reports and copyable commands.
 
 The protocol implementation handles RFB 3.3, 3.7, and 3.8. Apple's `RFB 003.889` banner is handled through a standard RFB 3.8 fallback; Apple-specific authentication is not implemented.
 
@@ -119,7 +119,7 @@ The last successfully connected address and port are restored on the next launch
 
 ### Windows private-network server connections
 
-Use the [read-only Windows network helper](docs/windows-private-network.md) to inspect listener binds and distinguish unknown firewall state from an absent rule. It also documents a separate firewall helper that previews a rule scoped to one peer, executable, address, port, interface, and profile. Applying or rolling back that rule requires an explicit administrator-run command; neither helper automatically elevates or changes VPN settings. A timeout alone does not prove a firewall problem.
+Use the [read-only Windows network helper](docs/windows-private-network.md) to inspect listener binds and distinguish unknown firewall state from an absent rule. The Firewall tab previews, sets, or resets a rule scoped to one peer, executable, address, port, interface, and profile. Set and Reset request Windows administrator approval when needed. The helpers do not change VPN settings. A timeout alone does not prove a firewall problem.
 
 For a work/home private-network setup, connect your VPN on both computers and
 ensure remote access and workplace-managed network policy permit the flow. Set
@@ -143,9 +143,12 @@ checks the existing debug executable; **Start in terminal** opens a separate
 password prompt. Stop hosting with Ctrl+C or by closing that terminal; closing
 the viewer leaves this separate server running. The **Network** tab runs the
 listener/firewall report. The **Firewall** tab accepts the exact peer, local
-address, executable, interface, profile, and port, and previews the rule. Use
-**Copy report** to copy the generated apply/rollback commands for manual review
-in an existing administrator PowerShell. The tab never applies a rule.
+address, executable, interface, profile, and port. **Preview rule** is read-only;
+**Set rule** creates the scoped allow rule and **Reset rule** removes only the
+exact matching TopVNC rule. Set and Reset request Windows administrator approval
+when needed and report the result in the tab. Reset retains the form and does
+not reset Windows Firewall. Enter previews only. **Copy report** also copies
+the generated apply/rollback commands for use in administrator PowerShell.
 
 These helpers need Windows PowerShell and permission to run the scripts under
 your existing execution policy. Keep `scripts/` beside a distributed executable;

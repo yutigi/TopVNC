@@ -8,10 +8,16 @@ addresses below are fictional examples; replace them with your own configuration
 
 The app's **Work**, **Network**, and **Firewall** tabs expose these helpers.
 Work opens an independent terminal for the launcher's password prompt. Network
-shows a read-only report; Firewall previews the exact scope and prints commands
-for manual use in an existing administrator PowerShell. Reports have Previous /
+shows a read-only report. Firewall offers **Preview rule**, **Set rule**, and
+**Reset rule**. Set creates the scoped allow rule; Reset removes only the exact
+matching TopVNC rule, retaining the form. Both request Windows administrator
+approval when needed. Existing matching rules and already absent rules are
+handled without additional changes. Enter only previews. The script itself
+still requires an administrator session for manual changes. Reports have Previous /
 Next pages and a Copy report button. Review deployment details before sharing
-copied output. Neither diagnostic tab changes policy or automatically elevates.
+copied output. Cancelling administrator approval does not start the rule worker.
+If an operation times out, an elevated worker may still finish; preview the same
+scope to check its state before retrying. Existing execution policy is respected.
 
 ## Work/home startup order
 
