@@ -4595,7 +4595,68 @@ mod tests {
                 }
                 assert_eq!((session.info.width, session.info.height), (width, height));
                 assert_eq!(framebuffer.pixels(), resized.pixels());
+                // A live picture alone does not prove the input reader survived.
+                writer.key(0x61, true).unwrap();
+                writer.key(0x61, false).unwrap();
+                writer.pointer(1, width - 1, height - 1).unwrap();
+                writer.pointer(0, width - 1, height - 1).unwrap();
+                for down in [true, false] {
+                    assert_eq!(
+                        pointer_event(&server),
+                        ClientEvent::Key {
+                            client_id: 1,
+                            keysym: 0x61,
+                            down,
+                        }
+                    );
+                }
+                for buttons in [1, 0] {
+                    assert_eq!(
+                        pointer_event(&server),
+                        ClientEvent::Pointer {
+                            client_id: 1,
+                            buttons,
+                            x: width - 1,
+                            y: height - 1,
+                        }
+                    );
+                }
             }
+            writer.shutdown().unwrap();
+            assert_eq!(
+                pointer_event(&server),
+                ClientEvent::ClientDisconnected { client_id: 1 }
+            );
+            let reconnected = Session::connect_with_encoding(
+                &address.to_string(),
+                true,
+                encoding,
+                || unreachable!(),
+            )
+            .unwrap();
+            let writer = reconnected.writer();
+            writer.key(0x62, true).unwrap();
+            writer.key(0x62, false).unwrap();
+            writer.pointer(0, 3, 1).unwrap();
+            for down in [true, false] {
+                assert_eq!(
+                    pointer_event(&server),
+                    ClientEvent::Key {
+                        client_id: 2,
+                        keysym: 0x62,
+                        down,
+                    }
+                );
+            }
+            assert_eq!(
+                pointer_event(&server),
+                ClientEvent::Pointer {
+                    client_id: 2,
+                    buttons: 0,
+                    x: 3,
+                    y: 1,
+                }
+            );
             writer.shutdown().unwrap();
             server.stop();
         }

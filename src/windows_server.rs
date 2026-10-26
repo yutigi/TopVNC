@@ -44,7 +44,7 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
 };
 use windows::core::Interface;
-use windows_sys::Win32::Foundation::GlobalFree;
+use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, SetLastError};
 use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
@@ -523,12 +523,14 @@ fn run_input(
     report: &(dyn Fn(ServerNotice) + Sync),
 ) {
     let mut input = InputReleaseGuard(RemoteInputState::default());
+    let mut injection_failed = false;
     while !shutdown.load(Ordering::Acquire) {
         let event = match server.recv_event_timeout(INPUT_POLL_INTERVAL) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        let mut injection = Ok(false);
         match event {
             ClientEvent::Key {
                 client_id,
@@ -537,7 +539,7 @@ fn run_input(
             } => {
                 let key = windows_key_identity(keysym);
                 if input.0.key_event(client_id, key, down) {
-                    inject_key(key, down);
+                    injection = inject_key(key, down);
                 }
             }
             ClientEvent::Pointer {
@@ -548,7 +550,7 @@ fn run_input(
             } => {
                 let transition = input.0.pointer_event(client_id, buttons);
                 if let Ok(placement) = placement.lock() {
-                    inject_pointer(*placement, x, y, transition);
+                    injection = inject_pointer(*placement, x, y, transition);
                 }
             }
             ClientEvent::RelativePointer {
@@ -558,14 +560,14 @@ fn run_input(
                 dy,
             } => {
                 let transition = input.0.pointer_event(client_id, buttons);
-                inject_relative_pointer(dx, dy, transition);
+                injection = inject_relative_pointer(dx, dy, transition);
             }
             ClientEvent::ClientDisconnected { client_id } => {
                 let (released, previous, buttons) = input.0.disconnect(client_id);
                 for key in released {
-                    inject_key(key, false);
+                    injection = inject_key(key, false).and(injection);
                 }
-                send_inputs(&button_inputs(previous, buttons));
+                injection = send_inputs(&button_inputs(previous, buttons)).and(injection);
             }
             ClientEvent::ClipboardText { text, .. } => {
                 match set_system_clipboard(&text) {
@@ -581,6 +583,26 @@ fn run_input(
                 }
             }
         }
+        // Report the first failure without flooding the UI on mouse motion.
+        // A rejected batch must remain visible until an actual injection succeeds.
+        match injection {
+            Err(error) if !injection_failed => {
+                injection_failed = true;
+                report(ServerNotice::Message(format!(
+                    "Windows rejected remote input: {error}. Check whether the foreground app \
+                     is elevated or the desktop is locked; reconnecting the viewer does not \
+                     change Windows input permissions."
+                )));
+            }
+            Err(_) => {}
+            Ok(true) if injection_failed => {
+                injection_failed = false;
+                report(ServerNotice::Message(
+                    "Remote input injection resumed.".into(),
+                ));
+            }
+            Ok(_) => {}
+        }
     }
 }
 
@@ -591,22 +613,37 @@ impl Drop for InputReleaseGuard {
     fn drop(&mut self) {
         let (keys, buttons) = self.0.release_all();
         for key in keys {
-            inject_key(key, false);
+            let _ = inject_key(key, false);
         }
-        send_inputs(&button_inputs(buttons, 0));
+        let _ = send_inputs(&button_inputs(buttons, 0));
     }
 }
 
-fn send_inputs(inputs: &[INPUT]) {
-    if !inputs.is_empty() {
-        unsafe {
-            SendInput(
-                inputs.len() as u32,
-                inputs.as_ptr(),
-                size_of::<INPUT>() as i32,
-            );
-        }
+fn send_inputs(inputs: &[INPUT]) -> std::io::Result<bool> {
+    if inputs.is_empty() {
+        return Ok(false);
     }
+    let (sent, error) = unsafe {
+        SetLastError(0);
+        let sent = SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            size_of::<INPUT>() as i32,
+        );
+        (sent, GetLastError())
+    };
+    input_injection_result(inputs.len(), sent, error)
+}
+
+fn input_injection_result(expected: usize, sent: u32, error: u32) -> std::io::Result<bool> {
+    if sent as usize == expected {
+        return Ok(expected != 0);
+    }
+    // UIPI rejection can leave last-error at zero; do not call it success.
+    Err(std::io::Error::other(format!(
+        "SendInput accepted {sent}/{expected} events (Windows error {error}; \
+         Windows may block injection without providing an error code)"
+    )))
 }
 
 fn keyboard_input(vk: u16, scan: u16, flags: u32) -> INPUT {
@@ -638,18 +675,18 @@ fn mouse_input(dx: i32, dy: i32, data: i32, flags: u32) -> INPUT {
     }
 }
 
-fn inject_key(key: KeyIdentity, down: bool) {
+fn inject_key(key: KeyIdentity, down: bool) -> std::io::Result<bool> {
     let key_up = if down { 0 } else { KEYEVENTF_KEYUP };
     match key {
         KeyIdentity::Virtual(VirtualKey { code, extended }) => {
             // Scan codes let games that read raw input or DirectInput see the key.
             let scan = unsafe { MapVirtualKeyW(u32::from(code), MAPVK_VK_TO_VSC) } as u16;
             let extended = if extended { KEYEVENTF_EXTENDEDKEY } else { 0 };
-            send_inputs(&[keyboard_input(code, scan, extended | key_up)]);
+            send_inputs(&[keyboard_input(code, scan, extended | key_up)])
         }
         KeyIdentity::Unicode(keysym) => {
             let Some((first, second)) = unicode_key_units(keysym) else {
-                return;
+                return Ok(false);
             };
             let unit = |unit| keyboard_input(0, unit, KEYEVENTF_UNICODE | key_up);
             match (second, down) {
@@ -711,13 +748,17 @@ fn change_inputs(transition: PointerTransition) -> Vec<INPUT> {
 
 /// Move the pointer by (`dx`, `dy`) without `MOUSEEVENTF_ABSOLUTE`, so games
 /// reading raw input receive exactly these deltas.
-fn inject_relative_pointer(dx: i32, dy: i32, transition: PointerTransition) {
+fn inject_relative_pointer(
+    dx: i32,
+    dy: i32,
+    transition: PointerTransition,
+) -> std::io::Result<bool> {
     let mut inputs = Vec::new();
     if (dx, dy) != (0, 0) {
         inputs.push(mouse_input(dx, dy, 0, MOUSEEVENTF_MOVE));
     }
     inputs.extend(change_inputs(transition));
-    send_inputs(&inputs);
+    send_inputs(&inputs)
 }
 
 /// Whether the system cursor is shown. While a game hides it to turn the
@@ -792,7 +833,12 @@ impl Drop for HostScheduling {
     }
 }
 
-fn inject_pointer(placement: DisplayPlacement, x: u16, y: u16, transition: PointerTransition) {
+fn inject_pointer(
+    placement: DisplayPlacement,
+    x: u16,
+    y: u16,
+    transition: PointerTransition,
+) -> std::io::Result<bool> {
     // Served pixels map to the display pixel under their center; this also
     // clamps a framebuffer briefly larger than a display that just shrank.
     let x = placement.left
@@ -822,7 +868,7 @@ fn inject_pointer(placement: DisplayPlacement, x: u16, y: u16, transition: Point
         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
     )];
     inputs.extend(change_inputs(transition));
-    send_inputs(&inputs);
+    send_inputs(&inputs)
 }
 
 fn read_system_clipboard_latin1() -> Result<Vec<u8>, Box<dyn Error>> {
@@ -1381,6 +1427,20 @@ fn find_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_injection_checks_partial_and_silent_windows_rejections() {
+        assert!(!input_injection_result(0, 0, 0).unwrap());
+        assert!(input_injection_result(2, 2, 0).unwrap());
+        assert!(input_injection_result(2, 0, 0).is_err());
+        assert!(input_injection_result(2, 1, 0).is_err());
+        assert!(
+            input_injection_result(2, 0, 5)
+                .unwrap_err()
+                .to_string()
+                .contains("Windows error 5")
+        );
+    }
 
     #[test]
     fn console_interrupt_requests_graceful_server_shutdown() {
