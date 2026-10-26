@@ -3,9 +3,10 @@
 
 use crate::desktop_host::{
     CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureSurface, CursorKind, CursorShape, DesktopImage,
-    KeyIdentity, PointerTransition, Rect, RemoteInputState, Rotation, WHEEL_DELTA,
-    absolute_mouse_coordinate, latin1_from_unicode, latin1_to_utf16, unicode_key_units,
-    validate_capture_dimensions, windows_key_identity,
+    Downscaler, KeyIdentity, MouseMode, PointerModeHint, PointerTransition, Rect, RemoteInputState,
+    Rotation, WHEEL_DELTA, absolute_mouse_coordinate, latin1_from_unicode, latin1_to_utf16,
+    native_coordinate, served_size, unicode_key_units, validate_capture_dimensions,
+    windows_key_identity,
 };
 use crate::desktop_host::{
     MAX_CLIPBOARD_CHARS, ServeOptions, ServerNotice, VirtualKey, parse_serve_arguments,
@@ -17,7 +18,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::{Duration, Instant};
-use topvnc::{ClientEvent, DamageRect, Framebuffer, ServerConfig, VncServer};
+use topvnc::{
+    BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, ClientEvent, DamageRect,
+    Framebuffer, ServerConfig, VncServer,
+};
 use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0,
@@ -36,11 +40,12 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_MORE_DATA, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT,
     DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
-    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1,
-    IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIDevice,
+    IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
 };
 use windows::core::Interface;
 use windows_sys::Win32::Foundation::GlobalFree;
+use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
     SetConsoleCtrlHandler,
@@ -53,6 +58,12 @@ use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetPriorityClass, HIGH_PRIORITY_CLASS,
+    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+    ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
+};
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     SetThreadDpiAwarenessContext,
@@ -62,11 +73,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT, MapVirtualKeyW, SendInput,
+    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetProcessDPIAware,
+    CURSOR_SHOWING, CURSOR_SUPPRESSED, CURSORINFO, CreateWindowExW, DestroyWindow, GetCursorInfo,
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetProcessDPIAware, XBUTTON1, XBUTTON2,
 };
 
 static SERVER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -103,6 +115,62 @@ struct DisplayPlacement {
     top: i32,
     width: u16,
     height: u16,
+    /// The framebuffer size viewers see, smaller than the display when the
+    /// served image is scaled down.
+    served_width: u16,
+    served_height: u16,
+}
+
+/// What viewers see: the captured image itself, or a downscaled copy.
+struct ServedImage {
+    scaled: Option<(Downscaler, Framebuffer)>,
+    regions: Vec<DamageRect>,
+}
+
+impl ServedImage {
+    fn new(native: (u16, u16), scale: f32) -> Result<Self, Box<dyn Error>> {
+        let served = served_size(native.0, native.1, scale);
+        let scaled = if served == native {
+            None
+        } else {
+            Some((
+                Downscaler::new(native, served),
+                Framebuffer::new(served.0, served.1)?,
+            ))
+        };
+        Ok(Self {
+            scaled,
+            regions: Vec::new(),
+        })
+    }
+
+    fn size(&self, captured: &Framebuffer) -> (u16, u16) {
+        let image = self.image(captured);
+        (image.width() as u16, image.height() as u16)
+    }
+
+    fn image<'a>(&'a self, captured: &'a Framebuffer) -> &'a Framebuffer {
+        self.scaled
+            .as_ref()
+            .map_or(captured, |(_, framebuffer)| framebuffer)
+    }
+
+    /// Bring the served image up to date with `damage`, in captured pixels.
+    /// `regions` then holds the served regions that changed.
+    fn update(&mut self, captured: &Framebuffer, damage: &[Rect]) {
+        self.regions.clear();
+        match &mut self.scaled {
+            None => self.regions.extend(damage.iter().map(damage_rect)),
+            Some((scaler, served)) => {
+                for rect in damage {
+                    if let Some(area) = scaler.served_rect(*rect) {
+                        scaler.scale(captured.pixels(), served.pixels_mut(), area);
+                        self.regions.push(damage_rect(&area));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Run `topvnc --serve` until the console asks the server to stop.
@@ -149,16 +217,26 @@ pub fn serve(
         address,
         display,
         allow_insecure,
+        scale,
+        mouse,
     } = options;
     // The GUI process stays DPI-unaware for its own windows, so the capture
     // and input threads opt in to physical pixels individually.
     enable_thread_dpi_awareness();
+    // The game runs in the foreground; keep capture and encoding on pace.
+    let _scheduling = HostScheduling::raise(report);
     let mut capture = DesktopCapture::new(display).map_err(|error| {
         format!(
             "{error}. Run the server in an interactive, unlocked desktop session; \
              services, disconnected Remote Desktop sessions, and the secure desktop cannot be captured"
         )
     })?;
+    if !capture.gpu_priority_raised {
+        report(ServerNotice::Message(
+            "Windows did not raise the capture GPU priority; capture may wait behind a busy game."
+                .into(),
+        ));
+    }
     let mut framebuffer = Framebuffer::new(capture.placement.width, capture.placement.height)?;
     let mut image = DesktopImage::new(capture.placement.width, capture.placement.height);
     let mut captured = Vec::new();
@@ -168,19 +246,32 @@ pub fn serve(
         capture.next_frame(&mut image, &mut captured)?;
     }
     image.present(&captured, framebuffer.pixels_mut(), &mut damage);
+    let native = (capture.placement.width, capture.placement.height);
+    let mut served = ServedImage::new(native, scale)?;
+    served.update(
+        &framebuffer,
+        &[Rect::new(0, 0, i32::from(native.0), i32::from(native.1))],
+    );
+    let (served_width, served_height) = served.size(&framebuffer);
     let config = ServerConfig {
         name: "TopVNC Windows Desktop".into(),
         password,
         allow_insecure,
+        // The high priority class already covers every thread.
+        thread_setup: None,
     };
-    let server = VncServer::bind(&address, framebuffer.clone(), config)?;
+    let server = VncServer::bind(&address, served.image(&framebuffer).clone(), config)?;
     report(ServerNotice::Serving {
         address: server.local_addr()?,
         display: capture.name.clone(),
-        width: capture.placement.width,
-        height: capture.placement.height,
+        width: served_width,
+        height: served_height,
     });
-    let placement = Mutex::new(capture.placement);
+    let placement = Mutex::new(DisplayPlacement {
+        served_width,
+        served_height,
+        ..capture.placement
+    });
     // Remote input is injected on its own thread so it never waits for a
     // frame to be captured or copied.
     let remote_clipboard_sequence = AtomicU32::new(0);
@@ -218,9 +309,12 @@ pub fn serve(
         let result = serve_desktop(
             &server,
             display,
+            scale,
+            mouse,
             capture,
             framebuffer,
             image,
+            served,
             &placement,
             &remote_clipboard_sequence,
             shutdown,
@@ -243,9 +337,12 @@ pub fn serve(
 fn serve_desktop(
     server: &VncServer,
     display: Option<usize>,
+    scale: f32,
+    mouse: MouseMode,
     capture: DesktopCapture,
     mut framebuffer: Framebuffer,
     mut image: DesktopImage,
+    mut served: ServedImage,
     placement: &Mutex<DisplayPlacement>,
     remote_clipboard_sequence: &AtomicU32,
     shutdown: &AtomicBool,
@@ -265,7 +362,15 @@ fn serve_desktop(
     let mut next_retry = Instant::now();
     let mut last_capture_error = String::new();
     let mut connections = 0;
+    let mut pointer_mode = PointerModeHint::default();
     while !shutdown.load(Ordering::Acquire) {
+        server.set_relative_pointer(match mouse {
+            // Games that turn the camera with the mouse hide the cursor;
+            // ask viewers for relative motion while it stays hidden.
+            MouseMode::Auto => pointer_mode.update(cursor_showing(), Instant::now()),
+            MouseMode::Relative => true,
+            MouseMode::Absolute => false,
+        });
         let current_connections = server.active_connections();
         if current_connections != connections {
             connections = current_connections;
@@ -300,16 +405,20 @@ fn serve_desktop(
                 Ok(recreated) => {
                     let size = (recreated.placement.width, recreated.placement.height);
                     if size != (framebuffer.width() as u16, framebuffer.height() as u16) {
-                        report(ServerNotice::Resized {
-                            width: size.0,
-                            height: size.1,
-                        });
                         framebuffer = Framebuffer::new(size.0, size.1)?;
                         image = DesktopImage::new(size.0, size.1);
+                        served = ServedImage::new(size, scale)?;
+                        let (width, height) = served.size(&framebuffer);
+                        report(ServerNotice::Resized { width, height });
                     }
+                    let (served_width, served_height) = served.size(&framebuffer);
                     *placement
                         .lock()
-                        .map_err(|_| "display placement lock poisoned")? = recreated.placement;
+                        .map_err(|_| "display placement lock poisoned")? = DisplayPlacement {
+                        served_width,
+                        served_height,
+                        ..recreated.placement
+                    };
                     report(ServerNotice::Message("Desktop capture resumed.".into()));
                     capture = Some(recreated);
                     retry_delay = CAPTURE_RETRY_MIN;
@@ -345,8 +454,10 @@ fn serve_desktop(
         damage.clear();
         image.present(&captured, framebuffer.pixels_mut(), &mut damage);
         if !damage.is_empty() {
-            let regions = damage.iter().map(damage_rect).collect::<Vec<_>>();
-            server.update_framebuffer_regions(&framebuffer, &regions)?;
+            served.update(&framebuffer, &damage);
+            if !served.regions.is_empty() {
+                server.update_framebuffer_regions(served.image(&framebuffer), &served.regions)?;
+            }
         }
     }
     Ok(())
@@ -413,6 +524,15 @@ fn run_input(
                 if let Ok(placement) = placement.lock() {
                     inject_pointer(*placement, x, y, transition);
                 }
+            }
+            ClientEvent::RelativePointer {
+                client_id,
+                buttons,
+                dx,
+                dy,
+            } => {
+                let transition = input.0.pointer_event(client_id, buttons);
+                inject_relative_pointer(dx, dy, transition);
             }
             ClientEvent::ClientDisconnected { client_id } => {
                 let (released, previous, buttons) = input.0.disconnect(client_id);
@@ -515,37 +635,35 @@ fn inject_key(key: KeyIdentity, down: bool) {
     }
 }
 
-fn button_inputs(previous: u8, next: u8) -> Vec<INPUT> {
+fn button_inputs(previous: u16, next: u16) -> Vec<INPUT> {
     [
-        (1, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-        (2, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
-        (4, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        (BUTTON_LEFT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0),
+        (
+            BUTTON_MIDDLE,
+            MOUSEEVENTF_MIDDLEDOWN,
+            MOUSEEVENTF_MIDDLEUP,
+            0,
+        ),
+        (BUTTON_RIGHT, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0),
+        (BUTTON_BACK, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON1),
+        (BUTTON_FORWARD, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON2),
     ]
     .into_iter()
-    .filter(|(mask, _, _)| previous & mask != next & mask)
-    .map(|(mask, down, up)| mouse_input(0, 0, 0, if next & mask != 0 { down } else { up }))
+    .filter(|(mask, ..)| previous & mask != next & mask)
+    .map(|(mask, down, up, data)| {
+        mouse_input(
+            0,
+            0,
+            i32::from(data),
+            if next & mask != 0 { down } else { up },
+        )
+    })
     .collect()
 }
 
-fn inject_pointer(placement: DisplayPlacement, x: u16, y: u16, transition: PointerTransition) {
-    // The framebuffer can briefly be larger than a display that just shrank.
-    let x = placement.left + i32::from(x.min(placement.width.saturating_sub(1)));
-    let y = placement.top + i32::from(y.min(placement.height.saturating_sub(1)));
-    let (virtual_left, virtual_top, virtual_width, virtual_height) = unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        )
-    };
-    let mut inputs = vec![mouse_input(
-        absolute_mouse_coordinate(x, virtual_left, virtual_width),
-        absolute_mouse_coordinate(y, virtual_top, virtual_height),
-        0,
-        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-    )];
-    inputs.extend(button_inputs(transition.previous, transition.buttons));
+/// Button and wheel inputs for a pointer event, after any motion.
+fn change_inputs(transition: PointerTransition) -> Vec<INPUT> {
+    let mut inputs = button_inputs(transition.previous, transition.buttons);
     if transition.vertical_notches != 0 {
         inputs.push(mouse_input(
             0,
@@ -562,6 +680,122 @@ fn inject_pointer(placement: DisplayPlacement, x: u16, y: u16, transition: Point
             MOUSEEVENTF_HWHEEL,
         ));
     }
+    inputs
+}
+
+/// Move the pointer by (`dx`, `dy`) without `MOUSEEVENTF_ABSOLUTE`, so games
+/// reading raw input receive exactly these deltas.
+fn inject_relative_pointer(dx: i32, dy: i32, transition: PointerTransition) {
+    let mut inputs = Vec::new();
+    if (dx, dy) != (0, 0) {
+        inputs.push(mouse_input(dx, dy, 0, MOUSEEVENTF_MOVE));
+    }
+    inputs.extend(change_inputs(transition));
+    send_inputs(&inputs);
+}
+
+/// Whether the system cursor is shown. While a game hides it to turn the
+/// camera with the mouse, this is false. Touch input suppresses the cursor
+/// without hiding it, and failures (such as on the secure desktop) count as
+/// shown.
+fn cursor_showing() -> bool {
+    let mut info = CURSORINFO {
+        cbSize: size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetCursorInfo(&mut info) } == 0 {
+        return true;
+    }
+    info.flags & CURSOR_SUPPRESSED != 0
+        || (info.flags & CURSOR_SHOWING != 0 && !info.hCursor.is_null())
+}
+
+/// Scheduling for a host whose game runs in the foreground: 1 ms timer
+/// resolution, no power throttling (EcoQoS would move encoding to efficiency
+/// cores and stretch timed waits), and a high priority class. Restored on
+/// drop. Each step is best effort.
+struct HostScheduling {
+    timer_period: bool,
+    previous_class: u32,
+}
+
+impl HostScheduling {
+    fn raise(report: &(dyn Fn(ServerNotice) + Sync)) -> Self {
+        let timer_period = unsafe { timeBeginPeriod(1) } == TIMERR_NOERROR;
+        let process = unsafe { GetCurrentProcess() };
+        let throttling = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            // Opted out of both.
+            StateMask: 0,
+        };
+        let unthrottled = unsafe {
+            SetProcessInformation(
+                process,
+                ProcessPowerThrottling,
+                (&throttling as *const PROCESS_POWER_THROTTLING_STATE).cast(),
+                size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            )
+        } != 0;
+        let previous_class = unsafe { GetPriorityClass(process) };
+        let raised = unsafe { SetPriorityClass(process, HIGH_PRIORITY_CLASS) } != 0;
+        if !(timer_period && unthrottled && raised) {
+            report(ServerNotice::Message(
+                "Could not fully raise host scheduling priority; capture and encoding may lag behind a busy game."
+                    .into(),
+            ));
+        }
+        Self {
+            timer_period,
+            previous_class: if raised { previous_class } else { 0 },
+        }
+    }
+}
+
+impl Drop for HostScheduling {
+    fn drop(&mut self) {
+        unsafe {
+            if self.timer_period {
+                timeEndPeriod(1);
+            }
+            if self.previous_class != 0 {
+                SetPriorityClass(GetCurrentProcess(), self.previous_class);
+            }
+        }
+    }
+}
+
+fn inject_pointer(placement: DisplayPlacement, x: u16, y: u16, transition: PointerTransition) {
+    // Served pixels map to the display pixel under their center; this also
+    // clamps a framebuffer briefly larger than a display that just shrank.
+    let x = placement.left
+        + i32::from(native_coordinate(
+            x,
+            placement.served_width,
+            placement.width,
+        ));
+    let y = placement.top
+        + i32::from(native_coordinate(
+            y,
+            placement.served_height,
+            placement.height,
+        ));
+    let (virtual_left, virtual_top, virtual_width, virtual_height) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    let mut inputs = vec![mouse_input(
+        absolute_mouse_coordinate(x, virtual_left, virtual_width),
+        absolute_mouse_coordinate(y, virtual_top, virtual_height),
+        0,
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+    )];
+    inputs.extend(change_inputs(transition));
     send_inputs(&inputs);
 }
 
@@ -677,6 +911,9 @@ fn set_system_clipboard(text: &[u8]) -> Result<u32, Box<dyn Error>> {
 /// whole capture; the caller recreates it from scratch.
 struct DesktopCapture {
     device: ID3D11Device,
+    /// Windows raised this device's GPU thread priority, so its copies do
+    /// not queue behind a game's rendering.
+    gpu_priority_raised: bool,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
@@ -724,6 +961,9 @@ impl DesktopCapture {
         }
         let device = device.ok_or("Direct3D did not return a capture device")?;
         let context = context.ok_or("Direct3D did not return a device context")?;
+        let gpu_priority_raised = device
+            .cast::<IDXGIDevice>()
+            .is_ok_and(|device| unsafe { device.SetGPUThreadPriority(7) }.is_ok());
         let output: IDXGIOutput1 = output.cast()?;
         let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(|error| {
             if error.code() == E_ACCESSDENIED {
@@ -739,6 +979,7 @@ impl DesktopCapture {
             .unwrap_or(output_desc.DeviceName.len());
         Ok(Self {
             device,
+            gpu_priority_raised,
             context,
             duplication,
             staging: None,
@@ -1028,6 +1269,8 @@ fn display_placement(desc: &DXGI_OUTPUT_DESC) -> Result<DisplayPlacement, Box<dy
         top: area.top,
         width,
         height,
+        served_width: width,
+        served_height: height,
     })
 }
 
@@ -1149,10 +1392,20 @@ mod tests {
         };
         assert_eq!(flags(button_inputs(0, 0)), Vec::<u32>::new());
         assert_eq!(
-            flags(button_inputs(0b001, 0b100)),
+            flags(button_inputs(BUTTON_LEFT, BUTTON_RIGHT)),
             [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN]
         );
-        assert_eq!(flags(button_inputs(0b010, 0b010)), Vec::<u32>::new());
+        assert_eq!(
+            flags(button_inputs(BUTTON_MIDDLE, BUTTON_MIDDLE)),
+            Vec::<u32>::new()
+        );
+        let inputs = button_inputs(BUTTON_FORWARD, BUTTON_BACK);
+        assert_eq!(flags(inputs.clone()), [MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP]);
+        let data = inputs
+            .iter()
+            .map(|input| unsafe { input.Anonymous.mi.mouseData })
+            .collect::<Vec<_>>();
+        assert_eq!(data, [u32::from(XBUTTON1), u32::from(XBUTTON2)]);
     }
 
     #[test]
