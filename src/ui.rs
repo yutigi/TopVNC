@@ -1,4 +1,4 @@
-use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, normalize_serve_scale};
+use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, MouseMode, normalize_serve_scale};
 use crate::helpers::{Helper, HelperForm, HelperRuntime};
 use winit::keyboard::KeyCode;
 
@@ -109,6 +109,8 @@ pub struct ServeForm {
     pub allow_insecure: bool,
     /// Served size as a fraction of the display's pixel size.
     pub scale: f32,
+    /// When viewers are asked for relative pointer motion.
+    pub mouse: MouseMode,
 }
 
 impl Default for ServeForm {
@@ -120,6 +122,7 @@ impl Default for ServeForm {
             display: String::new(),
             allow_insecure: false,
             scale: 1.0,
+            mouse: MouseMode::Auto,
         }
     }
 }
@@ -135,6 +138,7 @@ pub struct ServeRequest {
     pub allow_insecure: bool,
     /// Served size as a fraction of the display's pixel size.
     pub scale: f32,
+    pub mouse: MouseMode,
 }
 
 impl ServeForm {
@@ -166,6 +170,7 @@ impl ServeForm {
             password,
             allow_insecure: self.allow_insecure,
             scale: normalize_serve_scale(self.scale),
+            mouse: self.mouse,
         })
     }
 }
@@ -289,6 +294,7 @@ impl Tab {
 #[derive(Default)]
 pub struct UiState {
     pub tab: Tab,
+    pub menu_open: bool,
     pub focus: Option<Field>,
     pub error: Option<String>,
 }
@@ -322,6 +328,7 @@ impl UiState {
             self.focus = None;
             self.error = None;
         }
+        self.menu_open = false;
     }
 
     pub fn character(&mut self, config: &mut Config, character: char) {
@@ -534,21 +541,49 @@ pub const PASSWORD: Box2 = Box2 {
 pub const RAW: Box2 = Box2 {
     x: 400,
     y: 280,
-    w: 80,
+    w: 62,
     h: 36,
 };
 pub const ZLIB: Box2 = Box2 {
-    x: 490,
+    x: 470,
     y: 280,
-    w: 90,
+    w: 72,
     h: 36,
 };
-pub const TIGHT: Box2 = Box2 {
-    x: 590,
-    y: 280,
-    w: 168,
-    h: 36,
-};
+/// Tight JPEG quality presets: the RFB quality level each button selects.
+/// Lower levels send smaller frames, so they keep up on slower links.
+pub const JPEG_PRESETS: [(Box2, u8, &str); 3] = [
+    (
+        Box2 {
+            x: 550,
+            y: 280,
+            w: 64,
+            h: 36,
+        },
+        3,
+        "LOW",
+    ),
+    (
+        Box2 {
+            x: 620,
+            y: 280,
+            w: 64,
+            h: 36,
+        },
+        DEFAULT_JPEG_QUALITY,
+        "MED",
+    ),
+    (
+        Box2 {
+            x: 690,
+            y: 280,
+            w: 68,
+            h: 36,
+        },
+        9,
+        "HIGH",
+    ),
+];
 pub const INSECURE: Box2 = Box2 {
     x: 40,
     y: 292,
@@ -628,32 +663,39 @@ pub const TAB_SERVER: Box2 = Box2 {
     w: 98,
     h: 36,
 };
-pub const TAB_WORK: Box2 = Box2 {
+pub const TAB_MORE: Box2 = Box2 {
     x: 402,
     y: 34,
-    w: 100,
+    w: 72,
     h: 36,
 };
-pub const TAB_NETWORK: Box2 = Box2 {
-    x: 510,
-    y: 34,
-    w: 112,
+pub const MENU_WORK: Box2 = Box2 {
+    x: 402,
+    y: 78,
+    w: 150,
     h: 36,
 };
-pub const TAB_FIREWALL: Box2 = Box2 {
-    x: 630,
-    y: 34,
-    w: 128,
+pub const MENU_NETWORK: Box2 = Box2 {
+    x: 402,
+    y: 118,
+    w: 150,
     h: 36,
 };
-pub const TABS: [(Box2, Tab, &str); 5] = [
+pub const MENU_FIREWALL: Box2 = Box2 {
+    x: 402,
+    y: 158,
+    w: 150,
+    h: 36,
+};
+pub const MENU_TABS: [(Box2, Tab, &str); 3] = [
+    (MENU_WORK, Tab::Work, "WORK"),
+    (MENU_NETWORK, Tab::Network, "NETWORK"),
+    (MENU_FIREWALL, Tab::Firewall, "FIREWALL"),
+];
+pub const TABS: [(Box2, Tab, &str); 2] = [
     (TAB_CONNECT, Tab::Connect, "CONNECT"),
     (TAB_SERVER, Tab::Server, "SERVER"),
-    (TAB_WORK, Tab::Work, "WORK"),
-    (TAB_NETWORK, Tab::Network, "NETWORK"),
-    (TAB_FIREWALL, Tab::Firewall, "FIREWALL"),
 ];
-
 pub const HELPER_RUN: Box2 = Box2 {
     x: 40,
     y: 574,
@@ -788,12 +830,51 @@ pub fn helper_fields(tab: Tab) -> &'static [(Box2, Field)] {
         _ => &[],
     }
 }
+pub const SERVE_PASSWORD: Box2 = Box2 {
+    x: 40,
+    y: 215,
+    w: 490,
+    h: 40,
+};
 pub const SERVE_DISPLAY: Box2 = Box2 {
     x: 548,
-    y: 280,
+    y: 215,
     w: 210,
-    h: 36,
+    h: 40,
 };
+/// The `--mouse` choices: when viewers are asked for relative motion.
+pub const SERVE_MOUSE: [(Box2, MouseMode, &str); 3] = [
+    (
+        Box2 {
+            x: 400,
+            y: 280,
+            w: 80,
+            h: 36,
+        },
+        MouseMode::Auto,
+        "AUTO",
+    ),
+    (
+        Box2 {
+            x: 488,
+            y: 280,
+            w: 131,
+            h: 36,
+        },
+        MouseMode::Relative,
+        "RELATIVE",
+    ),
+    (
+        Box2 {
+            x: 627,
+            y: 280,
+            w: 131,
+            h: 36,
+        },
+        MouseMode::Absolute,
+        "ABSOLUTE",
+    ),
+];
 pub const LOCAL_ONLY: Box2 = Box2 {
     x: 40,
     y: 386,
@@ -878,11 +959,21 @@ pub fn landing(
     for (area, tab, label) in TABS {
         canvas.button(area, label, state.tab == tab);
     }
+    canvas.button(
+        TAB_MORE,
+        "...",
+        state.menu_open || state.tab.helper().is_some(),
+    );
     match state.tab {
         Tab::Connect => connect_tab(canvas, config, state, connecting),
         Tab::Server => server_tab(canvas, &config.serve, state, server),
         Tab::Work | Tab::Network | Tab::Firewall => {
             helper_tab(canvas, &config.helpers, state, helpers)
+        }
+    }
+    if state.menu_open {
+        for (area, tab, label) in MENU_TABS {
+            canvas.button(area, label, state.tab == tab);
         }
     }
 }
@@ -1161,11 +1252,15 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
     canvas.label(400, 258, "COMPRESSION");
     canvas.button(RAW, "RAW", config.compression == Compression::Raw);
     canvas.button(ZLIB, "ZLIB", config.compression == Compression::Zlib);
-    canvas.button(
-        TIGHT,
-        "TIGHT JPEG",
-        config.compression == Compression::Tight,
-    );
+    // The label names the level, which `--quality` may set off the presets.
+    canvas.label(550, 258, &format!("TIGHT JPEG Q{}", config.jpeg_quality));
+    for (area, level, name) in JPEG_PRESETS {
+        canvas.button(
+            area,
+            name,
+            config.compression == Compression::Tight && config.jpeg_quality == level,
+        );
+    }
     canvas.text(
         40,
         331,
@@ -1228,7 +1323,7 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     );
     canvas.label(40, 192, "SERVER PASSWORD");
     canvas.field(
-        PASSWORD,
+        SERVE_PASSWORD,
         &form.password,
         if form.allow_insecure {
             "NONE"
@@ -1244,7 +1339,7 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
         canvas.text(45, 296, "X", BG, 2);
     }
     canvas.text(76, 296, "ALLOW NONE AUTHENTICATION", TEXT, 2);
-    canvas.label(548, 258, "DISPLAY");
+    canvas.label(548, 192, "DISPLAY");
     canvas.field(
         SERVE_DISPLAY,
         &form.display,
@@ -1252,6 +1347,12 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
         state.focus == Some(Field::ServeDisplay),
         false,
     );
+    // Auto asks for relative motion while a game hides the cursor; macOS
+    // hosts cannot tell, so they need Relative for mouse look.
+    canvas.label(400, 258, "GAME MOUSE");
+    for (area, mode, name) in SERVE_MOUSE {
+        canvas.button(area, name, form.mouse == mode);
+    }
     canvas.text(
         40,
         331,
@@ -1893,5 +1994,63 @@ mod tests {
         assert_eq!(form.request().unwrap().scale, 0.5);
         form.scale = 7.0;
         assert_eq!(form.request().unwrap().scale, 1.0);
+    }
+
+    #[test]
+    fn serve_requests_carry_the_mouse_mode() {
+        let mut form = ServeForm {
+            allow_insecure: true,
+            ..ServeForm::default()
+        };
+        assert_eq!(form.request().unwrap().mouse, MouseMode::Auto);
+        for (_, mode, _) in SERVE_MOUSE {
+            form.mouse = mode;
+            assert_eq!(form.request().unwrap().mouse, mode);
+        }
+    }
+
+    #[test]
+    fn jpeg_presets_cover_the_default_and_stay_in_rfb_range() {
+        let levels = JPEG_PRESETS.map(|(_, level, _)| level);
+        assert!(levels.contains(&DEFAULT_JPEG_QUALITY));
+        assert!(levels.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(levels.iter().all(|level| *level <= 9));
+    }
+
+    #[test]
+    fn new_button_rows_fit_their_labels_without_overlapping() {
+        // Button text is 12 pixels per character after a 12-pixel inset.
+        let rows: [&[(Box2, &str)]; 2] = [
+            &[
+                (RAW, "RAW"),
+                (ZLIB, "ZLIB"),
+                (JPEG_PRESETS[0].0, JPEG_PRESETS[0].2),
+                (JPEG_PRESETS[1].0, JPEG_PRESETS[1].2),
+                (JPEG_PRESETS[2].0, JPEG_PRESETS[2].2),
+            ],
+            &[
+                (SERVE_MOUSE[0].0, SERVE_MOUSE[0].2),
+                (SERVE_MOUSE[1].0, SERVE_MOUSE[1].2),
+                (SERVE_MOUSE[2].0, SERVE_MOUSE[2].2),
+            ],
+        ];
+        for row in rows {
+            for (area, name) in row {
+                assert!(12 + name.len() * 12 <= area.w, "{name} overflows");
+                assert!(
+                    area.x + area.w <= HOST.x + PASSWORD.w,
+                    "{name} past the form"
+                );
+            }
+            for pair in row.windows(2) {
+                assert!(pair[0].0.x + pair[0].0.w < pair[1].0.x);
+            }
+        }
+        // The Server tab's password and display share one row.
+        assert_eq!(SERVE_PASSWORD.y, SERVE_DISPLAY.y);
+        const { assert!(SERVE_PASSWORD.x + SERVE_PASSWORD.w < SERVE_DISPLAY.x) };
+        // The mouse row stays clear of the authentication checkbox text.
+        let checkbox_text_end = 76 + "ALLOW NONE AUTHENTICATION".len() * 12;
+        assert!(checkbox_text_end < SERVE_MOUSE[0].0.x);
     }
 }

@@ -49,7 +49,7 @@ Out of scope: video codecs (H.264, HEVC), relative pointer input, GPU presentati
 
 ### Client
 
-- **Default.** Tight with JPEG quality level 6 is the default compression. The connection form offers Raw, Zlib, and Tight JPEG, and `--quality 0-9` sets the JPEG quality level.
+- **Default.** Tight with JPEG quality level 6 is the default compression. The connection form offers Raw, Zlib, and Tight JPEG presets Low (3), Med (6), and High (9), and names the current level. `--quality 0-9` sets any level.
 - **Adaptive pipelining.** The network worker sends the first full request and then reads with `Session::read_update_pipelined`. Without continuous updates, it requests each next incremental update itself.
   - While the link has spare capacity, the request goes out as soon as an update's header arrives, so the server can prepare the next frame without waiting a round trip.
   - The session times how long it blocks on the socket while reading each update's body. If that exceeds 6 ms, the link is the bottleneck and an early request would only queue a second frame behind the first. The next request is then sent after the update completes.

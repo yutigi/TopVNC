@@ -68,7 +68,7 @@ Estimated for a Windows host at 60 Hz streaming 1920×1080 at Tight quality 6 to
 - **Host option.** `topvnc --serve --mouse auto|relative|absolute` chooses the mode:
   - `relative` asks for relative motion for the whole session, for games the automatic mode misses and for Mac hosts.
   - `absolute` never asks.
-  - The Server tab uses `auto`.
+  - The Server tab's **Game mouse** row offers Auto (the default), Relative, and Absolute. Like the other server settings, it is locked while the server runs and is not saved.
 
 ### Extended mouse buttons (ExtendedMouseButtons, pseudo-encoding -316)
 
@@ -152,7 +152,6 @@ These were considered and deferred:
 3. **QEMU Extended Key Event (-258)** for layout-independent scan codes.
 4. **DSCP / `SO_NET_SERVICE_TYPE` marking**, so Wi-Fi gives input and video traffic priority.
 5. **A client-drawn cursor (Cursor pseudo-encoding)** for zero-latency pointer feedback in menus.
-6. **A Server tab control for the mouse mode**, which is command-line only for now.
 
 ## Validation status
 
@@ -221,7 +220,19 @@ Recorded on 2026-10-03 on an M3 Max MacBook Pro (12 performance and 4 efficiency
    - `topvnc --serve --mouse relative` served the built-in display at 3024×1964.
    - A headless TopVNC client waited for the relative-motion announcement and sent (+50, +30). The system cursor moved by exactly (+50, +30) points, and back.
    - **Found and fixed live:** setting a QoS floor on the already-active capture queue crashed the host on start (`SIGTRAP` from libdispatch). The queue is now created with a QoS attribute.
-6. **Not yet checked.**
+6. **A/B against `main` on Windows** (2026-10-25; Windows 11, 16 logical cores, a game running in the foreground; both benchmarks at below-normal priority on 12 of the 16 cores, so the absolute figures are conservative). `main` built from `f80b956` with this branch's `latency_bench` reduced to what `main` supports (Raw and Zlib, one request per frame; `main`'s server always sends Raw, so Zlib measured the same). 1920×1080 at 60 fps, 2 ms each way, 5 s per row:
+
+   | Link | `main`, best mode | This branch, Tight quality 6, push | This branch, Tight quality 3, push |
+   | --- | --- | --- | --- |
+   | 1 Gbit/s | 14.2 fps, 78.0 ms (p95 85.5) | 60.2 fps, 8.5 ms (p95 9.6) | 60.2 fps, 6.9 ms (p95 7.9) |
+   | 150 Mbit/s | 2.4 fps, 454.3 ms (p95 461.3) | 51.2 fps, 25.2 ms (p95 35.5) | 60.2 fps, 10.7 ms (p95 11.7) |
+   | 100 Mbit/s | 1.6 fps, 673.9 ms (p95 682.3) | 36.2 fps, 34.4 ms (p95 41.6) | 60.4 fps, 13.3 ms (p95 14.3) |
+
+   - Per frame: 8.2 MB (`main`) against 262 KB (quality 6) and 97 KB (quality 3).
+   - This branch's own Raw rows match `main` (1 Gbit/s: 13.8–14.4 fps, 78–80 ms), so the harness treats both builds alike and the gain comes from Tight, streaming, and pushed updates.
+   - At 150 Mbit/s, quality 6 with adaptive pipelining delivered 58.2 fps at 23.4 ms.
+   - `cargo test --workspace`: 70 binary tests pass. One library test, `clients_without_desktop_size_are_disconnected_on_resize`, fails on Windows every time (no `ClientDisconnected` event within 1 s); it was already failing before this run, which changed no library code.
+7. **Not yet checked.**
    - **Windows, live** (compiled and linted only):
      - relative `SendInput` and side buttons;
      - the `GetCursorInfo` automatic mode;
