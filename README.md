@@ -50,7 +50,7 @@ cargo run --release
 
 1. Enter the server address and port (usually `5900`). Use brackets around IPv6 addresses, such as `[::1]`.
 2. Enter the server's VNC password.
-3. Choose the compression (Tight JPEG for games and video, Raw for a lossless image on a fast link), the initial window size, presentation rate, and scaling mode.
+3. Choose the compression, the initial window size, presentation rate, and scaling mode. For games and video, pick a **Tight JPEG** quality: **Low** (level 3) for Wi-Fi or slow links, **Med** (level 6, the default), or **High** (level 9) for a fast wired link. **Raw** and **Zlib** are lossless but far larger.
 4. Click **Connect**. Press **F8** during the session to adjust display settings or disconnect.
 
 > **Transport security:** TopVNC currently uses unencrypted TCP. VNC password authentication does not encrypt the framebuffer or input traffic. Use an isolated network or a separately secured tunnel for sensitive sessions. See [Security and saved settings](#security-and-saved-settings).
@@ -71,14 +71,14 @@ cargo run --release -- 127.0.0.1:5900 --window 1280x720
 | `--native-size` | Show native pixels; center and crop if the image is larger than the window. |
 | `--window WIDTHxHEIGHT` | Set a custom initial window size, such as `1280x720`. |
 | `--allow-insecure` | Explicitly allow a server offering unauthenticated `None` security. |
-| `--quality LEVEL` | JPEG quality level for Tight, from 0 (smallest) to 9 (best); default 6. Lower it on a slow link. |
+| `--quality LEVEL` | JPEG quality level for Tight, from 0 (smallest) to 9 (best); default 6. Lower it on a slow link. The form shows the level and offers 3, 6, and 9 as presets. |
 | `--input-debug` | Log outgoing key and pointer events for troubleshooting. |
 
 Do not use `--input-debug` while typing passwords: it logs key events.
 
 ### Serve this desktop
 
-Open the **Server** tab in the TopVNC window, enter a password, and click **Start server**. The tab binds to `127.0.0.1:5900` by default; click **All networks** to listen on every interface, or enter a display number to share a display other than the primary one. **Served size** scales the image viewers receive, from 0.25× to 1.00× of the display's pixel size: drag the slider, or click **Full** or **Half**. Half size serves a Retina display at its size in points, a quarter of the pixels, which cuts encoding time and bandwidth for games. It shows the served size, address, and number of connected viewers, and keeps running while you use TopVNC as a viewer. Closing TopVNC stops the server. Server settings and passwords are not saved.
+Open the **Server** tab in the TopVNC window, enter a password, and click **Start server**. The tab binds to `127.0.0.1:5900` by default; click **All networks** to listen on every interface, or enter a display number to share a display other than the primary one. **Served size** scales the image viewers receive, from 0.25× to 1.00× of the display's pixel size: drag the slider, or click **Full** or **Half**. Half size serves a Retina display at its size in points, a quarter of the pixels, which cuts encoding time and bandwidth for games. **Game mouse** chooses when viewers are asked for relative mouse motion, as `--mouse` does below: **Auto**, **Relative**, or **Absolute**. The tab shows the served size, address, and number of connected viewers, and keeps running while you use TopVNC as a viewer. Closing TopVNC stops the server. Server settings and passwords are not saved.
 
 You can also run the server as a separate console mode. It binds to localhost by default and prompts for a VNC password:
 
@@ -96,7 +96,7 @@ The second and later commands listen on all network interfaces, and `--scale` se
 - `relative` always asks, for games the automatic mode misses and for Mac hosts, which cannot tell when a game hides the cursor. The viewer's pointer then stays locked for the whole session.
 - `absolute` never asks.
 
-The Server tab uses `auto`. Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
+The Server tab's **Game mouse** buttons set the same three modes, starting at Auto. Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
 
 The server shares the primary display unless `--display NUMBER` selects another attached display (numbered from 1). Run it in an interactive, unlocked session: services and disconnected Remote Desktop sessions cannot capture the desktop. While Windows shows the secure desktop (UAC prompts, the lock screen), viewers keep the last image and capture resumes automatically afterward. If the display resolution changes, viewers that support the DesktopSize extension follow the new size; others, including TopVNC's own viewer for now, are disconnected and can reconnect.
 
@@ -186,9 +186,9 @@ Shooters such as Fortnite need mouse look, which works only with TopVNC's server
 - **Run the host display at its highest refresh rate.** Windows Desktop Duplication delivers frames when the display refreshes, so a 60 Hz host adds up to 16.7 ms; 120 or 144 Hz cuts that to 7–8 ms.
 - **Cap the game's frame rate a little below what the host's GPU can sustain.** Capture copies frames on the same GPU, and a GPU at 100% makes each capture wait behind the game's rendering.
 - **Play in borderless windowed mode,** which Desktop Duplication captures most reliably.
-- **Use a wired connection for the host.** On Wi-Fi, use Tight quality 3–4, or serve a high-resolution display at a reduced size.
+- **Use a wired connection for the host.** On Wi-Fi, choose **Low** (Tight quality 3) or `--quality 4`, or serve a high-resolution display at a reduced size.
 - **In the viewer,** use full screen and **No limit**. On macOS, turn off *Pointer acceleration* (System Settings → Mouse) so the same hand motion always turns the camera the same amount. Set sensitivity in the game.
-- **If the camera does not turn** because the game hides its cursor in a way Windows does not report, start the host with `--mouse relative`.
+- **If the camera does not turn** because the game hides its cursor in a way Windows does not report, choose **Relative** under *Game mouse* in the host's Server tab, or start it with `--mouse relative`. Mac hosts always need Relative for mouse look.
 
 These settings and the Windows host's mouse handling have not yet been validated with a live game.
 

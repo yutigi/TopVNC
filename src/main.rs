@@ -26,7 +26,7 @@ mod helpers;
 mod settings;
 mod ui;
 mod window;
-use desktop_host::{HostPermissions, MouseMode, ServeOptions, ServerNotice};
+use desktop_host::{HostPermissions, ServeOptions, ServerNotice};
 use ui::{
     Box2, Canvas, Compression, Config, Field, Quality, ServeRequest, ServerPhase, ServerView, Tab,
     UiState, WindowMode,
@@ -641,7 +641,7 @@ impl HostedServer {
             display: request.display,
             allow_insecure: request.allow_insecure,
             scale: request.scale,
-            mouse: MouseMode::Auto,
+            mouse: request.mouse,
         };
         self.authenticated = request.password.is_some();
         let password = request.password;
@@ -917,12 +917,27 @@ fn show_landing(
                     let Some((x, y)) = cursor else {
                         continue;
                     };
-                    if let Some((_, tab, _)) =
+                    if let Some((_, tab, _)) = ui::MENU_TABS
+                        .iter()
+                        .find(|(area, _, _)| state.menu_open && area.contains(x, y))
+                    {
+                        state.switch_tab(*tab);
+                        helper_action = None;
+                    } else if ui::TAB_MORE.contains(x, y) {
+                        state.menu_open = !state.menu_open;
+                    } else if let Some((_, tab, _)) =
                         ui::TABS.iter().find(|(area, _, _)| area.contains(x, y))
                     {
                         state.switch_tab(*tab);
                         helper_action = None;
-                    } else if let Some(helper) = state.tab.helper() {
+                    } else {
+                        state.menu_open = false;
+                    }
+                    if !ui::TAB_MORE.contains(x, y)
+                        && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                        && !ui::MENU_TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                        && let Some(helper) = state.tab.helper()
+                    {
                         state.focus = None;
                         for (area, field) in ui::helper_fields(state.tab) {
                             if area.contains(x, y) {
@@ -971,14 +986,17 @@ fn show_landing(
                             }
                             _ => {}
                         }
-                    } else if state.tab == Tab::Server {
+                    } else if state.tab == Tab::Server
+                        && !ui::TAB_MORE.contains(x, y)
+                        && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                    {
                         // The form describes the next start, so it is locked while serving.
                         let editable = server.view.phase == ServerPhase::Stopped;
                         state.focus = None;
                         for (area, field) in [
                             (ui::HOST, Field::ServeHost),
                             (ui::PORT, Field::ServePort),
-                            (ui::PASSWORD, Field::ServePassword),
+                            (ui::SERVE_PASSWORD, Field::ServePassword),
                             (ui::SERVE_DISPLAY, Field::ServeDisplay),
                         ] {
                             if editable && area.contains(x, y) {
@@ -1005,10 +1023,19 @@ fn show_landing(
                         if editable && ui::SERVE_HALF_SIZE.contains(x, y) {
                             serve.scale = 0.5;
                         }
+                        for (area, mode, _) in ui::SERVE_MOUSE {
+                            if editable && area.contains(x, y) {
+                                serve.mouse = mode;
+                            }
+                        }
                         if ui::CONNECT.contains(x, y) {
                             server_clicked = true;
                         }
-                    } else {
+                    } else if state.tab == Tab::Connect
+                        && !ui::TAB_MORE.contains(x, y)
+                        && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                        && !ui::MENU_TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                    {
                         state.focus = None;
                         for (area, field) in [
                             (ui::HOST, Field::Host),
@@ -1029,8 +1056,11 @@ fn show_landing(
                         if ui::ZLIB.contains(x, y) {
                             config.compression = Compression::Zlib;
                         }
-                        if ui::TIGHT.contains(x, y) {
-                            config.compression = Compression::Tight;
+                        for (area, level, _) in ui::JPEG_PRESETS {
+                            if area.contains(x, y) {
+                                config.compression = Compression::Tight;
+                                config.jpeg_quality = level;
+                            }
                         }
                         if ui::FIT.contains(x, y) {
                             config.window_mode = WindowMode::Fit;
@@ -2004,6 +2034,7 @@ mod tests {
             password: Some("secret".into()),
             allow_insecure: false,
             scale: 1.0,
+            mouse: desktop_host::MouseMode::Auto,
         });
         assert_eq!(server.view.phase, ServerPhase::Starting);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
