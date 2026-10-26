@@ -1,5 +1,6 @@
 use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, MouseMode, normalize_serve_scale};
 use crate::helpers::{Helper, HelperForm, HelperRuntime};
+use topvnc::UpdatePriority;
 use winit::keyboard::KeyCode;
 
 pub const BG: u32 = 0x0b1020;
@@ -55,6 +56,8 @@ pub struct Config {
     /// Lock the pointer and send relative motion when the host asks, as it
     /// does while a game hides the cursor.
     pub relative_mouse: bool,
+    /// Present partial updates as rectangles arrive.
+    pub progressive: bool,
     pub serve: ServeForm,
     pub helpers: HelperForm,
 }
@@ -74,6 +77,7 @@ impl Default for Config {
             jpeg_quality: DEFAULT_JPEG_QUALITY,
             ui_scale: 1.0,
             relative_mouse: true,
+            progressive: false,
             serve: ServeForm::default(),
             helpers: HelperForm::default(),
         }
@@ -111,6 +115,7 @@ pub struct ServeForm {
     pub scale: f32,
     /// When viewers are asked for relative pointer motion.
     pub mouse: MouseMode,
+    pub priority: UpdatePriority,
 }
 
 impl Default for ServeForm {
@@ -123,6 +128,7 @@ impl Default for ServeForm {
             allow_insecure: false,
             scale: 1.0,
             mouse: MouseMode::Auto,
+            priority: UpdatePriority::Whole,
         }
     }
 }
@@ -139,6 +145,7 @@ pub struct ServeRequest {
     /// Served size as a fraction of the display's pixel size.
     pub scale: f32,
     pub mouse: MouseMode,
+    pub priority: UpdatePriority,
 }
 
 impl ServeForm {
@@ -171,6 +178,7 @@ impl ServeForm {
             allow_insecure: self.allow_insecure,
             scale: normalize_serve_scale(self.scale),
             mouse: self.mouse,
+            priority: self.priority,
         })
     }
 }
@@ -842,6 +850,49 @@ pub const SERVE_DISPLAY: Box2 = Box2 {
     w: 210,
     h: 40,
 };
+pub const SERVE_PRIORITY: [(Box2, UpdatePriority, &str); 4] = [
+    (
+        Box2 {
+            x: 190,
+            y: 428,
+            w: 150,
+            h: 26,
+        },
+        UpdatePriority::Whole,
+        "WHOLE",
+    ),
+    (
+        Box2 {
+            x: 348,
+            y: 428,
+            w: 125,
+            h: 26,
+        },
+        UpdatePriority::Center,
+        "CENTER",
+    ),
+    (
+        Box2 {
+            x: 481,
+            y: 428,
+            w: 125,
+            h: 26,
+        },
+        UpdatePriority::Mouse,
+        "MOUSE",
+    ),
+    (
+        Box2 {
+            x: 614,
+            y: 428,
+            w: 144,
+            h: 26,
+        },
+        UpdatePriority::Changes,
+        "CHANGES",
+    ),
+];
+
 /// The `--mouse` choices: when viewers are asked for relative motion.
 pub const SERVE_MOUSE: [(Box2, MouseMode, &str); 3] = [
     (
@@ -1406,6 +1457,10 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     canvas.button(SERVE_FULL_SIZE, "FULL", scale == 1.0);
     canvas.button(SERVE_HALF_SIZE, "HALF", scale == 0.5);
 
+    canvas.label(40, 434, "PRIORITY");
+    for (area, priority, name) in SERVE_PRIORITY {
+        canvas.button(area, name, form.priority == priority);
+    }
     canvas.label(40, 456, "STATUS");
     canvas.fill(SERVER_STATUS, PANEL);
     canvas.frame(SERVER_STATUS, BORDER);
@@ -1582,75 +1637,101 @@ pub const CLOSE_SETTINGS: Box2 = Box2 {
     w: 72,
     h: 32,
 };
+pub const LIVE_SERVE_SLIDER: Box2 = Box2 {
+    x: 24,
+    y: 196,
+    w: 392,
+    h: 40,
+};
+
+pub fn live_serve_percent_from_x(x: usize) -> u8 {
+    let offset = x
+        .saturating_sub(SLIDER_LEFT)
+        .min(SLIDER_RIGHT - SLIDER_LEFT);
+    25 + ((offset * 75 + (SLIDER_RIGHT - SLIDER_LEFT) / 2) / (SLIDER_RIGHT - SLIDER_LEFT)) as u8
+}
+
 pub const LIVE_FIT: Box2 = Box2 {
     x: 24,
-    y: 108,
+    y: 86,
     w: 190,
     h: 38,
 };
 pub const LIVE_NATIVE: Box2 = Box2 {
     x: 226,
-    y: 108,
+    y: 86,
     w: 190,
     h: 38,
 };
 pub const LIVE_FULLSCREEN: Box2 = Box2 {
     x: 24,
-    y: 154,
+    y: 130,
     w: 392,
     h: 38,
 };
 pub const LIVE_60: Box2 = Box2 {
     x: 24,
-    y: 236,
+    y: 270,
     w: 110,
     h: 38,
 };
 pub const LIVE_120: Box2 = Box2 {
     x: 146,
-    y: 236,
+    y: 270,
     w: 124,
     h: 38,
 };
 pub const LIVE_NO_LIMIT: Box2 = Box2 {
     x: 282,
-    y: 236,
+    y: 270,
     w: 134,
     h: 38,
 };
 pub const LIVE_SMOOTH: Box2 = Box2 {
     x: 24,
-    y: 318,
+    y: 340,
     w: 190,
     h: 38,
 };
 pub const LIVE_SHARP: Box2 = Box2 {
     x: 226,
-    y: 318,
+    y: 340,
     w: 190,
     h: 38,
 };
 pub const LIVE_MOUSE_AUTO: Box2 = Box2 {
     x: 24,
-    y: 400,
+    y: 410,
     w: 190,
     h: 38,
 };
 pub const LIVE_MOUSE_OFF: Box2 = Box2 {
     x: 226,
-    y: 400,
+    y: 410,
+    w: 190,
+    h: 38,
+};
+pub const LIVE_WHOLE_UPDATE: Box2 = Box2 {
+    x: 24,
+    y: 480,
+    w: 190,
+    h: 38,
+};
+pub const LIVE_PROGRESSIVE: Box2 = Box2 {
+    x: 226,
+    y: 480,
     w: 190,
     h: 38,
 };
 pub const SCALE_SLIDER: Box2 = Box2 {
     x: 24,
-    y: 477,
+    y: 578,
     w: 392,
     h: 48,
 };
 pub const DISCONNECT: Box2 = Box2 {
     x: 24,
-    y: 566,
+    y: 656,
     w: 392,
     h: 42,
 };
@@ -1672,10 +1753,10 @@ pub const SETTINGS_PANEL: Box2 = Box2 {
     x: 8,
     y: 8,
     w: 432,
-    h: 612,
+    h: 694,
 };
 
-pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
+pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool, serve_scale: Option<u8>) {
     if !open {
         let area = open_settings_box(config.ui_scale);
         let text_scale = (2.0 * config.ui_scale).round().clamp(1.0, 4.0) as usize;
@@ -1695,7 +1776,7 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     canvas.frame(SETTINGS_PANEL, ACCENT);
     canvas.text(24, 28, "SESSION SETTINGS", TEXT, 3);
     canvas.button(CLOSE_SETTINGS, "CLOSE", false);
-    canvas.text(24, 83, "WINDOW", ACCENT, 2);
+    canvas.text(24, 62, "WINDOW", ACCENT, 2);
     canvas.button(
         LIVE_FIT,
         "FIT IMAGE",
@@ -1707,18 +1788,64 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
         config.window_mode == WindowMode::Native,
     );
     canvas.button(LIVE_FULLSCREEN, "FULL SCREEN ON / OFF", false);
-    canvas.text(24, 210, "FRAME LIMIT", ACCENT, 2);
+    canvas.text(24, 178, "SERVED SIZE", ACCENT, 2);
+    let color = if serve_scale.is_some() {
+        ACCENT
+    } else {
+        BORDER
+    };
+    canvas.fill(
+        Box2 {
+            x: SLIDER_LEFT,
+            y: 212,
+            w: SLIDER_RIGHT - SLIDER_LEFT,
+            h: 6,
+        },
+        BORDER,
+    );
+    if let Some(percent) = serve_scale {
+        canvas.text(252, 178, &format!("{percent}% SHARED"), MUTED, 1);
+        let thumb = SLIDER_LEFT
+            + (usize::from(percent.clamp(25, 100) - 25) * (SLIDER_RIGHT - SLIDER_LEFT) + 37) / 75;
+        canvas.fill(
+            Box2 {
+                x: SLIDER_LEFT,
+                y: 212,
+                w: thumb - SLIDER_LEFT,
+                h: 6,
+            },
+            color,
+        );
+        canvas.fill(
+            Box2 {
+                x: thumb - 6,
+                y: 204,
+                w: 12,
+                h: 22,
+            },
+            color,
+        );
+        canvas.text(24, 230, "25%", MUTED, 1);
+        canvas.text(390, 230, "100%", MUTED, 1);
+    } else {
+        canvas.text(252, 178, "UNAVAILABLE", MUTED, 1);
+        canvas.text(24, 230, "REQUIRES AN UPDATED TOPVNC HOST", MUTED, 1);
+    }
+    canvas.text(24, 246, "FRAME LIMIT", ACCENT, 2);
     canvas.button(LIVE_60, "60 FPS", config.fps == 60);
     canvas.button(LIVE_120, "120 FPS", config.fps == 120);
     canvas.button(LIVE_NO_LIMIT, "NO LIMIT", config.fps == 0);
-    canvas.text(24, 292, "SCALING", ACCENT, 2);
+    canvas.text(24, 316, "SCALING", ACCENT, 2);
     canvas.button(LIVE_SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(LIVE_SHARP, "SHARP", config.quality == Quality::Sharp);
-    canvas.text(24, 374, "GAME MOUSE", ACCENT, 2);
+    canvas.text(24, 386, "GAME MOUSE", ACCENT, 2);
     canvas.button(LIVE_MOUSE_AUTO, "AUTO LOCK", config.relative_mouse);
     canvas.button(LIVE_MOUSE_OFF, "OFF", !config.relative_mouse);
-    canvas.text(24, 458, "F8 BUTTON SIZE", ACCENT, 2);
-    canvas.text(330, 458, &format!("{:.2}X", config.ui_scale), TEXT, 2);
+    canvas.text(24, 456, "PRESENT UPDATES", ACCENT, 2);
+    canvas.button(LIVE_WHOLE_UPDATE, "WHOLE", !config.progressive);
+    canvas.button(LIVE_PROGRESSIVE, "PROGRESSIVE", config.progressive);
+    canvas.text(24, 552, "F8 BUTTON SIZE", ACCENT, 2);
+    canvas.text(330, 552, &format!("{:.2}X", config.ui_scale), TEXT, 2);
     let track_y = SCALE_SLIDER.y + 19;
     canvas.fill(
         Box2 {
@@ -1750,7 +1877,7 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     );
     canvas.text(24, track_y + 26, "0.5X", MUTED, 1);
     canvas.text(384, track_y + 26, "2X", MUTED, 1);
-    canvas.text(24, 544, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
+    canvas.text(24, 634, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
     canvas.button(DISCONNECT, "DISCONNECT", false);
 }
 
@@ -1792,6 +1919,7 @@ fn glyph(c: char) -> [u8; 7] {
         '7' => [31, 1, 2, 4, 8, 8, 8],
         '8' => [14, 17, 17, 14, 17, 17, 14],
         '9' => [14, 17, 17, 15, 1, 1, 14],
+        '%' => [24, 25, 2, 4, 8, 19, 3],
         '.' => [0, 0, 0, 0, 0, 12, 12],
         ':' => [0, 12, 12, 0, 12, 12, 0],
         '-' => [0, 0, 0, 31, 0, 0, 0],
@@ -1821,6 +1949,26 @@ fn glyph(c: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_priority_buttons_fit_and_reach_the_host_request() {
+        let mut form = ServeForm {
+            password: "secret".into(),
+            ..ServeForm::default()
+        };
+        for (area, priority, name) in SERVE_PRIORITY {
+            assert!(12 + name.len() * 12 <= area.w);
+            assert!(area.y + area.h <= 456);
+            form.priority = priority;
+            assert_eq!(form.request().unwrap().priority, priority);
+        }
+        for pair in SERVE_PRIORITY.windows(2) {
+            assert!(pair[0].0.x + pair[0].0.w < pair[1].0.x);
+        }
+        const { assert!(LIVE_PROGRESSIVE.y + LIVE_PROGRESSIVE.h < SCALE_SLIDER.y) };
+        const { assert!(DISCONNECT.y + DISCONNECT.h <= SETTINGS_PANEL.y + SETTINGS_PANEL.h) };
+        assert!(!Config::default().progressive);
+    }
 
     #[test]
     fn helper_tabs_keep_field_focus_and_values_separate() {

@@ -31,7 +31,7 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 - **Parallel encoding and decoding.** The server encodes a frame in bands on every core and sends each band as soon as it is ready. The viewer decodes JPEG bands in parallel.
 - **Keyboard and mouse input** for interacting with the remote desktop. Keys are sent by their position on a US keyboard, as games expect.
 - **Adjustable display** with fit-to-window or native pixels, smooth or sharp scaling, full screen, and 60 FPS, 120 FPS, or no presentation limit.
-- **In-session settings** accessible through **F8**, including disconnect and a resizable on-screen settings button.
+- **In-session settings** accessible through **F8**, including live served-size requests to updated TopVNC hosts, disconnect, and a resizable on-screen settings button.
 - **Saved connection details** with platform-specific password storage.
 - **Experimental Windows and macOS server modes**, started from the app's Server tab or with `--serve`, with display capture, resolution-change handling, remote keyboard/mouse input, clipboard sync, and password authentication; live validation is pending.
 - **Windows helper tabs** for the work-server launcher, read-only network diagnostics, and scoped firewall preview, set, and reset actions, with paged reports and copyable commands.
@@ -96,9 +96,22 @@ The second and later commands listen on all network interfaces, and `--scale` se
 - `relative` always asks, for games the automatic mode misses and for Mac hosts, which cannot tell when a game hides the cursor. The viewer's pointer then stays locked for the whole session.
 - `absolute` never asks.
 
+**Update priority** (choose before starting the server) controls which pending pixels are transmitted first:
+
+| Server tab / CLI | Behavior |
+| --- | --- |
+| Whole / `--priority whole` | Existing whole-screen order; default. |
+| Center / `--priority center` | Tiles nearest the screen center first. |
+| Mouse / `--priority mouse` | Tiles nearest that viewer's last pointer position first; center before pointer input and during relative mouse look. |
+| Changes / `--priority changes` | Most recently modified tiles first. |
+
+All modes send every requested dirty region, including background areas. Priority applies to TopVNC's built-in server and works with Raw and Tight; it does not configure a third-party VNC server. Focus modes use smaller rectangles, so compression and bandwidth can differ. No latency improvement has been measured yet.
+
+In the viewer, **F8 → Present updates → Progressive** shows incoming regions before the full update finishes. **Whole** (the default) waits until the complete update arrives. Progressive uploads the first decoded region immediately, batches subsequent regions at intervals of at least 8 ms while receiving data, and flushes remaining changes at update completion. Presentation still follows the viewer's frame limit. You can also enable it with `cargo run --release -- HOST:5900 --progressive`. For example, start the host with `cargo run --release -- --serve --priority center`, then enable Progressive in the viewer to see the center arrive first.
+
 The Server tab's **Game mouse** buttons set the same three modes, starting at Auto. Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
 
-The server shares the primary display unless `--display NUMBER` selects another attached display (numbered from 1). Run it in an interactive, unlocked session: services and disconnected Remote Desktop sessions cannot capture the desktop. While Windows shows the secure desktop (UAC prompts, the lock screen), viewers keep the last image and capture resumes automatically afterward. If the display resolution changes, viewers that support the DesktopSize extension follow the new size; others, including TopVNC's own viewer for now, are disconnected and can reconnect.
+The server shares the primary display unless `--display NUMBER` selects another attached display (numbered from 1). Run it in an interactive, unlocked session: services and disconnected Remote Desktop sessions cannot capture the desktop. While Windows shows the secure desktop (UAC prompts, the lock screen), viewers keep the last image and capture resumes automatically afterward. If the display resolution changes, viewers that support the DesktopSize extension follow the new size; others are disconnected and can reconnect. TopVNC's viewer now handles live size changes without reconnecting.
 
 #### On macOS
 
@@ -117,6 +130,7 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 | Mouse lock | While the host hides its cursor (in a game), the pointer locks and every motion turns the camera. The title bar shows *mouse locked*. |
 | **F8** or **F8 SETTINGS** | Open the in-session settings panel. This also releases a locked pointer, and the on-screen button hides while the pointer is locked. |
 | Window edges | Drag to resize the viewer. |
+| F8 → Served size | Drag from **25% to 100%** in 1% steps; release to request the size from an updated TopVNC host. |
 | Fit / 1:1 pixels | Scale the remote image to the window while preserving its aspect ratio, or show native pixels, centered and cropped when necessary. |
 | Full screen | Switch the viewer to full screen and back. |
 | 60 FPS / 120 FPS / No limit | Cap local presentation. **No limit**, the default, presents every frame as it arrives. This does not set the server's frame rate. |
@@ -124,6 +138,16 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 | Game mouse: Auto lock / Off | **Off** never locks the pointer: the viewer stops offering relative motion and the server sends absolute positions. |
 | F8 button size | Adjust the on-screen settings button from 0.5× to 2.0×. |
 | Disconnect | Return to the connection form. |
+
+![TopVNC F8 session settings showing the served-size slider at 50%](docs/images/topvnc-session-settings.png)
+
+*Capture of the actual software-rendered F8 panel, generated with `examples/capture_session_ui.rs`; this is a renderer capture, not a live desktop screenshot.*
+
+**Served size** was previously available only before starting the host. Both the viewer and host must run this updated build to change it through F8. The control reduces the pixels encoded and sent in the stream; **Fit image**, **1:1 pixels**, and **Smooth/Sharp** adjust local presentation. It does not change the host's display resolution. The percentage is shared by all viewers, and the last request wins. The slider previews the percentage while dragging and sends one request on release, avoiding capture restarts for every mouse movement. After release it follows the percentage published by the host. Older TopVNC hosts and third-party servers show a disabled served-size slider with **Requires an updated TopVNC host** and receive no scale commands. If the slider is disabled, update and restart the remote TopVNC host, then reconnect. If the entire **Served size** row is missing, restart the viewer using this branch's rebuilt executable. Older viewers without DesktopSize support may disconnect when another viewer changes the shared size.
+
+![F8 served-size controls disabled until an updated TopVNC host advertises support](docs/images/topvnc-session-settings-unavailable.png)
+
+For a local synthetic preview that captures no desktop, run `cargo run --example served_size_demo`, then open TopVNC, connect to `127.0.0.1:5998` with **Allow insecure** explicitly enabled, choose a `1280x720` window, and open F8. The demo binds only to loopback, discards input, and stops after five minutes. Windows protocol tests cover repeated resize and full refresh with Raw/Tight and requested/pushed updates. macOS capture wiring is implemented but has not been compiled or run here; live desktop capture and GUI click validation remain pending.
 
 The initial viewer fits within the primary display by default when the remote screen is larger. Scaling happens on the GPU at the display's full resolution. The network thread requests updates independently of the presentation limit.
 

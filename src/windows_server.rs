@@ -219,6 +219,7 @@ pub fn serve(
         allow_insecure,
         scale,
         mouse,
+        priority,
     } = options;
     // The GUI process stays DPI-unaware for its own windows, so the capture
     // and input threads opt in to physical pixels individually.
@@ -254,6 +255,7 @@ pub fn serve(
     );
     let (served_width, served_height) = served.size(&framebuffer);
     let config = ServerConfig {
+        priority,
         name: "TopVNC Windows Desktop".into(),
         password,
         allow_insecure,
@@ -261,6 +263,7 @@ pub fn serve(
         thread_setup: None,
     };
     let server = VncServer::bind(&address, served.image(&framebuffer).clone(), config)?;
+    server.set_serve_scale((scale * 100.0).round() as u8);
     report(ServerNotice::Serving {
         address: server.local_addr()?,
         display: capture.name.clone(),
@@ -337,7 +340,7 @@ pub fn serve(
 fn serve_desktop(
     server: &VncServer,
     display: Option<usize>,
-    scale: f32,
+    mut scale: f32,
     mouse: MouseMode,
     capture: DesktopCapture,
     mut framebuffer: Framebuffer,
@@ -451,12 +454,35 @@ fn serve_desktop(
             next_retry = Instant::now() + retry_delay;
             continue;
         }
+        let requested_scale = f32::from(server.requested_serve_scale()) / 100.0;
+        let scale_changed = requested_scale != scale;
+        if scale_changed {
+            scale = requested_scale;
+            served = ServedImage::new((active.placement.width, active.placement.height), scale)?;
+            let (width, height) = served.size(&framebuffer);
+            let mut target = placement
+                .lock()
+                .map_err(|_| "display placement lock poisoned")?;
+            target.served_width = width;
+            target.served_height = height;
+            report(ServerNotice::Resized { width, height });
+        }
         damage.clear();
         image.present(&captured, framebuffer.pixels_mut(), &mut damage);
+        if scale_changed {
+            damage.clear();
+            damage.push(Rect::new(
+                0,
+                0,
+                framebuffer.width() as i32,
+                framebuffer.height() as i32,
+            ));
+        }
         if !damage.is_empty() {
             served.update(&framebuffer, &damage);
             if !served.regions.is_empty() {
                 server.update_framebuffer_regions(served.image(&framebuffer), &served.regions)?;
+                server.set_serve_scale((scale * 100.0).round() as u8);
             }
         }
     }

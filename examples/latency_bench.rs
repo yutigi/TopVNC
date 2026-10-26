@@ -15,7 +15,7 @@
 //! - Mbit/s and KB/frame: server-to-client traffic.
 //!
 //! Run with `cargo run --release --example latency_bench -- [--size WxH]
-//! [--seconds N] [--fps N] [--delay-ms N] [--mbps N,N,...]`.
+//! [--priority whole|center|mouse|changes] [--seconds N] [--fps N] [--delay-ms N] [--mbps N,N,...]`.
 //!
 //! `--serve HOST:PORT` instead serves the scene without authentication until
 //! interrupted, for trying a viewer against moving content:
@@ -35,9 +35,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use topvnc::{Encoding, Framebuffer, ServerConfig, Session, VncServer};
+use topvnc::{Encoding, Framebuffer, ServerConfig, Session, UpdatePriority, VncServer};
 
 struct Options {
+    priority: UpdatePriority,
     width: u16,
     height: u16,
     seconds: f64,
@@ -56,6 +57,7 @@ struct Options {
 
 fn options() -> Result<Options, Box<dyn Error>> {
     let mut options = Options {
+        priority: UpdatePriority::Whole,
         width: 1920,
         height: 1080,
         seconds: 6.0,
@@ -71,6 +73,15 @@ fn options() -> Result<Options, Box<dyn Error>> {
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
+            "--priority" => {
+                options.priority = match value()?.as_str() {
+                    "whole" => UpdatePriority::Whole,
+                    "center" => UpdatePriority::Center,
+                    "mouse" => UpdatePriority::Mouse,
+                    "changes" => UpdatePriority::Changes,
+                    _ => return Err("--priority is whole|center|mouse|changes".into()),
+                };
+            }
             "--size" => {
                 let value = value()?;
                 let (width, height) = value.split_once('x').ok_or("--size is WIDTHxHEIGHT")?;
@@ -323,6 +334,7 @@ fn run(
         "127.0.0.1:0",
         initial.clone(),
         ServerConfig {
+            priority: options.priority,
             allow_insecure: true,
             ..ServerConfig::default()
         },
@@ -428,6 +440,7 @@ fn serve_scene(options: &Options, scene: &Scene, address: &str) -> Result<(), Bo
         address,
         framebuffer.clone(),
         ServerConfig {
+            priority: options.priority,
             allow_insecure: true,
             ..ServerConfig::default()
         },
@@ -492,6 +505,7 @@ fn serve_scene(options: &Options, scene: &Scene, address: &str) -> Result<(), Bo
 
 fn main() -> Result<(), Box<dyn Error>> {
     let options = options()?;
+    println!("Update priority: {:?}", options.priority);
     let scene = Arc::new(Scene::new(
         usize::from(options.width),
         usize::from(options.height),
