@@ -28,3 +28,9 @@ Always render Full/Half/Quarter in F8. When capability negotiation has not succe
 
 ## Slider refinement
 Replace fixed presets with a 25-100% slider in 1% steps. Preview locally during dragging and send a single request on release so mouse movement cannot queue capture restarts. Cancel pending drags when focus is lost or F8 closes the panel. Keep the unavailable state explicit and refresh README captures.
+
+## Follow-up: input loss investigation (Windows 11)
+- A user reports continued video with mouse and keyboard unavailable after resizing, including after closing F8 and reconnecting. The live failure has not been reproduced or diagnosed.
+- Extend the Raw/Tight, requested/pushed resize test to assert key presses/releases and pointer presses/releases reach the server after each resize, then assert input delivery after reconnecting. These checks pass; they do not exercise Windows injection.
+- Check Windows `SendInput` counts, including partial acceptance and rejection with error code zero. Report the first failure and subsequent successful injection in server status without logging key contents or flooding mouse-motion notices.
+- Formatting, Clippy, build, and 143 workspace tests pass with the existing disconnect-timeout test excluded; two timing tests remain ignored. The full workspace run still fails `clients_without_desktop_size_are_disconnected_on_resize` as documented above. Native injection failure and recovery need live validation using the rebuilt server's diagnostics.

@@ -282,6 +282,8 @@ Address lookup/TCP connection and the RFB handshake each have a ten-second deadl
 
 Launch with `--input-debug` to inspect outgoing key and pointer events. Avoid entering passwords or other sensitive text while logging, and remove sensitive details before sharing logs.
 
+On Windows, the server reports `Windows rejected remote input` when `SendInput` accepts fewer events than requested, and reports when injection resumes. Check the Server tab status or the server terminal. Windows can reject injection into an elevated foreground application or a locked desktop, sometimes without an error code. Reconnecting the viewer does not change these permissions. This message confirms an injection failure; it does not identify its exact cause.
+
 ## Development
 
 ```sh
