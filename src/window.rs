@@ -429,59 +429,17 @@ impl Presenter {
         })
     }
 
-    /// A `width` by `height` layer, black until uploaded.
-    pub fn layer(&self, width: u32, height: u32) -> Layer {
-        let device = &self.gpu.device;
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("TopVNC layer"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.layer_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let placement = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("TopVNC layer placement"),
-            size: 32,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind_group = |sampler: &wgpu::Sampler| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("TopVNC layer"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: placement.as_entire_binding(),
-                    },
-                ],
-            })
-        };
-        let bind_groups = [bind_group(&self.samplers[0]), bind_group(&self.samplers[1])];
-        Layer {
-            texture,
-            queue: self.gpu.queue.clone(),
-            placement,
-            bind_groups,
-            width: width.max(1),
-            height: height.max(1),
+    pub fn layer_factory(&self) -> LayerFactory {
+        LayerFactory {
+            gpu: Arc::clone(&self.gpu),
+            bind_group_layout: self.bind_group_layout.clone(),
+            samplers: self.samplers.clone(),
+            layer_format: self.layer_format,
         }
+    }
+
+    pub fn layer(&self, width: u32, height: u32) -> Layer {
+        self.layer_factory().layer(width, height)
     }
 
     /// Match the surface to the window's current size.
@@ -569,5 +527,69 @@ impl Presenter {
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
         Ok(true)
+    }
+}
+
+#[derive(Clone)]
+pub struct LayerFactory {
+    gpu: Arc<Gpu>,
+    bind_group_layout: wgpu::BindGroupLayout,
+    samplers: [wgpu::Sampler; 2],
+    layer_format: wgpu::TextureFormat,
+}
+impl LayerFactory {
+    /// A `width` by `height` layer, black until uploaded.
+    pub fn layer(&self, width: u32, height: u32) -> Layer {
+        let device = &self.gpu.device;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("TopVNC layer"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.layer_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let placement = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("TopVNC layer placement"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = |sampler: &wgpu::Sampler| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("TopVNC layer"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: placement.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let bind_groups = [bind_group(&self.samplers[0]), bind_group(&self.samplers[1])];
+        Layer {
+            texture,
+            queue: self.gpu.queue.clone(),
+            placement,
+            bind_groups,
+            width: width.max(1),
+            height: height.max(1),
+        }
     }
 }

@@ -219,6 +219,7 @@ pub fn serve(
         allow_insecure,
         scale,
         mouse,
+        priority,
     } = options;
     require_supported_macos()?;
     require_screen_recording()?;
@@ -242,6 +243,7 @@ pub fn serve(
         }
     }
     let config = ServerConfig {
+        priority,
         name: "TopVNC macOS Desktop".into(),
         password,
         allow_insecure,
@@ -253,6 +255,7 @@ pub fn serve(
     // macOS has no system-wide cursor visibility to follow, so only an
     // explicit choice asks viewers for relative motion.
     server.set_relative_pointer(mouse == MouseMode::Relative);
+    server.set_serve_scale((scale * 100.0).round() as u8);
     report(ServerNotice::Serving {
         address: server.local_addr()?,
         display: capture.name.clone(),
@@ -360,7 +363,7 @@ fn bind_error(error: std::io::Error, address: &str) -> Box<dyn Error> {
 fn serve_desktop(
     server: &VncServer,
     display: Option<usize>,
-    scale: f32,
+    mut scale: f32,
     capture: DisplayCapture,
     mut framebuffer: Framebuffer,
     placement: &Mutex<InputPlacement>,
@@ -386,6 +389,12 @@ fn serve_desktop(
     let mut connections = 0;
     let mut regions = Vec::new();
     while !shutdown.load(Ordering::Acquire) {
+        let requested_scale = f32::from(server.requested_serve_scale()) / 100.0;
+        if requested_scale != scale {
+            scale = requested_scale;
+            capture = None;
+            next_retry = Instant::now();
+        }
         let current_connections = server.active_connections();
         if current_connections != connections {
             connections = current_connections;
@@ -501,6 +510,7 @@ fn serve_desktop(
                 regions.extend(rects.iter().map(damage_rect));
                 if !regions.is_empty() {
                     server.update_framebuffer_regions(&framebuffer, &regions)?;
+                    server.set_serve_scale((scale * 100.0).round() as u8);
                 }
             }
             Err(error) => {
