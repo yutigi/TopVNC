@@ -4,7 +4,7 @@
 
 Add a macOS host backend so the Server tab and `topvnc --serve` can share a Mac display with the same RFB server, security rules, and UI as the Windows host (spec 004). The backend captures one display with ScreenCaptureKit, injects remote keyboard and mouse input with Quartz events, and syncs clipboard text. Protocol code in `src/lib.rs` is unchanged. Platform-neutral host logic stays in `src/desktop_host.rs`, and macOS API calls live in a new `src/macos_server.rs` compiled only for `target_os = "macos"`.
 
-Out of scope: Apple Remote Desktop authentication, capturing or unlocking the login window, curtain mode, audio, running as a LaunchDaemon or before login, preventing sleep, serving scaled-down (point-sized) framebuffers, and serving more than one display per process.
+Out of scope: Apple Remote Desktop authentication, capturing or unlocking the login window, curtain mode, audio, running as a LaunchDaemon or before login, preventing sleep, and serving more than one display per process.
 
 ## Acceptance criteria
 
@@ -60,8 +60,8 @@ Out of scope: Apple Remote Desktop authentication, capturing or unlocking the lo
 
 ## Limitations
 
-- **Protocol and security:** RFB 3.8, Raw encoding, standard VNC authentication, no TCP encryption, and Latin-1 clipboard limits are inherited from spec 004.
-- **Bandwidth:** serving native pixels on Retina displays means large Raw updates. A 5K display is 5120×2880, so a full update is about 59 MB at 32 bits per pixel.
+- **Protocol and security:** RFB 3.8, Raw and Tight encodings (spec 006), standard VNC authentication, no TCP encryption, and Latin-1 clipboard limits are inherited from spec 004.
+- **Bandwidth:** serving native pixels on Retina displays means large updates. A 5K display is 5120×2880, so a full Raw update is about 59 MB at 32 bits per pixel; Tight with JPEG (spec 006) reduces this, but the pixel count still scales encoding time and bandwidth.
 - **Login and lock screen:** a user process cannot capture or drive the login window. While the Mac is locked, viewers keep the last image, and the screen cannot be unlocked through this server.
 - **macOS prompts:** newer macOS versions show a recording indicator and may periodically ask the user to confirm Screen Recording access. The server cannot suppress either.
 - **Keyboard layouts:** printable keys are mapped to ANSI US-layout key codes. Other layouts may produce different characters for mapped keys, the same limitation as the Windows host.
