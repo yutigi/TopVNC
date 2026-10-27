@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
     BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, Encoding, Framebuffer, InputWriter,
-    Session, StatsSnapshot, encoding_name,
+    PerformanceMode, Session, StatsSnapshot, encoding_name,
 };
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -43,7 +43,7 @@ fn encoding(config: &Config) -> Encoding {
     }
 }
 
-const USAGE: &str = "usage: topvnc [HOST:PORT] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--quality 0-9] [--progressive] [--input-debug]";
+const USAGE: &str = "usage: topvnc [HOST:PORT] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--quality 0-9] [--progressive] [--ultra] [--input-debug]";
 
 fn parse_quality(value: &str) -> Result<u8, Box<dyn Error>> {
     match value.parse::<u8>() {
@@ -516,6 +516,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 config.jpeg_quality = parse_quality(&value)?;
             }
             "--progressive" => config.progressive = true,
+            "--ultra" => config.performance = PerformanceMode::Ultra,
             "--input-debug" => input_debug = true,
             _ if arg.starts_with('-') || address.is_some() => return Err(USAGE.into()),
             _ => address = Some(arg),
@@ -638,6 +639,7 @@ impl HostedServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (events, receiver) = mpsc::channel();
         let options = ServeOptions {
+            performance: request.performance,
             address: request.address,
             display: request.display,
             allow_insecure: request.allow_insecure,
@@ -1012,6 +1014,9 @@ fn show_landing(
                         if editable && ui::LOCAL_ONLY.contains(x, y) {
                             serve.host = ui::LOCAL_ONLY_HOST.into();
                         }
+                        if editable && ui::ULTRA_MODE.contains(x, y) {
+                            serve.performance = toggle_performance(serve.performance);
+                        }
                         if editable && ui::ALL_NETWORKS.contains(x, y) {
                             serve.host = ui::ALL_NETWORKS_HOST.into();
                         }
@@ -1080,12 +1085,17 @@ fn show_landing(
                         }
                         if ui::FPS60.contains(x, y) {
                             config.fps = 60;
+                            config.performance = PerformanceMode::Standard;
                         }
                         if ui::FPS120.contains(x, y) {
                             config.fps = 120;
+                            config.performance = PerformanceMode::Standard;
                         }
                         if ui::FPS_NO_LIMIT.contains(x, y) {
                             config.fps = 0;
+                        }
+                        if ui::ULTRA_MODE.contains(x, y) {
+                            config.performance = toggle_performance(config.performance);
                         }
                         if ui::SMOOTH.contains(x, y) {
                             config.quality = Quality::Smooth;
@@ -1155,6 +1165,13 @@ fn show_landing(
 /// How often the title bar's statistics refresh.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
+fn toggle_performance(mode: PerformanceMode) -> PerformanceMode {
+    match mode {
+        PerformanceMode::Standard => PerformanceMode::Ultra,
+        PerformanceMode::Ultra => PerformanceMode::Standard,
+    }
+}
+
 /// Accumulate dirty pixels until an upload is due or the update completes.
 #[derive(Default)]
 struct UpdateUploads {
@@ -1163,12 +1180,13 @@ struct UpdateUploads {
 }
 
 impl UpdateUploads {
-    fn push(&mut self, rect: Rect, progressive: bool, now: Instant) -> Option<Rect> {
+    fn push(&mut self, rect: Rect, policy: u8, now: Instant) -> Option<Rect> {
         self.changed = Some(self.changed.map_or(rect, |area| area.union(rect)));
-        if progressive
-            && self
-                .last_upload
-                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_millis(8))
+        if policy == 2
+            || (policy == 1
+                && self
+                    .last_upload
+                    .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_millis(8)))
         {
             self.last_upload = Some(now);
             self.finish()
@@ -1182,15 +1200,20 @@ impl UpdateUploads {
     }
 }
 
-/// When the oldest update the window thread has not yet presented finished
-/// uploading; set by the network thread.
+/// When the oldest pending texture write was queued by the network thread.
+/// Presentation submits it to the GPU; this does not timestamp visible pixels.
 #[derive(Default)]
 struct Arrival(Mutex<Option<Instant>>);
 
 impl Arrival {
-    fn mark(&self) {
+    /// Only the transition from no pending pixels needs a window wake-up.
+    fn mark(&self) -> bool {
         if let Ok(mut pending) = self.0.lock() {
+            let wake = pending.is_none();
             pending.get_or_insert_with(Instant::now);
+            wake
+        } else {
+            false
         }
     }
 
@@ -1308,12 +1331,12 @@ fn run_session_inner(
         Arc::new(factory.layer(u32::from(info.width), u32::from(info.height))),
     )));
     let arrival = Arc::new(Arrival::default());
-    let progressive = Arc::new(AtomicBool::new(config.progressive));
+    let upload_policy = Arc::new(AtomicU8::new(config.upload_policy()));
     let (error_tx, error_rx) = mpsc::channel();
     {
         let image = Arc::clone(&image);
         let arrival = Arc::clone(&arrival);
-        let progressive = Arc::clone(&progressive);
+        let upload_policy = Arc::clone(&upload_policy);
         let writer = writer.clone();
         let waker = ui.waker();
         let (width, height) = (info.width, info.height);
@@ -1339,8 +1362,9 @@ fn run_session_inner(
                                     Arc::new(factory.layer(u32::from(w), u32::from(h))),
                                 );
                                 uploads = UpdateUploads::default();
-                                arrival.mark();
-                                waker.wake();
+                                if arrival.mark() {
+                                    waker.wake();
+                                }
                                 return Ok(());
                             }
                             framebuffer.apply_raw(x, y, w, h, bytes)?;
@@ -1352,7 +1376,7 @@ fn run_session_inner(
                             };
                             if let Some(area) = uploads.push(
                                 rect,
-                                progressive.load(Ordering::Relaxed),
+                                upload_policy.load(Ordering::Relaxed),
                                 Instant::now(),
                             ) {
                                 image
@@ -1367,8 +1391,9 @@ fn run_session_inner(
                                         area.width(),
                                         area.height(),
                                     );
-                                arrival.mark();
-                                waker.wake();
+                                if arrival.mark() {
+                                    waker.wake();
+                                }
                             }
                             Ok(())
                         })?;
@@ -1385,8 +1410,9 @@ fn run_session_inner(
                                     area.width(),
                                     area.height(),
                                 );
-                            arrival.mark();
-                            waker.wake();
+                            if arrival.mark() {
+                                waker.wake();
+                            }
                         }
                     }
                 })();
@@ -1434,11 +1460,7 @@ fn run_session_inner(
             overlay_changed = true;
             redraw = true;
         }
-        let frame_interval = if config.fps == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs_f64(1.0 / config.fps as f64)
-        };
+        let frame_interval = config.presentation_interval();
         let now = Instant::now();
         // Sleep until input arrives, a frame arrives, the frame limit allows
         // a waiting frame, or the statistics are due.
@@ -1626,8 +1648,14 @@ fn run_session_inner(
                                             Some(ui::live_serve_percent_from_x(x));
                                     } else if ui::LIVE_60.contains(x, y) {
                                         config.fps = 60;
+                                        config.performance = PerformanceMode::Standard;
+                                        upload_policy
+                                            .store(config.upload_policy(), Ordering::Relaxed);
                                     } else if ui::LIVE_120.contains(x, y) {
                                         config.fps = 120;
+                                        config.performance = PerformanceMode::Standard;
+                                        upload_policy
+                                            .store(config.upload_policy(), Ordering::Relaxed);
                                     } else if ui::LIVE_NO_LIMIT.contains(x, y) {
                                         config.fps = 0;
                                     } else if ui::LIVE_SMOOTH.contains(x, y) {
@@ -1642,10 +1670,18 @@ fn run_session_inner(
                                         writer.set_relative_pointer_allowed(false)?;
                                     } else if ui::LIVE_WHOLE_UPDATE.contains(x, y) {
                                         config.progressive = false;
-                                        progressive.store(false, Ordering::Relaxed);
+                                        config.performance = PerformanceMode::Standard;
+                                        upload_policy
+                                            .store(config.upload_policy(), Ordering::Relaxed);
                                     } else if ui::LIVE_PROGRESSIVE.contains(x, y) {
                                         config.progressive = true;
-                                        progressive.store(true, Ordering::Relaxed);
+                                        config.performance = PerformanceMode::Standard;
+                                        upload_policy
+                                            .store(config.upload_policy(), Ordering::Relaxed);
+                                    } else if ui::LIVE_ULTRA.contains(x, y) {
+                                        config.performance = toggle_performance(config.performance);
+                                        upload_policy
+                                            .store(config.upload_policy(), Ordering::Relaxed);
                                     } else if ui::SCALE_SLIDER.contains(x, y) {
                                         dragging_ui_scale = true;
                                         config.ui_scale = ui::scale_from_slider_x(x);
@@ -1753,9 +1789,12 @@ fn run_session_inner(
             );
             if to_present.1 > 0 {
                 status += &format!(
-                    " · {:.1} ms to present",
+                    " · {:.2} ms upload to submit",
                     (to_present.0 / to_present.1).as_secs_f64() * 1e3
                 );
+            }
+            if config.performance == PerformanceMode::Ultra {
+                status += " · Ultra";
             }
             if locked {
                 status += " · mouse locked, F8 releases";
@@ -1875,10 +1914,10 @@ mod tests {
             y1: 64,
         };
         let mut whole = UpdateUploads::default();
-        assert!(whole.push(first, false, now).is_none());
+        assert!(whole.push(first, 0, now).is_none());
         assert!(
             whole
-                .push(second, false, now + Duration::from_secs(1))
+                .push(second, 0, now + Duration::from_secs(1))
                 .is_none()
         );
         let area = whole.finish().unwrap();
@@ -1886,24 +1925,53 @@ mod tests {
         assert!(whole.finish().is_none());
 
         let mut progressive = UpdateUploads::default();
-        let area = progressive.push(first, true, now).unwrap();
+        let area = progressive.push(first, 1, now).unwrap();
         assert_eq!((area.x0, area.y0), (64, 64));
         assert!(
             progressive
-                .push(second, true, now + Duration::from_millis(1))
+                .push(second, 1, now + Duration::from_millis(1))
                 .is_none()
         );
         let area = progressive
-            .push(first, true, now + Duration::from_millis(8))
+            .push(first, 1, now + Duration::from_millis(8))
             .unwrap();
         assert_eq!((area.x0, area.y0, area.x1, area.y1), (0, 0, 128, 128));
         assert!(
             progressive
-                .push(second, true, now + Duration::from_millis(9))
+                .push(second, 1, now + Duration::from_millis(9))
                 .is_none()
         );
         assert!(progressive.finish().is_some());
         assert!(progressive.finish().is_none());
+    }
+
+    #[test]
+    fn ultra_uploads_each_region_and_coalesces_pending_wakes() {
+        let now = Instant::now();
+        let rect = Rect {
+            x0: 4,
+            y0: 8,
+            x1: 12,
+            y1: 16,
+        };
+        let mut uploads = UpdateUploads::default();
+        for micros in [0, 1, 100, 499] {
+            let area = uploads
+                .push(rect, 2, now + Duration::from_micros(micros))
+                .unwrap();
+            assert_eq!((area.x0, area.y0, area.x1, area.y1), (4, 8, 12, 16));
+        }
+        assert!(uploads.finish().is_none());
+
+        let arrival = Arrival::default();
+        assert!(arrival.mark());
+        let oldest = *arrival.0.lock().unwrap();
+        assert!(!arrival.mark());
+        assert_eq!(arrival.take(), oldest);
+        assert!(arrival.mark());
+        arrival.restore(oldest);
+        assert!(!arrival.mark());
+        assert_eq!(arrival.take(), oldest);
     }
 
     #[test]
@@ -2189,6 +2257,7 @@ mod tests {
     fn hosted_server_reports_unsupported_platforms_and_stops() {
         let mut server = HostedServer::default();
         server.start(ServeRequest {
+            performance: PerformanceMode::Standard,
             address: "127.0.0.1:0".into(),
             display: None,
             password: Some("secret".into()),

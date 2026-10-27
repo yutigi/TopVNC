@@ -220,6 +220,7 @@ pub fn serve(
         scale,
         mouse,
         priority,
+        performance,
     } = options;
     // The GUI process stays DPI-unaware for its own windows, so the capture
     // and input threads opt in to physical pixels individually.
@@ -256,6 +257,7 @@ pub fn serve(
     let (served_width, served_height) = served.size(&framebuffer);
     let config = ServerConfig {
         priority,
+        performance,
         name: "TopVNC Windows Desktop".into(),
         password,
         allow_insecure,

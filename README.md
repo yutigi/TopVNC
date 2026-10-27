@@ -72,6 +72,7 @@ cargo run --release -- 127.0.0.1:5900 --window 1280x720
 | `--window WIDTHxHEIGHT` | Set a custom initial window size, such as `1280x720`. |
 | `--allow-insecure` | Explicitly allow a server offering unauthenticated `None` security. |
 | `--quality LEVEL` | JPEG quality level for Tight, from 0 (smallest) to 9 (best); default 6. Lower it on a slow link. The form shows the level and offers 3, 6, and 9 as presets. |
+| `--ultra` | Enable Ultra performance mode: upload each decoded region immediately and remove the local presentation cap. Also selectable in the connection form and F8 panel. |
 | `--input-debug` | Log outgoing key and pointer events for troubleshooting. |
 
 Do not use `--input-debug` while typing passwords: it logs key events.
@@ -109,6 +110,19 @@ All modes send every requested dirty region, including background areas. Priorit
 
 In the viewer, **F8 → Present updates → Progressive** shows incoming regions before the full update finishes. **Whole** (the default) waits until the complete update arrives. Progressive uploads the first decoded region immediately, batches subsequent regions at intervals of at least 8 ms while receiving data, and flushes remaining changes at update completion. Presentation still follows the viewer's frame limit. You can also enable it with `cargo run --release -- HOST:5900 --progressive`. For example, start the host with `cargo run --release -- --serve --priority center`, then enable Progressive in the viewer to see the center arrive first.
 
+**Ultra performance mode** uploads every decoded region immediately and presents without a local FPS cap. Choose **ULTRA: ON** in the connection form or **F8 → Present updates → Ultra**, or run:
+
+```sh
+cargo run --release -- HOST:5900 --ultra
+cargo run --release -- --serve --ultra
+```
+
+The Server tab has its own **ULTRA: ON** choice, set before starting the host. Server Ultra flushes each encoded Tight band immediately and honors future pacing deadlines below 1 ms without deliberately rounding them up to 1 ms. The viewer's mode works with other servers too, but cannot change their capture or encoding behavior. Both ends retain normal authentication and flow control. Encoding, JPEG quality, and served resolution remain explicit choices.
+
+Ultra can increase texture uploads, GPU submissions, socket writes, CPU use, and tearing. Idle sessions still wait for events. Toggle Ultra off to restore the previous presentation cap and Whole/Progressive policy; choosing 60/120 FPS or Whole/Progressive also exits Ultra. These settings are not saved between launches.
+
+**Below 0.5 ms input-to-screen is an unachieved target.** Ultra does not guarantee it. Capture waits for an available desktop image, and GPU presentation can still depend on the driver and compositor. See [Microsoft's capture API](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-acquirenextframe) and [wgpu's presentation modes](https://docs.rs/wgpu/30.0.0/wgpu/enum.PresentMode.html). Physical input-to-visible-response requires measurement with real capture and display hardware.
+
 The Server tab's **Game mouse** buttons set the same three modes, starting at Auto. Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
 
 The server shares the primary display unless `--display NUMBER` selects another attached display (numbered from 1). Run it in an interactive, unlocked session: services and disconnected Remote Desktop sessions cannot capture the desktop. While Windows shows the secure desktop (UAC prompts, the lock screen), viewers keep the last image and capture resumes automatically afterward. If the display resolution changes, viewers that support the DesktopSize extension follow the new size; others are disconnected and can reconnect. TopVNC's viewer now handles live size changes without reconnecting.
@@ -134,6 +148,7 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 | Fit / 1:1 pixels | Scale the remote image to the window while preserving its aspect ratio, or show native pixels, centered and cropped when necessary. |
 | Full screen | Switch the viewer to full screen and back. |
 | 60 FPS / 120 FPS / No limit | Cap local presentation. **No limit**, the default, presents every frame as it arrives. This does not set the server's frame rate. |
+| Ultra | Upload each decoded region immediately and present without a local FPS cap; click again to restore the prior settings. |
 | Smooth / Sharp | Choose the scaling appearance. |
 | Game mouse: Auto lock / Off | **Off** never locks the pointer: the viewer stops offering relative motion and the server sends absolute positions. |
 | F8 button size | Adjust the on-screen settings button from 0.5× to 2.0×. |
@@ -197,11 +212,23 @@ For playable results:
 - **Read the title bar.** During a session, the viewer's title shows:
   - frames per second, KB per frame, and Mbit/s;
   - the encoding the server sends, and `push` when the server pushes frames;
-  - the mean time from a frame's arrival to its presentation.
+  - the mean time from queuing a texture upload to returning from GPU submission, labeled **upload to submit**. This excludes input, capture, transport, decode, GPU completion, and display scanout.
 
   If it says Raw, the server does not support Tight; without `push`, every frame waits a round trip.
 
 Tight between TopVNC's server and client is covered by tests. Tight against third-party servers and viewers, and with live desktop capture, has not yet been validated. See [`specs/006-low-latency-gaming/spec.md`](specs/006-low-latency-gaming/spec.md) and [`specs/007-competitive-gaming/spec.md`](specs/007-competitive-gaming/spec.md) for the full measurements.
+
+### Ultra measurements
+
+On Windows with a Ryzen 9 9950X3D, the validated row conversion reduced the **CPU framebuffer application stage** at 1920×1080 from 0.763 ms mean / 0.790 ms p95 to 0.381 ms mean / 0.393 ms p95 (300 samples after warm-up). This conversion is used in both modes. It does not measure the complete input-to-screen path:
+
+```sh
+cargo run --release --example framebuffer_bench
+cargo run --release --example latency_bench -- --direct --mode tight6-push --size 1920x1080 --fps 120 --seconds 5
+cargo run --release --example latency_bench -- --direct --mode tight6-push --size 1920x1080 --fps 120 --seconds 5 --ultra
+```
+
+The direct-loopback pipeline delivered 120 FPS in both modes. Across two runs each, Standard full-update publish-to-decode means were 4.10–4.18 ms, versus 3.97–4.16 ms for Ultra; this does not establish a meaningful pipeline improvement. These runs exclude physical input, desktop capture, texture uploads, GPU presentation, and screen scanout. First-marker latency, frame intervals, CPU time, peak process memory, and validation limits are recorded in [`specs/010-ultra-performance/spec.md`](specs/010-ultra-performance/spec.md). Ultra's live viewer/display latency has not been measured.
 
 ### Playing fast games
 
@@ -309,6 +336,7 @@ cargo run
 | [`src/macos_server.rs`](src/macos_server.rs) | macOS ScreenCaptureKit capture, Quartz keyboard/mouse injection, and pasteboard sync for the Server tab and `--serve`. |
 | [`build.rs`](build.rs) | Weak-links ScreenCaptureKit so the app still starts on macOS releases older than 12.3. |
 | [`examples/latency_bench.rs`](examples/latency_bench.rs) | End-to-end frame rate and latency benchmark over an emulated network link. |
+| [`examples/framebuffer_bench.rs`](examples/framebuffer_bench.rs) | CPU framebuffer conversion comparison; excludes codecs, network, and display. |
 | [`tools/screen_latency.swift`](tools/screen_latency.swift) | macOS tool that measures the time until benchmark frames are displayed in a viewer window. |
 | [`specs/004-vnc-server/spec.md`](specs/004-vnc-server/spec.md) | Server scope, security behavior, and limitations. |
 | [`specs/`](specs/) | Feature scope and acceptance criteria. |
