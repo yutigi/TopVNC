@@ -1,10 +1,10 @@
 //! The viewer's windows. winit delivers input as the system reports it,
-//! and wgpu presents each frame as soon as it arrives, at up to the display's
-//! refresh rate, without waiting for vertical sync.
+//! and wgpu presents on a separate worker with selectable synchronization.
 
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
+use topvnc::presentation::MotionPresentation;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
@@ -91,7 +91,13 @@ impl Waker {
 
 impl Ui {
     pub fn new() -> Result<Self, Box<dyn Error>> {
-        let event_loop = EventLoop::with_user_event().build()?;
+        let mut builder = EventLoop::with_user_event();
+        #[cfg(all(test, windows))]
+        {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            builder.with_any_thread(true);
+        }
+        let event_loop = builder.build()?;
         event_loop.listen_device_events(DeviceEvents::WhenFocused);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(event_loop.owned_display_handle()),
@@ -300,6 +306,19 @@ fn fragment(input: Varyings) -> @location(0) vec4<f32> {
 ";
 
 impl Presenter {
+    pub fn set_motion(&mut self, motion: MotionPresentation) {
+        let capabilities = self.surface.get_capabilities(&self.gpu.adapter);
+        let mode = select_present_mode(motion, &capabilities.present_modes);
+        if self.config.present_mode != mode {
+            self.config.present_mode = mode;
+            self.surface.configure(&self.gpu.device, &self.config);
+        }
+    }
+
+    pub fn present_mode(&self) -> wgpu::PresentMode {
+        self.config.present_mode
+    }
+
     pub fn new(ui: &mut Ui, window: Arc<Window>) -> Result<Self, Box<dyn Error>> {
         let surface = ui.instance.create_surface(Arc::clone(&window))?;
         let gpu = ui.gpu(&surface)?;
@@ -323,8 +342,8 @@ impl Presenter {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
-            // Present at once instead of at the next vertical blank: tearing
-            // where the platform allows it, never a queue of finished frames.
+            // Connection windows use immediate presentation. Session windows
+            // choose Smooth/Immediate before their first draw.
             present_mode: wgpu::PresentMode::AutoNoVsync,
             // Two drawables on Metal; one queued frame on DX12.
             desired_maximum_frame_latency: 1,
@@ -445,12 +464,16 @@ impl Presenter {
     /// Match the surface to the window's current size.
     pub fn resize(&mut self) {
         let size = self.window.inner_size();
-        if size.width == 0 || size.height == 0 {
+        self.resize_to(size.width, size.height);
+    }
+
+    fn resize_to(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
             return;
         }
-        if (size.width, size.height) != (self.config.width, self.config.height) {
-            self.config.width = size.width;
-            self.config.height = size.height;
+        if (width, height) != (self.config.width, self.config.height) {
+            self.config.width = width;
+            self.config.height = height;
             self.surface.configure(&self.gpu.device, &self.config);
         }
     }
@@ -460,20 +483,49 @@ impl Presenter {
     /// not yet on screen, minimized, or occluded; draw again later.
     pub fn draw(&mut self, draws: &[Draw<'_>]) -> Result<bool, Box<dyn Error>> {
         self.resize();
+        let Some(frame) = self.acquire_current()? else {
+            return Ok(false);
+        };
+        self.draw_acquired(draws, frame)?;
+        Ok(true)
+    }
+
+    /// Worker-thread draw using geometry captured by the event thread. Avoids
+    /// synchronous main-thread window queries on macOS, including at shutdown.
+    pub fn acquire_sized(
+        &mut self,
+        size: (u32, u32),
+    ) -> Result<Option<wgpu::SurfaceTexture>, Box<dyn Error>> {
+        if size.0 == 0 || size.1 == 0 {
+            return Ok(None);
+        }
+        self.resize_to(size.0, size.1);
+        self.acquire_current()
+    }
+
+    fn acquire_current(&mut self) -> Result<Option<wgpu::SurfaceTexture>, Box<dyn Error>> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.gpu.device, &self.config);
-                return Ok(false);
+                return Ok(None);
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(false);
+                return Ok(None);
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 return Err("the window surface could not provide a frame".into());
             }
         };
+        Ok(Some(frame))
+    }
+
+    pub fn draw_acquired(
+        &mut self,
+        draws: &[Draw<'_>],
+        frame: wgpu::SurfaceTexture,
+    ) -> Result<(), Box<dyn Error>> {
         let (width, height) = (f64::from(self.config.width), f64::from(self.config.height));
         for draw in draws {
             let [x, y, w, h] = draw.target;
@@ -526,7 +578,46 @@ impl Presenter {
         self.gpu.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
-        Ok(true)
+        Ok(())
+    }
+}
+
+fn select_present_mode(
+    motion: MotionPresentation,
+    supported: &[wgpu::PresentMode],
+) -> wgpu::PresentMode {
+    match motion {
+        MotionPresentation::Smooth if supported.contains(&wgpu::PresentMode::Mailbox) => {
+            wgpu::PresentMode::Mailbox
+        }
+        MotionPresentation::Smooth => wgpu::PresentMode::Fifo,
+        MotionPresentation::Immediate => wgpu::PresentMode::AutoNoVsync,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn smooth_never_falls_back_to_tearing() {
+        assert_eq!(
+            select_present_mode(
+                MotionPresentation::Smooth,
+                &[wgpu::PresentMode::Immediate, wgpu::PresentMode::Fifo]
+            ),
+            wgpu::PresentMode::Fifo
+        );
+        assert_eq!(
+            select_present_mode(
+                MotionPresentation::Smooth,
+                &[wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]
+            ),
+            wgpu::PresentMode::Mailbox
+        );
+        assert_eq!(
+            select_present_mode(MotionPresentation::Immediate, &[wgpu::PresentMode::Fifo]),
+            wgpu::PresentMode::AutoNoVsync
+        );
     }
 }
 

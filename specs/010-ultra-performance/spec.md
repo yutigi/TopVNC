@@ -1,5 +1,10 @@
 # Ultra performance mode
 
+> Historical implementation and measurements. The immediate per-band viewer
+> policy below is superseded by [Smooth gaming frames](../011-smooth-gaming/spec.md):
+> Ultra now publishes complete snapshots and defaults to synchronized motion.
+> Server Ultra behavior and the framebuffer conversion optimization remain.
+
 ## Goal and scope
 
 The requested target is **below 0.5 ms from physical input to visible remote

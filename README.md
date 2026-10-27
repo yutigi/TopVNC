@@ -10,7 +10,7 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 
 **Early development:**
 
-- **Viewer.** It was tested on Windows against a live macOS VNC server and on macOS against a live server on the local network, both before the 0.3 window rewrite. The rewritten viewer (winit and wgpu) has been run live on macOS against TopVNC's server, including pointer lock and the side buttons. On Windows it compiles but has not been run. The Linux build is untested.
+- **Viewer.** It was tested on Windows against a live macOS VNC server and on macOS against a live server on the local network, both before the 0.3 window rewrite. The rewritten viewer (winit and wgpu) has been run live on macOS against TopVNC's server, including pointer lock and the side buttons. The newer render worker has passed a synthetic Windows GPU test with 1080p uploads on a 240 Hz monitor; its live Windows-to-Mac gaming behavior remains unverified. The Linux build is untested.
 - **Windows server mode.** It compiles and links, and its platform-neutral logic is tested, but live desktop capture and input injection have not been verified (an earlier attempt outside an interactive desktop was denied with `0x80070005`).
 - **macOS server mode.** It has served a live display, and relative mouse motion from a viewer moved the Mac's pointer. Full remote control and unlocking are still under validation.
 - Linux hosting is not implemented.
@@ -27,7 +27,7 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
   - When the host hides its cursor, as games do while you aim, the viewer locks and hides its pointer and sends raw relative motion, so the camera turns freely. This uses the QEMU Pointer Motion Change extension.
   - **F8** or switching to another app releases the pointer.
   - The back and forward side buttons reach the host too (ExtendedMouseButtons).
-- **GPU presentation** with winit and wgpu. Each frame is presented as soon as it arrives, without waiting for vertical sync, and scaled on the GPU. Input is sent as the system delivers it.
+- **Coherent GPU presentation** with winit and wgpu. A dedicated render worker selects the latest complete frame, scales it on the GPU, and uses synchronized Smooth motion by default. Input is sent as the system delivers it, independently of GPU and vsync waits.
 - **Parallel encoding and decoding.** The server encodes a frame in bands on every core and sends each band as soon as it is ready. The viewer decodes JPEG bands in parallel.
 - **Keyboard and mouse input** for interacting with the remote desktop. Keys are sent by their position on a US keyboard, as games expect.
 - **Adjustable display** with fit-to-window or native pixels, smooth or sharp scaling, full screen, and 60 FPS, 120 FPS, or no presentation limit.
@@ -72,7 +72,9 @@ cargo run --release -- 127.0.0.1:5900 --window 1280x720
 | `--window WIDTHxHEIGHT` | Set a custom initial window size, such as `1280x720`. |
 | `--allow-insecure` | Explicitly allow a server offering unauthenticated `None` security. |
 | `--quality LEVEL` | JPEG quality level for Tight, from 0 (smallest) to 9 (best); default 6. Lower it on a slow link. The form shows the level and offers 3, 6, and 9 as presets. |
-| `--ultra` | Enable Ultra performance mode: upload each decoded region immediately and remove the local presentation cap. Also selectable in the connection form and F8 panel. |
+| `--ultra` | Enable Ultra performance mode: keep complete images coherent and remove the local FPS cap. Also selectable in the connection form and F8 panel. |
+| `--smooth-motion` | Synchronize presentation to the display, preferring Mailbox and otherwise Fifo; default. |
+| `--immediate` | Present without waiting for vertical sync where supported; may tear. |
 | `--input-debug` | Log outgoing key and pointer events for troubleshooting. |
 
 Do not use `--input-debug` while typing passwords: it logs key events.
@@ -108,18 +110,20 @@ The second and later commands listen on all network interfaces, and `--scale` se
 
 All modes send every requested dirty region, including background areas. Priority applies to TopVNC's built-in server and works with Raw and Tight; it does not configure a third-party VNC server. Focus modes use smaller rectangles, so compression and bandwidth can differ. No latency improvement has been measured yet.
 
-In the viewer, **F8 → Present updates → Progressive** shows incoming regions before the full update finishes. **Whole** (the default) waits until the complete update arrives. Progressive uploads the first decoded region immediately, batches subsequent regions at intervals of at least 8 ms while receiving data, and flushes remaining changes at update completion. Presentation still follows the viewer's frame limit. You can also enable it with `cargo run --release -- HOST:5900 --progressive`. For example, start the host with `cargo run --release -- --serve --priority center`, then enable Progressive in the viewer to see the center arrive first.
+In the viewer, **F8 → Present updates → Whole** (the default) and **Ultra** wait for a complete framebuffer update. **Progressive** explicitly permits partial images: it publishes the first decoded region immediately, batches subsequent regions at intervals of at least 8 ms, and publishes remaining changes at update completion. Those snapshots still follow the selected presentation policy and frame limit. Progressive can make camera motion look discontinuous; choose Whole or Ultra for coherent gaming images. `--progressive` remains available for experimenting with prioritized regions.
 
-**Ultra performance mode** uploads every decoded region immediately and presents without a local FPS cap. Choose **ULTRA: ON** in the connection form or **F8 → Present updates → Ultra**, or run:
+**Ultra performance mode** now hands off complete images and presents without an additional local FPS cap. Earlier Ultra versions displayed individual bands; that policy has been replaced because fast camera movement could show parts of different frames. Choose **ULTRA: ON** in the connection form or **F8 → Present updates → Ultra**, or run:
 
 ```sh
-cargo run --release -- HOST:5900 --ultra
+cargo run --release -- HOST:5900 --ultra --smooth-motion
 cargo run --release -- --serve --ultra
 ```
 
 The Server tab has its own **ULTRA: ON** choice, set before starting the host. Server Ultra flushes each encoded Tight band immediately and honors future pacing deadlines below 1 ms without deliberately rounding them up to 1 ms. The viewer's mode works with other servers too, but cannot change their capture or encoding behavior. Both ends retain normal authentication and flow control. Encoding, JPEG quality, and served resolution remain explicit choices.
 
-Ultra can increase texture uploads, GPU submissions, socket writes, CPU use, and tearing. Idle sessions still wait for events. Toggle Ultra off to restore the previous presentation cap and Whole/Progressive policy; choosing 60/120 FPS or Whole/Progressive also exits Ultra. These settings are not saved between launches.
+Keep **F8 → Smooth motion** selected for synchronized presentation. It uses Mailbox when the surface advertises it, otherwise Fifo (the Metal path); **Immediate** allows tearing where supported. GPU waits run on a separate thread so they do not block input. Ultra can increase GPU submissions, socket writes, CPU use, and bandwidth; it does not disable Smooth motion. Idle sessions still wait for events. Toggle Ultra off to restore the previous presentation cap and Whole/Progressive policy; choosing 60/120 FPS or Whole/Progressive also exits Ultra. These settings are not saved between launches.
+
+The decoder and renderer communicate through one pending image and two reusable CPU snapshot buffers. Newer complete frames replace unread ones and retain all changed areas, so a slow or occluded viewer does not accumulate stale frames. Buffer reuse copies changed/stale regions, rather than copying the entire image for every rectangle. Only the render worker writes the image texture. It acquires a display drawable before selecting the newest snapshot, so a vsync wait does not age an already selected frame. Raw server updates also snapshot changed pixels before transmission, preventing later capture rows from leaking into the current update.
 
 **Below 0.5 ms input-to-screen is an unachieved target.** Ultra does not guarantee it. Capture waits for an available desktop image, and GPU presentation can still depend on the driver and compositor. See [Microsoft's capture API](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-acquirenextframe) and [wgpu's presentation modes](https://docs.rs/wgpu/30.0.0/wgpu/enum.PresentMode.html). Physical input-to-visible-response requires measurement with real capture and display hardware.
 
@@ -147,8 +151,9 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 | F8 → Served size | Drag from **25% to 100%** in 1% steps; release to request the size from an updated TopVNC host. |
 | Fit / 1:1 pixels | Scale the remote image to the window while preserving its aspect ratio, or show native pixels, centered and cropped when necessary. |
 | Full screen | Switch the viewer to full screen and back. |
-| 60 FPS / 120 FPS / No limit | Cap local presentation. **No limit**, the default, presents every frame as it arrives. This does not set the server's frame rate. |
-| Ultra | Upload each decoded region immediately and present without a local FPS cap; click again to restore the prior settings. |
+| 60 FPS / 120 FPS / No limit | Cap local presentation. **No limit**, the default, adds no application FPS cap; Smooth motion still synchronizes to the display. This does not set the server's frame rate. |
+| Ultra | Publish complete images without an additional local FPS cap; click again to restore the prior settings. |
+| Smooth motion / Immediate | Synchronize presentation to the display, or permit immediate presentation and tearing. Separate from Smooth/Sharp image scaling. |
 | Smooth / Sharp | Choose the scaling appearance. |
 | Game mouse: Auto lock / Off | **Off** never locks the pointer: the viewer stops offering relative motion and the server sends absolute positions. |
 | F8 button size | Adjust the on-screen settings button from 0.5× to 2.0×. |
@@ -210,9 +215,10 @@ For playable results:
   | 3024×1964 (full) | 26.3 | 55.6 ms |
   | 1512×982 (half) | 60.3 | 13.6 ms |
 - **Read the title bar.** During a session, the viewer's title shows:
-  - frames per second, KB per frame, and Mbit/s;
+  - decoded FPS, KB per frame, and Mbit/s;
   - the encoding the server sends, and `push` when the server pushes frames;
-  - the mean time from queuing a texture upload to returning from GPU submission, labeled **upload to submit**. This excludes input, capture, transport, decode, GPU completion, and display scanout.
+  - rendered FPS, p95 frame-submission interval, and the selected GPU presentation mode;
+  - the mean time from publishing a completed snapshot to submission, labeled **ready to submit**, and the count of **superseded** unread snapshots. These are client-side measurements, excluding input, capture, transport, decode, GPU completion, and scanout.
 
   If it says Raw, the server does not support Tight; without `push`, every frame waits a round trip.
 
@@ -230,6 +236,15 @@ cargo run --release --example latency_bench -- --direct --mode tight6-push --siz
 
 The direct-loopback pipeline delivered 120 FPS in both modes. Across two runs each, Standard full-update publish-to-decode means were 4.10–4.18 ms, versus 3.97–4.16 ms for Ultra; this does not establish a meaningful pipeline improvement. These runs exclude physical input, desktop capture, texture uploads, GPU presentation, and screen scanout. First-marker latency, frame intervals, CPU time, peak process memory, and validation limits are recorded in [`specs/010-ultra-performance/spec.md`](specs/010-ultra-performance/spec.md). Ultra's live viewer/display latency has not been measured.
 
+The newer coherent-frame handoff is exercised separately with:
+
+```sh
+cargo run --release --example frame_pacing_bench
+cargo run --release --example frame_pacing_bench -- --stall-ms 50
+```
+
+This is a CPU handoff stress test, not a network or display benchmark: 1080p, a 240 Hz producer, a 120 Hz consumer, and deliberate consumer stalls. It checks frame coherence and the two-buffer bound, and reports frame age, intervals including their maximum, and superseded snapshots. On the test Windows machine it delivered 120 FPS without mixed frames in the unstalled run. The dedicated render worker also passed an interactive Windows GPU smoke test with 1080p uploads on a 240 Hz monitor. Neither result validates Metal presentation or live game latency on a Mac. See [`specs/011-smooth-gaming/spec.md`](specs/011-smooth-gaming/spec.md) for the measured costs and validation limits.
+
 ### Playing fast games
 
 Shooters such as Fortnite need mouse look, which works only with TopVNC's server on both ends (or another server with the QEMU Pointer Motion Change extension). On top of TopVNC's own latency:
@@ -238,7 +253,7 @@ Shooters such as Fortnite need mouse look, which works only with TopVNC's server
 - **Cap the game's frame rate a little below what the host's GPU can sustain.** Capture copies frames on the same GPU, and a GPU at 100% makes each capture wait behind the game's rendering.
 - **Play in borderless windowed mode,** which Desktop Duplication captures most reliably.
 - **Use a wired connection for the host.** On Wi-Fi, choose **Low** (Tight quality 3) or `--quality 4`, or serve a high-resolution display at a reduced size.
-- **In the viewer,** use full screen and **No limit**. On macOS, turn off *Pointer acceleration* (System Settings → Mouse) so the same hand motion always turns the camera the same amount. Set sensitivity in the game.
+- **In the viewer,** use full screen, **Whole** or **Ultra**, and **Smooth motion** for coherent images synchronized to the display. **No limit** removes an extra application FPS cap; it still respects Smooth motion. On macOS, turn off *Pointer acceleration* (System Settings → Mouse) so the same hand motion always turns the camera the same amount. Set sensitivity in the game.
 - **If the camera does not turn** because the game hides its cursor in a way Windows does not report, choose **Relative** under *Game mouse* in the host's Server tab, or start it with `--mouse relative`. Mac hosts always need Relative for mouse look.
 
 These settings and the Windows host's mouse handling have not yet been validated with a live game.
@@ -327,7 +342,9 @@ cargo run
 | [`src/lib.rs`](src/lib.rs) | Reusable RFB protocol handling, authentication, decoding, framebuffer state, and session logic. |
 | [`src/tight.rs`](src/tight.rs) | Tight encoding: the server's Fill, palette, JPEG, and zlib encoder and the client decoder. |
 | [`src/main.rs`](src/main.rs) | Native application, connection and session loops, input handling, and pointer lock. |
-| [`src/window.rs`](src/window.rs) | winit event loop and wgpu presentation: windows, frame textures, and presenting without waiting for vertical sync. |
+| [`src/window.rs`](src/window.rs) | winit event loop, wgpu textures and surfaces, and synchronized or immediate presentation. |
+| [`src/presentation.rs`](src/presentation.rs) | Platform-neutral incremental frame mailbox and bounded frame-pacing statistics. |
+| [`src/session_render.rs`](src/session_render.rs) | Dedicated session render worker, separate from input and protocol decoding. |
 | [`src/ui.rs`](src/ui.rs) | Connect, Server, Work, Network, and Firewall tabs and in-session settings UI. |
 | [`src/helpers.rs`](src/helpers.rs) | Windows helper forms, script resolution, bounded background execution, and reports. |
 | [`src/settings.rs`](src/settings.rs) | Saved connection details and platform-specific password storage. |
@@ -337,6 +354,7 @@ cargo run
 | [`build.rs`](build.rs) | Weak-links ScreenCaptureKit so the app still starts on macOS releases older than 12.3. |
 | [`examples/latency_bench.rs`](examples/latency_bench.rs) | End-to-end frame rate and latency benchmark over an emulated network link. |
 | [`examples/framebuffer_bench.rs`](examples/framebuffer_bench.rs) | CPU framebuffer conversion comparison; excludes codecs, network, and display. |
+| [`examples/frame_pacing_bench.rs`](examples/frame_pacing_bench.rs) | Coherent-frame handoff under fast producers and stalled consumers; excludes network and GPU. |
 | [`tools/screen_latency.swift`](tools/screen_latency.swift) | macOS tool that measures the time until benchmark frames are displayed in a viewer window. |
 | [`specs/004-vnc-server/spec.md`](specs/004-vnc-server/spec.md) | Server scope, security behavior, and limitations. |
 | [`specs/`](specs/) | Feature scope and acceptance criteria. |
