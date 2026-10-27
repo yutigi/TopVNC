@@ -56,6 +56,8 @@ pub struct Config {
     /// RFB JPEG quality level, 0 (smallest) to 9 (best), used with Tight.
     pub jpeg_quality: u8,
     pub ui_scale: f32,
+    /// Show detailed session statistics in the title bar.
+    pub debug: bool,
     /// Lock the pointer and send relative motion when the host asks, as it
     /// does while a game hides the cursor.
     pub relative_mouse: bool,
@@ -81,6 +83,7 @@ impl Default for Config {
             compression: Compression::Tight,
             jpeg_quality: DEFAULT_JPEG_QUALITY,
             ui_scale: 1.0,
+            debug: false,
             relative_mouse: true,
             progressive: false,
             serve: ServeForm::default(),
@@ -1794,10 +1797,16 @@ pub const LIVE_MOTION_IMMEDIATE: Box2 = Box2 {
     w: 190,
     h: 24,
 };
-pub const DISCONNECT: Box2 = Box2 {
+pub const LIVE_DEBUG: Box2 = Box2 {
     x: 24,
     y: 656,
-    w: 392,
+    w: 190,
+    h: 42,
+};
+pub const DISCONNECT: Box2 = Box2 {
+    x: 226,
+    y: 656,
+    w: 190,
     h: 42,
 };
 const SLIDER_LEFT: usize = 36;
@@ -1971,6 +1980,15 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool, serve_scale
     canvas.text(24, track_y + 26, "0.5X", MUTED, 1);
     canvas.text(384, track_y + 26, "2X", MUTED, 1);
     canvas.text(24, 634, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
+    canvas.button(
+        LIVE_DEBUG,
+        if config.debug {
+            "DEBUG: ON"
+        } else {
+            "DEBUG: OFF"
+        },
+        config.debug,
+    );
     canvas.button(DISCONNECT, "DISCONNECT", false);
 }
 

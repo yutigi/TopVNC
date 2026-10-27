@@ -16,7 +16,10 @@ fn main() -> io::Result<()> {
     let mut pixels = vec![ui::BG; width * height];
     ui::overlay(
         &mut ui::Canvas::new(&mut pixels, width, height),
-        &ui::Config::default(),
+        &ui::Config {
+            debug: std::env::args().any(|arg| arg == "--debug"),
+            ..ui::Config::default()
+        },
         true,
         if std::env::args().any(|arg| arg == "--unavailable") {
             None

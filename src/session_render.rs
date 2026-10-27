@@ -22,6 +22,7 @@ pub struct RenderOptions {
     pub progressive: bool,
     pub relative_mouse: bool,
     pub ui_scale: f32,
+    pub debug: bool,
     pub open: bool,
     pub locked: bool,
     pub occluded: bool,
@@ -43,6 +44,7 @@ impl RenderOptions {
             progressive: config.progressive,
             relative_mouse: config.relative_mouse,
             ui_scale: config.ui_scale,
+            debug: config.debug,
             open: false,
             locked: false,
             occluded: false,
@@ -62,6 +64,7 @@ impl RenderOptions {
             progressive: self.progressive,
             relative_mouse: self.relative_mouse,
             ui_scale: self.ui_scale,
+            debug: self.debug,
             ..Config::default()
         }
     }
