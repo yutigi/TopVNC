@@ -1,6 +1,6 @@
 use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, MouseMode, normalize_serve_scale};
 use crate::helpers::{Helper, HelperForm, HelperRuntime};
-use topvnc::UpdatePriority;
+use topvnc::{PerformanceMode, UpdatePriority};
 use winit::keyboard::KeyCode;
 
 pub const BG: u32 = 0x0b1020;
@@ -39,6 +39,7 @@ pub const DEFAULT_JPEG_QUALITY: u8 = 6;
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub performance: PerformanceMode,
     pub host: String,
     pub port: String,
     pub password: String,
@@ -65,6 +66,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            performance: PerformanceMode::Standard,
             host: String::new(),
             port: "5900".into(),
             password: String::new(),
@@ -106,6 +108,7 @@ pub const ALL_NETWORKS_HOST: &str = "0.0.0.0";
 /// The Server tab form. Like the client's security choices, it is never saved.
 #[derive(Clone, Debug)]
 pub struct ServeForm {
+    pub performance: PerformanceMode,
     pub host: String,
     pub port: String,
     pub password: String,
@@ -121,6 +124,7 @@ pub struct ServeForm {
 impl Default for ServeForm {
     fn default() -> Self {
         Self {
+            performance: PerformanceMode::Standard,
             host: LOCAL_ONLY_HOST.into(),
             port: "5900".into(),
             password: String::new(),
@@ -136,6 +140,7 @@ impl Default for ServeForm {
 /// A validated request to start serving this desktop.
 #[derive(Debug, PartialEq)]
 pub struct ServeRequest {
+    pub performance: PerformanceMode,
     pub address: String,
     /// 1-based display number; `None` serves the primary display.
     pub display: Option<usize>,
@@ -172,6 +177,7 @@ impl ServeForm {
             Some(self.password.clone())
         };
         Ok(ServeRequest {
+            performance: self.performance,
             address,
             display,
             password,
@@ -211,6 +217,23 @@ pub struct ServerView {
 }
 
 impl Config {
+    pub fn presentation_interval(&self) -> std::time::Duration {
+        if self.performance == PerformanceMode::Ultra || self.fps == 0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs_f64(1.0 / self.fps as f64)
+        }
+    }
+
+    /// 0 = whole, 1 = progressive batching, 2 = immediate Ultra uploads.
+    pub fn upload_policy(&self) -> u8 {
+        if self.performance == PerformanceMode::Ultra {
+            2
+        } else {
+            u8::from(self.progressive)
+        }
+    }
+
     pub fn address(&self) -> Result<String, String> {
         let address = socket_address(&self.host, &self.port, "Enter a valid server address.")?;
         if self.window_mode == WindowMode::Custom {
@@ -527,6 +550,13 @@ impl<'a> Canvas<'a> {
         );
     }
 }
+
+pub const ULTRA_MODE: Box2 = Box2 {
+    x: 520,
+    y: 66,
+    w: 238,
+    h: 32,
+};
 
 pub const HOST: Box2 = Box2 {
     x: 40,
@@ -1270,6 +1300,7 @@ fn helper_tab(
 
 fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connecting: bool) {
     canvas.text(42, 76, "CONNECT TO A REMOTE DESKTOP", MUTED, 2);
+    ultra_button(canvas, ULTRA_MODE, config.performance);
     canvas.label(40, 108, "SERVER ADDRESS");
     canvas.label(548, 108, "PORT");
     canvas.field(
@@ -1332,9 +1363,21 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
     );
     canvas.label(40, 456, "FRAME LIMIT");
     canvas.label(420, 456, "SCALING");
-    canvas.button(FPS60, "60 FPS", config.fps == 60);
-    canvas.button(FPS120, "120 FPS", config.fps == 120);
-    canvas.button(FPS_NO_LIMIT, "NO LIMIT", config.fps == 0);
+    canvas.button(
+        FPS60,
+        "60 FPS",
+        config.fps == 60 && config.performance == PerformanceMode::Standard,
+    );
+    canvas.button(
+        FPS120,
+        "120 FPS",
+        config.fps == 120 && config.performance == PerformanceMode::Standard,
+    );
+    canvas.button(
+        FPS_NO_LIMIT,
+        "NO LIMIT",
+        config.presentation_interval().is_zero(),
+    );
     canvas.button(SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(SHARP, "SHARP", config.quality == Quality::Sharp);
     if let Some(error) = &state.error {
@@ -1356,6 +1399,7 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
 
 fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server: &ServerView) {
     canvas.text(42, 76, "SHARE THIS DESKTOP OVER VNC", MUTED, 2);
+    ultra_button(canvas, ULTRA_MODE, form.performance);
     canvas.label(40, 108, "LISTEN ADDRESS");
     canvas.label(548, 108, "PORT");
     canvas.field(
@@ -1714,13 +1758,19 @@ pub const LIVE_MOUSE_OFF: Box2 = Box2 {
 pub const LIVE_WHOLE_UPDATE: Box2 = Box2 {
     x: 24,
     y: 480,
-    w: 190,
+    w: 110,
     h: 38,
 };
 pub const LIVE_PROGRESSIVE: Box2 = Box2 {
-    x: 226,
+    x: 146,
     y: 480,
-    w: 190,
+    w: 158,
+    h: 38,
+};
+pub const LIVE_ULTRA: Box2 = Box2 {
+    x: 316,
+    y: 480,
+    w: 100,
     h: 38,
 };
 pub const SCALE_SLIDER: Box2 = Box2 {
@@ -1755,6 +1805,11 @@ pub const SETTINGS_PANEL: Box2 = Box2 {
     w: 432,
     h: 694,
 };
+
+fn ultra_button(canvas: &mut Canvas<'_>, area: Box2, performance: PerformanceMode) {
+    let ultra = performance == PerformanceMode::Ultra;
+    canvas.button(area, if ultra { "ULTRA: ON" } else { "ULTRA: OFF" }, ultra);
+}
 
 pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool, serve_scale: Option<u8>) {
     if !open {
@@ -1832,9 +1887,21 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool, serve_scale
         canvas.text(24, 230, "REQUIRES AN UPDATED TOPVNC HOST", MUTED, 1);
     }
     canvas.text(24, 246, "FRAME LIMIT", ACCENT, 2);
-    canvas.button(LIVE_60, "60 FPS", config.fps == 60);
-    canvas.button(LIVE_120, "120 FPS", config.fps == 120);
-    canvas.button(LIVE_NO_LIMIT, "NO LIMIT", config.fps == 0);
+    canvas.button(
+        LIVE_60,
+        "60 FPS",
+        config.fps == 60 && config.performance == PerformanceMode::Standard,
+    );
+    canvas.button(
+        LIVE_120,
+        "120 FPS",
+        config.fps == 120 && config.performance == PerformanceMode::Standard,
+    );
+    canvas.button(
+        LIVE_NO_LIMIT,
+        "NO LIMIT",
+        config.presentation_interval().is_zero(),
+    );
     canvas.text(24, 316, "SCALING", ACCENT, 2);
     canvas.button(LIVE_SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(LIVE_SHARP, "SHARP", config.quality == Quality::Sharp);
@@ -1842,8 +1909,9 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool, serve_scale
     canvas.button(LIVE_MOUSE_AUTO, "AUTO LOCK", config.relative_mouse);
     canvas.button(LIVE_MOUSE_OFF, "OFF", !config.relative_mouse);
     canvas.text(24, 456, "PRESENT UPDATES", ACCENT, 2);
-    canvas.button(LIVE_WHOLE_UPDATE, "WHOLE", !config.progressive);
-    canvas.button(LIVE_PROGRESSIVE, "PROGRESSIVE", config.progressive);
+    canvas.button(LIVE_WHOLE_UPDATE, "WHOLE", config.upload_policy() == 0);
+    canvas.button(LIVE_PROGRESSIVE, "PROGRESSIVE", config.upload_policy() == 1);
+    canvas.button(LIVE_ULTRA, "ULTRA", config.upload_policy() == 2);
     canvas.text(24, 552, "F8 BUTTON SIZE", ACCENT, 2);
     canvas.text(330, 552, &format!("{:.2}X", config.ui_scale), TEXT, 2);
     let track_y = SCALE_SLIDER.y + 19;
@@ -1949,6 +2017,42 @@ fn glyph(c: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ultra_overrides_pacing_and_preserves_user_settings_and_security() {
+        let mut config = Config {
+            fps: 60,
+            progressive: true,
+            ..Config::default()
+        };
+        let interval = config.presentation_interval();
+        assert_eq!(config.upload_policy(), 1);
+        config.performance = PerformanceMode::Ultra;
+        assert_eq!(config.presentation_interval(), std::time::Duration::ZERO);
+        assert_eq!(config.upload_policy(), 2);
+        assert_eq!(config.fps, 60);
+        assert!(!config.allow_insecure);
+        config.performance = PerformanceMode::Standard;
+        assert_eq!(config.presentation_interval(), interval);
+        assert_eq!(config.upload_policy(), 1);
+
+        let form = ServeForm {
+            performance: PerformanceMode::Ultra,
+            ..ServeForm::default()
+        };
+        assert!(form.request().is_err());
+        let form = ServeForm {
+            password: "secret".into(),
+            ..form
+        };
+        assert_eq!(form.request().unwrap().performance, PerformanceMode::Ultra);
+        assert!(!form.request().unwrap().allow_insecure);
+        const {
+            assert!(LIVE_WHOLE_UPDATE.x + LIVE_WHOLE_UPDATE.w < LIVE_PROGRESSIVE.x);
+            assert!(LIVE_PROGRESSIVE.x + LIVE_PROGRESSIVE.w < LIVE_ULTRA.x);
+            assert!(LIVE_ULTRA.x + LIVE_ULTRA.w <= SETTINGS_PANEL.x + SETTINGS_PANEL.w);
+        }
+    }
 
     #[test]
     fn server_priority_buttons_fit_and_reach_the_host_request() {

@@ -220,6 +220,7 @@ pub fn serve(
         scale,
         mouse,
         priority,
+        performance,
     } = options;
     require_supported_macos()?;
     require_screen_recording()?;
@@ -244,6 +245,7 @@ pub fn serve(
     }
     let config = ServerConfig {
         priority,
+        performance,
         name: "TopVNC macOS Desktop".into(),
         password,
         allow_insecure,

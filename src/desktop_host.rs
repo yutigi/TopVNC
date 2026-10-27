@@ -8,12 +8,12 @@ use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
-use topvnc::UpdatePriority;
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
     BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, MAX_FRAMEBUFFER_DIMENSION,
     MAX_FRAMEBUFFER_PIXELS,
 };
+use topvnc::{PerformanceMode, UpdatePriority};
 
 pub const MAX_HELD_KEYS_PER_CLIENT: usize = 256;
 /// Largest clipboard text accepted from the host system, in characters.
@@ -24,7 +24,7 @@ pub const WHEEL_DELTA: i32 = 120;
 pub const CAPTURE_RETRY_MIN: Duration = Duration::from_millis(250);
 pub const CAPTURE_RETRY_MAX: Duration = Duration::from_secs(2);
 
-pub const SERVE_USAGE: &str = "usage: topvnc --serve [HOST:PORT] [--display NUMBER] [--scale 0.25-1] [--mouse auto|relative|absolute] [--priority whole|center|mouse|changes] [--allow-insecure]";
+pub const SERVE_USAGE: &str = "usage: topvnc --serve [HOST:PORT] [--display NUMBER] [--scale 0.25-1] [--mouse auto|relative|absolute] [--priority whole|center|mouse|changes] [--ultra] [--allow-insecure]";
 
 /// The smallest served size, as a fraction of the display's pixel size.
 pub const MIN_SERVE_SCALE: f32 = 0.25;
@@ -32,6 +32,7 @@ pub const MIN_SERVE_SCALE: f32 = 0.25;
 /// Options for `topvnc --serve`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServeOptions {
+    pub performance: PerformanceMode,
     pub address: String,
     /// 1-based display number; `None` serves the primary display.
     pub display: Option<usize>,
@@ -233,6 +234,7 @@ impl std::fmt::Display for ServerNotice {
 
 pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'static str> {
     let mut options = ServeOptions {
+        performance: PerformanceMode::Standard,
         address: "127.0.0.1:5900".to_owned(),
         display: None,
         allow_insecure: false,
@@ -247,6 +249,7 @@ pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'sta
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--ultra" => options.performance = PerformanceMode::Ultra,
             "--allow-insecure" => options.allow_insecure = true,
             "--display" if options.display.is_none() => {
                 let number = arguments
@@ -1487,10 +1490,14 @@ mod tests {
 
     #[test]
     fn serve_arguments_select_address_display_and_security() {
+        let ultra = parse_serve_arguments(&arguments(&["--ultra"])).unwrap();
+        assert_eq!(ultra.performance, PerformanceMode::Ultra);
+        assert!(!ultra.allow_insecure);
         assert_eq!(
             parse_serve_arguments(&[]),
             Ok(ServeOptions {
                 address: "127.0.0.1:5900".into(),
+                performance: PerformanceMode::Standard,
                 display: None,
                 allow_insecure: false,
                 scale: 1.0,
@@ -1507,6 +1514,7 @@ mod tests {
             ])),
             Ok(ServeOptions {
                 address: "0.0.0.0:5901".into(),
+                performance: PerformanceMode::Standard,
                 display: Some(2),
                 allow_insecure: true,
                 scale: 1.0,

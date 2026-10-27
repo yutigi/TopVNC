@@ -653,11 +653,21 @@ pub enum UpdatePriority {
     Changes,
 }
 
+/// Opt-in latency policy. Ultra trades additional uploads and socket writes
+/// for earlier delivery; it does not guarantee end-to-end display latency.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PerformanceMode {
+    #[default]
+    Standard,
+    Ultra,
+}
+
 /// Configuration for the embedded RFB server. Password authentication is the
 /// default; `None` security must be selected explicitly.
 #[derive(Clone)]
 pub struct ServerConfig {
     pub priority: UpdatePriority,
+    pub performance: PerformanceMode,
     pub name: String,
     pub password: Option<String>,
     pub allow_insecure: bool,
@@ -671,6 +681,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             priority: UpdatePriority::Whole,
+            performance: PerformanceMode::Standard,
             name: "TopVNC".into(),
             password: None,
             allow_insecure: false,
@@ -1135,6 +1146,7 @@ impl VncServer {
                 clipboard: Arc::clone(&self.clipboard),
                 thread_setup: self.config.thread_setup,
                 priority: self.config.priority,
+                performance: self.config.performance,
                 focus: Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
             };
             let events = self.events.clone();
@@ -1276,6 +1288,7 @@ fn send_pending_clipboard(
 /// Server state every client session uses.
 struct SessionShared {
     priority: UpdatePriority,
+    performance: PerformanceMode,
     focus: Arc<std::sync::atomic::AtomicU32>,
     framebuffer: Arc<Mutex<ServerFramebuffer>>,
     geometry: Arc<Geometry>,
@@ -1858,6 +1871,28 @@ impl FlowControl {
     }
 }
 
+/// Wait for work or a future pacing deadline. An expired link deadline is
+/// irrelevant once there are no changed pixels: wait for the next wake-up.
+fn server_wait_timeout(
+    performance: PerformanceMode,
+    mut timeout: Duration,
+    continuous: bool,
+    window: SendWindow,
+    now: Instant,
+) -> Duration {
+    if continuous
+        && let SendWindow::OpensAt(at) = window
+        && (performance == PerformanceMode::Standard || at > now)
+    {
+        timeout = timeout.min(at.saturating_duration_since(now));
+    }
+    if performance == PerformanceMode::Standard || timeout.is_zero() {
+        timeout.max(Duration::from_millis(1))
+    } else {
+        timeout
+    }
+}
+
 fn write_client_updates(
     stream: &mut TcpStream,
     session: &SessionShared,
@@ -1887,6 +1922,7 @@ fn write_client_updates(
     let mut announced_scale = 0;
     let mut encoder = SessionEncoder {
         priority: session.priority,
+        performance: session.performance,
         focus: Arc::clone(&session.focus),
         relative: Arc::clone(&session.relative_pointer),
         pool: None,
@@ -2034,12 +2070,14 @@ fn write_client_updates(
         {
             timeout = waiting.deadline.saturating_duration_since(now);
         }
-        if continuous.is_some()
-            && let SendWindow::OpensAt(at) = window
-        {
-            timeout = timeout.min(at.saturating_duration_since(now));
-        }
-        match receiver.recv_timeout(timeout.max(Duration::from_millis(1))) {
+        timeout = server_wait_timeout(
+            session.performance,
+            timeout,
+            continuous.is_some(),
+            window,
+            now,
+        );
+        match receiver.recv_timeout(timeout) {
             Ok(SessionInput::PixelFormat(format)) => pixel_format = format,
             Ok(SessionInput::Encodings(advertised)) => {
                 if advertised.extended_mouse_buttons && !encodings.extended_mouse_buttons {
@@ -2812,6 +2850,7 @@ fn encoder_threads() -> usize {
 /// A session's encoder threads, started on first use.
 struct SessionEncoder {
     priority: UpdatePriority,
+    performance: PerformanceMode,
     focus: Arc<std::sync::atomic::AtomicU32>,
     relative: Arc<AtomicBool>,
     pool: Option<EncodePool>,
@@ -2888,7 +2927,9 @@ fn write_tight_update(
             output.extend_from_slice(body);
             // Send bands as they become ready, so transmission overlaps the
             // encoding of the rest.
-            if output.len() >= SERVER_STREAM_FLUSH_BYTES {
+            if encoder.performance == PerformanceMode::Ultra
+                || output.len() >= SERVER_STREAM_FLUSH_BYTES
+            {
                 stream.write_all(output)?;
                 written += output.len();
                 output.clear();
@@ -3162,13 +3203,15 @@ impl Framebuffer {
         if bytes.len() != row_width * usize::from(height) * 4 {
             return Err(invalid("raw rectangle has incorrect byte length"));
         }
-        for row in 0..usize::from(height) {
-            let dest_start = (usize::from(y) + row) * self.width() + usize::from(x);
-            let source_start = row * row_width * 4;
-            for col in 0..row_width {
-                let pixel = &bytes[source_start + col * 4..source_start + col * 4 + 4];
-                self.pixels[dest_start + col] =
-                    (u32::from(pixel[2]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[0]);
+        let stride = self.width();
+        for (row, source) in bytes.chunks_exact(row_width * 4).enumerate() {
+            let dest_start = (usize::from(y) + row) * stride + usize::from(x);
+            let target = &mut self.pixels[dest_start..dest_start + row_width];
+            // Validated row slices let the compiler vectorize the conversion
+            // without a separate bounds check for each pixel. Wire byte 3 is
+            // padding, even when a server sends a nonzero value there.
+            for (pixel, bgra) in target.iter_mut().zip(source.chunks_exact(4)) {
+                *pixel = u32::from_le_bytes([bgra[0], bgra[1], bgra[2], 0]);
             }
         }
         Ok(())
@@ -4003,6 +4046,7 @@ mod tests {
             clipboard: Arc::new(Mutex::new(ServerClipboard::default())),
             thread_setup: None,
             priority: UpdatePriority::Whole,
+            performance: PerformanceMode::Standard,
             focus: Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
         }
     }
@@ -4029,11 +4073,121 @@ mod tests {
     fn priority_encoder(priority: UpdatePriority) -> SessionEncoder {
         SessionEncoder {
             priority,
+            performance: PerformanceMode::Standard,
             focus: Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
             relative: Arc::new(AtomicBool::new(false)),
             pool: None,
             thread_setup: None,
         }
+    }
+
+    #[test]
+    fn ultra_honors_submillisecond_deadlines_without_idle_polling() {
+        let now = Instant::now();
+        let idle = SERVER_IDLE_WAKE_INTERVAL;
+        let future = SendWindow::OpensAt(now + Duration::from_micros(200));
+        assert_eq!(
+            server_wait_timeout(PerformanceMode::Ultra, idle, true, future, now),
+            Duration::from_micros(200)
+        );
+        assert_eq!(
+            server_wait_timeout(PerformanceMode::Standard, idle, true, future, now),
+            Duration::from_millis(1)
+        );
+        for window in [
+            SendWindow::Open,
+            SendWindow::Closed,
+            SendWindow::OpensAt(now),
+        ] {
+            assert_eq!(
+                server_wait_timeout(PerformanceMode::Ultra, idle, true, window, now),
+                idle
+            );
+        }
+        assert_eq!(
+            server_wait_timeout(PerformanceMode::Ultra, idle, false, future, now),
+            idle
+        );
+        assert_eq!(
+            server_wait_timeout(
+                PerformanceMode::Ultra,
+                Duration::ZERO,
+                false,
+                SendWindow::Open,
+                now
+            ),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn ultra_server_preserves_authentication_pixels_and_input() {
+        let mut source = Framebuffer::new(128, 128).unwrap();
+        for (index, pixel) in source.pixels_mut().iter_mut().enumerate() {
+            *pixel = if index % 128 < 64 { 0x123456 } else { 0xabcdef };
+        }
+        let server = Arc::new(
+            VncServer::bind(
+                "127.0.0.1:0",
+                source.clone(),
+                ServerConfig {
+                    performance: PerformanceMode::Ultra,
+                    priority: UpdatePriority::Center,
+                    password: Some("secret".into()),
+                    ..ServerConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let runner = Arc::clone(&server);
+        let serving = std::thread::spawn(move || runner.run());
+        let mut client = Session::connect_with_encoding(
+            &server.local_addr().unwrap().to_string(),
+            false,
+            Encoding::Tight { quality: 6 },
+            || Ok("secret".into()),
+        )
+        .unwrap();
+        assert_eq!(client.info.security, Security::VncPassword);
+        let writer = client.writer();
+        let mut received = Framebuffer::new(128, 128).unwrap();
+        writer.request_update(false, 128, 128).unwrap();
+        read_until_pixels(&mut client, &mut Vec::new(), &mut received, true);
+        assert_eq!(received.pixels(), source.pixels());
+        writer.key(0x61, true).unwrap();
+        assert!(matches!(
+            server.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+            ClientEvent::Key {
+                keysym: 0x61,
+                down: true,
+                ..
+            }
+        ));
+        writer.shutdown().unwrap();
+        server.stop();
+        serving.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn raw_conversion_handles_unaligned_partial_rows_and_rejects_bad_payloads() {
+        let mut image = Framebuffer::new(4, 3).unwrap();
+        image.pixels_mut().fill(0x112233);
+        let bytes = [99, 1, 2, 3, 255, 4, 5, 6, 128, 7, 8, 9, 77, 10, 11, 12, 66];
+        image.apply_raw(1, 1, 2, 2, &bytes[1..]).unwrap();
+        assert_eq!(
+            image.pixels(),
+            &[
+                0x112233, 0x112233, 0x112233, 0x112233, 0x112233, 0x030201, 0x060504, 0x112233,
+                0x112233, 0x090807, 0x0c0b0a, 0x112233,
+            ]
+        );
+        let before = image.pixels().to_vec();
+        for length in [0, 15, 17] {
+            assert!(image.apply_raw(1, 1, 2, 2, &bytes[..length]).is_err());
+            assert_eq!(image.pixels(), before);
+        }
+        assert!(image.apply_raw(3, 1, 2, 2, &bytes[1..]).is_err());
+        assert_eq!(image.pixels(), before);
     }
 
     #[test]
