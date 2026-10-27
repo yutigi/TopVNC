@@ -1,5 +1,7 @@
 use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, MouseMode, normalize_serve_scale};
 use crate::helpers::{Helper, HelperForm, HelperRuntime};
+use topvnc::presentation::MotionPresentation;
+use topvnc::{PerformanceMode, UpdatePriority};
 use winit::keyboard::KeyCode;
 
 pub const BG: u32 = 0x0b1020;
@@ -38,6 +40,8 @@ pub const DEFAULT_JPEG_QUALITY: u8 = 6;
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub performance: PerformanceMode,
+    pub motion: MotionPresentation,
     pub host: String,
     pub port: String,
     pub password: String,
@@ -52,9 +56,13 @@ pub struct Config {
     /// RFB JPEG quality level, 0 (smallest) to 9 (best), used with Tight.
     pub jpeg_quality: u8,
     pub ui_scale: f32,
+    /// Show detailed session statistics in the title bar.
+    pub debug: bool,
     /// Lock the pointer and send relative motion when the host asks, as it
     /// does while a game hides the cursor.
     pub relative_mouse: bool,
+    /// Present partial updates as rectangles arrive.
+    pub progressive: bool,
     pub serve: ServeForm,
     pub helpers: HelperForm,
 }
@@ -62,6 +70,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            performance: PerformanceMode::Standard,
+            motion: MotionPresentation::Smooth,
             host: String::new(),
             port: "5900".into(),
             password: String::new(),
@@ -73,7 +83,9 @@ impl Default for Config {
             compression: Compression::Tight,
             jpeg_quality: DEFAULT_JPEG_QUALITY,
             ui_scale: 1.0,
+            debug: false,
             relative_mouse: true,
+            progressive: false,
             serve: ServeForm::default(),
             helpers: HelperForm::default(),
         }
@@ -102,6 +114,7 @@ pub const ALL_NETWORKS_HOST: &str = "0.0.0.0";
 /// The Server tab form. Like the client's security choices, it is never saved.
 #[derive(Clone, Debug)]
 pub struct ServeForm {
+    pub performance: PerformanceMode,
     pub host: String,
     pub port: String,
     pub password: String,
@@ -111,11 +124,13 @@ pub struct ServeForm {
     pub scale: f32,
     /// When viewers are asked for relative pointer motion.
     pub mouse: MouseMode,
+    pub priority: UpdatePriority,
 }
 
 impl Default for ServeForm {
     fn default() -> Self {
         Self {
+            performance: PerformanceMode::Standard,
             host: LOCAL_ONLY_HOST.into(),
             port: "5900".into(),
             password: String::new(),
@@ -123,6 +138,7 @@ impl Default for ServeForm {
             allow_insecure: false,
             scale: 1.0,
             mouse: MouseMode::Auto,
+            priority: UpdatePriority::Whole,
         }
     }
 }
@@ -130,6 +146,7 @@ impl Default for ServeForm {
 /// A validated request to start serving this desktop.
 #[derive(Debug, PartialEq)]
 pub struct ServeRequest {
+    pub performance: PerformanceMode,
     pub address: String,
     /// 1-based display number; `None` serves the primary display.
     pub display: Option<usize>,
@@ -139,6 +156,7 @@ pub struct ServeRequest {
     /// Served size as a fraction of the display's pixel size.
     pub scale: f32,
     pub mouse: MouseMode,
+    pub priority: UpdatePriority,
 }
 
 impl ServeForm {
@@ -165,12 +183,14 @@ impl ServeForm {
             Some(self.password.clone())
         };
         Ok(ServeRequest {
+            performance: self.performance,
             address,
             display,
             password,
             allow_insecure: self.allow_insecure,
             scale: normalize_serve_scale(self.scale),
             mouse: self.mouse,
+            priority: self.priority,
         })
     }
 }
@@ -203,6 +223,23 @@ pub struct ServerView {
 }
 
 impl Config {
+    pub fn presentation_interval(&self) -> std::time::Duration {
+        if self.performance == PerformanceMode::Ultra || self.fps == 0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs_f64(1.0 / self.fps as f64)
+        }
+    }
+
+    /// 0 = whole, 1 = progressive batching, 2 = coherent Ultra updates.
+    pub fn upload_policy(&self) -> u8 {
+        if self.performance == PerformanceMode::Ultra {
+            2
+        } else {
+            u8::from(self.progressive)
+        }
+    }
+
     pub fn address(&self) -> Result<String, String> {
         let address = socket_address(&self.host, &self.port, "Enter a valid server address.")?;
         if self.window_mode == WindowMode::Custom {
@@ -519,6 +556,13 @@ impl<'a> Canvas<'a> {
         );
     }
 }
+
+pub const ULTRA_MODE: Box2 = Box2 {
+    x: 520,
+    y: 66,
+    w: 238,
+    h: 32,
+};
 
 pub const HOST: Box2 = Box2 {
     x: 40,
@@ -842,6 +886,49 @@ pub const SERVE_DISPLAY: Box2 = Box2 {
     w: 210,
     h: 40,
 };
+pub const SERVE_PRIORITY: [(Box2, UpdatePriority, &str); 4] = [
+    (
+        Box2 {
+            x: 190,
+            y: 428,
+            w: 150,
+            h: 26,
+        },
+        UpdatePriority::Whole,
+        "WHOLE",
+    ),
+    (
+        Box2 {
+            x: 348,
+            y: 428,
+            w: 125,
+            h: 26,
+        },
+        UpdatePriority::Center,
+        "CENTER",
+    ),
+    (
+        Box2 {
+            x: 481,
+            y: 428,
+            w: 125,
+            h: 26,
+        },
+        UpdatePriority::Mouse,
+        "MOUSE",
+    ),
+    (
+        Box2 {
+            x: 614,
+            y: 428,
+            w: 144,
+            h: 26,
+        },
+        UpdatePriority::Changes,
+        "CHANGES",
+    ),
+];
+
 /// The `--mouse` choices: when viewers are asked for relative motion.
 pub const SERVE_MOUSE: [(Box2, MouseMode, &str); 3] = [
     (
@@ -1219,6 +1306,7 @@ fn helper_tab(
 
 fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connecting: bool) {
     canvas.text(42, 76, "CONNECT TO A REMOTE DESKTOP", MUTED, 2);
+    ultra_button(canvas, ULTRA_MODE, config.performance);
     canvas.label(40, 108, "SERVER ADDRESS");
     canvas.label(548, 108, "PORT");
     canvas.field(
@@ -1281,9 +1369,21 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
     );
     canvas.label(40, 456, "FRAME LIMIT");
     canvas.label(420, 456, "SCALING");
-    canvas.button(FPS60, "60 FPS", config.fps == 60);
-    canvas.button(FPS120, "120 FPS", config.fps == 120);
-    canvas.button(FPS_NO_LIMIT, "NO LIMIT", config.fps == 0);
+    canvas.button(
+        FPS60,
+        "60 FPS",
+        config.fps == 60 && config.performance == PerformanceMode::Standard,
+    );
+    canvas.button(
+        FPS120,
+        "120 FPS",
+        config.fps == 120 && config.performance == PerformanceMode::Standard,
+    );
+    canvas.button(
+        FPS_NO_LIMIT,
+        "NO LIMIT",
+        config.presentation_interval().is_zero(),
+    );
     canvas.button(SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(SHARP, "SHARP", config.quality == Quality::Sharp);
     if let Some(error) = &state.error {
@@ -1305,6 +1405,7 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
 
 fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server: &ServerView) {
     canvas.text(42, 76, "SHARE THIS DESKTOP OVER VNC", MUTED, 2);
+    ultra_button(canvas, ULTRA_MODE, form.performance);
     canvas.label(40, 108, "LISTEN ADDRESS");
     canvas.label(548, 108, "PORT");
     canvas.field(
@@ -1406,6 +1507,10 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     canvas.button(SERVE_FULL_SIZE, "FULL", scale == 1.0);
     canvas.button(SERVE_HALF_SIZE, "HALF", scale == 0.5);
 
+    canvas.label(40, 434, "PRIORITY");
+    for (area, priority, name) in SERVE_PRIORITY {
+        canvas.button(area, name, form.priority == priority);
+    }
     canvas.label(40, 456, "STATUS");
     canvas.fill(SERVER_STATUS, PANEL);
     canvas.frame(SERVER_STATUS, BORDER);
@@ -1582,76 +1687,126 @@ pub const CLOSE_SETTINGS: Box2 = Box2 {
     w: 72,
     h: 32,
 };
+pub const LIVE_SERVE_SLIDER: Box2 = Box2 {
+    x: 24,
+    y: 196,
+    w: 392,
+    h: 40,
+};
+
+pub fn live_serve_percent_from_x(x: usize) -> u8 {
+    let offset = x
+        .saturating_sub(SLIDER_LEFT)
+        .min(SLIDER_RIGHT - SLIDER_LEFT);
+    25 + ((offset * 75 + (SLIDER_RIGHT - SLIDER_LEFT) / 2) / (SLIDER_RIGHT - SLIDER_LEFT)) as u8
+}
+
 pub const LIVE_FIT: Box2 = Box2 {
     x: 24,
-    y: 108,
+    y: 86,
     w: 190,
     h: 38,
 };
 pub const LIVE_NATIVE: Box2 = Box2 {
     x: 226,
-    y: 108,
+    y: 86,
     w: 190,
     h: 38,
 };
 pub const LIVE_FULLSCREEN: Box2 = Box2 {
     x: 24,
-    y: 154,
+    y: 130,
     w: 392,
     h: 38,
 };
 pub const LIVE_60: Box2 = Box2 {
     x: 24,
-    y: 236,
+    y: 270,
     w: 110,
     h: 38,
 };
 pub const LIVE_120: Box2 = Box2 {
     x: 146,
-    y: 236,
+    y: 270,
     w: 124,
     h: 38,
 };
 pub const LIVE_NO_LIMIT: Box2 = Box2 {
     x: 282,
-    y: 236,
+    y: 270,
     w: 134,
     h: 38,
 };
 pub const LIVE_SMOOTH: Box2 = Box2 {
     x: 24,
-    y: 318,
+    y: 340,
     w: 190,
     h: 38,
 };
 pub const LIVE_SHARP: Box2 = Box2 {
     x: 226,
-    y: 318,
+    y: 340,
     w: 190,
     h: 38,
 };
 pub const LIVE_MOUSE_AUTO: Box2 = Box2 {
     x: 24,
-    y: 400,
+    y: 410,
     w: 190,
     h: 38,
 };
 pub const LIVE_MOUSE_OFF: Box2 = Box2 {
     x: 226,
-    y: 400,
+    y: 410,
     w: 190,
+    h: 38,
+};
+pub const LIVE_WHOLE_UPDATE: Box2 = Box2 {
+    x: 24,
+    y: 480,
+    w: 110,
+    h: 38,
+};
+pub const LIVE_PROGRESSIVE: Box2 = Box2 {
+    x: 146,
+    y: 480,
+    w: 158,
+    h: 38,
+};
+pub const LIVE_ULTRA: Box2 = Box2 {
+    x: 316,
+    y: 480,
+    w: 100,
     h: 38,
 };
 pub const SCALE_SLIDER: Box2 = Box2 {
     x: 24,
-    y: 477,
+    y: 578,
     w: 392,
     h: 48,
 };
-pub const DISCONNECT: Box2 = Box2 {
+pub const LIVE_MOTION_SMOOTH: Box2 = Box2 {
     x: 24,
-    y: 566,
-    w: 392,
+    y: 524,
+    w: 190,
+    h: 24,
+};
+pub const LIVE_MOTION_IMMEDIATE: Box2 = Box2 {
+    x: 226,
+    y: 524,
+    w: 190,
+    h: 24,
+};
+pub const LIVE_DEBUG: Box2 = Box2 {
+    x: 24,
+    y: 656,
+    w: 190,
+    h: 42,
+};
+pub const DISCONNECT: Box2 = Box2 {
+    x: 226,
+    y: 656,
+    w: 190,
     h: 42,
 };
 const SLIDER_LEFT: usize = 36;
@@ -1672,10 +1827,15 @@ pub const SETTINGS_PANEL: Box2 = Box2 {
     x: 8,
     y: 8,
     w: 432,
-    h: 612,
+    h: 694,
 };
 
-pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
+fn ultra_button(canvas: &mut Canvas<'_>, area: Box2, performance: PerformanceMode) {
+    let ultra = performance == PerformanceMode::Ultra;
+    canvas.button(area, if ultra { "ULTRA: ON" } else { "ULTRA: OFF" }, ultra);
+}
+
+pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool, serve_scale: Option<u8>) {
     if !open {
         let area = open_settings_box(config.ui_scale);
         let text_scale = (2.0 * config.ui_scale).round().clamp(1.0, 4.0) as usize;
@@ -1695,7 +1855,7 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     canvas.frame(SETTINGS_PANEL, ACCENT);
     canvas.text(24, 28, "SESSION SETTINGS", TEXT, 3);
     canvas.button(CLOSE_SETTINGS, "CLOSE", false);
-    canvas.text(24, 83, "WINDOW", ACCENT, 2);
+    canvas.text(24, 62, "WINDOW", ACCENT, 2);
     canvas.button(
         LIVE_FIT,
         "FIT IMAGE",
@@ -1707,18 +1867,87 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
         config.window_mode == WindowMode::Native,
     );
     canvas.button(LIVE_FULLSCREEN, "FULL SCREEN ON / OFF", false);
-    canvas.text(24, 210, "FRAME LIMIT", ACCENT, 2);
-    canvas.button(LIVE_60, "60 FPS", config.fps == 60);
-    canvas.button(LIVE_120, "120 FPS", config.fps == 120);
-    canvas.button(LIVE_NO_LIMIT, "NO LIMIT", config.fps == 0);
-    canvas.text(24, 292, "SCALING", ACCENT, 2);
+    canvas.text(24, 178, "SERVED SIZE", ACCENT, 2);
+    let color = if serve_scale.is_some() {
+        ACCENT
+    } else {
+        BORDER
+    };
+    canvas.fill(
+        Box2 {
+            x: SLIDER_LEFT,
+            y: 212,
+            w: SLIDER_RIGHT - SLIDER_LEFT,
+            h: 6,
+        },
+        BORDER,
+    );
+    if let Some(percent) = serve_scale {
+        canvas.text(252, 178, &format!("{percent}% SHARED"), MUTED, 1);
+        let thumb = SLIDER_LEFT
+            + (usize::from(percent.clamp(25, 100) - 25) * (SLIDER_RIGHT - SLIDER_LEFT) + 37) / 75;
+        canvas.fill(
+            Box2 {
+                x: SLIDER_LEFT,
+                y: 212,
+                w: thumb - SLIDER_LEFT,
+                h: 6,
+            },
+            color,
+        );
+        canvas.fill(
+            Box2 {
+                x: thumb - 6,
+                y: 204,
+                w: 12,
+                h: 22,
+            },
+            color,
+        );
+        canvas.text(24, 230, "25%", MUTED, 1);
+        canvas.text(390, 230, "100%", MUTED, 1);
+    } else {
+        canvas.text(252, 178, "UNAVAILABLE", MUTED, 1);
+        canvas.text(24, 230, "REQUIRES AN UPDATED TOPVNC HOST", MUTED, 1);
+    }
+    canvas.text(24, 246, "FRAME LIMIT", ACCENT, 2);
+    canvas.button(
+        LIVE_60,
+        "60 FPS",
+        config.fps == 60 && config.performance == PerformanceMode::Standard,
+    );
+    canvas.button(
+        LIVE_120,
+        "120 FPS",
+        config.fps == 120 && config.performance == PerformanceMode::Standard,
+    );
+    canvas.button(
+        LIVE_NO_LIMIT,
+        "NO LIMIT",
+        config.presentation_interval().is_zero(),
+    );
+    canvas.text(24, 316, "SCALING", ACCENT, 2);
     canvas.button(LIVE_SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(LIVE_SHARP, "SHARP", config.quality == Quality::Sharp);
-    canvas.text(24, 374, "GAME MOUSE", ACCENT, 2);
+    canvas.text(24, 386, "GAME MOUSE", ACCENT, 2);
     canvas.button(LIVE_MOUSE_AUTO, "AUTO LOCK", config.relative_mouse);
     canvas.button(LIVE_MOUSE_OFF, "OFF", !config.relative_mouse);
-    canvas.text(24, 458, "F8 BUTTON SIZE", ACCENT, 2);
-    canvas.text(330, 458, &format!("{:.2}X", config.ui_scale), TEXT, 2);
+    canvas.text(24, 456, "PRESENT UPDATES", ACCENT, 2);
+    canvas.button(LIVE_WHOLE_UPDATE, "WHOLE", config.upload_policy() == 0);
+    canvas.button(LIVE_PROGRESSIVE, "PROGRESSIVE", config.upload_policy() == 1);
+    canvas.button(LIVE_ULTRA, "ULTRA", config.upload_policy() == 2);
+    canvas.button(
+        LIVE_MOTION_SMOOTH,
+        "SMOOTH MOTION",
+        config.motion == MotionPresentation::Smooth,
+    );
+    canvas.button(
+        LIVE_MOTION_IMMEDIATE,
+        "IMMEDIATE",
+        config.motion == MotionPresentation::Immediate,
+    );
+    canvas.text(24, 552, "F8 BUTTON SIZE", ACCENT, 2);
+    canvas.text(330, 552, &format!("{:.2}X", config.ui_scale), TEXT, 2);
     let track_y = SCALE_SLIDER.y + 19;
     canvas.fill(
         Box2 {
@@ -1750,7 +1979,16 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool) {
     );
     canvas.text(24, track_y + 26, "0.5X", MUTED, 1);
     canvas.text(384, track_y + 26, "2X", MUTED, 1);
-    canvas.text(24, 544, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
+    canvas.text(24, 634, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
+    canvas.button(
+        LIVE_DEBUG,
+        if config.debug {
+            "DEBUG: ON"
+        } else {
+            "DEBUG: OFF"
+        },
+        config.debug,
+    );
     canvas.button(DISCONNECT, "DISCONNECT", false);
 }
 
@@ -1792,6 +2030,7 @@ fn glyph(c: char) -> [u8; 7] {
         '7' => [31, 1, 2, 4, 8, 8, 8],
         '8' => [14, 17, 17, 14, 17, 17, 14],
         '9' => [14, 17, 17, 15, 1, 1, 14],
+        '%' => [24, 25, 2, 4, 8, 19, 3],
         '.' => [0, 0, 0, 0, 0, 12, 12],
         ':' => [0, 12, 12, 0, 12, 12, 0],
         '-' => [0, 0, 0, 31, 0, 0, 0],
@@ -1821,6 +2060,66 @@ fn glyph(c: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ultra_overrides_pacing_and_preserves_user_settings_and_security() {
+        assert_eq!(Config::default().motion, MotionPresentation::Smooth);
+        let mut config = Config {
+            fps: 60,
+            progressive: true,
+            ..Config::default()
+        };
+        let interval = config.presentation_interval();
+        assert_eq!(config.upload_policy(), 1);
+        config.performance = PerformanceMode::Ultra;
+        assert_eq!(config.presentation_interval(), std::time::Duration::ZERO);
+        assert_eq!(config.upload_policy(), 2);
+        assert_eq!(config.fps, 60);
+        assert!(!config.allow_insecure);
+        config.performance = PerformanceMode::Standard;
+        assert_eq!(config.presentation_interval(), interval);
+        assert_eq!(config.upload_policy(), 1);
+
+        let form = ServeForm {
+            performance: PerformanceMode::Ultra,
+            ..ServeForm::default()
+        };
+        assert!(form.request().is_err());
+        let form = ServeForm {
+            password: "secret".into(),
+            ..form
+        };
+        assert_eq!(form.request().unwrap().performance, PerformanceMode::Ultra);
+        assert!(!form.request().unwrap().allow_insecure);
+        const {
+            assert!(LIVE_WHOLE_UPDATE.x + LIVE_WHOLE_UPDATE.w < LIVE_PROGRESSIVE.x);
+            assert!(LIVE_PROGRESSIVE.x + LIVE_PROGRESSIVE.w < LIVE_ULTRA.x);
+            assert!(LIVE_ULTRA.x + LIVE_ULTRA.w <= SETTINGS_PANEL.x + SETTINGS_PANEL.w);
+            assert!(LIVE_ULTRA.y + LIVE_ULTRA.h < LIVE_MOTION_SMOOTH.y);
+            assert!(LIVE_MOTION_SMOOTH.y + LIVE_MOTION_SMOOTH.h < 552);
+            assert!(LIVE_MOTION_SMOOTH.x + LIVE_MOTION_SMOOTH.w < LIVE_MOTION_IMMEDIATE.x);
+        }
+    }
+
+    #[test]
+    fn server_priority_buttons_fit_and_reach_the_host_request() {
+        let mut form = ServeForm {
+            password: "secret".into(),
+            ..ServeForm::default()
+        };
+        for (area, priority, name) in SERVE_PRIORITY {
+            assert!(12 + name.len() * 12 <= area.w);
+            assert!(area.y + area.h <= 456);
+            form.priority = priority;
+            assert_eq!(form.request().unwrap().priority, priority);
+        }
+        for pair in SERVE_PRIORITY.windows(2) {
+            assert!(pair[0].0.x + pair[0].0.w < pair[1].0.x);
+        }
+        const { assert!(LIVE_PROGRESSIVE.y + LIVE_PROGRESSIVE.h < SCALE_SLIDER.y) };
+        const { assert!(DISCONNECT.y + DISCONNECT.h <= SETTINGS_PANEL.y + SETTINGS_PANEL.h) };
+        assert!(!Config::default().progressive);
+    }
 
     #[test]
     fn helper_tabs_keep_field_focus_and_values_separate() {

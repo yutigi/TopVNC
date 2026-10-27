@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
     BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, Encoding, Framebuffer, InputWriter,
-    Session, StatsSnapshot, encoding_name,
+    PerformanceMode, Session, StatsSnapshot, encoding_name,
 };
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -32,6 +32,9 @@ use ui::{
     UiState, WindowMode,
 };
 use window::{Draw, Layer, Presenter, Ui, UiEvent};
+mod session_render;
+use session_render::{RenderOptions, RenderWorker};
+use topvnc::presentation::{FrameMailbox, MotionPresentation};
 
 fn encoding(config: &Config) -> Encoding {
     match config.compression {
@@ -43,7 +46,7 @@ fn encoding(config: &Config) -> Encoding {
     }
 }
 
-const USAGE: &str = "usage: topvnc [HOST:PORT] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--quality 0-9] [--input-debug]";
+const USAGE: &str = "usage: topvnc [HOST:PORT] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--quality 0-9] [--progressive] [--ultra] [--smooth-motion | --immediate] [--input-debug]";
 
 fn parse_quality(value: &str) -> Result<u8, Box<dyn Error>> {
     match value.parse::<u8>() {
@@ -515,6 +518,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .ok_or("--quality requires a level from 0 to 9")?;
                 config.jpeg_quality = parse_quality(&value)?;
             }
+            "--progressive" => config.progressive = true,
+            "--ultra" => config.performance = PerformanceMode::Ultra,
+            "--smooth-motion" => config.motion = MotionPresentation::Smooth,
+            "--immediate" => config.motion = MotionPresentation::Immediate,
             "--input-debug" => input_debug = true,
             _ if arg.starts_with('-') || address.is_some() => return Err(USAGE.into()),
             _ => address = Some(arg),
@@ -637,11 +644,13 @@ impl HostedServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (events, receiver) = mpsc::channel();
         let options = ServeOptions {
+            performance: request.performance,
             address: request.address,
             display: request.display,
             allow_insecure: request.allow_insecure,
             scale: request.scale,
             mouse: request.mouse,
+            priority: request.priority,
         };
         self.authenticated = request.password.is_some();
         let password = request.password;
@@ -1010,6 +1019,9 @@ fn show_landing(
                         if editable && ui::LOCAL_ONLY.contains(x, y) {
                             serve.host = ui::LOCAL_ONLY_HOST.into();
                         }
+                        if editable && ui::ULTRA_MODE.contains(x, y) {
+                            serve.performance = toggle_performance(serve.performance);
+                        }
                         if editable && ui::ALL_NETWORKS.contains(x, y) {
                             serve.host = ui::ALL_NETWORKS_HOST.into();
                         }
@@ -1022,6 +1034,11 @@ fn show_landing(
                         }
                         if editable && ui::SERVE_HALF_SIZE.contains(x, y) {
                             serve.scale = 0.5;
+                        }
+                        for (area, priority, _) in ui::SERVE_PRIORITY {
+                            if editable && area.contains(x, y) {
+                                serve.priority = priority;
+                            }
                         }
                         for (area, mode, _) in ui::SERVE_MOUSE {
                             if editable && area.contains(x, y) {
@@ -1073,12 +1090,17 @@ fn show_landing(
                         }
                         if ui::FPS60.contains(x, y) {
                             config.fps = 60;
+                            config.performance = PerformanceMode::Standard;
                         }
                         if ui::FPS120.contains(x, y) {
                             config.fps = 120;
+                            config.performance = PerformanceMode::Standard;
                         }
                         if ui::FPS_NO_LIMIT.contains(x, y) {
                             config.fps = 0;
+                        }
+                        if ui::ULTRA_MODE.contains(x, y) {
+                            config.performance = toggle_performance(config.performance);
                         }
                         if ui::SMOOTH.contains(x, y) {
                             config.quality = Quality::Smooth;
@@ -1148,33 +1170,56 @@ fn show_landing(
 /// How often the title bar's statistics refresh.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
-/// When the oldest update the window thread has not yet presented finished
-/// uploading; set by the network thread.
+fn toggle_performance(mode: PerformanceMode) -> PerformanceMode {
+    match mode {
+        PerformanceMode::Standard => PerformanceMode::Ultra,
+        PerformanceMode::Ultra => PerformanceMode::Standard,
+    }
+}
+
+/// Accumulate dirty pixels until an upload is due or the update completes.
 #[derive(Default)]
-struct Arrival(Mutex<Option<Instant>>);
+struct UpdateUploads {
+    changed: Option<Rect>,
+    last_upload: Option<Instant>,
+}
 
-impl Arrival {
-    fn mark(&self) {
-        if let Ok(mut pending) = self.0.lock() {
-            pending.get_or_insert_with(Instant::now);
+impl UpdateUploads {
+    fn push(&mut self, rect: Rect, policy: u8, now: Instant) -> Option<Rect> {
+        self.changed = Some(self.changed.map_or(rect, |area| area.union(rect)));
+        if policy == 1
+            && self
+                .last_upload
+                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_millis(8))
+        {
+            self.last_upload = Some(now);
+            self.finish()
+        } else {
+            None
         }
     }
 
-    fn pending(&self) -> bool {
-        self.0.lock().is_ok_and(|pending| pending.is_some())
+    fn finish(&mut self) -> Option<Rect> {
+        self.changed.take()
     }
+}
 
-    fn take(&self) -> Option<Instant> {
-        self.0.lock().ok().and_then(|mut pending| pending.take())
+fn publish_frame(
+    frames: &FrameMailbox,
+    framebuffer: &Framebuffer,
+    area: Rect,
+    signal: &session_render::RenderSignal,
+) -> std::io::Result<()> {
+    let damage = topvnc::DamageRect {
+        x: area.x0 as u16,
+        y: area.y0 as u16,
+        width: area.width() as u16,
+        height: area.height() as u16,
+    };
+    if frames.publish(framebuffer, damage, Instant::now())? {
+        signal.wake();
     }
-
-    /// Put back an arrival that could not be presented, keeping the older
-    /// of it and any newer one.
-    fn restore(&self, arrived: Option<Instant>) {
-        if let (Ok(mut pending), Some(arrived)) = (self.0.lock(), arrived) {
-            *pending = Some(pending.map_or(arrived, |newer| newer.min(arrived)));
-        }
-    }
+    Ok(())
 }
 
 /// How long to wait before drawing again when the window could not take a
@@ -1254,26 +1299,44 @@ fn run_session_inner(
         writer.set_relative_pointer_allowed(false)?;
     }
     let stats = session.stats();
-    let remote = (usize::from(info.width), usize::from(info.height));
+    let mut remote = (usize::from(info.width), usize::from(info.height));
     let initial = match config.window_mode {
         WindowMode::Fit => fit_dimensions(remote, display_space()),
         WindowMode::Native => remote,
         WindowMode::Custom => config.custom_size()?,
     };
-    let title = format!("TopVNC — {}", info.name);
+    let mut name = info.name.chars().filter(|c| !c.is_control());
+    let mut short_name: String = name.by_ref().take(24).collect();
+    if name.next().is_some() {
+        short_name.push('…');
+    }
+    let title = if short_name.trim().is_empty() {
+        "TopVNC".to_owned()
+    } else {
+        format!("TopVNC — {short_name}")
+    };
     let window = ui.create_window(
         WindowAttributes::default()
             .with_title(&title)
             .with_inner_size(LogicalSize::new(initial.0 as f64, initial.1 as f64))
             .with_resizable(true),
     )?;
-    let mut presenter = Presenter::new(ui, Arc::clone(&window))?;
-    let image = Arc::new(presenter.layer(u32::from(info.width), u32::from(info.height)));
-    let arrival = Arc::new(Arrival::default());
+    let presenter = Presenter::new(ui, Arc::clone(&window))?;
+    let frames = Arc::new(FrameMailbox::new(info.width, info.height)?);
+    let upload_policy = Arc::new(AtomicU8::new(config.upload_policy()));
     let (error_tx, error_rx) = mpsc::channel();
+    let renderer = RenderWorker::start(
+        presenter,
+        Arc::clone(&frames),
+        RenderOptions::new(config, &window),
+        remote,
+        error_tx.clone(),
+        ui.waker(),
+    )?;
     {
-        let image = Arc::clone(&image);
-        let arrival = Arc::clone(&arrival);
+        let frames = Arc::clone(&frames);
+        let render_signal = renderer.signal();
+        let upload_policy = Arc::clone(&upload_policy);
         let writer = writer.clone();
         let waker = ui.waker();
         let (width, height) = (info.width, info.height);
@@ -1281,15 +1344,26 @@ fn run_session_inner(
             .name("topvnc-network".into())
             .spawn(move || {
                 let result: std::io::Result<()> = (|| {
-                    // Updates are decoded into this thread's own framebuffer
-                    // and uploaded whole, so the window thread never copies
-                    // or scales pixels, and never shows half an update.
+                    // This thread owns decoding, never GPU resources. Whole and
+                    // Ultra publish coherent snapshots after the update completes.
                     let mut framebuffer = Framebuffer::new(width, height)?;
                     let mut scratch = Vec::new();
                     writer.request_update(false, width, height)?;
                     loop {
-                        let mut changed: Option<Rect> = None;
+                        let mut uploads = UpdateUploads::default();
+                        let controls_before = (writer.relative_pointer(), writer.serve_scale());
                         session.read_update_pipelined(&mut scratch, |x, y, w, h, bytes| {
+                            if bytes.is_empty() {
+                                framebuffer = Framebuffer::new(w, h)?;
+                                uploads = UpdateUploads::default();
+                                uploads.changed = Some(Rect {
+                                    x0: 0,
+                                    y0: 0,
+                                    x1: usize::from(w),
+                                    y1: usize::from(h),
+                                });
+                                return Ok(());
+                            }
                             framebuffer.apply_raw(x, y, w, h, bytes)?;
                             let rect = Rect {
                                 x0: usize::from(x),
@@ -1297,19 +1371,19 @@ fn run_session_inner(
                                 x1: usize::from(x) + usize::from(w),
                                 y1: usize::from(y) + usize::from(h),
                             };
-                            changed = Some(changed.map_or(rect, |area| area.union(rect)));
+                            if let Some(area) = uploads.push(
+                                rect,
+                                upload_policy.load(Ordering::Relaxed),
+                                Instant::now(),
+                            ) {
+                                publish_frame(&frames, &framebuffer, area, &render_signal)?;
+                            }
                             Ok(())
                         })?;
-                        if let Some(area) = changed {
-                            image.upload(
-                                framebuffer.pixels(),
-                                framebuffer.width(),
-                                area.x0,
-                                area.y0,
-                                area.width(),
-                                area.height(),
-                            );
-                            arrival.mark();
+                        if let Some(area) = uploads.finish() {
+                            publish_frame(&frames, &framebuffer, area, &render_signal)?;
+                        }
+                        if controls_before != (writer.relative_pointer(), writer.serve_scale()) {
                             waker.wake();
                         }
                     }
@@ -1319,7 +1393,6 @@ fn run_session_inner(
             })?;
     }
 
-    let mut overlay: Option<Overlay> = None;
     let mut overlay_changed = true;
     let mut pressed_keys = HashMap::new();
     let mut buttons = 0u16;
@@ -1332,6 +1405,7 @@ fn run_session_inner(
     let mut motion = (0.0f64, 0.0f64);
     let mut settings_open = false;
     let mut dragging_ui_scale = false;
+    let mut dragging_serve_scale = None;
     // A left press that began on the overlay; its release stays local.
     let mut ui_captured_mouse = false;
     let mut focused = window.has_focus();
@@ -1339,31 +1413,22 @@ fn run_session_inner(
     // A minimized or fully covered window draws nothing until it is shown.
     let mut occluded = false;
     let mut redraw = true;
-    let mut last_present = Instant::now()
-        .checked_sub(STATS_INTERVAL)
-        .unwrap_or_else(Instant::now);
-    // No drawing before this, after the window could not take a frame.
-    let mut retry_at = Instant::now();
     let mut last_stats = (Instant::now(), stats.snapshot());
-    // Time from an update's upload to its presentation, summed since the
-    // title last changed, and the number of updates.
-    let mut to_present = (Duration::ZERO, 0u32);
+    let mut last_rendered = 0u64;
+    let mut compact_status = title.clone();
+    let mut debug_status = title.clone();
+    let mut known_serve_scale = None;
     loop {
-        let frame_interval = if config.fps == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs_f64(1.0 / config.fps as f64)
-        };
-        let now = Instant::now();
-        // Sleep until input arrives, a frame arrives, the frame limit allows
-        // a waiting frame, or the statistics are due.
-        let timeout = if (arrival.pending() || redraw) && !occluded {
-            (last_present + frame_interval)
-                .max(retry_at)
-                .saturating_duration_since(now)
-        } else {
-            (last_stats.0 + STATS_INTERVAL).saturating_duration_since(now)
-        };
+        let mut title_changed = false;
+        remote = frames.dimensions();
+        let serve_scale = writer.serve_scale();
+        if known_serve_scale != serve_scale {
+            known_serve_scale = serve_scale;
+            overlay_changed = true;
+            redraw = true;
+        }
+        // Presentation waits never run on the input event thread.
+        let timeout = (last_stats.0 + STATS_INTERVAL).saturating_duration_since(Instant::now());
         for event in ui.pump(timeout) {
             match event {
                 UiEvent::Device(DeviceEvent::MouseMotion { delta }) if locked => {
@@ -1405,6 +1470,7 @@ fn run_session_inner(
                                 send_buttons(&writer, 0, locked, last_pointer)?;
                                 ui_captured_mouse = false;
                                 dragging_ui_scale = false;
+                                dragging_serve_scale = None;
                             }
                         }
                         WindowEvent::KeyboardInput {
@@ -1422,6 +1488,7 @@ fn run_session_inner(
                                     overlay_changed = true;
                                     redraw = true;
                                     dragging_ui_scale = false;
+                                    dragging_serve_scale = None;
                                     for (_, symbol) in pressed_keys.drain() {
                                         writer.key(symbol, false)?;
                                     }
@@ -1449,6 +1516,12 @@ fn run_session_inner(
                             let scale = window.scale_factor();
                             let point = (position.x / scale, position.y / scale);
                             cursor = Some(point);
+                            if dragging_serve_scale.is_some() {
+                                dragging_serve_scale =
+                                    Some(ui::live_serve_percent_from_x(point.0.max(0.0) as usize));
+                                overlay_changed = true;
+                                redraw = true;
+                            }
                             if dragging_ui_scale {
                                 config.ui_scale =
                                     ui::scale_from_slider_x(point.0.max(0.0) as usize);
@@ -1492,6 +1565,13 @@ fn run_session_inner(
                             let pressed = state == ElementState::Pressed;
                             let left = button == MouseButton::Left;
                             if left && !pressed && ui_captured_mouse {
+                                if let Some(percent) = dragging_serve_scale.take() {
+                                    if Some(percent) != writer.serve_scale() {
+                                        writer.request_serve_scale(percent)?;
+                                    }
+                                    overlay_changed = true;
+                                    redraw = true;
+                                }
                                 ui_captured_mouse = false;
                                 dragging_ui_scale = false;
                                 continue;
@@ -1519,10 +1599,21 @@ fn run_session_inner(
                                             Some(_) => None,
                                             None => Some(Fullscreen::Borderless(None)),
                                         });
+                                    } else if ui::LIVE_SERVE_SLIDER.contains(x, y)
+                                        && serve_scale.is_some()
+                                    {
+                                        dragging_serve_scale =
+                                            Some(ui::live_serve_percent_from_x(x));
                                     } else if ui::LIVE_60.contains(x, y) {
                                         config.fps = 60;
+                                        config.performance = PerformanceMode::Standard;
+                                        upload_policy
+                                            .store(config.upload_policy(), Ordering::Relaxed);
                                     } else if ui::LIVE_120.contains(x, y) {
                                         config.fps = 120;
+                                        config.performance = PerformanceMode::Standard;
+                                        upload_policy
+                                            .store(config.upload_policy(), Ordering::Relaxed);
                                     } else if ui::LIVE_NO_LIMIT.contains(x, y) {
                                         config.fps = 0;
                                     } else if ui::LIVE_SMOOTH.contains(x, y) {
@@ -1535,9 +1626,30 @@ fn run_session_inner(
                                     } else if ui::LIVE_MOUSE_OFF.contains(x, y) {
                                         config.relative_mouse = false;
                                         writer.set_relative_pointer_allowed(false)?;
+                                    } else if ui::LIVE_WHOLE_UPDATE.contains(x, y) {
+                                        config.progressive = false;
+                                        config.performance = PerformanceMode::Standard;
+                                        upload_policy
+                                            .store(config.upload_policy(), Ordering::Relaxed);
+                                    } else if ui::LIVE_PROGRESSIVE.contains(x, y) {
+                                        config.progressive = true;
+                                        config.performance = PerformanceMode::Standard;
+                                        upload_policy
+                                            .store(config.upload_policy(), Ordering::Relaxed);
+                                    } else if ui::LIVE_ULTRA.contains(x, y) {
+                                        config.performance = toggle_performance(config.performance);
+                                        upload_policy
+                                            .store(config.upload_policy(), Ordering::Relaxed);
+                                    } else if ui::LIVE_MOTION_SMOOTH.contains(x, y) {
+                                        config.motion = MotionPresentation::Smooth;
+                                    } else if ui::LIVE_MOTION_IMMEDIATE.contains(x, y) {
+                                        config.motion = MotionPresentation::Immediate;
                                     } else if ui::SCALE_SLIDER.contains(x, y) {
                                         dragging_ui_scale = true;
                                         config.ui_scale = ui::scale_from_slider_x(x);
+                                    } else if ui::LIVE_DEBUG.contains(x, y) {
+                                        config.debug = !config.debug;
+                                        title_changed = true;
                                     } else if ui::DISCONNECT.contains(x, y) {
                                         return Ok(None);
                                     }
@@ -1628,116 +1740,61 @@ fn run_session_inner(
         if lock != locked {
             locked = lock;
             lock_pointer(&window, locked);
+            title_changed = true;
             motion = (0.0, 0.0);
             overlay_changed = true;
             redraw = true;
         }
-        // Live throughput in the title bar shows whether the link or the
-        // encoding limits the frame rate.
+        // Keep the title compact; cache full diagnostics for the debug toggle.
         if last_stats.0.elapsed() >= STATS_INTERVAL {
             let now = (Instant::now(), stats.snapshot());
             let mut status = format!(
-                "{title} — {}",
+                "{title} — decode {}",
                 throughput(last_stats.1, now.1, now.0 - last_stats.0)
             );
-            if to_present.1 > 0 {
+            let submitted = renderer.snapshot()?;
+            let render_fps = submitted.frames.saturating_sub(last_rendered) as f64
+                / (now.0 - last_stats.0).as_secs_f64();
+            compact_status = format!("{title} · {render_fps:.0} fps");
+            status += &format!(" · render {render_fps:.0} fps");
+            last_rendered = submitted.frames;
+            if let Some((_, p95)) = submitted.pacing {
                 status += &format!(
-                    " · {:.1} ms to present",
-                    (to_present.0 / to_present.1).as_secs_f64() * 1e3
+                    " / p95 {:.1} ms · {:.2} ms ready to submit",
+                    p95.as_secs_f64() * 1e3,
+                    submitted.age_mean.as_secs_f64() * 1e3
                 );
             }
-            if locked {
-                status += " · mouse locked, F8 releases";
+            if let Some(mode) = submitted.mode {
+                status += &format!(" · {mode:?}");
             }
-            window.set_title(&status);
+            status += &format!(" · {} superseded", frames.stats()?.replaced);
+            if config.performance == PerformanceMode::Ultra {
+                status += " · Ultra";
+            }
+            debug_status = status;
+            title_changed = true;
             last_stats = now;
-            to_present = (Duration::ZERO, 0);
         }
-        if !(arrival.pending() || redraw)
-            || occluded
-            || Instant::now() < (last_present + frame_interval).max(retry_at)
-        {
-            continue;
-        }
-        let arrived = arrival.take();
-        let logical = logical_size(&window);
-        let scale = window.scale_factor();
-        if overlay
-            .as_ref()
-            .is_some_and(|overlay| overlay.size != logical)
-        {
-            overlay = None;
-        }
-        let overlay = overlay.get_or_insert_with(|| {
-            overlay_changed = true;
-            Overlay {
-                pixels: vec![0; logical.0 * logical.1],
-                size: logical,
-                layer: presenter.layer(logical.0 as u32, logical.1 as u32),
+        if title_changed {
+            let status = if config.debug {
+                &debug_status
+            } else {
+                &compact_status
+            };
+            if locked {
+                window.set_title(&format!("{status} · locked (F8)"));
+            } else {
+                window.set_title(status);
             }
-        });
-        // The settings button hides while the pointer is locked, so it never
-        // covers a game; F8 still opens the panel.
-        let area = if settings_open {
-            Some(ui::SETTINGS_PANEL)
-        } else if locked {
-            None
-        } else {
-            Some(ui::open_settings_box(config.ui_scale))
         }
-        .and_then(|area| clip(area, logical));
-        if overlay_changed && let Some(area) = area {
-            ui::overlay(
-                &mut Canvas::new(&mut overlay.pixels, logical.0, logical.1),
-                config,
-                settings_open,
-            );
-            overlay
-                .layer
-                .upload(&overlay.pixels, logical.0, area.x, area.y, area.w, area.h);
-        }
+        let mut options = RenderOptions::new(config, &window);
+        options.open = settings_open;
+        options.locked = locked;
+        options.occluded = occluded;
+        options.serve_scale = dragging_serve_scale.or(serve_scale);
+        renderer.update(options, overlay_changed || redraw)?;
         overlay_changed = false;
-        let physical = |x: usize, y: usize, w: usize, h: usize| {
-            [
-                x as f64 * scale,
-                y as f64 * scale,
-                w as f64 * scale,
-                h as f64 * scale,
-            ]
-        };
-        let mut draws = Vec::with_capacity(2);
-        if let Some((target, source)) = placement(config.window_mode, remote, logical) {
-            draws.push(Draw {
-                layer: &image,
-                target: physical(target.x0, target.y0, target.width(), target.height()),
-                source: [
-                    source.x0 as f64,
-                    source.y0 as f64,
-                    source.width() as f64,
-                    source.height() as f64,
-                ],
-                smooth: config.quality == Quality::Smooth,
-            });
-        }
-        if let Some(area) = area {
-            draws.push(Draw {
-                layer: &overlay.layer,
-                target: physical(area.x, area.y, area.w, area.h),
-                source: [area.x as f64, area.y as f64, area.w as f64, area.h as f64],
-                smooth: scale.fract() != 0.0,
-            });
-        }
-        if !presenter.draw(&draws)? {
-            arrival.restore(arrived);
-            redraw = true;
-            retry_at = Instant::now() + RETRY_INTERVAL;
-            continue;
-        }
-        last_present = Instant::now();
-        if let Some(arrived) = arrived {
-            to_present.0 += last_present.saturating_duration_since(arrived);
-            to_present.1 += 1;
-        }
         redraw = false;
     }
 }
@@ -1745,6 +1802,153 @@ fn run_session_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Requires a real interactive Windows desktop and GPU. Opens a small
+    /// two-second window, then tests worker shutdown with no UI pumping.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an interactive GPU desktop"]
+    fn render_worker_smoke_on_interactive_desktop() {
+        let mut ui = Ui::new().unwrap();
+        let window = ui
+            .create_window(
+                WindowAttributes::default()
+                    .with_title("TopVNC smooth-frame test (closes automatically)")
+                    .with_inner_size(LogicalSize::new(640.0, 360.0)),
+            )
+            .unwrap();
+        let presenter = Presenter::new(&mut ui, Arc::clone(&window)).unwrap();
+        let frames = Arc::new(FrameMailbox::new(1920, 1080).unwrap());
+        let config = Config {
+            performance: PerformanceMode::Ultra,
+            ..Config::default()
+        };
+        let (errors, receiver) = mpsc::channel();
+        let renderer = RenderWorker::start(
+            presenter,
+            Arc::clone(&frames),
+            RenderOptions::new(&config, &window),
+            (1920, 1080),
+            errors,
+            ui.waker(),
+        )
+        .unwrap();
+        let signal = renderer.signal();
+        let mut framebuffer = Framebuffer::new(1920, 1080).unwrap();
+        let started = Instant::now();
+        let mut next = started;
+        let mut frame = 0u32;
+        while started.elapsed() < Duration::from_secs(2) {
+            ui.pump(Duration::from_millis(2));
+            if Instant::now() >= next {
+                for (index, pixel) in framebuffer.pixels_mut().iter_mut().enumerate() {
+                    let level = ((index % 1920 + frame as usize) % 128) as u32 + 16;
+                    *pixel = level << 16 | level << 8 | level;
+                }
+                publish_frame(
+                    &frames,
+                    &framebuffer,
+                    Rect {
+                        x0: 0,
+                        y0: 0,
+                        x1: 1920,
+                        y1: 1080,
+                    },
+                    &signal,
+                )
+                .unwrap();
+                frame += 1;
+                next += Duration::from_secs_f64(1.0 / 240.0);
+            }
+            if let Ok(error) = receiver.try_recv() {
+                panic!("render worker failed: {error:?}");
+            }
+        }
+        let snapshot = renderer.snapshot().unwrap();
+        println!(
+            "Windows 1080p GPU worker smoke: {snapshot:?}; mailbox {:?}; monitor refresh {:?}",
+            frames.stats().unwrap(),
+            window
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz())
+        );
+        assert!(snapshot.pacing.is_some(), "no frames were submitted");
+        assert!(matches!(
+            snapshot.mode,
+            Some(wgpu::PresentMode::Mailbox | wgpu::PresentMode::Fifo)
+        ));
+        drop(renderer);
+        drop(window);
+    }
+
+    #[test]
+    fn whole_updates_wait_and_progressive_uploads_batch_dirty_pixels() {
+        let now = Instant::now();
+        let first = Rect {
+            x0: 64,
+            y0: 64,
+            x1: 128,
+            y1: 128,
+        };
+        let second = Rect {
+            x0: 0,
+            y0: 0,
+            x1: 64,
+            y1: 64,
+        };
+        let mut whole = UpdateUploads::default();
+        assert!(whole.push(first, 0, now).is_none());
+        assert!(
+            whole
+                .push(second, 0, now + Duration::from_secs(1))
+                .is_none()
+        );
+        let area = whole.finish().unwrap();
+        assert_eq!((area.x0, area.y0, area.x1, area.y1), (0, 0, 128, 128));
+        assert!(whole.finish().is_none());
+
+        let mut progressive = UpdateUploads::default();
+        let area = progressive.push(first, 1, now).unwrap();
+        assert_eq!((area.x0, area.y0), (64, 64));
+        assert!(
+            progressive
+                .push(second, 1, now + Duration::from_millis(1))
+                .is_none()
+        );
+        let area = progressive
+            .push(first, 1, now + Duration::from_millis(8))
+            .unwrap();
+        assert_eq!((area.x0, area.y0, area.x1, area.y1), (0, 0, 128, 128));
+        assert!(
+            progressive
+                .push(second, 1, now + Duration::from_millis(9))
+                .is_none()
+        );
+        assert!(progressive.finish().is_some());
+        assert!(progressive.finish().is_none());
+    }
+
+    #[test]
+    fn ultra_keeps_regions_private_until_the_update_completes() {
+        let now = Instant::now();
+        let rect = Rect {
+            x0: 4,
+            y0: 8,
+            x1: 12,
+            y1: 16,
+        };
+        let mut uploads = UpdateUploads::default();
+        for micros in [0, 1, 100, 499] {
+            assert!(
+                uploads
+                    .push(rect, 2, now + Duration::from_micros(micros))
+                    .is_none()
+            );
+        }
+        let area = uploads.finish().unwrap();
+        assert_eq!((area.x0, area.y0, area.x1, area.y1), (4, 8, 12, 16));
+        assert!(uploads.finish().is_none());
+    }
 
     #[test]
     fn fit_shrinks_large_remote_without_changing_aspect() {
@@ -2029,12 +2233,14 @@ mod tests {
     fn hosted_server_reports_unsupported_platforms_and_stops() {
         let mut server = HostedServer::default();
         server.start(ServeRequest {
+            performance: PerformanceMode::Standard,
             address: "127.0.0.1:0".into(),
             display: None,
             password: Some("secret".into()),
             allow_insecure: false,
             scale: 1.0,
             mouse: desktop_host::MouseMode::Auto,
+            priority: topvnc::UpdatePriority::Whole,
         });
         assert_eq!(server.view.phase, ServerPhase::Starting);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
