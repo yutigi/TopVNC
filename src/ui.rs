@@ -1,5 +1,6 @@
 use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, MouseMode, normalize_serve_scale};
 use crate::helpers::{Helper, HelperForm, HelperRuntime};
+use topvnc::presentation::MotionPresentation;
 use topvnc::{PerformanceMode, UpdatePriority};
 use winit::keyboard::KeyCode;
 
@@ -40,6 +41,7 @@ pub const DEFAULT_JPEG_QUALITY: u8 = 6;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub performance: PerformanceMode,
+    pub motion: MotionPresentation,
     pub host: String,
     pub port: String,
     pub password: String,
@@ -67,6 +69,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             performance: PerformanceMode::Standard,
+            motion: MotionPresentation::Smooth,
             host: String::new(),
             port: "5900".into(),
             password: String::new(),
@@ -225,7 +228,7 @@ impl Config {
         }
     }
 
-    /// 0 = whole, 1 = progressive batching, 2 = immediate Ultra uploads.
+    /// 0 = whole, 1 = progressive batching, 2 = coherent Ultra updates.
     pub fn upload_policy(&self) -> u8 {
         if self.performance == PerformanceMode::Ultra {
             2
@@ -1779,6 +1782,18 @@ pub const SCALE_SLIDER: Box2 = Box2 {
     w: 392,
     h: 48,
 };
+pub const LIVE_MOTION_SMOOTH: Box2 = Box2 {
+    x: 24,
+    y: 524,
+    w: 190,
+    h: 24,
+};
+pub const LIVE_MOTION_IMMEDIATE: Box2 = Box2 {
+    x: 226,
+    y: 524,
+    w: 190,
+    h: 24,
+};
 pub const DISCONNECT: Box2 = Box2 {
     x: 24,
     y: 656,
@@ -1912,6 +1927,16 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool, serve_scale
     canvas.button(LIVE_WHOLE_UPDATE, "WHOLE", config.upload_policy() == 0);
     canvas.button(LIVE_PROGRESSIVE, "PROGRESSIVE", config.upload_policy() == 1);
     canvas.button(LIVE_ULTRA, "ULTRA", config.upload_policy() == 2);
+    canvas.button(
+        LIVE_MOTION_SMOOTH,
+        "SMOOTH MOTION",
+        config.motion == MotionPresentation::Smooth,
+    );
+    canvas.button(
+        LIVE_MOTION_IMMEDIATE,
+        "IMMEDIATE",
+        config.motion == MotionPresentation::Immediate,
+    );
     canvas.text(24, 552, "F8 BUTTON SIZE", ACCENT, 2);
     canvas.text(330, 552, &format!("{:.2}X", config.ui_scale), TEXT, 2);
     let track_y = SCALE_SLIDER.y + 19;
@@ -2020,6 +2045,7 @@ mod tests {
 
     #[test]
     fn ultra_overrides_pacing_and_preserves_user_settings_and_security() {
+        assert_eq!(Config::default().motion, MotionPresentation::Smooth);
         let mut config = Config {
             fps: 60,
             progressive: true,
@@ -2051,6 +2077,9 @@ mod tests {
             assert!(LIVE_WHOLE_UPDATE.x + LIVE_WHOLE_UPDATE.w < LIVE_PROGRESSIVE.x);
             assert!(LIVE_PROGRESSIVE.x + LIVE_PROGRESSIVE.w < LIVE_ULTRA.x);
             assert!(LIVE_ULTRA.x + LIVE_ULTRA.w <= SETTINGS_PANEL.x + SETTINGS_PANEL.w);
+            assert!(LIVE_ULTRA.y + LIVE_ULTRA.h < LIVE_MOTION_SMOOTH.y);
+            assert!(LIVE_MOTION_SMOOTH.y + LIVE_MOTION_SMOOTH.h < 552);
+            assert!(LIVE_MOTION_SMOOTH.x + LIVE_MOTION_SMOOTH.w < LIVE_MOTION_IMMEDIATE.x);
         }
     }
 

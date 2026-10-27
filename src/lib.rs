@@ -12,6 +12,7 @@ use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod presentation;
 mod tight;
 use tight::{TightDecoder, TightSettings};
 
@@ -2548,10 +2549,9 @@ fn prepare_update(
     }))
 }
 
-/// Write a prepared update. The framebuffer lock is taken per row so capture
-/// is never blocked on the network. If the framebuffer is resized while the
-/// update is being written, the remaining rows are sent black; the client
-/// receives the new size in its next update.
+/// Snapshot all requested changed pixels under one framebuffer lock, then
+/// write without that lock. A slow socket cannot mix later capture frames
+/// into an update or block capture on network backpressure.
 #[allow(clippy::too_many_arguments)]
 fn write_update(
     stream: &mut TcpStream,
@@ -2563,7 +2563,32 @@ fn write_update(
     generation: u64,
     pseudo: &[PseudoRect],
 ) -> io::Result<usize> {
+    let snapshot = {
+        let fb = shared
+            .lock()
+            .map_err(|_| invalid("framebuffer lock is poisoned"))?;
+        let pixels = update
+            .rectangles
+            .iter()
+            .map(|rect| usize::from(rect.width) * usize::from(rect.height))
+            .sum();
+        let mut snapshot = Vec::with_capacity(pixels);
+        for rect in &update.rectangles {
+            for row in usize::from(rect.y)..usize::from(rect.y) + usize::from(rect.height) {
+                if fb.generation == generation {
+                    let start = row * fb.framebuffer.width() + usize::from(rect.x);
+                    snapshot.extend_from_slice(
+                        &fb.framebuffer.pixels[start..start + usize::from(rect.width)],
+                    );
+                } else {
+                    snapshot.resize(snapshot.len() + usize::from(rect.width), 0);
+                }
+            }
+        }
+        snapshot
+    };
     let mut written = 0;
+    let mut position = 0;
     output.clear();
     update_header(output, pseudo, update.rectangles.len())?;
     for rect in &update.rectangles {
@@ -2572,20 +2597,10 @@ fn write_update(
         output.extend_from_slice(&rect.width.to_be_bytes());
         output.extend_from_slice(&rect.height.to_be_bytes());
         output.extend_from_slice(&0i32.to_be_bytes());
-        let row_len = usize::from(rect.width) * pixel_format.bytes_per_pixel();
-        for row in usize::from(rect.y)..usize::from(rect.y) + usize::from(rect.height) {
-            {
-                let fb = shared
-                    .lock()
-                    .map_err(|_| invalid("framebuffer lock is poisoned"))?;
-                if fb.generation == generation {
-                    let start = row * fb.framebuffer.width() + usize::from(rect.x);
-                    let end = start + usize::from(rect.width);
-                    pixel_format.encode_row(&fb.framebuffer.pixels[start..end], output);
-                } else {
-                    output.resize(output.len() + row_len, 0);
-                }
-            }
+        let width = usize::from(rect.width);
+        for _ in 0..rect.height {
+            pixel_format.encode_row(&snapshot[position..position + width], output);
+            position += width;
             if output.len() >= SERVER_WRITE_CHUNK_BYTES {
                 stream.write_all(output)?;
                 written += output.len();
@@ -4188,6 +4203,54 @@ mod tests {
         }
         assert!(image.apply_raw(3, 1, 2, 2, &bytes[1..]).is_err());
         assert_eq!(image.pixels(), before);
+    }
+
+    #[test]
+    fn raw_update_uses_one_capture_snapshot_across_network_writes() {
+        let mut source = Framebuffer::new(800, 800).unwrap();
+        source.pixels_mut().fill(0x112233);
+        let shared = Arc::new(Mutex::new(ServerFramebuffer::new(source)));
+        let writer_shared = Arc::clone(&shared);
+        let (mut writer, mut reader) = tcp_pair();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let sending = std::thread::spawn(move || {
+            let tiles = writer_shared.lock().unwrap().tile_revisions.len();
+            send_framebuffer_update(
+                &mut writer,
+                &writer_shared,
+                &mut vec![u64::MAX; tiles],
+                &mut Vec::new(),
+                ServerPixelFormat::DEFAULT,
+                UpdateRequest {
+                    incremental: false,
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 800,
+                },
+            )
+            .unwrap();
+        });
+        let mut header = [0; 16];
+        reader.read_exact(&mut header).unwrap();
+        assert_eq!(u16::from_be_bytes([header[2], header[3]]), 1);
+        // Change capture after transmission has started, while the large Raw
+        // body can be blocked by the receiver. All rows must remain one frame.
+        shared
+            .lock()
+            .unwrap()
+            .framebuffer
+            .pixels_mut()
+            .fill(0xaabbcc);
+        let mut body = vec![0; 800 * 800 * 4];
+        reader.read_exact(&mut body).unwrap();
+        assert!(
+            body.chunks_exact(4)
+                .all(|pixel| pixel == [0x33, 0x22, 0x11, 0])
+        );
+        sending.join().unwrap();
     }
 
     #[test]
