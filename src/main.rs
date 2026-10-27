@@ -1305,7 +1305,16 @@ fn run_session_inner(
         WindowMode::Native => remote,
         WindowMode::Custom => config.custom_size()?,
     };
-    let title = format!("TopVNC — {}", info.name);
+    let mut name = info.name.chars().filter(|c| !c.is_control());
+    let mut short_name: String = name.by_ref().take(24).collect();
+    if name.next().is_some() {
+        short_name.push('…');
+    }
+    let title = if short_name.trim().is_empty() {
+        "TopVNC".to_owned()
+    } else {
+        format!("TopVNC — {short_name}")
+    };
     let window = ui.create_window(
         WindowAttributes::default()
             .with_title(&title)
@@ -1406,8 +1415,11 @@ fn run_session_inner(
     let mut redraw = true;
     let mut last_stats = (Instant::now(), stats.snapshot());
     let mut last_rendered = 0u64;
+    let mut compact_status = title.clone();
+    let mut debug_status = title.clone();
     let mut known_serve_scale = None;
     loop {
+        let mut title_changed = false;
         remote = frames.dimensions();
         let serve_scale = writer.serve_scale();
         if known_serve_scale != serve_scale {
@@ -1635,6 +1647,9 @@ fn run_session_inner(
                                     } else if ui::SCALE_SLIDER.contains(x, y) {
                                         dragging_ui_scale = true;
                                         config.ui_scale = ui::scale_from_slider_x(x);
+                                    } else if ui::LIVE_DEBUG.contains(x, y) {
+                                        config.debug = !config.debug;
+                                        title_changed = true;
                                     } else if ui::DISCONNECT.contains(x, y) {
                                         return Ok(None);
                                     }
@@ -1725,12 +1740,12 @@ fn run_session_inner(
         if lock != locked {
             locked = lock;
             lock_pointer(&window, locked);
+            title_changed = true;
             motion = (0.0, 0.0);
             overlay_changed = true;
             redraw = true;
         }
-        // Live throughput in the title bar shows whether the link or the
-        // encoding limits the frame rate.
+        // Keep the title compact; cache full diagnostics for the debug toggle.
         if last_stats.0.elapsed() >= STATS_INTERVAL {
             let now = (Instant::now(), stats.snapshot());
             let mut status = format!(
@@ -1740,6 +1755,7 @@ fn run_session_inner(
             let submitted = renderer.snapshot()?;
             let render_fps = submitted.frames.saturating_sub(last_rendered) as f64
                 / (now.0 - last_stats.0).as_secs_f64();
+            compact_status = format!("{title} · {render_fps:.0} fps");
             status += &format!(" · render {render_fps:.0} fps");
             last_rendered = submitted.frames;
             if let Some((_, p95)) = submitted.pacing {
@@ -1756,11 +1772,21 @@ fn run_session_inner(
             if config.performance == PerformanceMode::Ultra {
                 status += " · Ultra";
             }
-            if locked {
-                status += " · mouse locked, F8 releases";
-            }
-            window.set_title(&status);
+            debug_status = status;
+            title_changed = true;
             last_stats = now;
+        }
+        if title_changed {
+            let status = if config.debug {
+                &debug_status
+            } else {
+                &compact_status
+            };
+            if locked {
+                window.set_title(&format!("{status} · locked (F8)"));
+            } else {
+                window.set_title(status);
+            }
         }
         let mut options = RenderOptions::new(config, &window);
         options.open = settings_open;

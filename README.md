@@ -145,7 +145,7 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 | Control or setting | Behavior |
 | --- | --- |
 | Keyboard and mouse | Send input to the remote desktop, including the back and forward side buttons. |
-| Mouse lock | While the host hides its cursor (in a game), the pointer locks and every motion turns the camera. The title bar shows *mouse locked*. |
+| Mouse lock | While the host hides its cursor (in a game), the pointer locks and every motion turns the camera. The title bar shows *locked (F8)*. |
 | **F8** or **F8 SETTINGS** | Open the in-session settings panel. This also releases a locked pointer, and the on-screen button hides while the pointer is locked. |
 | Window edges | Drag to resize the viewer. |
 | F8 → Served size | Drag from **25% to 100%** in 1% steps; release to request the size from an updated TopVNC host. |
@@ -157,6 +157,7 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 | Smooth / Sharp | Choose the scaling appearance. |
 | Game mouse: Auto lock / Off | **Off** never locks the pointer: the viewer stops offering relative motion and the server sends absolute positions. |
 | F8 button size | Adjust the on-screen settings button from 0.5× to 2.0×. |
+| F8 → Debug | Toggle **DEBUG: OFF/ON**. Off by default: the title shows a shortened desktop name and rendered FPS. On shows the detailed performance counters. This does not enable input logging. |
 | Disconnect | Return to the connection form. |
 
 ![TopVNC F8 session settings showing the served-size slider at 50%](docs/images/topvnc-session-settings.png)
@@ -214,7 +215,7 @@ For playable results:
   | --- | --- | --- |
   | 3024×1964 (full) | 26.3 | 55.6 ms |
   | 1512×982 (half) | 60.3 | 13.6 ms |
-- **Read the title bar.** During a session, the viewer's title shows:
+- **Enable F8 → DEBUG: ON for diagnostics.** The title normally shows only the desktop name (shortened to 24 characters plus an ellipsis when needed) and rendered FPS, with a short hint while the mouse is locked. Debug mode adds:
   - decoded FPS, KB per frame, and Mbit/s;
   - the encoding the server sends, and `push` when the server pushes frames;
   - rendered FPS, p95 frame-submission interval, and the selected GPU presentation mode;
