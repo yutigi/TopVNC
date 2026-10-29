@@ -2,12 +2,12 @@
 //! capture, Quartz event injection, and pasteboard sync.
 
 use crate::desktop_host::{
-    CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureSurface, ClickTracker, DisplayBounds, FrameDamage,
-    FrameSlot, HostPermissions, KeyIdentity, MAC_FLAG_ALPHA_SHIFT, MAX_CLIPBOARD_CHARS, MacKeyCode,
-    MouseMode, PointerTransition, Rect, RemoteInputState, Rotation, ServeOptions, ServerNotice,
-    capture_rate, display_point, frame_damage, latin1_from_unicode, latin1_to_string,
-    macos_event_flags, macos_key_flags, macos_key_identity, macos_modifier_flags,
-    parse_serve_arguments, relative_point, served_size, unicode_key_units,
+    CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureSurface, ClickTracker, DisplayBounds,
+    DisplaySelection, FrameDamage, FrameSlot, HostPermissions, KeyIdentity, MAC_FLAG_ALPHA_SHIFT,
+    MAX_CLIPBOARD_CHARS, MacKeyCode, MouseMode, PointerTransition, Rect, RemoteInputState,
+    Rotation, ServeOptions, ServerNotice, capture_rate, display_point, frame_damage,
+    latin1_from_unicode, latin1_to_string, macos_event_flags, macos_key_flags, macos_key_identity,
+    macos_modifier_flags, parse_serve_arguments, relative_point, served_size, unicode_key_units,
     validate_capture_dimensions,
 };
 use block2::RcBlock;
@@ -222,6 +222,12 @@ pub fn serve(
         priority,
         performance,
     } = options;
+    if display == DisplaySelection::All {
+        return Err(
+            "serving all displays at once is not implemented for macOS hosts yet; choose one display"
+                .into(),
+        );
+    }
     require_supported_macos()?;
     require_screen_recording()?;
     interactive_qos();
@@ -364,7 +370,7 @@ fn bind_error(error: std::io::Error, address: &str) -> Box<dyn Error> {
 #[allow(clippy::too_many_arguments)]
 fn serve_desktop(
     server: &VncServer,
-    display: Option<usize>,
+    display: DisplaySelection,
     mut scale: f32,
     capture: DisplayCapture,
     mut framebuffer: Framebuffer,
@@ -855,7 +861,7 @@ struct DisplayCapture {
 impl DisplayCapture {
     /// Capture the display numbered `display` (1-based, in `SCShareableContent`
     /// order), or the main display, at `scale` times its pixel size.
-    fn start(display: Option<usize>, scale: f32) -> Result<Self, Box<dyn Error>> {
+    fn start(display: DisplaySelection, scale: f32) -> Result<Self, Box<dyn Error>> {
         let displays = shareable_displays()?;
         if displays.is_empty() {
             // ScreenCaptureKit lists no displays while the session is locked.
@@ -866,10 +872,15 @@ impl DisplayCapture {
         }
         let count = displays.len();
         let selected = match display {
-            Some(number) => displays.get(number - 1).ok_or_else(|| {
+            DisplaySelection::Number(number) => displays.get(number - 1).ok_or_else(|| {
                 format!("display {number} not found; {count} display(s) are available")
             })?,
-            None => {
+            DisplaySelection::All => {
+                return Err(
+                    "serving all displays at once is not implemented for macOS hosts yet".into(),
+                );
+            }
+            DisplaySelection::Primary => {
                 let main = CGMainDisplayID();
                 displays
                     .iter()
@@ -973,8 +984,8 @@ impl DisplayCapture {
     }
 
     /// Why the stream no longer matches the display it should capture.
-    fn needs_restart(&self, display: Option<usize>) -> Option<String> {
-        if display.is_none() && CGMainDisplayID() != self.display {
+    fn needs_restart(&self, display: DisplaySelection) -> Option<String> {
+        if display == DisplaySelection::Primary && CGMainDisplayID() != self.display {
             return Some("the main display changed".into());
         }
         match display_pixel_size(self.display) {

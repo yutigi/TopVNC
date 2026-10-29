@@ -7,8 +7,8 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use topvnc::PerformanceMode;
 use topvnc::presentation::{FrameMailbox, FramePacing, MotionPresentation};
+use topvnc::{PerformanceMode, ServedDisplays};
 use winit::window::Window;
 
 /// Only display settings cross the thread boundary; credentials stay on the UI.
@@ -27,6 +27,7 @@ pub struct RenderOptions {
     pub locked: bool,
     pub occluded: bool,
     pub serve_scale: Option<u8>,
+    pub serve_display: Option<ServedDisplays>,
     pub viewport: (u32, u32),
     pub scale: f64,
 }
@@ -49,6 +50,7 @@ impl RenderOptions {
             locked: false,
             occluded: false,
             serve_scale: None,
+            serve_display: None,
             viewport: (size.width, size.height),
             scale: window.scale_factor(),
         }
@@ -314,6 +316,7 @@ fn render_loop(
                 &config,
                 options.open,
                 options.serve_scale,
+                options.serve_display,
             );
             overlay
                 .layer

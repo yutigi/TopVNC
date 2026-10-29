@@ -1,7 +1,10 @@
-use crate::desktop_host::{HostPermissions, MIN_SERVE_SCALE, MouseMode, normalize_serve_scale};
+use crate::desktop_host::{
+    DisplayArea, DisplaySelection, HostPermissions, MIN_SERVE_SCALE, MouseMode, Rect,
+    choose_displays, normalize_serve_scale,
+};
 use crate::helpers::{Helper, HelperForm, HelperRuntime};
 use topvnc::presentation::MotionPresentation;
-use topvnc::{PerformanceMode, UpdatePriority};
+use topvnc::{PerformanceMode, ServedDisplays, UpdatePriority};
 use winit::keyboard::KeyCode;
 
 pub const BG: u32 = 0x0b1020;
@@ -118,7 +121,7 @@ pub struct ServeForm {
     pub host: String,
     pub port: String,
     pub password: String,
-    pub display: String,
+    pub display: DisplaySelection,
     pub allow_insecure: bool,
     /// Served size as a fraction of the display's pixel size.
     pub scale: f32,
@@ -134,7 +137,7 @@ impl Default for ServeForm {
             host: LOCAL_ONLY_HOST.into(),
             port: "5900".into(),
             password: String::new(),
-            display: String::new(),
+            display: DisplaySelection::Primary,
             allow_insecure: false,
             scale: 1.0,
             mouse: MouseMode::Auto,
@@ -148,8 +151,7 @@ impl Default for ServeForm {
 pub struct ServeRequest {
     pub performance: PerformanceMode,
     pub address: String,
-    /// 1-based display number; `None` serves the primary display.
-    pub display: Option<usize>,
+    pub display: DisplaySelection,
     /// `None` only when unauthenticated access was explicitly allowed.
     pub password: Option<String>,
     pub allow_insecure: bool,
@@ -162,16 +164,6 @@ pub struct ServeRequest {
 impl ServeForm {
     pub fn request(&self) -> Result<ServeRequest, String> {
         let address = socket_address(&self.host, &self.port, "Enter a valid listen address.")?;
-        let display = match self.display.trim() {
-            "" => None,
-            number => Some(
-                number
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|number| *number > 0)
-                    .ok_or("Display must be a number from 1, or empty.")?,
-            ),
-        };
         // A typed password always enables authentication; the checkbox only
         // permits leaving it empty.
         let password = if self.password.is_empty() {
@@ -185,7 +177,7 @@ impl ServeForm {
         Ok(ServeRequest {
             performance: self.performance,
             address,
-            display,
+            display: self.display,
             password,
             allow_insecure: self.allow_insecure,
             scale: normalize_serve_scale(self.scale),
@@ -220,6 +212,60 @@ pub struct ServerView {
     pub message: Option<String>,
     /// Host permission state, on platforms that require it.
     pub permissions: Option<HostPermissions>,
+    /// Displays this host can serve, in `--display` numbering, where the
+    /// platform lists them.
+    pub displays: Option<Vec<DisplayArea>>,
+}
+
+/// Displays the Server tab cycles through where the host cannot list them.
+const UNLISTED_DISPLAYS: usize = 4;
+
+/// The display after `selection` when the Server tab's display button is
+/// clicked: the primary, each display, then all of them when the host can
+/// `span` them.
+pub fn next_display(
+    selection: DisplaySelection,
+    displays: Option<&[DisplayArea]>,
+    span: bool,
+) -> DisplaySelection {
+    let count = displays.map_or(UNLISTED_DISPLAYS, <[DisplayArea]>::len);
+    match selection {
+        DisplaySelection::Primary if count > 0 => DisplaySelection::Number(1),
+        DisplaySelection::Number(number) if number < count => DisplaySelection::Number(number + 1),
+        DisplaySelection::Number(_) if span && displays.is_some_and(|list| list.len() > 1) => {
+            DisplaySelection::All
+        }
+        _ => DisplaySelection::Primary,
+    }
+}
+
+/// The Server tab's display button text: the selection and its pixel size.
+pub fn display_choice_label(
+    selection: DisplaySelection,
+    displays: Option<&[DisplayArea]>,
+) -> String {
+    let size = |rect: Rect| format!("{}X{}", rect.right - rect.left, rect.bottom - rect.top);
+    let Some(displays) = displays.filter(|list| !list.is_empty()) else {
+        return match selection {
+            DisplaySelection::Primary => "MAIN".into(),
+            DisplaySelection::Number(number) => format!("DISPLAY {number}"),
+            DisplaySelection::All => "ALL".into(),
+        };
+    };
+    match selection {
+        DisplaySelection::Number(number) if number > displays.len() => {
+            format!("{number}: NOT FOUND")
+        }
+        DisplaySelection::Number(number) => {
+            format!("{number}: {}", size(displays[number - 1].rect))
+        }
+        selection => match choose_displays(selection, displays) {
+            Ok(chosen) if chosen.fallback.is_some() => "ALL: TOO LARGE".into(),
+            Ok(chosen) if chosen.number.is_none() => format!("ALL {}", size(chosen.bounds)),
+            Ok(chosen) => format!("MAIN {}", size(chosen.bounds)),
+            Err(_) => "MAIN".into(),
+        },
+    }
 }
 
 impl Config {
@@ -274,7 +320,6 @@ pub enum Field {
     ServeHost,
     ServePort,
     ServePassword,
-    ServeDisplay,
     WorkHost,
     WorkPort,
     NetworkPort,
@@ -300,12 +345,7 @@ impl Tab {
     fn fields(self) -> &'static [Field] {
         match self {
             Self::Connect => &[Field::Host, Field::Port, Field::Password, Field::WindowSize],
-            Self::Server => &[
-                Field::ServeHost,
-                Field::ServePort,
-                Field::ServePassword,
-                Field::ServeDisplay,
-            ],
+            Self::Server => &[Field::ServeHost, Field::ServePort, Field::ServePassword],
             Self::Work => &[Field::WorkHost, Field::WorkPort],
             Self::Network => &[Field::NetworkPort],
             Self::Firewall => &[
@@ -393,7 +433,6 @@ impl UiState {
             Field::ServeHost => Some(&mut config.serve.host),
             Field::ServePort => Some(&mut config.serve.port),
             Field::ServePassword => Some(&mut config.serve.password),
-            Field::ServeDisplay => Some(&mut config.serve.display),
             Field::WorkHost => Some(&mut config.helpers.work_host),
             Field::WorkPort => Some(&mut config.helpers.work_port),
             Field::NetworkPort => Some(&mut config.helpers.network_port),
@@ -1440,13 +1479,20 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
         canvas.text(45, 296, "X", BG, 2);
     }
     canvas.text(76, 296, "ALLOW NONE AUTHENTICATION", TEXT, 2);
+    // A click cycles through the main display, each display, and all.
     canvas.label(548, 192, "DISPLAY");
-    canvas.field(
+    canvas.text(640, 196, "CLICK TO CHANGE", MUTED, 1);
+    canvas.button(
         SERVE_DISPLAY,
-        &form.display,
-        "PRIMARY",
-        state.focus == Some(Field::ServeDisplay),
+        &display_choice_label(form.display, server.displays.as_deref()),
         false,
+    );
+    canvas.text(
+        SERVE_DISPLAY.x + SERVE_DISPLAY.w - 22,
+        SERVE_DISPLAY.y + 13,
+        ">",
+        MUTED,
+        2,
     );
     // Auto asks for relative motion while a game hides the cursor; macOS
     // hosts cannot tell, so they need Relative for mouse look.
@@ -1704,21 +1750,60 @@ pub fn live_serve_percent_from_x(x: usize) -> u8 {
 pub const LIVE_FIT: Box2 = Box2 {
     x: 24,
     y: 86,
-    w: 190,
+    w: 96,
     h: 38,
 };
 pub const LIVE_NATIVE: Box2 = Box2 {
-    x: 226,
+    x: 128,
     y: 86,
-    w: 190,
+    w: 136,
     h: 38,
 };
 pub const LIVE_FULLSCREEN: Box2 = Box2 {
-    x: 24,
-    y: 130,
-    w: 392,
+    x: 272,
+    y: 86,
+    w: 144,
     h: 38,
 };
+/// The row of host display buttons: one per display, then ALL.
+const LIVE_DISPLAY_ROW: Box2 = Box2 {
+    x: 118,
+    y: 130,
+    w: 298,
+    h: 38,
+};
+const LIVE_DISPLAY_ALL_WIDTH: usize = 56;
+const LIVE_DISPLAY_GAP: usize = 6;
+/// The most display buttons the row shows.
+const LIVE_DISPLAY_BUTTONS: u8 = 8;
+
+/// The F8 host display buttons: each area and the display it requests,
+/// numbered from 1, or 0 for all displays.
+pub fn live_display_buttons(displays: ServedDisplays) -> Vec<(Box2, u8)> {
+    let shown = displays.count.clamp(1, LIVE_DISPLAY_BUTTONS);
+    let all_x = LIVE_DISPLAY_ROW.x + LIVE_DISPLAY_ROW.w - LIVE_DISPLAY_ALL_WIDTH;
+    let width = ((all_x - LIVE_DISPLAY_ROW.x) / usize::from(shown) - LIVE_DISPLAY_GAP).min(44);
+    let button = |x, w| Box2 {
+        x,
+        w,
+        ..LIVE_DISPLAY_ROW
+    };
+    (1..=shown)
+        .map(|number| {
+            let x = LIVE_DISPLAY_ROW.x + usize::from(number - 1) * (width + LIVE_DISPLAY_GAP);
+            (button(x, width), number)
+        })
+        .chain([(button(all_x, LIVE_DISPLAY_ALL_WIDTH), 0)])
+        .collect()
+}
+
+/// The display the F8 button at (`x`, `y`) requests.
+pub fn live_display_choice(displays: ServedDisplays, x: usize, y: usize) -> Option<u8> {
+    live_display_buttons(displays)
+        .into_iter()
+        .find(|(area, _)| area.contains(x, y))
+        .map(|(_, display)| display)
+}
 pub const LIVE_60: Box2 = Box2 {
     x: 24,
     y: 270,
@@ -1835,7 +1920,13 @@ fn ultra_button(canvas: &mut Canvas<'_>, area: Box2, performance: PerformanceMod
     canvas.button(area, if ultra { "ULTRA: ON" } else { "ULTRA: OFF" }, ultra);
 }
 
-pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool, serve_scale: Option<u8>) {
+pub fn overlay(
+    canvas: &mut Canvas<'_>,
+    config: &Config,
+    open: bool,
+    serve_scale: Option<u8>,
+    serve_display: Option<ServedDisplays>,
+) {
     if !open {
         let area = open_settings_box(config.ui_scale);
         let text_scale = (2.0 * config.ui_scale).round().clamp(1.0, 4.0) as usize;
@@ -1856,17 +1947,34 @@ pub fn overlay(canvas: &mut Canvas<'_>, config: &Config, open: bool, serve_scale
     canvas.text(24, 28, "SESSION SETTINGS", TEXT, 3);
     canvas.button(CLOSE_SETTINGS, "CLOSE", false);
     canvas.text(24, 62, "WINDOW", ACCENT, 2);
-    canvas.button(
-        LIVE_FIT,
-        "FIT IMAGE",
-        config.window_mode != WindowMode::Native,
-    );
+    canvas.button(LIVE_FIT, "FIT", config.window_mode != WindowMode::Native);
     canvas.button(
         LIVE_NATIVE,
         "1:1 PIXELS",
         config.window_mode == WindowMode::Native,
     );
-    canvas.button(LIVE_FULLSCREEN, "FULL SCREEN ON / OFF", false);
+    canvas.button(LIVE_FULLSCREEN, "FULL SCREEN", false);
+    // The host display is shared by every viewer, like the served size.
+    canvas.text(24, 142, "DISPLAY", ACCENT, 2);
+    match serve_display {
+        Some(displays) => {
+            for (area, display) in live_display_buttons(displays) {
+                let label = match display {
+                    0 => "ALL".to_string(),
+                    number => number.to_string(),
+                };
+                canvas.button(area, &label, display == displays.served);
+            }
+        }
+        // Older hosts, third-party servers, and macOS hosts do not offer it.
+        None => canvas.text(
+            LIVE_DISPLAY_ROW.x,
+            LIVE_DISPLAY_ROW.y + 16,
+            "NOT OFFERED BY THIS HOST",
+            MUTED,
+            1,
+        ),
+    }
     canvas.text(24, 178, "SERVED SIZE", ACCENT, 2);
     let color = if serve_scale.is_some() {
         ACCENT
@@ -2200,7 +2308,6 @@ mod tests {
             Field::ServeHost,
             Field::ServePort,
             Field::ServePassword,
-            Field::ServeDisplay,
             Field::ServeHost,
         ] {
             state.key(&mut config, KeyCode::Tab);
@@ -2248,22 +2355,154 @@ mod tests {
         form.allow_insecure = true;
         let request = form.request().unwrap();
         assert_eq!(request.address, "127.0.0.1:5900");
-        assert_eq!((request.password, request.display), (None, None));
+        assert_eq!(
+            (request.password, request.display),
+            (None, DisplaySelection::Primary)
+        );
         form.password = "secret".into();
         assert_eq!(form.request().unwrap().password.as_deref(), Some("secret"));
-        form.display = "2".into();
-        assert_eq!(form.request().unwrap().display, Some(2));
-        for display in ["0", "-1", "two"] {
-            form.display = display.into();
-            assert!(form.request().is_err());
-        }
-        form.display.clear();
+        form.display = DisplaySelection::All;
+        assert_eq!(form.request().unwrap().display, DisplaySelection::All);
         form.host = "::".into();
         assert!(form.request().is_err());
         form.host = "[::]".into();
         assert_eq!(form.request().unwrap().address, "[::]:5900");
         form.port = "0".into();
         assert!(form.request().is_err());
+    }
+
+    fn attached(rects: &[(i32, i32, i32, i32)]) -> Vec<DisplayArea> {
+        rects
+            .iter()
+            .enumerate()
+            .map(|(index, &(left, top, right, bottom))| DisplayArea {
+                name: format!("\\\\.\\DISPLAY{}", index + 1),
+                rect: Rect::new(left, top, right, bottom),
+                primary: (left, top) == (0, 0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn display_button_cycles_through_listed_displays_and_all() {
+        let displays = attached(&[(0, 0, 3440, 1440), (3440, 0, 4880, 2560)]);
+        let mut selection = DisplaySelection::Primary;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            selection = next_display(selection, Some(&displays), true);
+            seen.push(selection);
+        }
+        assert_eq!(
+            seen,
+            [
+                DisplaySelection::Number(1),
+                DisplaySelection::Number(2),
+                DisplaySelection::All,
+                DisplaySelection::Primary,
+            ]
+        );
+        // Hosts that cannot span displays skip ALL, as does a single display.
+        assert_eq!(
+            next_display(DisplaySelection::Number(2), Some(&displays), false),
+            DisplaySelection::Primary
+        );
+        assert_eq!(
+            next_display(DisplaySelection::Number(1), Some(&displays[..1]), true),
+            DisplaySelection::Primary
+        );
+        // A display that was unplugged moves on to the main display.
+        assert_eq!(
+            next_display(DisplaySelection::Number(5), Some(&displays), false),
+            DisplaySelection::Primary
+        );
+        // Unlisted displays still offer a few numbers.
+        assert_eq!(
+            next_display(DisplaySelection::Number(3), None, true),
+            DisplaySelection::Number(4)
+        );
+        assert_eq!(
+            next_display(DisplaySelection::Number(4), None, true),
+            DisplaySelection::Primary
+        );
+        assert_eq!(
+            next_display(DisplaySelection::Primary, Some(&[]), true),
+            DisplaySelection::Primary
+        );
+    }
+
+    #[test]
+    fn display_button_labels_name_the_choice_and_fit_the_button() {
+        let displays = attached(&[(0, 0, 3440, 1440), (3440, 0, 4880, 2560)]);
+        let listed = Some(displays.as_slice());
+        let cases = [
+            (DisplaySelection::Primary, listed, "MAIN 3440X1440"),
+            (DisplaySelection::Number(2), listed, "2: 1440X2560"),
+            (DisplaySelection::Number(16), listed, "16: NOT FOUND"),
+            (DisplaySelection::All, listed, "ALL 4880X2560"),
+            (DisplaySelection::Primary, None, "MAIN"),
+            (DisplaySelection::Number(3), None, "DISPLAY 3"),
+        ];
+        for (selection, displays, expected) in cases {
+            let label = display_choice_label(selection, displays);
+            assert_eq!(label, expected);
+            // Text starts 12 pixels in and leaves room for the arrow.
+            assert!(12 + label.len() * 12 <= SERVE_DISPLAY.w - 22, "{label}");
+        }
+        let wide = attached(&[
+            (0, 0, 3840, 2160),
+            (3840, 0, 7680, 2160),
+            (7680, 0, 11520, 2160),
+        ]);
+        assert_eq!(
+            display_choice_label(DisplaySelection::All, Some(&wide)),
+            "ALL: TOO LARGE"
+        );
+    }
+
+    #[test]
+    fn f8_display_buttons_fit_the_row_and_map_clicks() {
+        for count in 1..=topvnc::MAX_SERVED_DISPLAYS {
+            let displays = ServedDisplays { served: 1, count };
+            let buttons = live_display_buttons(displays);
+            assert_eq!(
+                buttons.len(),
+                usize::from(count.min(LIVE_DISPLAY_BUTTONS)) + 1
+            );
+            assert_eq!(buttons.last().unwrap().1, 0);
+            for (area, display) in &buttons {
+                // Glyphs advance 12 pixels; the last has no trailing gap.
+                let label = if *display == 0 {
+                    3
+                } else {
+                    display.to_string().len()
+                };
+                assert!(12 + label * 12 - 2 <= area.w, "{count} displays: {display}");
+                assert!(area.x >= LIVE_DISPLAY_ROW.x);
+                assert!(area.x + area.w <= LIVE_FULLSCREEN.x + LIVE_FULLSCREEN.w);
+                let (x, y) = (area.x + area.w / 2, area.y + area.h / 2);
+                assert_eq!(live_display_choice(displays, x, y), Some(*display));
+            }
+            for pair in buttons.windows(2) {
+                assert!(pair[0].0.x + pair[0].0.w < pair[1].0.x);
+            }
+        }
+        let displays = ServedDisplays {
+            served: 0,
+            count: 2,
+        };
+        assert_eq!(live_display_choice(displays, 24, 140), None);
+        // The window row above keeps its labels inside its buttons.
+        for (area, name) in [
+            (LIVE_FIT, "FIT"),
+            (LIVE_NATIVE, "1:1 PIXELS"),
+            (LIVE_FULLSCREEN, "FULL SCREEN"),
+        ] {
+            assert!(12 + name.len() * 12 <= area.w, "{name} overflows");
+            assert!(area.y + area.h < LIVE_DISPLAY_ROW.y);
+        }
+        const { assert!(LIVE_DISPLAY_ROW.y + LIVE_DISPLAY_ROW.h < LIVE_SERVE_SLIDER.y) };
+        // "DISPLAY" ends before the first button.
+        const { assert!(24 + "DISPLAY".len() * 12 < LIVE_DISPLAY_ROW.x) };
     }
 
     #[test]
