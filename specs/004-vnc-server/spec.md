@@ -24,7 +24,7 @@ Provide a reusable RFB server endpoint and a usable Windows host mode that captu
 
 - Authentication is password protected by default; unauthenticated mode requires an explicit flag.
 - The process is per-monitor DPI aware so capture sizes, cursor positions, and injected pointer coordinates are physical pixels.
-- DXGI Desktop Duplication captures the primary display, or the attached display chosen with `--display NUMBER` (1-based, in DXGI enumeration order), and orients rotated displays upright.
+- DXGI Desktop Duplication captures the primary display, the attached display chosen with `--display NUMBER` (1-based, in DXGI enumeration order), or every display with `--display all`, and orients rotated displays upright. Display changes and viewer display switching are specified in spec 013.
 - Only dirty and moved regions reported by Desktop Duplication are copied from the GPU; frames where only the pointer changed redraw just the old and new cursor areas. The cursor, which Desktop Duplication reports separately, is composited over the served image.
 - When capture fails (desktop switch to UAC or the lock screen, display mode change, device loss), the server keeps serving the last image and recreates capture with backoff. A changed display size is served to DesktopSize clients without a restart.
 - Remote input is injected on its own thread with `SendInput`: absolute pointer moves across the virtual desktop, left/middle/right buttons, vertical and horizontal wheel (RFB buttons 4–7), and keys with scan codes and extended-key flags, distinct left/right modifiers, keypad navigation keys, and media keys. Keysyms without a virtual key are typed as Unicode characters.
@@ -33,9 +33,9 @@ Provide a reusable RFB server endpoint and a usable Windows host mode that captu
 
 ### Server tab (app UI)
 
-- The connection window has **Connect** and **Server** tabs. The Server tab starts and stops the same Windows host as `--serve` without a console: listen address and port (default `127.0.0.1:5900`, with *This PC only* and *All networks* shortcuts), password, optional 1-based display number (empty serves the primary display), and an *Allow none authentication* checkbox.
+- The connection window has **Connect** and **Server** tabs. The Server tab starts and stops the same Windows host as `--serve` without a console: listen address and port (default `127.0.0.1:5900`, with *This PC only* and *All networks* shortcuts), password, a display picker (main display, each detected display, or all; see spec 013), and an *Allow none authentication* checkbox.
 - A typed password always enables VNC authentication. Starting with an empty password is refused unless *Allow none authentication* is checked, and an unauthenticated server shows a persistent warning while it runs. Server form values, including the password, are never saved.
-- The form is validated before starting (address and IPv6 brackets, port 1–65535, display number) and is locked while the server runs.
+- The form is validated before starting (address and IPv6 brackets, port 1–65535) and is locked while the server runs.
 - The server runs on a background thread. The tab shows its phase (stopped, starting, serving, stopping), the served size and bound address, open viewer connections (including ones still authenticating), the latest capture or clipboard message, and the error that stopped it.
 - The server keeps running while the app is connected to another desktop as a viewer. Closing the app stops the server and waits for it to release every remotely held key and button.
 - The capture and input threads opt in to per-monitor DPI awareness individually, so the app's own windows keep their DPI behavior. The `--serve` CLI still sets it process-wide.
@@ -45,7 +45,7 @@ Provide a reusable RFB server endpoint and a usable Windows host mode that captu
 
 The server supports RFB 3.8 with Raw encoding, and Tight with JPEG as specified in spec 006. It does not encrypt TCP; deployments must use a secured network or tunnel. Standard VNC authentication retains its protocol limitation of using only the first eight password bytes. Clipboard text is limited to Latin-1; Windows text outside that range is replaced with `?` for viewers.
 
-The secure desktop (UAC prompts, the lock screen) cannot be captured by a user process; the last image stays on screen until capture resumes. One display is served per server process, and the Server tab runs one server at a time. Printable ASCII keysyms are mapped to US-layout virtual keys. TopVNC's own viewer does not yet advertise DesktopSize, so it is disconnected when the served display changes size and must reconnect. The macOS host backend is specified in spec 005; a Linux backend remains future work.
+The secure desktop (UAC prompts, the lock screen) cannot be captured by a user process; the last image stays on screen until capture resumes. Each server process serves one display or all of them in one image, and the Server tab runs one server at a time; separate processes can serve displays on separate ports. Printable ASCII keysyms are mapped to US-layout virtual keys. TopVNC's own viewer does not yet advertise DesktopSize, so it is disconnected when the served display changes size and must reconnect. The macOS host backend is specified in spec 005; a Linux backend remains future work.
 
 ## Validation status
 

@@ -24,18 +24,396 @@ pub const WHEEL_DELTA: i32 = 120;
 pub const CAPTURE_RETRY_MIN: Duration = Duration::from_millis(250);
 pub const CAPTURE_RETRY_MAX: Duration = Duration::from_secs(2);
 
-pub const SERVE_USAGE: &str = "usage: topvnc --serve [HOST:PORT] [--display NUMBER] [--scale 0.25-1] [--mouse auto|relative|absolute] [--priority whole|center|mouse|changes] [--ultra] [--allow-insecure]";
+pub const SERVE_USAGE: &str = "usage: topvnc --serve [HOST:PORT] [--display primary|NUMBER|all] [--scale 0.25-1] [--mouse auto|relative|absolute] [--priority whole|center|mouse|changes] [--ultra] [--allow-insecure]";
 
 /// The smallest served size, as a fraction of the display's pixel size.
 pub const MIN_SERVE_SCALE: f32 = 0.25;
+
+/// The most attached displays a host enumerates and numbers.
+pub const MAX_DISPLAYS: usize = topvnc::MAX_SERVED_DISPLAYS as usize;
+
+/// Which attached displays a host serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplaySelection {
+    /// The primary display, followed when another display becomes primary.
+    #[default]
+    Primary,
+    /// The display numbered from 1 in the platform's enumeration order. The
+    /// primary display is served while that one is not attached.
+    Number(usize),
+    /// Every attached display, arranged as on the desktop.
+    All,
+}
+
+impl DisplaySelection {
+    /// Parse `primary`, `all`, or a display number from 1.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "primary" | "main" => Some(Self::Primary),
+            "all" => Some(Self::All),
+            number => number
+                .parse::<usize>()
+                .ok()
+                .filter(|number| (1..=MAX_DISPLAYS).contains(number))
+                .map(Self::Number),
+        }
+    }
+
+    /// The selection a viewer requested: 0 for all displays, else a number.
+    pub fn from_request(display: u8) -> Self {
+        match display {
+            0 => Self::All,
+            number => Self::Number(usize::from(number)),
+        }
+    }
+}
+
+impl std::fmt::Display for DisplaySelection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Primary => formatter.write_str("the primary display"),
+            Self::Number(number) => write!(formatter, "display {number}"),
+            Self::All => formatter.write_str("all displays"),
+        }
+    }
+}
+
+/// An attached display's area on the virtual desktop, in physical pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayArea {
+    pub name: String,
+    pub rect: Rect,
+    pub primary: bool,
+}
+
+/// The attached displays a [`DisplaySelection`] resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenDisplays {
+    /// Indices into the attached displays, in enumeration order.
+    pub indices: Vec<usize>,
+    /// The desktop area they span, which the served image covers.
+    pub bounds: Rect,
+    /// The display number served, or `None` when all are.
+    pub number: Option<usize>,
+    /// Why the primary display is served instead of the selection, such as
+    /// a selected display that is not attached.
+    pub fallback: Option<String>,
+}
+
+impl ChosenDisplays {
+    /// What viewers are told: the served display (0 for all) and the count.
+    pub fn announcement(&self, attached: usize) -> topvnc::ServedDisplays {
+        let count = attached.clamp(1, MAX_DISPLAYS) as u8;
+        topvnc::ServedDisplays {
+            served: self.number.map_or(0, |number| (number as u8).min(count)),
+            count,
+        }
+    }
+}
+
+/// Resolve `selection` among the attached `displays`, in enumeration order.
+/// A selection that cannot be served falls back to the primary display, so
+/// viewers keep a live picture; [`ChosenDisplays::fallback`] says why.
+pub fn choose_displays(
+    selection: DisplaySelection,
+    displays: &[DisplayArea],
+) -> Result<ChosenDisplays, String> {
+    if displays.is_empty() {
+        return Err("no attached display was found".into());
+    }
+    let primary = displays
+        .iter()
+        .position(|display| display.primary)
+        .unwrap_or(0);
+    let single = |index: usize, fallback| ChosenDisplays {
+        indices: vec![index],
+        bounds: displays[index].rect,
+        number: Some(index + 1),
+        fallback,
+    };
+    match selection {
+        DisplaySelection::Primary => Ok(single(primary, None)),
+        DisplaySelection::Number(number) if (1..=displays.len()).contains(&number) => {
+            Ok(single(number - 1, None))
+        }
+        DisplaySelection::Number(number) => Ok(single(
+            primary,
+            Some(format!(
+                "display {number} is not attached ({} attached)",
+                displays.len()
+            )),
+        )),
+        DisplaySelection::All => {
+            // Mirrored displays share one area; capture it once.
+            let indices = (0..displays.len())
+                .filter(|&index| {
+                    !displays[..index]
+                        .iter()
+                        .any(|earlier| earlier.rect == displays[index].rect)
+                })
+                .collect::<Vec<_>>();
+            let bounds = indices
+                .iter()
+                .fold(displays[indices[0]].rect, |bounds, &index| {
+                    bounds.union(displays[index].rect)
+                });
+            let (width, height) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
+            let fits = u16::try_from(width)
+                .ok()
+                .zip(u16::try_from(height).ok())
+                .is_some_and(|(width, height)| validate_capture_dimensions(width, height).is_ok());
+            if !fits {
+                return Ok(single(
+                    primary,
+                    Some(format!(
+                        "all displays together span {width}x{height} pixels, beyond VNC's \
+                         {MAX_FRAMEBUFFER_DIMENSION}-pixel limit"
+                    )),
+                ));
+            }
+            Ok(ChosenDisplays {
+                indices,
+                bounds,
+                number: None,
+                fallback: None,
+            })
+        }
+    }
+}
+
+/// Follows a display layout read periodically. A change is reported once
+/// the same new layout is read twice in a row, after the system finishes
+/// reconfiguring, so capture is not restarted on an intermediate state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutWatch<L> {
+    current: L,
+    settling: Option<L>,
+}
+
+impl<L: PartialEq> LayoutWatch<L> {
+    pub fn new(current: L) -> Self {
+        Self {
+            current,
+            settling: None,
+        }
+    }
+
+    /// Compare a newly read `layout`. Returns whether it is a settled
+    /// change, which then becomes the current layout.
+    pub fn changed(&mut self, layout: L) -> bool {
+        if layout == self.current {
+            self.settling = None;
+            false
+        } else if self.settling.as_ref() != Some(&layout) {
+            self.settling = Some(layout);
+            false
+        } else {
+            self.current = layout;
+            self.settling = None;
+            true
+        }
+    }
+}
+
+/// What a host serves for a selection, resolved against the displays
+/// attached at one moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayPlan {
+    pub chosen: ChosenDisplays,
+    /// Names and desktop areas of the displays to capture.
+    pub outputs: Vec<(String, Rect)>,
+    /// How many displays were attached.
+    pub attached: usize,
+}
+
+impl DisplayPlan {
+    pub fn new(selection: DisplaySelection, attached: &[DisplayArea]) -> Result<Self, String> {
+        let chosen = choose_displays(selection, attached)?;
+        let outputs = chosen
+            .indices
+            .iter()
+            .map(|&index| (attached[index].name.clone(), attached[index].rect))
+            .collect();
+        Ok(Self {
+            chosen,
+            outputs,
+            attached: attached.len(),
+        })
+    }
+
+    /// What viewers are told about the served display.
+    pub fn announcement(&self) -> topvnc::ServedDisplays {
+        self.chosen.announcement(self.attached)
+    }
+
+    pub fn description(&self) -> String {
+        match self.chosen.number {
+            Some(number) => format!(
+                "display {number} of {} ({})",
+                self.attached, self.outputs[0].0
+            ),
+            None => format!("all {} displays", self.outputs.len()),
+        }
+    }
+
+    /// Why the primary display is served instead of the selection.
+    pub fn fallback_notice(&self) -> Option<String> {
+        let mut reason = self.chosen.fallback.clone()?;
+        if let Some(first) = reason.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
+        Some(format!("{reason}; serving {} instead.", self.description()))
+    }
+}
+
+/// What a host must do after a viewer request or a display change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayChange {
+    /// Nothing viewers can see changed.
+    None,
+    /// The same displays are still captured, but their numbering or the
+    /// reason for a fallback changed; announce [`DisplayFollower::plan`].
+    Renumbered,
+    /// Other displays must be captured: stop capture, then start it again.
+    Restart,
+}
+
+/// Decides what a host serves as viewers ask for displays and monitors are
+/// plugged in, unplugged, or made primary. Backends read the monitor layout
+/// and list the attached displays; this decides what follows from them.
+#[derive(Debug, Clone)]
+pub struct DisplayFollower {
+    selection: DisplaySelection,
+    /// What the running capture serves, and the layout it was checked
+    /// against; `None` while capture is stopped.
+    serving: Option<(DisplayPlan, LayoutWatch<Vec<DisplayArea>>)>,
+}
+
+impl DisplayFollower {
+    pub fn new(selection: DisplaySelection) -> Self {
+        Self {
+            selection,
+            serving: None,
+        }
+    }
+
+    pub fn selection(&self) -> DisplaySelection {
+        self.selection
+    }
+
+    /// What the running capture serves.
+    pub fn plan(&self) -> Option<&DisplayPlan> {
+        self.serving.as_ref().map(|(plan, _)| plan)
+    }
+
+    /// Capture started serving `plan`. `layout` must be read before the
+    /// displays were listed, so a change while starting is noticed.
+    pub fn started(&mut self, plan: DisplayPlan, layout: Vec<DisplayArea>) {
+        self.serving = Some((plan, LayoutWatch::new(layout)));
+    }
+
+    /// Capture stopped; the next one is planned from the displays then.
+    pub fn stopped(&mut self) {
+        self.serving = None;
+    }
+
+    /// A viewer asked for `display`: 0 for all, or a display number.
+    /// `attached` lists the displays attached now.
+    pub fn request(
+        &mut self,
+        display: u8,
+        attached: impl FnOnce() -> Result<Vec<DisplayArea>, String>,
+    ) -> DisplayChange {
+        let requested = DisplaySelection::from_request(display);
+        if requested == self.selection {
+            return DisplayChange::None;
+        }
+        self.selection = requested;
+        self.follow(attached)
+    }
+
+    /// The monitor layout was read again. A change counts once it reads the
+    /// same twice in a row; see [`LayoutWatch`].
+    pub fn layout_read(
+        &mut self,
+        layout: Vec<DisplayArea>,
+        attached: impl FnOnce() -> Result<Vec<DisplayArea>, String>,
+    ) -> DisplayChange {
+        let settled = self
+            .serving
+            .as_mut()
+            .is_some_and(|(_, watch)| watch.changed(layout));
+        if settled {
+            self.follow(attached)
+        } else {
+            DisplayChange::None
+        }
+    }
+
+    fn follow(
+        &mut self,
+        attached: impl FnOnce() -> Result<Vec<DisplayArea>, String>,
+    ) -> DisplayChange {
+        let Some((plan, _)) = &mut self.serving else {
+            return DisplayChange::Restart;
+        };
+        let Ok(next) = attached().and_then(|attached| DisplayPlan::new(self.selection, &attached))
+        else {
+            return DisplayChange::Restart;
+        };
+        if next.outputs != plan.outputs {
+            return DisplayChange::Restart;
+        }
+        let renumbered = next.announcement() != plan.announcement()
+            || next.chosen.fallback != plan.chosen.fallback;
+        *plan = next;
+        if renumbered {
+            DisplayChange::Renumbered
+        } else {
+            DisplayChange::None
+        }
+    }
+}
+
+/// Decides which output's pointer reports move the cursor when several
+/// outputs are captured at once. Each output reports the pointer only while
+/// it is on that output, so a report from another output hides it only
+/// when that output last showed it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PointerOwner {
+    output: Option<usize>,
+    visible: bool,
+    time: i64,
+}
+
+impl PointerOwner {
+    /// Whether a pointer report from `output`, made at `time`, should move
+    /// or hide the cursor. Records the output as the owner when it does.
+    pub fn accept(&mut self, output: usize, visible: bool, time: i64) -> bool {
+        let owned = self.output == Some(output);
+        if !visible && !owned && self.output.is_some() {
+            return false;
+        }
+        // Two outputs can both report a visible pointer around a move
+        // between them; the newer report wins.
+        if visible && self.visible && !owned && time < self.time {
+            return false;
+        }
+        *self = Self {
+            output: Some(output),
+            visible,
+            time,
+        };
+        true
+    }
+}
 
 /// Options for `topvnc --serve`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServeOptions {
     pub performance: PerformanceMode,
     pub address: String,
-    /// 1-based display number; `None` serves the primary display.
-    pub display: Option<usize>,
+    pub display: DisplaySelection,
     pub allow_insecure: bool,
     /// Served size as a fraction of the display's pixel size, from
     /// [`MIN_SERVE_SCALE`] to 1. A Retina display at 0.5 is served at its
@@ -236,13 +614,14 @@ pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'sta
     let mut options = ServeOptions {
         performance: PerformanceMode::Standard,
         address: "127.0.0.1:5900".to_owned(),
-        display: None,
+        display: DisplaySelection::Primary,
         allow_insecure: false,
         scale: 1.0,
         mouse: MouseMode::Auto,
         priority: UpdatePriority::Whole,
     };
     let mut address_set = false;
+    let mut display_set = false;
     let mut scale_set = false;
     let mut mouse_set = false;
     let mut priority_set = false;
@@ -251,13 +630,12 @@ pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'sta
         match argument.as_str() {
             "--ultra" => options.performance = PerformanceMode::Ultra,
             "--allow-insecure" => options.allow_insecure = true,
-            "--display" if options.display.is_none() => {
-                let number = arguments
+            "--display" if !display_set => {
+                options.display = arguments
                     .next()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .filter(|number| *number > 0)
+                    .and_then(|value| DisplaySelection::parse(value))
                     .ok_or(SERVE_USAGE)?;
-                options.display = Some(number);
+                display_set = true;
             }
             "--scale" if !scale_set => {
                 options.scale = arguments
@@ -1001,6 +1379,26 @@ impl Rect {
         (!rect.is_empty()).then_some(rect)
     }
 
+    /// The smallest rectangle containing both.
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
+    /// This rectangle moved by (`dx`, `dy`).
+    pub fn offset(self, dx: i32, dy: i32) -> Self {
+        Self::new(
+            self.left + dx,
+            self.top + dy,
+            self.right + dx,
+            self.bottom + dy,
+        )
+    }
+
     fn width(self) -> usize {
         (self.right - self.left) as usize
     }
@@ -1204,13 +1602,26 @@ impl CaptureSurface<'_> {
     /// Copy the upright desktop `rect` into `desktop` (0x00RRGGBB pixels,
     /// `desktop_width` per row). `rect` must lie inside the desktop.
     pub fn copy_rect(&self, rect: Rect, desktop: &mut [u32], desktop_width: usize) {
+        self.copy_rect_to(rect, desktop, desktop_width, (0, 0));
+    }
+
+    /// Like [`CaptureSurface::copy_rect`], but writes the upright `rect` of
+    /// this surface to `desktop` at `rect` moved by `origin`, where this
+    /// surface is one of several displays in a combined image.
+    pub fn copy_rect_to(
+        &self,
+        rect: Rect,
+        desktop: &mut [u32],
+        desktop_width: usize,
+        origin: (usize, usize),
+    ) {
         let pixel = |source_x: usize, source_y: usize| {
             let offset = source_y * self.row_pitch + source_x * 4;
             let bytes: [u8; 4] = self.bytes[offset..offset + 4].try_into().unwrap();
             u32::from_le_bytes(bytes) & 0x00ff_ffff
         };
         for y in rect.top as usize..rect.bottom as usize {
-            let row_start = y * desktop_width + rect.left as usize;
+            let row_start = (origin.1 + y) * desktop_width + origin.0 + rect.left as usize;
             let row = &mut desktop[row_start..row_start + rect.width()];
             if self.rotation == Rotation::Identity {
                 let start = y * self.row_pitch + rect.left as usize * 4;
@@ -1390,6 +1801,28 @@ impl DesktopImage {
         }
     }
 
+    /// Copy the upright `rect` of `surface`, one display of several, to
+    /// this image with the display's top-left corner at `origin`. Returns
+    /// the area of this image that changed.
+    pub fn copy_from_at(
+        &mut self,
+        surface: &CaptureSurface<'_>,
+        rect: Rect,
+        origin: (usize, usize),
+    ) -> Option<Rect> {
+        let (width, height) = match surface.rotation {
+            Rotation::Identity | Rotation::Rotate180 => (surface.width, surface.height),
+            Rotation::Rotate90 | Rotation::Rotate270 => (surface.height, surface.width),
+        };
+        let (dx, dy) = (origin.0 as i32, origin.1 as i32);
+        let target = rect
+            .intersect(Rect::new(0, 0, width as i32, height as i32))?
+            .offset(dx, dy)
+            .intersect(self.bounds())?;
+        surface.copy_rect_to(target.offset(-dx, -dy), &mut self.clean, self.width, origin);
+        Some(target)
+    }
+
     pub fn set_cursor_position(&mut self, x: i32, y: i32, visible: bool) {
         if (x, y) != self.cursor_position || visible != self.cursor_visible {
             self.cursor_position = (x, y);
@@ -1498,7 +1931,7 @@ mod tests {
             Ok(ServeOptions {
                 address: "127.0.0.1:5900".into(),
                 performance: PerformanceMode::Standard,
-                display: None,
+                display: DisplaySelection::Primary,
                 allow_insecure: false,
                 scale: 1.0,
                 mouse: MouseMode::Auto,
@@ -1515,13 +1948,25 @@ mod tests {
             Ok(ServeOptions {
                 address: "0.0.0.0:5901".into(),
                 performance: PerformanceMode::Standard,
-                display: Some(2),
+                display: DisplaySelection::Number(2),
                 allow_insecure: true,
                 scale: 1.0,
                 mouse: MouseMode::Auto,
                 priority: UpdatePriority::Whole,
             })
         );
+        for (value, display) in [
+            ("all", DisplaySelection::All),
+            ("ALL", DisplaySelection::All),
+            ("primary", DisplaySelection::Primary),
+            ("16", DisplaySelection::Number(16)),
+        ] {
+            assert_eq!(
+                parse_serve_arguments(&arguments(&["--display", value]))
+                    .map(|options| options.display),
+                Ok(display)
+            );
+        }
         assert_eq!(
             parse_serve_arguments(&arguments(&["--scale", "0.5"])).map(|options| options.scale),
             Ok(0.5)
@@ -1543,8 +1988,10 @@ mod tests {
         for invalid in [
             &["--display"][..],
             &["--display", "0"],
+            &["--display", "17"],
             &["--display", "x"],
             &["--display", "1", "--display", "2"],
+            &["--display", "all", "--display", "all"],
             &["--scale"],
             &["--scale", "0.2"],
             &["--scale", "1.5"],
@@ -1960,6 +2407,748 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(desktop, expected);
+    }
+
+    #[test]
+    fn displays_composite_at_their_offsets_and_clip_to_the_image() {
+        // A 2x3 source whose pixel values encode (x, y).
+        let (width, height, pitch) = (2usize, 3usize, 8usize);
+        let mut bytes = vec![0; pitch * height];
+        for y in 0..height {
+            for x in 0..width {
+                bytes[y * pitch + x * 4..y * pitch + x * 4 + 4]
+                    .copy_from_slice(&[x as u8, y as u8, 0x10, 0xff]);
+            }
+        }
+        let surface = CaptureSurface {
+            bytes: &bytes,
+            row_pitch: pitch,
+            width,
+            height,
+            rotation: Rotation::Identity,
+        };
+        // A 4x3 image: this display sits at its right half.
+        let mut image = DesktopImage::new(4, 3);
+        let changed = image.copy_from_at(&surface, Rect::new(0, 1, 2, 3), (2, 0));
+        assert_eq!(changed, Some(Rect::new(2, 1, 4, 3)));
+        let mut output = vec![0; 12];
+        let mut damage = Vec::new();
+        image.present(&[Rect::new(0, 0, 4, 3)], &mut output, &mut damage);
+        assert_eq!(
+            output,
+            [
+                0, 0, 0, 0, //
+                0, 0, 0x10_0100, 0x10_0101, //
+                0, 0, 0x10_0200, 0x10_0201,
+            ]
+        );
+        // Damage outside the display, or past the image, is clipped.
+        assert_eq!(
+            image.copy_from_at(&surface, Rect::new(0, 0, 9, 9), (3, 1)),
+            Some(Rect::new(3, 1, 4, 3))
+        );
+        assert_eq!(
+            image.copy_from_at(&surface, Rect::new(0, 0, 2, 3), (4, 0)),
+            None
+        );
+        // Rotated displays clip against their upright size.
+        let rotated = CaptureSurface {
+            rotation: Rotation::Rotate90,
+            ..surface
+        };
+        assert_eq!(
+            image.copy_from_at(&rotated, Rect::new(0, 0, 9, 9), (0, 0)),
+            Some(Rect::new(0, 0, 3, 2))
+        );
+    }
+
+    fn display(name: &str, rect: Rect, primary: bool) -> DisplayArea {
+        DisplayArea {
+            name: name.into(),
+            rect,
+            primary,
+        }
+    }
+
+    #[test]
+    fn display_selections_resolve_and_fall_back_to_the_primary() {
+        // The primary is enumerated second and sits right of the origin's
+        // left neighbor, as when a display is placed left of the primary.
+        let displays = [
+            display("left", Rect::new(-1440, -560, 0, 2000), false),
+            display("main", Rect::new(0, 0, 3440, 1440), true),
+        ];
+        let primary = choose_displays(DisplaySelection::Primary, &displays).unwrap();
+        assert_eq!(primary.indices, [1]);
+        assert_eq!(primary.bounds, displays[1].rect);
+        assert_eq!(
+            (primary.number, primary.fallback.as_deref()),
+            (Some(2), None)
+        );
+        let first = choose_displays(DisplaySelection::Number(1), &displays).unwrap();
+        assert_eq!((first.indices[0], first.number), (0, Some(1)));
+        // An unplugged display serves the primary until it returns.
+        let missing = choose_displays(DisplaySelection::Number(3), &displays).unwrap();
+        assert_eq!(
+            (missing.indices.as_slice(), missing.number),
+            (&[1][..], Some(2))
+        );
+        assert_eq!(
+            missing.fallback.as_deref(),
+            Some("display 3 is not attached (2 attached)")
+        );
+        let all = choose_displays(DisplaySelection::All, &displays).unwrap();
+        assert_eq!(all.indices, [0, 1]);
+        assert_eq!(all.bounds, Rect::new(-1440, -560, 3440, 2000));
+        assert_eq!(all.number, None);
+        assert_eq!(
+            all.announcement(2),
+            topvnc::ServedDisplays {
+                served: 0,
+                count: 2
+            }
+        );
+        assert_eq!(
+            primary.announcement(40),
+            topvnc::ServedDisplays {
+                served: 2,
+                count: MAX_DISPLAYS as u8
+            }
+        );
+        // Without a primary flag the first display is used.
+        let unflagged = [display("a", Rect::new(0, 0, 10, 10), false)];
+        assert_eq!(
+            choose_displays(DisplaySelection::Primary, &unflagged)
+                .unwrap()
+                .indices,
+            [0]
+        );
+        assert!(choose_displays(DisplaySelection::Primary, &[]).is_err());
+        // Spans past VNC's framebuffer limits serve the primary, not a
+        // truncated or frozen image.
+        let wide = [
+            display("a", Rect::new(0, 0, 3840, 2160), false),
+            display("b", Rect::new(3840, 0, 7680, 2160), true),
+            display("c", Rect::new(7680, 0, 11520, 2160), false),
+        ];
+        let oversized = choose_displays(DisplaySelection::All, &wide).unwrap();
+        assert_eq!(
+            (oversized.indices.as_slice(), oversized.number),
+            (&[1][..], Some(2))
+        );
+        let reason = oversized.fallback.unwrap();
+        assert!(reason.contains("11520x2160"), "{reason}");
+        assert_eq!(
+            choose_displays(DisplaySelection::Number(3), &wide)
+                .unwrap()
+                .number,
+            Some(3)
+        );
+        // Mirrored displays share an area and are captured once.
+        let mirrored = [
+            display("a", Rect::new(0, 0, 1920, 1080), true),
+            display("b", Rect::new(0, 0, 1920, 1080), true),
+            display("c", Rect::new(1920, 0, 3840, 1080), false),
+        ];
+        let all = choose_displays(DisplaySelection::All, &mirrored).unwrap();
+        assert_eq!(all.indices, [0, 2]);
+        assert_eq!(all.bounds, Rect::new(0, 0, 3840, 1080));
+    }
+
+    #[test]
+    fn display_selections_parse_and_map_viewer_requests() {
+        assert_eq!(
+            DisplaySelection::parse(" Main "),
+            Some(DisplaySelection::Primary)
+        );
+        assert_eq!(
+            DisplaySelection::parse("2"),
+            Some(DisplaySelection::Number(2))
+        );
+        for invalid in ["", "0", "17", "-1", "two"] {
+            assert_eq!(DisplaySelection::parse(invalid), None, "{invalid}");
+        }
+        assert_eq!(DisplaySelection::from_request(0), DisplaySelection::All);
+        assert_eq!(
+            DisplaySelection::from_request(3),
+            DisplaySelection::Number(3)
+        );
+        assert_eq!(DisplaySelection::All.to_string(), "all displays");
+    }
+
+    /// Desktops as Windows reports them, in DXGI numbering order, modeled on
+    /// the test machine: display 1 is 3440x1440 and display 2 a 2160x3840
+    /// portrait. Windows moves whichever display is primary to the origin.
+    mod desktops {
+        use super::*;
+
+        pub fn one_primary() -> Vec<DisplayArea> {
+            vec![
+                display("\\\\.\\DISPLAY1", Rect::new(0, 0, 3440, 1440), true),
+                display("\\\\.\\DISPLAY2", Rect::new(3440, 0, 5600, 3840), false),
+            ]
+        }
+
+        pub fn two_primary() -> Vec<DisplayArea> {
+            vec![
+                display("\\\\.\\DISPLAY1", Rect::new(-3440, 0, 0, 1440), false),
+                display("\\\\.\\DISPLAY2", Rect::new(0, 0, 2160, 3840), true),
+            ]
+        }
+
+        /// Display 2 unplugged.
+        pub fn only_one() -> Vec<DisplayArea> {
+            vec![display(
+                "\\\\.\\DISPLAY1",
+                Rect::new(0, 0, 3440, 1440),
+                true,
+            )]
+        }
+
+        /// Display 1 unplugged; display 2 becomes primary at the origin.
+        pub fn only_two() -> Vec<DisplayArea> {
+            vec![display(
+                "\\\\.\\DISPLAY2",
+                Rect::new(0, 0, 2160, 3840),
+                true,
+            )]
+        }
+    }
+
+    /// Start serving as a backend does: plan from the attached displays.
+    fn start(follower: &mut DisplayFollower, attached: &[DisplayArea]) -> DisplayPlan {
+        let plan = DisplayPlan::new(follower.selection(), attached).unwrap();
+        follower.started(plan.clone(), attached.to_vec());
+        plan
+    }
+
+    /// Read `layout` at two consecutive checks, as the serving loop does
+    /// twice a second, with the same displays attached. The first reading
+    /// never acts.
+    fn settle(follower: &mut DisplayFollower, layout: &[DisplayArea]) -> DisplayChange {
+        let attached = || Ok(layout.to_vec());
+        assert_eq!(
+            follower.layout_read(layout.to_vec(), attached),
+            DisplayChange::None
+        );
+        follower.layout_read(layout.to_vec(), attached)
+    }
+
+    /// A restart, as the serving loop does it: stop, then start again.
+    fn restart(follower: &mut DisplayFollower, attached: &[DisplayArea]) -> DisplayPlan {
+        follower.stopped();
+        start(follower, attached)
+    }
+
+    fn served(plan: &DisplayPlan) -> (&str, (i32, i32), topvnc::ServedDisplays) {
+        let rect = plan.chosen.bounds;
+        (
+            plan.outputs[0].0.as_str(),
+            (rect.right - rect.left, rect.bottom - rect.top),
+            plan.announcement(),
+        )
+    }
+
+    fn announced(served: u8, count: u8) -> topvnc::ServedDisplays {
+        topvnc::ServedDisplays { served, count }
+    }
+
+    /// The reported bug: the main display changes, and the host must stop
+    /// serving the old one.
+    #[test]
+    fn primary_selection_follows_a_new_main_display() {
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        let plan = start(&mut follower, &desktops::one_primary());
+        assert_eq!(
+            served(&plan),
+            ("\\\\.\\DISPLAY1", (3440, 1440), announced(1, 2))
+        );
+        // Display 2 is made the main display.
+        assert_eq!(
+            settle(&mut follower, &desktops::two_primary()),
+            DisplayChange::Restart
+        );
+        let plan = restart(&mut follower, &desktops::two_primary());
+        assert_eq!(
+            served(&plan),
+            ("\\\\.\\DISPLAY2", (2160, 3840), announced(2, 2))
+        );
+        // And back.
+        assert_eq!(
+            settle(&mut follower, &desktops::one_primary()),
+            DisplayChange::Restart
+        );
+        let plan = restart(&mut follower, &desktops::one_primary());
+        assert_eq!(served(&plan).0, "\\\\.\\DISPLAY1");
+    }
+
+    /// The reported bug: the served monitor is unplugged.
+    #[test]
+    fn unplugging_the_served_primary_moves_to_the_remaining_display() {
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        start(&mut follower, &desktops::one_primary());
+        assert_eq!(
+            settle(&mut follower, &desktops::only_two()),
+            DisplayChange::Restart
+        );
+        let plan = restart(&mut follower, &desktops::only_two());
+        assert_eq!(
+            served(&plan),
+            ("\\\\.\\DISPLAY2", (2160, 3840), announced(1, 1))
+        );
+        assert_eq!(plan.fallback_notice(), None);
+    }
+
+    #[test]
+    fn unplugged_chosen_display_falls_back_to_the_primary_until_it_returns() {
+        let mut follower = DisplayFollower::new(DisplaySelection::Number(2));
+        let plan = start(&mut follower, &desktops::one_primary());
+        assert_eq!(served(&plan).0, "\\\\.\\DISPLAY2");
+        assert_eq!(
+            settle(&mut follower, &desktops::only_one()),
+            DisplayChange::Restart
+        );
+        let plan = restart(&mut follower, &desktops::only_one());
+        assert_eq!(
+            served(&plan),
+            ("\\\\.\\DISPLAY1", (3440, 1440), announced(1, 1))
+        );
+        assert_eq!(
+            plan.fallback_notice().as_deref(),
+            Some(
+                "Display 2 is not attached (1 attached); serving display 1 of 1 \
+                 (\\\\.\\DISPLAY1) instead."
+            )
+        );
+        // The choice is remembered: plugging display 2 back serves it again.
+        assert_eq!(follower.selection(), DisplaySelection::Number(2));
+        assert_eq!(
+            settle(&mut follower, &desktops::one_primary()),
+            DisplayChange::Restart
+        );
+        let plan = restart(&mut follower, &desktops::one_primary());
+        assert_eq!(
+            served(&plan),
+            ("\\\\.\\DISPLAY2", (2160, 3840), announced(2, 2))
+        );
+        assert_eq!(plan.fallback_notice(), None);
+    }
+
+    #[test]
+    fn changes_to_other_displays_keep_capture_and_only_renumber() {
+        // Serving display 2 as the primary; display 1 is unplugged. Display
+        // 2 keeps its place, so capture continues; only its number changes.
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        start(&mut follower, &desktops::two_primary());
+        assert_eq!(
+            settle(&mut follower, &desktops::only_two()),
+            DisplayChange::Renumbered
+        );
+        assert_eq!(
+            served(follower.plan().unwrap()),
+            ("\\\\.\\DISPLAY2", (2160, 3840), announced(1, 1))
+        );
+        // A display enumerated before the served one also renumbers it.
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        start(&mut follower, &desktops::only_one());
+        let mut added = vec![display(
+            "\\\\.\\DISPLAY3",
+            Rect::new(-1920, 0, 0, 1080),
+            false,
+        )];
+        added.extend(desktops::only_one());
+        assert_eq!(settle(&mut follower, &added), DisplayChange::Renumbered);
+        assert_eq!(follower.plan().unwrap().announcement(), announced(2, 2));
+    }
+
+    #[test]
+    fn all_displays_follow_monitors_added_and_removed() {
+        let mut follower = DisplayFollower::new(DisplaySelection::All);
+        let plan = start(&mut follower, &desktops::one_primary());
+        assert_eq!(plan.chosen.bounds, Rect::new(0, 0, 5600, 3840));
+        assert_eq!(plan.announcement(), announced(0, 2));
+        assert_eq!(
+            settle(&mut follower, &desktops::only_one()),
+            DisplayChange::Restart
+        );
+        let plan = restart(&mut follower, &desktops::only_one());
+        assert_eq!(plan.chosen.bounds, Rect::new(0, 0, 3440, 1440));
+        assert_eq!(plan.announcement(), announced(0, 1));
+        assert_eq!(
+            settle(&mut follower, &desktops::two_primary()),
+            DisplayChange::Restart
+        );
+        let plan = restart(&mut follower, &desktops::two_primary());
+        assert_eq!(plan.chosen.bounds, Rect::new(-3440, 0, 2160, 3840));
+        assert_eq!(plan.outputs.len(), 2);
+    }
+
+    #[test]
+    fn brief_layout_glitches_never_restart_capture() {
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        start(&mut follower, &desktops::one_primary());
+        // Reconfiguring passes through states that each last one reading.
+        for glitch in [
+            desktops::only_one(),
+            desktops::two_primary(),
+            desktops::only_two(),
+        ] {
+            let attached = || Ok(glitch.clone());
+            assert_eq!(
+                follower.layout_read(glitch.clone(), attached),
+                DisplayChange::None
+            );
+        }
+        // It ends where it started; nothing happens.
+        assert_eq!(
+            settle(&mut follower, &desktops::one_primary()),
+            DisplayChange::None
+        );
+        assert_eq!(served(follower.plan().unwrap()).0, "\\\\.\\DISPLAY1");
+    }
+
+    #[test]
+    fn viewer_requests_restart_capture_only_for_other_displays() {
+        let attached = || Ok(desktops::one_primary());
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        start(&mut follower, &desktops::one_primary());
+        // Display 1 is already served as the primary.
+        assert_eq!(follower.request(1, attached), DisplayChange::None);
+        assert_eq!(follower.selection(), DisplaySelection::Number(1));
+        assert_eq!(follower.request(1, attached), DisplayChange::None);
+        assert_eq!(follower.request(2, attached), DisplayChange::Restart);
+        let plan = restart(&mut follower, &desktops::one_primary());
+        assert_eq!(served(&plan).0, "\\\\.\\DISPLAY2");
+        assert_eq!(follower.request(0, attached), DisplayChange::Restart);
+        let plan = restart(&mut follower, &desktops::one_primary());
+        assert_eq!(plan.announcement(), announced(0, 2));
+        // A number the viewer saw before an unplug serves the primary.
+        assert_eq!(follower.request(9, attached), DisplayChange::Restart);
+        let plan = restart(&mut follower, &desktops::one_primary());
+        assert_eq!(served(&plan).0, "\\\\.\\DISPLAY1");
+        assert!(
+            plan.fallback_notice()
+                .unwrap()
+                .starts_with("Display 9 is not attached")
+        );
+        // Asking for the primary's number keeps capture, without the notice.
+        assert_eq!(follower.request(1, attached), DisplayChange::Renumbered);
+        assert_eq!(follower.plan().unwrap().fallback_notice(), None);
+        // While capture is stopped, a request is applied at the next start;
+        // a failure to list displays restarts rather than guesses.
+        follower.stopped();
+        assert_eq!(follower.request(2, attached), DisplayChange::Restart);
+        assert_eq!(follower.selection(), DisplaySelection::Number(2));
+        start(&mut follower, &desktops::one_primary());
+        assert_eq!(
+            follower.request(0, || Err("DXGI failed".into())),
+            DisplayChange::Restart
+        );
+    }
+
+    /// A host with simulated displays, each one solid color, behind a real
+    /// RFB server. It reacts to layout readings and viewer requests the way
+    /// the Windows serving loop does, so a real viewer can show what changes.
+    struct SimulatedHost {
+        server: std::sync::Arc<topvnc::VncServer>,
+        follower: DisplayFollower,
+        displays: Vec<(DisplayArea, u32)>,
+    }
+
+    impl SimulatedHost {
+        fn attached(&self) -> Vec<DisplayArea> {
+            self.displays.iter().map(|(area, _)| area.clone()).collect()
+        }
+
+        /// Start capture: serve the image of what the follower selects.
+        fn start(&mut self) {
+            let attached = self.attached();
+            let plan = start(&mut self.follower, &attached);
+            let bounds = plan.chosen.bounds;
+            let (width, height) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
+            let mut image = topvnc::Framebuffer::new(width as u16, height as u16).unwrap();
+            for (name, rect) in &plan.outputs {
+                let color = self
+                    .displays
+                    .iter()
+                    .find(|(area, _)| &area.name == name)
+                    .unwrap()
+                    .1;
+                let area = rect.offset(-bounds.left, -bounds.top);
+                for y in area.top..area.bottom {
+                    let row = y as usize * width as usize;
+                    image.pixels_mut()[row + area.left as usize..row + area.right as usize]
+                        .fill(color);
+                }
+            }
+            self.server.update_framebuffer(&image).unwrap();
+            self.server.set_serve_display(plan.announcement());
+        }
+
+        fn apply(&mut self, change: DisplayChange) {
+            match change {
+                DisplayChange::None => {}
+                DisplayChange::Renumbered => self
+                    .server
+                    .set_serve_display(self.follower.plan().unwrap().announcement()),
+                DisplayChange::Restart => {
+                    self.follower.stopped();
+                    self.start();
+                }
+            }
+        }
+
+        /// Monitors change; the next two layout checks see it.
+        fn monitors_change(&mut self, displays: Vec<(DisplayArea, u32)>) {
+            self.displays = displays;
+            for _ in 0..2 {
+                let attached = self.attached();
+                let change = self.follower.layout_read(attached.clone(), || Ok(attached));
+                self.apply(change);
+            }
+        }
+
+        /// Wait for the viewer's display request and act on it.
+        fn handle_request(&mut self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(request) = self.server.take_display_request() {
+                    let attached = self.attached();
+                    let change = self.follower.request(request, || Ok(attached));
+                    return self.apply(change);
+                }
+                assert!(std::time::Instant::now() < deadline, "no display request");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Read updates until the viewer shows a `size` image whose pixels at
+    /// the given points have the given colors, and the host announces
+    /// `displays`.
+    fn viewer_sees(
+        session: &mut topvnc::Session,
+        image: &mut topvnc::Framebuffer,
+        size: (u16, u16),
+        displays: topvnc::ServedDisplays,
+        colors: &[(usize, usize, u32)],
+    ) {
+        let writer = session.writer();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let shows = |session: &topvnc::Session, image: &topvnc::Framebuffer| {
+            (session.info.width, session.info.height) == size
+                && (image.width(), image.height()) == (usize::from(size.0), usize::from(size.1))
+                && writer.serve_display() == Some(displays)
+                && colors
+                    .iter()
+                    .all(|&(x, y, color)| image.pixels()[y * image.width() + x] == color)
+        };
+        while !shows(session, image) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "viewer never showed {size:?} {displays:?}"
+            );
+            session
+                .read_update_pipelined(&mut Vec::new(), |x, y, w, h, bytes| {
+                    if bytes.is_empty() {
+                        *image = topvnc::Framebuffer::new(w, h)?;
+                        Ok(())
+                    } else {
+                        image.apply_raw(x, y, w, h, bytes)
+                    }
+                })
+                .unwrap();
+        }
+    }
+
+    /// End to end with a real server and viewer: the viewer's picture and
+    /// display buttons follow a main-display change, its own requests, an
+    /// unplugged monitor, and the monitor returning.
+    #[test]
+    fn viewers_follow_simulated_monitor_changes() {
+        // A viewer waiting for a picture that never comes blocks in its read;
+        // the watchdog turns that into a failure instead of a hang.
+        let (done, finished) = std::sync::mpsc::channel();
+        let scenario = std::thread::spawn(move || {
+            simulated_monitor_scenario();
+            let _ = done.send(());
+        });
+        match finished.recv_timeout(Duration::from_secs(30)) {
+            Ok(()) => scenario.join().unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(scenario.join().unwrap_err())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the viewer never showed the expected display")
+            }
+        }
+    }
+
+    fn simulated_monitor_scenario() {
+        const RED: u32 = 0x00d0_2020;
+        const BLUE: u32 = 0x0020_40d0;
+        // Display 1 is 16x8 and red; display 2 is an 8x12 portrait in blue.
+        let one = |rect, primary| (display("\\\\.\\DISPLAY1", rect, primary), RED);
+        let two = |rect, primary| (display("\\\\.\\DISPLAY2", rect, primary), BLUE);
+        let one_primary = vec![
+            one(Rect::new(0, 0, 16, 8), true),
+            two(Rect::new(16, 0, 24, 12), false),
+        ];
+        let two_primary = vec![
+            one(Rect::new(-16, 0, 0, 8), false),
+            two(Rect::new(0, 0, 8, 12), true),
+        ];
+        let only_one = vec![one(Rect::new(0, 0, 16, 8), true)];
+
+        let server = std::sync::Arc::new(
+            topvnc::VncServer::bind(
+                "127.0.0.1:0",
+                topvnc::Framebuffer::new(1, 1).unwrap(),
+                topvnc::ServerConfig {
+                    allow_insecure: true,
+                    ..topvnc::ServerConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let address = server.local_addr().unwrap();
+        let runner = std::sync::Arc::clone(&server);
+        let listener = std::thread::spawn(move || runner.run());
+        let mut host = SimulatedHost {
+            server: std::sync::Arc::clone(&server),
+            follower: DisplayFollower::new(DisplaySelection::Primary),
+            displays: one_primary.clone(),
+        };
+        host.start();
+
+        let mut session = topvnc::Session::connect_with_encoding(
+            &address.to_string(),
+            true,
+            topvnc::Encoding::Raw,
+            || unreachable!(),
+        )
+        .unwrap();
+        let writer = session.writer();
+        let mut image = topvnc::Framebuffer::new(session.info.width, session.info.height).unwrap();
+        writer
+            .request_update(false, session.info.width, session.info.height)
+            .unwrap();
+        // The primary display, display 1, is served.
+        viewer_sees(
+            &mut session,
+            &mut image,
+            (16, 8),
+            announced(1, 2),
+            &[(8, 4, RED)],
+        );
+
+        // Display 2 is made the main display: the viewer follows it.
+        host.monitors_change(two_primary.clone());
+        viewer_sees(
+            &mut session,
+            &mut image,
+            (8, 12),
+            announced(2, 2),
+            &[(4, 6, BLUE)],
+        );
+
+        // The viewer asks for all displays: both, arranged as on the
+        // desktop, with black where neither display reaches.
+        writer.request_serve_display(0).unwrap();
+        host.handle_request();
+        viewer_sees(
+            &mut session,
+            &mut image,
+            (24, 12),
+            announced(0, 2),
+            &[(8, 4, RED), (20, 6, BLUE), (8, 10, 0)],
+        );
+
+        // The viewer asks for display 2, which is then unplugged: the host
+        // serves the primary instead of a frozen picture of display 2.
+        writer.request_serve_display(2).unwrap();
+        host.handle_request();
+        viewer_sees(
+            &mut session,
+            &mut image,
+            (8, 12),
+            announced(2, 2),
+            &[(4, 6, BLUE)],
+        );
+        host.monitors_change(only_one);
+        viewer_sees(
+            &mut session,
+            &mut image,
+            (16, 8),
+            announced(1, 1),
+            &[(8, 4, RED)],
+        );
+        assert!(
+            host.follower
+                .plan()
+                .unwrap()
+                .fallback_notice()
+                .unwrap()
+                .starts_with("Display 2 is not attached")
+        );
+
+        // Display 2 is plugged back in: the viewer's choice returns.
+        host.monitors_change(one_primary);
+        viewer_sees(
+            &mut session,
+            &mut image,
+            (8, 12),
+            announced(2, 2),
+            &[(4, 6, BLUE)],
+        );
+
+        // Input still reaches the host after all of this.
+        writer.pointer(1, 7, 11).unwrap();
+        loop {
+            match server.recv_event_timeout(Duration::from_secs(2)).unwrap() {
+                topvnc::ClientEvent::Pointer { buttons, x, y, .. } => {
+                    assert_eq!((buttons, x, y), (1, 7, 11));
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        writer.shutdown().unwrap();
+        server.stop();
+        listener.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn layout_changes_are_reported_once_settled() {
+        let mut watch = LayoutWatch::new(vec!["a", "b"]);
+        assert!(!watch.changed(vec!["a", "b"]));
+        // Display b is unplugged; the first reading only starts settling.
+        assert!(!watch.changed(vec!["a"]));
+        assert!(watch.changed(vec!["a"]));
+        assert!(!watch.changed(vec!["a"]));
+        // An intermediate state that does not repeat is never reported.
+        assert!(!watch.changed(vec!["c"]));
+        assert!(!watch.changed(vec!["a", "c"]));
+        assert!(!watch.changed(vec!["a"]));
+        assert!(!watch.changed(vec!["a", "c"]));
+        assert!(watch.changed(vec!["a", "c"]));
+    }
+
+    #[test]
+    fn pointer_reports_from_other_outputs_hide_only_their_own_cursor() {
+        let mut owner = PointerOwner::default();
+        // The first report sets the owner, even a hidden one.
+        assert!(owner.accept(1, false, 10));
+        assert!(owner.accept(0, true, 20));
+        // Output 1 does not see the pointer; it cannot hide output 0's.
+        assert!(!owner.accept(1, false, 30));
+        // The pointer moves to output 1; its newer report wins.
+        assert!(owner.accept(1, true, 40));
+        // A stale visible report from output 0 is ignored.
+        assert!(!owner.accept(0, true, 35));
+        // The owner may hide its own cursor.
+        assert!(owner.accept(1, false, 50));
+        assert!(owner.accept(0, true, 45));
     }
 
     #[test]

@@ -18,6 +18,29 @@ use tight::{TightDecoder, TightSettings};
 
 const SERVE_SCALE_ENCODING: i32 = 0x5456_4e53;
 const SERVE_SCALE_FENCE: &[u8] = b"TopVNC.Scale/1:";
+const SERVE_DISPLAY_ENCODING: i32 = 0x5456_4e44;
+const SERVE_DISPLAY_FENCE: &[u8] = b"TopVNC.Display/1:";
+/// Marks a stored display request, so display 0 (all) is distinguishable
+/// from no request.
+const DISPLAY_REQUEST_PENDING: u16 = 0x100;
+/// The most host displays the display capability describes.
+pub const MAX_SERVED_DISPLAYS: u8 = 16;
+
+/// Which host display a TopVNC host serves, as it announces to viewers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServedDisplays {
+    /// The display served, numbered from 1, or 0 when all displays are
+    /// served side by side.
+    pub served: u8,
+    /// Attached displays, from 1 to [`MAX_SERVED_DISPLAYS`].
+    pub count: u8,
+}
+
+impl ServedDisplays {
+    fn is_valid(self) -> bool {
+        (1..=MAX_SERVED_DISPLAYS).contains(&self.count) && self.served <= self.count
+    }
+}
 
 pub const MAX_FRAMEBUFFER_DIMENSION: u16 = 8192;
 pub const MAX_FRAMEBUFFER_PIXELS: usize = 33_554_432;
@@ -327,6 +350,7 @@ impl Encoding {
             CONTINUOUS_UPDATES_ENCODING,
             DESKTOP_SIZE_ENCODING,
             SERVE_SCALE_ENCODING,
+            SERVE_DISPLAY_ENCODING,
         ]);
         // Relative motion for games that capture the mouse, and the back
         // and forward buttons.
@@ -704,6 +728,8 @@ pub struct VncServer {
     relative_pointer: Arc<AtomicBool>,
     serve_scale: Arc<std::sync::atomic::AtomicU8>,
     requested_serve_scale: Arc<std::sync::atomic::AtomicU8>,
+    serve_display: Arc<std::sync::atomic::AtomicU16>,
+    requested_display: Arc<std::sync::atomic::AtomicU16>,
     events: std::sync::mpsc::SyncSender<ClientEvent>,
     event_receiver: Mutex<std::sync::mpsc::Receiver<ClientEvent>>,
     config: ServerConfig,
@@ -960,6 +986,8 @@ impl VncServer {
             relative_pointer: Arc::new(AtomicBool::new(false)),
             serve_scale: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             requested_serve_scale: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            serve_display: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            requested_display: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             events,
             event_receiver: Mutex::new(event_receiver),
             config,
@@ -1013,6 +1041,24 @@ impl VncServer {
     /// Hosts publish with `set_serve_scale` after updating the framebuffer.
     pub fn requested_serve_scale(&self) -> u8 {
         self.requested_serve_scale.load(Ordering::Acquire)
+    }
+
+    /// Offer display switching to viewers, or publish the display now
+    /// served. Viewers that advertised the capability are told promptly.
+    pub fn set_serve_display(&self, displays: ServedDisplays) {
+        assert!(displays.is_valid());
+        let packed = u16::from(displays.served) << 8 | u16::from(displays.count);
+        if self.serve_display.swap(packed, Ordering::AcqRel) != packed {
+            self.wake_sessions();
+        }
+    }
+
+    /// Take the latest display a viewer asked for: 0 for all displays, or a
+    /// display number from 1 to [`MAX_SERVED_DISPLAYS`]. Numbers may exceed
+    /// the attached count when a display was unplugged meanwhile.
+    pub fn take_display_request(&self) -> Option<u8> {
+        let request = self.requested_display.swap(0, Ordering::AcqRel);
+        (request & DISPLAY_REQUEST_PENDING != 0).then_some(request as u8)
     }
 
     /// Replace the current desktop image. When the dimensions change, clients
@@ -1144,6 +1190,8 @@ impl VncServer {
                 relative_pointer: Arc::clone(&self.relative_pointer),
                 serve_scale: Arc::clone(&self.serve_scale),
                 requested_serve_scale: Arc::clone(&self.requested_serve_scale),
+                serve_display: Arc::clone(&self.serve_display),
+                requested_display: Arc::clone(&self.requested_display),
                 clipboard: Arc::clone(&self.clipboard),
                 thread_setup: self.config.thread_setup,
                 priority: self.config.priority,
@@ -1296,6 +1344,12 @@ struct SessionShared {
     relative_pointer: Arc<AtomicBool>,
     serve_scale: Arc<std::sync::atomic::AtomicU8>,
     requested_serve_scale: Arc<std::sync::atomic::AtomicU8>,
+    /// The served display and attached count as `served << 8 | count`;
+    /// zero while the host does not offer display switching.
+    serve_display: Arc<std::sync::atomic::AtomicU16>,
+    /// [`DISPLAY_REQUEST_PENDING`] with the requested display in the low
+    /// byte, or zero when no request is waiting.
+    requested_display: Arc<std::sync::atomic::AtomicU16>,
     clipboard: Arc<Mutex<ServerClipboard>>,
     /// See [`ServerConfig::thread_setup`].
     thread_setup: Option<fn()>,
@@ -1654,6 +1708,7 @@ fn read_client_message(
 struct ClientEncodings {
     desktop_size: bool,
     serve_scale: bool,
+    serve_display: bool,
     fence: bool,
     continuous_updates: bool,
     /// QEMU Pointer Motion Change: the client sends relative motion on request.
@@ -1677,6 +1732,7 @@ impl ClientEncodings {
                 }
                 DESKTOP_SIZE_ENCODING => result.desktop_size = true,
                 SERVE_SCALE_ENCODING => result.serve_scale = true,
+                SERVE_DISPLAY_ENCODING => result.serve_display = true,
                 FENCE_ENCODING => result.fence = true,
                 CONTINUOUS_UPDATES_ENCODING => result.continuous_updates = true,
                 POINTER_MOTION_CHANGE_ENCODING => result.pointer_motion_change = true,
@@ -1921,6 +1977,7 @@ fn write_client_updates(
     // `Some(true)` for relative motion.
     let mut pointer_mode: Option<bool> = None;
     let mut announced_scale = 0;
+    let mut announced_displays = 0;
     let mut encoder = SessionEncoder {
         priority: session.priority,
         performance: session.performance,
@@ -1950,6 +2007,18 @@ fn write_client_updates(
                 height: 0,
             });
             announced_scale = scale;
+        }
+        let displays = session.serve_display.load(Ordering::Acquire);
+        if encodings.serve_display && displays != 0 && displays != announced_displays {
+            pseudo.retain(|rect| rect.encoding != SERVE_DISPLAY_ENCODING);
+            pseudo.push(PseudoRect {
+                encoding: SERVE_DISPLAY_ENCODING,
+                x: displays >> 8,
+                y: displays & 0xff,
+                width: 0,
+                height: 0,
+            });
+            announced_displays = displays;
         }
         if encodings.pointer_motion_change {
             let relative = session.relative_pointer.load(Ordering::Acquire);
@@ -2095,6 +2164,7 @@ fn write_client_updates(
                 // encodings may have reset its own.
                 pointer_mode = None;
                 announced_scale = 0;
+                announced_displays = 0;
                 if !advertised.pointer_motion_change {
                     announced_relative.store(false, Ordering::Release);
                 }
@@ -2143,6 +2213,22 @@ fn write_client_updates(
                         session
                             .requested_serve_scale
                             .store(value[0], Ordering::Release);
+                    }
+                    if let Some(value) = payload.strip_prefix(SERVE_DISPLAY_FENCE) {
+                        // A number past the attached count is accepted: the
+                        // viewer may not yet know that a display was unplugged.
+                        if !encodings.serve_display
+                            || !encodings.desktop_size
+                            || session.serve_display.load(Ordering::Acquire) == 0
+                            || value.len() != 1
+                            || value[0] > MAX_SERVED_DISPLAYS
+                        {
+                            return Err(invalid("invalid display request"));
+                        }
+                        session.requested_display.store(
+                            DISPLAY_REQUEST_PENDING | u16::from(value[0]),
+                            Ordering::Release,
+                        );
                     }
                     // Messages are handled in order, which satisfies every
                     // supported flag.
@@ -3291,6 +3377,7 @@ fn validate_frame_size(width: u16, height: u16) -> io::Result<()> {
 /// Server messages about the update stream itself.
 enum ServerControl<'a> {
     ServeScale(u8),
+    ServeDisplay(ServedDisplays),
     /// The server supports continuous updates, or stopped sending them.
     EndOfContinuousUpdates,
     Fence {
@@ -3360,6 +3447,16 @@ fn read_update_inner(
                                 return Err(invalid("invalid served-size capability"));
                             }
                             control(ServerControl::ServeScale(width as u8))?;
+                            continue;
+                        }
+                        SERVE_DISPLAY_ENCODING => {
+                            let displays = u8::try_from(x)
+                                .ok()
+                                .zip(u8::try_from(y).ok())
+                                .map(|(served, count)| ServedDisplays { served, count })
+                                .filter(|displays| width == 0 && height == 0 && displays.is_valid())
+                                .ok_or_else(|| invalid("invalid display capability"))?;
+                            control(ServerControl::ServeDisplay(displays))?;
                             continue;
                         }
                         POINTER_MOTION_CHANGE_ENCODING => {
@@ -3496,6 +3593,7 @@ struct WriterState {
     /// The server acknowledged extended PointerEvents.
     extended_buttons: bool,
     serve_scale: Option<u8>,
+    serve_display: Option<ServedDisplays>,
     /// The last absolute position sent.
     position: (u16, u16),
     /// The buttons last sent.
@@ -3535,6 +3633,7 @@ impl InputWriter {
             relative: false,
             extended_buttons: false,
             serve_scale: None,
+            serve_display: None,
             position: (0, 0),
             buttons: 0,
         })))
@@ -3576,6 +3675,28 @@ impl InputWriter {
         }
         let mut payload = SERVE_SCALE_FENCE.to_vec();
         payload.push(percent);
+        state
+            .stream
+            .write_all(&fence_message(FENCE_REQUEST, &payload))
+    }
+
+    /// The host display served, when the host offers display switching.
+    pub fn serve_display(&self) -> Option<ServedDisplays> {
+        self.state().ok().and_then(|state| state.serve_display)
+    }
+
+    /// Ask the host to serve `display`, numbered from 1, or 0 for all
+    /// displays. The host's choice is shared by every viewer.
+    pub fn request_serve_display(&self, display: u8) -> io::Result<()> {
+        if display > MAX_SERVED_DISPLAYS {
+            return Err(invalid("display number is out of range"));
+        }
+        let mut state = self.state()?;
+        if state.serve_display.is_none() {
+            return Err(invalid("server does not offer display switching"));
+        }
+        let mut payload = SERVE_DISPLAY_FENCE.to_vec();
+        payload.push(display);
         state
             .stream
             .write_all(&fence_message(FENCE_REQUEST, &payload))
@@ -3923,6 +4044,10 @@ impl Session {
                     writer.state()?.serve_scale = Some(percent);
                     Ok(())
                 }
+                ServerControl::ServeDisplay(displays) => {
+                    writer.state()?.serve_display = Some(displays);
+                    Ok(())
+                }
                 ServerControl::EndOfContinuousUpdates => {
                     if continuous.get() {
                         // The server stopped pushing; go back to requests.
@@ -4058,6 +4183,8 @@ mod tests {
             relative_pointer: Arc::new(AtomicBool::new(false)),
             serve_scale: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             requested_serve_scale: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            serve_display: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            requested_display: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             clipboard: Arc::new(Mutex::new(ServerClipboard::default())),
             thread_setup: None,
             priority: UpdatePriority::Whole,
@@ -4908,6 +5035,175 @@ mod tests {
             assert!(!matches!(client.read(&mut [0]), Ok(1)));
             assert_eq!(server.requested_serve_scale(), 100);
             server.stop();
+        }
+    }
+
+    #[test]
+    fn session_negotiates_display_switching_and_follows_the_served_display() {
+        fn read(session: &mut Session, framebuffer: &mut Framebuffer) {
+            session
+                .read_update_pipelined(&mut Vec::new(), |x, y, w, h, bytes| {
+                    if bytes.is_empty() {
+                        *framebuffer = Framebuffer::new(w, h)?;
+                        Ok(())
+                    } else {
+                        framebuffer.apply_raw(x, y, w, h, bytes)
+                    }
+                })
+                .unwrap()
+        }
+        for push in [false, true] {
+            let (server, address) = start_insecure_server(Framebuffer::new(4, 2).unwrap());
+            let mut session = Session::connect_with_encoding(
+                &address.to_string(),
+                true,
+                Encoding::Raw,
+                || unreachable!(),
+            )
+            .unwrap();
+            session.set_continuous_updates(push);
+            let writer = session.writer();
+            let mut framebuffer = Framebuffer::new(4, 2).unwrap();
+            writer.request_update(false, 4, 2).unwrap();
+            read(&mut session, &mut framebuffer);
+            // Nothing is offered until the host enables it.
+            assert_eq!(writer.serve_display(), None);
+            assert!(writer.request_serve_display(1).is_err());
+
+            server.set_serve_display(ServedDisplays {
+                served: 1,
+                count: 2,
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while writer.serve_display().is_none() {
+                assert!(Instant::now() < deadline);
+                read(&mut session, &mut framebuffer);
+            }
+            assert_eq!(
+                writer.serve_display(),
+                Some(ServedDisplays {
+                    served: 1,
+                    count: 2
+                })
+            );
+            assert!(
+                writer
+                    .request_serve_display(MAX_SERVED_DISPLAYS + 1)
+                    .is_err()
+            );
+            assert_eq!(server.take_display_request(), None);
+            // All displays (0), and a number past the attached count, which a
+            // viewer may send right after a display is unplugged.
+            for display in [0, 2, 5] {
+                writer.request_serve_display(display).unwrap();
+                let mut taken = None;
+                while taken.is_none() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                    taken = server.take_display_request();
+                }
+                assert_eq!(taken, Some(display));
+                assert_eq!(server.take_display_request(), None);
+            }
+            // The host publishes what it serves; the viewer follows.
+            let mut wide = Framebuffer::new(8, 2).unwrap();
+            wide.pixels_mut().fill(0x0010_2030);
+            server.update_framebuffer(&wide).unwrap();
+            server.set_serve_display(ServedDisplays {
+                served: 0,
+                count: 2,
+            });
+            while writer.serve_display().map(|displays| displays.served) != Some(0)
+                || framebuffer.pixels() != wide.pixels()
+            {
+                assert!(Instant::now() < deadline);
+                read(&mut session, &mut framebuffer);
+            }
+            assert_eq!((session.info.width, session.info.height), (8, 2));
+            writer.shutdown().unwrap();
+            server.stop();
+        }
+    }
+
+    #[test]
+    fn display_requests_require_negotiation_and_valid_numbers() {
+        for (encodings, suffix) in [
+            (vec![0, DESKTOP_SIZE_ENCODING], vec![1]),
+            (vec![0, SERVE_DISPLAY_ENCODING], vec![1]),
+            (
+                vec![0, DESKTOP_SIZE_ENCODING, SERVE_DISPLAY_ENCODING],
+                vec![MAX_SERVED_DISPLAYS + 1],
+            ),
+            (
+                vec![0, DESKTOP_SIZE_ENCODING, SERVE_DISPLAY_ENCODING],
+                vec![1, 0],
+            ),
+            (
+                vec![0, DESKTOP_SIZE_ENCODING, SERVE_DISPLAY_ENCODING],
+                vec![],
+            ),
+        ] {
+            let (server, address) = start_insecure_server(Framebuffer::new(2, 1).unwrap());
+            server.set_serve_display(ServedDisplays {
+                served: 1,
+                count: 1,
+            });
+            let (mut client, _, _) = raw_client(address, &encodings);
+            let mut payload = SERVE_DISPLAY_FENCE.to_vec();
+            payload.extend(suffix);
+            client
+                .write_all(&fence_message(FENCE_REQUEST, &payload))
+                .unwrap();
+            assert!(!matches!(client.read(&mut [0]), Ok(1)));
+            assert_eq!(server.take_display_request(), None);
+            server.stop();
+        }
+        // A host that never offered switching rejects requests too.
+        let (server, address) = start_insecure_server(Framebuffer::new(2, 1).unwrap());
+        let (mut client, _, _) =
+            raw_client(address, &[0, DESKTOP_SIZE_ENCODING, SERVE_DISPLAY_ENCODING]);
+        let mut payload = SERVE_DISPLAY_FENCE.to_vec();
+        payload.push(1);
+        client
+            .write_all(&fence_message(FENCE_REQUEST, &payload))
+            .unwrap();
+        assert!(!matches!(client.read(&mut [0]), Ok(1)));
+        assert_eq!(server.take_display_request(), None);
+        server.stop();
+    }
+
+    #[test]
+    fn display_capability_parser_rejects_invalid_announcements() {
+        let update = |x: u16, y: u16, width: u16, height: u16| {
+            let mut update = vec![0, 0, 0, 1];
+            for value in [x, y, width, height] {
+                update.extend_from_slice(&value.to_be_bytes());
+            }
+            update.extend_from_slice(&SERVE_DISPLAY_ENCODING.to_be_bytes());
+            update
+        };
+        for (x, y, width, height) in [
+            (0, 0, 0, 0),
+            (3, 2, 0, 0),
+            (1, 17, 0, 0),
+            (1, 2, 1, 0),
+            (1, 2, 0, 1),
+            (256, 2, 0, 0),
+        ] {
+            let mut fb = Framebuffer::new(1, 1).unwrap();
+            assert!(
+                read_update(
+                    &mut &update(x, y, width, height)[..],
+                    &mut fb,
+                    &mut Vec::new()
+                )
+                .is_err(),
+                "({x}, {y}, {width}, {height}) was accepted"
+            );
+        }
+        for (x, y) in [(0, 1), (1, 1), (16, 16)] {
+            let mut fb = Framebuffer::new(1, 1).unwrap();
+            read_update(&mut &update(x, y, 0, 0)[..], &mut fb, &mut Vec::new()).unwrap();
         }
     }
 
@@ -6363,6 +6659,7 @@ mod tests {
                 CONTINUOUS_UPDATES_ENCODING,
                 DESKTOP_SIZE_ENCODING,
                 SERVE_SCALE_ENCODING,
+                SERVE_DISPLAY_ENCODING,
                 POINTER_MOTION_CHANGE_ENCODING,
                 EXTENDED_MOUSE_BUTTONS_ENCODING,
             ],
