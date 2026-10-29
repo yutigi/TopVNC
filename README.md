@@ -31,7 +31,8 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 - **Parallel encoding and decoding.** The server encodes a frame in bands on every core and sends each band as soon as it is ready. The viewer decodes JPEG bands in parallel.
 - **Keyboard and mouse input** for interacting with the remote desktop. Keys are sent by their position on a US keyboard, as games expect.
 - **Adjustable display** with fit-to-window or native pixels, smooth or sharp scaling, full screen, and 60 FPS, 120 FPS, or no presentation limit.
-- **In-session settings** accessible through **F8**, including live served-size requests to updated TopVNC hosts, disconnect, and a resizable on-screen settings button.
+- **In-session settings** accessible through **F8**, including live served-size and host-display requests to updated TopVNC hosts, disconnect, and a resizable on-screen settings button.
+- **Multiple host displays** on Windows hosts: serve the primary display, a chosen one, or all of them side by side, switch between them from the viewer, and follow monitors that are unplugged, plugged in, or made primary.
 - **Saved connection details** with platform-specific password storage.
 - **Experimental Windows and macOS server modes**, started from the app's Server tab or with `--serve`, with display capture, resolution-change handling, remote keyboard/mouse input, clipboard sync, and password authentication; live validation is pending.
 - **Windows helper tabs** for the work-server launcher, read-only network diagnostics, and scoped firewall preview, set, and reset actions, with paged reports and copyable commands.
@@ -81,7 +82,7 @@ Do not use `--input-debug` while typing passwords: it logs key events.
 
 ### Serve this desktop
 
-Open the **Server** tab in the TopVNC window, enter a password, and click **Start server**. The tab binds to `127.0.0.1:5900` by default; click **All networks** to listen on every interface, or enter a display number to share a display other than the primary one. **Served size** scales the image viewers receive, from 0.25× to 1.00× of the display's pixel size: drag the slider, or click **Full** or **Half**. Half size serves a Retina display at its size in points, a quarter of the pixels, which cuts encoding time and bandwidth for games. **Game mouse** chooses when viewers are asked for relative mouse motion, as `--mouse` does below: **Auto**, **Relative**, or **Absolute**. The tab shows the served size, address, and number of connected viewers, and keeps running while you use TopVNC as a viewer. Closing TopVNC stops the server. Server settings and passwords are not saved.
+Open the **Server** tab in the TopVNC window, enter a password, and click **Start server**. The tab binds to `127.0.0.1:5900` by default; click **All networks** to listen on every interface. Click **Display** to choose what to share: each click moves to the next choice, from **MAIN** (the primary display) to each detected display with its pixel size, then **ALL** displays side by side on Windows. **Served size** scales the image viewers receive, from 0.25× to 1.00× of the display's pixel size: drag the slider, or click **Full** or **Half**. Half size serves a Retina display at its size in points, a quarter of the pixels, which cuts encoding time and bandwidth for games. **Game mouse** chooses when viewers are asked for relative mouse motion, as `--mouse` does below: **Auto**, **Relative**, or **Absolute**. The tab shows the served size, address, and number of connected viewers, and keeps running while you use TopVNC as a viewer. Closing TopVNC stops the server. Server settings and passwords are not saved.
 
 You can also run the server as a separate console mode. It binds to localhost by default and prompts for a VNC password:
 
@@ -89,6 +90,7 @@ You can also run the server as a separate console mode. It binds to localhost by
 cargo run --release -- --serve
 cargo run --release -- --serve 0.0.0.0:5900
 cargo run --release -- --serve 0.0.0.0:5900 --display 2
+cargo run --release -- --serve 0.0.0.0:5900 --display all
 cargo run --release -- --serve 0.0.0.0:5900 --scale 0.5
 cargo run --release -- --serve 0.0.0.0:5900 --mouse relative
 ```
@@ -129,7 +131,7 @@ The decoder and renderer communicate through one pending image and two reusable 
 
 The Server tab's **Game mouse** buttons set the same three modes, starting at Auto. Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
 
-The server shares the primary display unless `--display NUMBER` selects another attached display (numbered from 1). Run it in an interactive, unlocked session: services and disconnected Remote Desktop sessions cannot capture the desktop. While Windows shows the secure desktop (UAC prompts, the lock screen), viewers keep the last image and capture resumes automatically afterward. If the display resolution changes, viewers that support the DesktopSize extension follow the new size; others are disconnected and can reconnect. TopVNC's viewer now handles live size changes without reconnecting.
+The server shares the primary display unless `--display NUMBER` selects another attached display (numbered from 1, as the Server tab lists them) or `--display all` shares every display in one image arranged as on the desktop. On Windows, the server follows display changes within about a second. If another display becomes primary, the primary choice switches to it. If a chosen display is unplugged, the primary display is served until it returns. Plugging in or removing a monitor under **ALL** recomputes the layout. If all displays together exceed VNC's 8192-pixel limit, the primary is served instead, with a notice. Viewers can switch displays during a session with **F8 → Display**; like the served size, the choice is shared by all viewers. To give each display its own port, run one server per display, such as `--serve 0.0.0.0:5900 --display 1` and `--serve 0.0.0.0:5901 --display 2`. See [`specs/013-multi-monitor/spec.md`](specs/013-multi-monitor/spec.md) for what has been validated. Run it in an interactive, unlocked session: services and disconnected Remote Desktop sessions cannot capture the desktop. While Windows shows the secure desktop (UAC prompts, the lock screen), viewers keep the last image and capture resumes automatically afterward. If the display resolution changes, viewers that support the DesktopSize extension follow the new size; others are disconnected and can reconnect. TopVNC's viewer now handles live size changes without reconnecting.
 
 #### On macOS
 
@@ -138,7 +140,7 @@ Hosting a Mac needs macOS 12.3 or later and two permissions, which the Server ta
 - **Screen Recording** (*System Settings → Privacy & Security → Screen & System Audio Recording*) is required. Without it the server asks for access and refuses to start; quit and relaunch after granting it.
 - **Accessibility** (*System Settings → Privacy & Security → Accessibility*) lets viewers type and use the mouse. Without it the server runs view-only and shows a warning, and remote input starts as soon as access is granted, without a restart.
 
-When TopVNC runs from a terminal, including `cargo run`, macOS grants both permissions to the terminal app, not to TopVNC. The server shares the main display, or `--display NUMBER` in ScreenCaptureKit's display order, at its native pixel size by default: a Retina display is then served at its full pixel resolution, which makes updates large. For games, serve at half size and use Tight JPEG in the viewer. ScreenCaptureKit scales the image on the GPU. The cursor is part of the captured image. If port 5900 is already taken, macOS Screen Sharing or Remote Management may be listening on it; choose another port such as 5901. A Mac that is locked cannot be captured or unlocked through this server: viewers keep the last image, and starting the server while the Mac is locked fails.
+When TopVNC runs from a terminal, including `cargo run`, macOS grants both permissions to the terminal app, not to TopVNC. The server shares the main display, following it when another display becomes main, or `--display NUMBER` in ScreenCaptureKit's display order. Serving all displays at once and switching displays from the viewer are not implemented for Mac hosts yet. The display is served at its native pixel size by default: a Retina display is then served at its full pixel resolution, which makes updates large. For games, serve at half size and use Tight JPEG in the viewer. ScreenCaptureKit scales the image on the GPU. The cursor is part of the captured image. If port 5900 is already taken, macOS Screen Sharing or Remote Management may be listening on it; choose another port such as 5901. A Mac that is locked cannot be captured or unlocked through this server: viewers keep the last image, and starting the server while the Mac is locked fails.
 
 ## Controls and display settings
 
@@ -148,6 +150,7 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 | Mouse lock | While the host hides its cursor (in a game), the pointer locks and every motion turns the camera. The title bar shows *locked (F8)*. |
 | **F8** or **F8 SETTINGS** | Open the in-session settings panel. This also releases a locked pointer, and the on-screen button hides while the pointer is locked. |
 | Window edges | Drag to resize the viewer. |
+| F8 → Display | Choose which host display to see, numbered as on the host, or **ALL** displays side by side. The highlighted button is what the host serves; the choice is shared by every viewer. Shows *Not offered by this host* for Mac hosts, older TopVNC hosts, and other servers. |
 | F8 → Served size | Drag from **25% to 100%** in 1% steps; release to request the size from an updated TopVNC host. |
 | Fit / 1:1 pixels | Scale the remote image to the window while preserving its aspect ratio, or show native pixels, centered and cropped when necessary. |
 | Full screen | Switch the viewer to full screen and back. |
