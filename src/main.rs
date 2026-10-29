@@ -26,7 +26,7 @@ mod helpers;
 mod settings;
 mod ui;
 mod window;
-use desktop_host::{HostPermissions, ServeOptions, ServerNotice};
+use desktop_host::{DisplayArea, HostPermissions, ServeOptions, ServerNotice};
 use ui::{
     Box2, Canvas, Compression, Config, Field, Quality, ServeRequest, ServerPhase, ServerView, Tab,
     UiState, WindowMode,
@@ -608,6 +608,20 @@ fn host_permissions() -> Option<HostPermissions> {
     None
 }
 
+/// Displays the Server tab offers, where the host lists them.
+#[cfg(windows)]
+fn host_displays() -> Option<Vec<DisplayArea>> {
+    Some(windows_server::displays())
+}
+
+#[cfg(not(windows))]
+fn host_displays() -> Option<Vec<DisplayArea>> {
+    None
+}
+
+/// Whether the host can serve all displays side by side.
+const HOST_SPANS_DISPLAYS: bool = cfg!(windows);
+
 #[cfg(not(any(windows, target_os = "macos")))]
 fn serve_desktop(
     _options: ServeOptions,
@@ -675,6 +689,7 @@ impl HostedServer {
                     phase: ServerPhase::Starting,
                     message: None,
                     permissions: self.view.permissions,
+                    displays: self.view.displays.take(),
                 };
                 self.running = Some((shutdown, receiver, thread));
             }
@@ -720,6 +735,7 @@ impl HostedServer {
                 phase: ServerPhase::Stopped,
                 message: failure.is_none().then(|| "Server stopped.".into()),
                 permissions: self.view.permissions,
+                displays: self.view.displays.take(),
             };
         }
         failure
@@ -811,10 +827,14 @@ fn show_landing(
     loop {
         helpers.poll();
         // Permissions can change in System Settings while the window is open.
+        // So can the attached displays, which the Server tab lists.
         if server.view.phase == ServerPhase::Stopped
             && permissions_checked.is_none_or(|checked| checked.elapsed().as_secs() >= 1)
         {
             server.view.permissions = host_permissions();
+            if state.tab == Tab::Server {
+                server.view.displays = host_displays();
+            }
             permissions_checked = Some(Instant::now());
         }
         if let Some(error) = server.poll() {
@@ -1006,13 +1026,19 @@ fn show_landing(
                             (ui::HOST, Field::ServeHost),
                             (ui::PORT, Field::ServePort),
                             (ui::SERVE_PASSWORD, Field::ServePassword),
-                            (ui::SERVE_DISPLAY, Field::ServeDisplay),
                         ] {
                             if editable && area.contains(x, y) {
                                 state.focus = Some(field);
                             }
                         }
                         let serve = &mut config.serve;
+                        if editable && ui::SERVE_DISPLAY.contains(x, y) {
+                            serve.display = ui::next_display(
+                                serve.display,
+                                server.view.displays.as_deref(),
+                                HOST_SPANS_DISPLAYS,
+                            );
+                        }
                         if editable && ui::INSECURE.contains(x, y) {
                             serve.allow_insecure = !serve.allow_insecure;
                         }
@@ -1351,7 +1377,11 @@ fn run_session_inner(
                     writer.request_update(false, width, height)?;
                     loop {
                         let mut uploads = UpdateUploads::default();
-                        let controls_before = (writer.relative_pointer(), writer.serve_scale());
+                        let controls_before = (
+                            writer.relative_pointer(),
+                            writer.serve_scale(),
+                            writer.serve_display(),
+                        );
                         session.read_update_pipelined(&mut scratch, |x, y, w, h, bytes| {
                             if bytes.is_empty() {
                                 framebuffer = Framebuffer::new(w, h)?;
@@ -1383,7 +1413,13 @@ fn run_session_inner(
                         if let Some(area) = uploads.finish() {
                             publish_frame(&frames, &framebuffer, area, &render_signal)?;
                         }
-                        if controls_before != (writer.relative_pointer(), writer.serve_scale()) {
+                        if controls_before
+                            != (
+                                writer.relative_pointer(),
+                                writer.serve_scale(),
+                                writer.serve_display(),
+                            )
+                        {
                             waker.wake();
                         }
                     }
@@ -1418,12 +1454,14 @@ fn run_session_inner(
     let mut compact_status = title.clone();
     let mut debug_status = title.clone();
     let mut known_serve_scale = None;
+    let mut known_serve_display = None;
     loop {
         let mut title_changed = false;
         remote = frames.dimensions();
         let serve_scale = writer.serve_scale();
-        if known_serve_scale != serve_scale {
-            known_serve_scale = serve_scale;
+        let serve_display = writer.serve_display();
+        if (known_serve_scale, known_serve_display) != (serve_scale, serve_display) {
+            (known_serve_scale, known_serve_display) = (serve_scale, serve_display);
             overlay_changed = true;
             redraw = true;
         }
@@ -1599,6 +1637,14 @@ fn run_session_inner(
                                             Some(_) => None,
                                             None => Some(Fullscreen::Borderless(None)),
                                         });
+                                    } else if let Some(displays) = serve_display
+                                        && let Some(display) =
+                                            ui::live_display_choice(displays, x, y)
+                                    {
+                                        // The host answers by announcing what it serves.
+                                        if display != displays.served {
+                                            writer.request_serve_display(display)?;
+                                        }
                                     } else if ui::LIVE_SERVE_SLIDER.contains(x, y)
                                         && serve_scale.is_some()
                                     {
@@ -1793,6 +1839,7 @@ fn run_session_inner(
         options.locked = locked;
         options.occluded = occluded;
         options.serve_scale = dragging_serve_scale.or(serve_scale);
+        options.serve_display = serve_display;
         renderer.update(options, overlay_changed || redraw)?;
         overlay_changed = false;
         redraw = false;

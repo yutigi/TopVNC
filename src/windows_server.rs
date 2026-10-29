@@ -3,26 +3,27 @@
 
 use crate::desktop_host::{
     CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureSurface, CursorKind, CursorShape, DesktopImage,
-    Downscaler, KeyIdentity, MouseMode, PointerModeHint, PointerTransition, Rect, RemoteInputState,
-    Rotation, WHEEL_DELTA, absolute_mouse_coordinate, latin1_from_unicode, latin1_to_utf16,
-    native_coordinate, served_size, unicode_key_units, validate_capture_dimensions,
-    windows_key_identity,
+    DisplayArea, DisplayChange, DisplayFollower, DisplayPlan, Downscaler, KeyIdentity,
+    MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner, PointerTransition, Rect,
+    RemoteInputState, Rotation, WHEEL_DELTA, absolute_mouse_coordinate, latin1_from_unicode,
+    latin1_to_utf16, native_coordinate, served_size, unicode_key_units,
+    validate_capture_dimensions, windows_key_identity,
 };
 use crate::desktop_host::{
     MAX_CLIPBOARD_CHARS, ServeOptions, ServerNotice, VirtualKey, parse_serve_arguments,
 };
 use std::error::Error;
 use std::mem::size_of;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, ClientEvent, DamageRect,
     Framebuffer, ServerConfig, VncServer,
 };
-use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, RECT};
+use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0,
 };
@@ -43,7 +44,10 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIDevice,
     IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
 };
-use windows::core::Interface;
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+};
+use windows::core::{BOOL, Interface};
 use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, SetLastError};
 use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::System::Console::{
@@ -65,8 +69,8 @@ use windows_sys::Win32::System::Threading::{
     ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
 };
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-    SetThreadDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
@@ -77,17 +81,26 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSOR_SUPPRESSED, CURSORINFO, CreateWindowExW, DestroyWindow, GetCursorInfo,
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SetProcessDPIAware, XBUTTON1, XBUTTON2,
+    GetSystemMetrics, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetProcessDPIAware, XBUTTON1, XBUTTON2,
 };
 
 static SERVER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// How long one capture poll waits for a new desktop frame.
 const FRAME_TIMEOUT_MS: u32 = 50;
+const FRAME_TIMEOUT: Duration = Duration::from_millis(FRAME_TIMEOUT_MS as u64);
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How often the monitor layout is compared, to follow displays that are
+/// plugged in, unplugged, or made primary without interrupting capture.
+const LAYOUT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// Above this many changed rectangles, copy the whole frame to the CPU once.
 const MAX_REGION_COPIES: usize = 64;
+/// Captured regions waiting for the serving loop; beyond this they collapse
+/// to the whole image.
+const MAX_PENDING_RECTS: usize = 256;
+/// Monitors GDI may report; more than any desktop attaches.
+const MAX_MONITORS: usize = 64;
 const MAX_POINTER_SHAPE_BYTES: u32 = 16 * 1024 * 1024;
 const MAX_FRAME_METADATA_BYTES: u32 = 16 * 1024 * 1024;
 
@@ -227,7 +240,8 @@ pub fn serve(
     enable_thread_dpi_awareness();
     // The game runs in the foreground; keep capture and encoding on pace.
     let _scheduling = HostScheduling::raise(report);
-    let mut capture = DesktopCapture::new(display).map_err(|error| {
+    let mut follower = DisplayFollower::new(display);
+    let (capture, plan) = start_capture(&mut follower).map_err(|error| {
         format!(
             "{error}. Run the server in an interactive, unlocked desktop session; \
              services, disconnected Remote Desktop sessions, and the secure desktop cannot be captured"
@@ -240,14 +254,11 @@ pub fn serve(
         ));
     }
     let mut framebuffer = Framebuffer::new(capture.placement.width, capture.placement.height)?;
-    let mut image = DesktopImage::new(capture.placement.width, capture.placement.height);
-    let mut captured = Vec::new();
     let mut damage = Vec::new();
     let started = Instant::now();
-    while captured.is_empty() && started.elapsed() < FIRST_FRAME_TIMEOUT {
-        capture.next_frame(&mut image, &mut captured)?;
+    while damage.is_empty() && started.elapsed() < FIRST_FRAME_TIMEOUT {
+        capture.next_frame(framebuffer.pixels_mut(), &mut damage)?;
     }
-    image.present(&captured, framebuffer.pixels_mut(), &mut damage);
     let native = (capture.placement.width, capture.placement.height);
     let mut served = ServedImage::new(native, scale)?;
     served.update(
@@ -266,12 +277,16 @@ pub fn serve(
     };
     let server = VncServer::bind(&address, served.image(&framebuffer).clone(), config)?;
     server.set_serve_scale((scale * 100.0).round() as u8);
+    server.set_serve_display(plan.announcement());
     report(ServerNotice::Serving {
         address: server.local_addr()?,
-        display: capture.name.clone(),
+        display: plan.description(),
         width: served_width,
         height: served_height,
     });
+    if let Some(notice) = plan.fallback_notice() {
+        report(ServerNotice::Message(notice));
+    }
     let placement = Mutex::new(DisplayPlacement {
         served_width,
         served_height,
@@ -313,12 +328,11 @@ pub fn serve(
 
         let result = serve_desktop(
             &server,
-            display,
+            follower,
             scale,
             mouse,
             capture,
             framebuffer,
-            image,
             served,
             &placement,
             &remote_clipboard_sequence,
@@ -341,19 +355,17 @@ pub fn serve(
 #[allow(clippy::too_many_arguments)]
 fn serve_desktop(
     server: &VncServer,
-    display: Option<usize>,
+    mut follower: DisplayFollower,
     mut scale: f32,
     mouse: MouseMode,
     capture: DesktopCapture,
     mut framebuffer: Framebuffer,
-    mut image: DesktopImage,
     mut served: ServedImage,
     placement: &Mutex<DisplayPlacement>,
     remote_clipboard_sequence: &AtomicU32,
     shutdown: &AtomicBool,
     report: &(dyn Fn(ServerNotice) + Sync),
 ) -> Result<(), Box<dyn Error>> {
-    let mut captured = Vec::new();
     let mut damage = Vec::new();
     let mut clipboard_sequence = unsafe { GetClipboardSequenceNumber() };
     match read_system_clipboard_latin1() {
@@ -366,6 +378,7 @@ fn serve_desktop(
     let mut retry_delay = CAPTURE_RETRY_MIN;
     let mut next_retry = Instant::now();
     let mut last_capture_error = String::new();
+    let mut last_layout_check = Instant::now();
     let mut connections = 0;
     let mut pointer_mode = PointerModeHint::default();
     while !shutdown.load(Ordering::Acquire) {
@@ -401,17 +414,66 @@ fn serve_desktop(
             }
         }
 
+        // Viewers share one display choice; the last request wins.
+        let mut change = DisplayChange::None;
+        if let Some(request) = server.take_display_request() {
+            let before = follower.selection();
+            change = follower.request(request, attached_areas);
+            if follower.selection() != before {
+                report(ServerNotice::Message(format!(
+                    "A viewer asked for {}.",
+                    follower.selection()
+                )));
+            }
+        }
+        // Plugging, unplugging, or choosing another primary display does not
+        // always interrupt Desktop Duplication, so compare the layout too.
+        if change != DisplayChange::Restart
+            && capture.is_some()
+            && last_layout_check.elapsed() >= LAYOUT_CHECK_INTERVAL
+        {
+            last_layout_check = Instant::now();
+            change = match follower.layout_read(monitor_layout(), attached_areas) {
+                DisplayChange::None => change,
+                DisplayChange::Restart => {
+                    report(ServerNotice::Message(format!(
+                        "The display layout changed; restarting capture of {}.",
+                        follower.selection()
+                    )));
+                    DisplayChange::Restart
+                }
+                renumbered => renumbered,
+            };
+        }
+        match change {
+            DisplayChange::None => {}
+            DisplayChange::Renumbered => {
+                if let Some(plan) = follower.plan() {
+                    server.set_serve_display(plan.announcement());
+                    if let Some(notice) = plan.fallback_notice() {
+                        report(ServerNotice::Message(notice));
+                    }
+                }
+            }
+            DisplayChange::Restart => {
+                // A display can be duplicated once per process; stop first.
+                capture = None;
+                follower.stopped();
+                next_retry = Instant::now();
+                retry_delay = CAPTURE_RETRY_MIN;
+            }
+        }
+
         let Some(active) = capture.as_mut() else {
             if Instant::now() < next_retry {
                 thread::sleep(Duration::from_millis(50));
                 continue;
             }
-            match DesktopCapture::new(display) {
-                Ok(recreated) => {
+            match start_capture(&mut follower) {
+                Ok((recreated, plan)) => {
                     let size = (recreated.placement.width, recreated.placement.height);
                     if size != (framebuffer.width() as u16, framebuffer.height() as u16) {
                         framebuffer = Framebuffer::new(size.0, size.1)?;
-                        image = DesktopImage::new(size.0, size.1);
                         served = ServedImage::new(size, scale)?;
                         let (width, height) = served.size(&framebuffer);
                         report(ServerNotice::Resized { width, height });
@@ -424,10 +486,15 @@ fn serve_desktop(
                         served_height,
                         ..recreated.placement
                     };
-                    report(ServerNotice::Message("Desktop capture resumed.".into()));
+                    server.set_serve_display(plan.announcement());
+                    report(ServerNotice::Message(
+                        plan.fallback_notice()
+                            .unwrap_or_else(|| format!("Serving {}.", plan.description())),
+                    ));
                     capture = Some(recreated);
                     retry_delay = CAPTURE_RETRY_MIN;
                     last_capture_error.clear();
+                    last_layout_check = Instant::now();
                 }
                 Err(error) => {
                     let message = error.to_string();
@@ -443,16 +510,17 @@ fn serve_desktop(
             }
             continue;
         };
-        captured.clear();
-        if let Err(error) = active.next_frame(&mut image, &mut captured) {
-            // Desktop switches (UAC, lock screen), mode changes, and driver
-            // resets all invalidate duplication; keep serving the last image
-            // and recreate capture.
+        damage.clear();
+        if let Err(error) = active.next_frame(framebuffer.pixels_mut(), &mut damage) {
+            // Desktop switches (UAC, lock screen), mode changes, unplugged
+            // displays, and driver resets all invalidate duplication; keep
+            // serving the last image and recreate capture.
             report(ServerNotice::Message(format!(
                 "Desktop capture paused: {error}"
             )));
             last_capture_error = error.to_string();
             capture = None;
+            follower.stopped();
             next_retry = Instant::now() + retry_delay;
             continue;
         }
@@ -469,8 +537,6 @@ fn serve_desktop(
             target.served_height = height;
             report(ServerNotice::Resized { width, height });
         }
-        damage.clear();
-        image.present(&captured, framebuffer.pixels_mut(), &mut damage);
         if scale_changed {
             damage.clear();
             damage.push(Rect::new(
@@ -981,18 +1047,192 @@ fn set_system_clipboard(text: &[u8]) -> Result<u32, Box<dyn Error>> {
     Ok(unsafe { GetClipboardSequenceNumber() })
 }
 
-/// Desktop Duplication of the primary display. Any failure invalidates the
-/// whole capture; the caller recreates it from scratch.
+/// Desktop Duplication of the selected displays. Each display is captured on
+/// its own thread, so a display without changes never delays another, into
+/// one image arranged as on the desktop. Any failure invalidates the whole
+/// capture; the serving loop recreates it from scratch.
 struct DesktopCapture {
+    shared: Arc<CaptureShared>,
+    stop: Arc<AtomicBool>,
+    threads: Vec<thread::JoinHandle<()>>,
+    /// The area the captured image covers on the virtual desktop.
+    placement: DisplayPlacement,
+    /// Windows raised every capture device's GPU thread priority, so copies
+    /// do not queue behind a game's rendering.
+    gpu_priority_raised: bool,
+}
+
+/// What capture threads hand to the serving loop.
+struct CaptureShared {
+    state: Mutex<CaptureState>,
+    changed: Condvar,
+}
+
+struct CaptureState {
+    image: DesktopImage,
+    /// Image regions captured since the serving loop last presented.
+    captured: Vec<Rect>,
+    /// The image or cursor changed since the serving loop last presented.
+    changed: bool,
+    pointer: PointerOwner,
+    /// Why a display's capture stopped; the whole capture is then recreated.
+    error: Option<String>,
+}
+
+/// Start capturing what `follower` selects, among the displays attached
+/// now, and tell it what is served.
+fn start_capture(
+    follower: &mut DisplayFollower,
+) -> Result<(DesktopCapture, DisplayPlan), Box<dyn Error>> {
+    // Read the layout first: a change while starting is then noticed.
+    let layout = monitor_layout();
+    let attached = attached_outputs()?;
+    let areas = attached
+        .iter()
+        .map(|output| output.area.clone())
+        .collect::<Vec<_>>();
+    let plan = DisplayPlan::new(follower.selection(), &areas)?;
+    let capture = DesktopCapture::new(&plan, &attached)?;
+    follower.started(plan.clone(), layout);
+    Ok((capture, plan))
+}
+
+/// The attached displays, for the display follower.
+fn attached_areas() -> Result<Vec<DisplayArea>, String> {
+    attached_outputs()
+        .map(|outputs| outputs.into_iter().map(|output| output.area).collect())
+        .map_err(|error| error.to_string())
+}
+
+impl DesktopCapture {
+    /// Capture the displays `plan` chose from `attached`.
+    fn new(plan: &DisplayPlan, attached: &[AttachedOutput]) -> Result<Self, Box<dyn Error>> {
+        let bounds = plan.chosen.bounds;
+        let width = u16::try_from(bounds.right - bounds.left)
+            .map_err(|_| "display width is outside VNC limits")?;
+        let height = u16::try_from(bounds.bottom - bounds.top)
+            .map_err(|_| "display height is outside VNC limits")?;
+        validate_capture_dimensions(width, height)?;
+        let mut captures = Vec::new();
+        for (owner, &index) in plan.chosen.indices.iter().enumerate() {
+            let output = attached
+                .get(index)
+                .ok_or("a planned display is not attached")?;
+            let rect = output.area.rect;
+            let origin = (
+                (rect.left - bounds.left) as usize,
+                (rect.top - bounds.top) as usize,
+            );
+            captures.push(OutputCapture::new(output, owner, origin)?);
+        }
+        let mut capture = Self {
+            shared: Arc::new(CaptureShared {
+                state: Mutex::new(CaptureState {
+                    image: DesktopImage::new(width, height),
+                    // The first present covers areas no display fills, too.
+                    captured: vec![Rect::new(0, 0, i32::from(width), i32::from(height))],
+                    changed: false,
+                    pointer: PointerOwner::default(),
+                    error: None,
+                }),
+                changed: Condvar::new(),
+            }),
+            stop: Arc::new(AtomicBool::new(false)),
+            threads: Vec::new(),
+            placement: DisplayPlacement {
+                left: bounds.left,
+                top: bounds.top,
+                width,
+                height,
+                served_width: width,
+                served_height: height,
+            },
+            gpu_priority_raised: captures.iter().all(|output| output.gpu_priority_raised),
+        };
+        for output in captures {
+            let shared = Arc::clone(&capture.shared);
+            let stop = Arc::clone(&capture.stop);
+            // Dropping `capture` on a failed spawn stops the threads started.
+            capture.threads.push(
+                thread::Builder::new()
+                    .name("topvnc-capture".into())
+                    .spawn(move || capture_output(output, &shared, &stop))?,
+            );
+        }
+        Ok(capture)
+    }
+
+    /// Wait up to one frame interval for desktop or pointer changes, then
+    /// draw them into `output`, the captured-size framebuffer pixels, and
+    /// append the regions that changed to `damage`.
+    fn next_frame(&self, output: &mut [u32], damage: &mut Vec<Rect>) -> Result<(), Box<dyn Error>> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| "capture state lock poisoned")?;
+        let (mut state, _) = self
+            .shared
+            .changed
+            .wait_timeout_while(state, FRAME_TIMEOUT, |state| {
+                !state.changed && state.error.is_none()
+            })
+            .map_err(|_| "capture state lock poisoned")?;
+        if let Some(error) = state.error.take() {
+            return Err(error.into());
+        }
+        if state.changed {
+            let state = &mut *state;
+            state.image.present(&state.captured, output, damage);
+            state.captured.clear();
+            state.changed = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DesktopCapture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Capture one display until stopped or until its capture fails.
+fn capture_output(mut output: OutputCapture, shared: &CaptureShared, stop: &AtomicBool) {
+    enable_thread_dpi_awareness();
+    while !stop.load(Ordering::Acquire) {
+        if let Err(error) = output.next_frame(shared) {
+            if let Ok(mut state) = shared.state.lock() {
+                state.error.get_or_insert_with(|| error.to_string());
+            }
+            shared.changed.notify_all();
+            return;
+        }
+    }
+}
+
+/// An attached display output and its place on the desktop.
+struct AttachedOutput {
+    adapter: IDXGIAdapter1,
+    output: IDXGIOutput,
+    area: DisplayArea,
+    rotation: DXGI_MODE_ROTATION,
+}
+
+/// Desktop Duplication of one display output.
+struct OutputCapture {
+    /// This display's position among the captured ones, for cursor ownership.
+    owner: usize,
+    /// Where this display's top-left pixel is in the captured image.
+    origin: (usize, usize),
     device: ID3D11Device,
-    /// Windows raised this device's GPU thread priority, so its copies do
-    /// not queue behind a game's rendering.
     gpu_priority_raised: bool,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
-    placement: DisplayPlacement,
-    name: String,
     rotation: Rotation,
     source_width: u16,
     source_height: u16,
@@ -1004,14 +1244,21 @@ struct DesktopCapture {
     source_rects: Vec<Rect>,
 }
 
-impl DesktopCapture {
-    fn new(display: Option<usize>) -> Result<Self, Box<dyn Error>> {
-        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
-        let (adapter, output) = find_output(&factory, display)?;
-        let output_desc = unsafe { output.GetDesc()? };
-        let placement = display_placement(&output_desc)?;
-        let rotation = rotation(output_desc.Rotation)?;
-        let (source_width, source_height) = rotation.source_size(placement.width, placement.height);
+impl OutputCapture {
+    fn new(
+        attached: &AttachedOutput,
+        owner: usize,
+        origin: (usize, usize),
+    ) -> Result<Self, Box<dyn Error>> {
+        let rect = attached.area.rect;
+        let width = u16::try_from(rect.right - rect.left)
+            .map_err(|_| "display width is outside VNC limits")?;
+        let height = u16::try_from(rect.bottom - rect.top)
+            .map_err(|_| "display height is outside VNC limits")?;
+        validate_capture_dimensions(width, height)?;
+        let rotation = rotation(attached.rotation)?;
+        let (source_width, source_height) = rotation.source_size(width, height);
+        let adapter = &attached.adapter;
         let feature_levels = [
             D3D_FEATURE_LEVEL_11_0,
             D3D_FEATURE_LEVEL_10_1,
@@ -1021,7 +1268,7 @@ impl DesktopCapture {
         let mut context = None;
         unsafe {
             D3D11CreateDevice(
-                &adapter,
+                adapter,
                 D3D_DRIVER_TYPE_UNKNOWN,
                 HMODULE(std::ptr::null_mut()),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -1038,7 +1285,7 @@ impl DesktopCapture {
         let gpu_priority_raised = device
             .cast::<IDXGIDevice>()
             .is_ok_and(|device| unsafe { device.SetGPUThreadPriority(7) }.is_ok());
-        let output: IDXGIOutput1 = output.cast()?;
+        let output: IDXGIOutput1 = attached.output.cast()?;
         let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(|error| {
             if error.code() == E_ACCESSDENIED {
                 format!("Windows denied access to the desktop (secure desktop or locked session): {error}")
@@ -1046,19 +1293,14 @@ impl DesktopCapture {
                 format!("could not start Desktop Duplication: {error}")
             }
         })?;
-        let name_len = output_desc
-            .DeviceName
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(output_desc.DeviceName.len());
         Ok(Self {
+            owner,
+            origin,
             device,
             gpu_priority_raised,
             context,
             duplication,
             staging: None,
-            placement,
-            name: String::from_utf16_lossy(&output_desc.DeviceName[..name_len]),
             rotation,
             source_width,
             source_height,
@@ -1070,13 +1312,9 @@ impl DesktopCapture {
         })
     }
 
-    /// Wait up to one frame interval for desktop or pointer changes. Changed
-    /// desktop regions are copied into `image` and appended to `captured`.
-    fn next_frame(
-        &mut self,
-        image: &mut DesktopImage,
-        captured: &mut Vec<Rect>,
-    ) -> Result<(), Box<dyn Error>> {
+    /// Wait up to one frame interval for desktop or pointer changes, and
+    /// copy them into the shared image.
+    fn next_frame(&mut self, shared: &CaptureShared) -> Result<(), Box<dyn Error>> {
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource = None;
         if let Err(error) = unsafe {
@@ -1089,40 +1327,111 @@ impl DesktopCapture {
             return Err(format!("could not acquire a desktop frame: {error}").into());
         }
         let _frame = FrameGuard(self.duplication.clone());
+        let shape = match frame_info.PointerShapeBufferSize {
+            0 => None,
+            size => Some(self.read_pointer_shape(size)?),
+        };
+        // Only the pointer changed when nothing was presented.
+        let texture = if frame_info.LastPresentTime != 0 || self.full_frame_pending {
+            let resource = resource.ok_or("Desktop Duplication returned no frame resource")?;
+            let texture: ID3D11Texture2D = resource.cast()?;
+            let mut texture_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { texture.GetDesc(&mut texture_desc) };
+            if texture_desc.Width != u32::from(self.source_width)
+                || texture_desc.Height != u32::from(self.source_height)
+            {
+                return Err("display mode changed".into());
+            }
+            if texture_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+                return Err("desktop frames are not 32-bit BGRA".into());
+            }
+            self.collect_source_rects(&frame_info)?;
+            Some(texture).filter(|_| !self.source_rects.is_empty())
+        } else {
+            None
+        };
+        let staging = match &texture {
+            Some(texture) => Some(self.copy_to_staging(texture)?),
+            None => None,
+        };
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        let _mapped = match &staging {
+            Some(staging) => {
+                unsafe {
+                    self.context
+                        .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+                }
+                Some(MappedTexture {
+                    context: &self.context,
+                    texture: staging,
+                })
+            }
+            None => None,
+        };
+        let surface = match &_mapped {
+            Some(_) => Some(mapped_surface(
+                &mapped,
+                self.source_width,
+                self.source_height,
+                self.rotation,
+            )?),
+            None => None,
+        };
+
+        let mut state = shared
+            .state
+            .lock()
+            .map_err(|_| "capture state lock poisoned")?;
+        let state = &mut *state;
         if frame_info.LastMouseUpdateTime != 0 {
             let position = frame_info.PointerPosition.Position;
-            image.set_cursor_position(
-                position.x,
-                position.y,
-                frame_info.PointerPosition.Visible.as_bool(),
-            );
+            let visible = frame_info.PointerPosition.Visible.as_bool();
+            if state
+                .pointer
+                .accept(self.owner, visible, frame_info.LastMouseUpdateTime)
+            {
+                // Positions are relative to this display.
+                state.image.set_cursor_position(
+                    self.origin.0 as i32 + position.x,
+                    self.origin.1 as i32 + position.y,
+                    visible,
+                );
+            }
         }
-        if frame_info.PointerShapeBufferSize > 0 {
-            image.set_cursor_shape(self.read_pointer_shape(frame_info.PointerShapeBufferSize)?);
+        if let Some(shape) = shape {
+            state.image.set_cursor_shape(shape);
         }
-        if frame_info.LastPresentTime == 0 && !self.full_frame_pending {
-            // Only the pointer changed.
-            return Ok(());
+        if let Some(surface) = &surface {
+            for rect in &self.source_rects {
+                let desktop = self.rotation.desktop_rect(
+                    *rect,
+                    i32::from(self.source_width),
+                    i32::from(self.source_height),
+                );
+                if let Some(changed) = state.image.copy_from_at(surface, desktop, self.origin) {
+                    state.captured.push(changed);
+                }
+            }
+            if state.captured.len() > MAX_PENDING_RECTS {
+                state.captured.clear();
+                state.captured.push(state.image.bounds());
+            }
+            self.full_frame_pending = false;
         }
-        let resource = resource.ok_or("Desktop Duplication returned no frame resource")?;
-        let texture: ID3D11Texture2D = resource.cast()?;
-        let mut texture_desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { texture.GetDesc(&mut texture_desc) };
-        if texture_desc.Width != u32::from(self.source_width)
-            || texture_desc.Height != u32::from(self.source_height)
-        {
-            return Err("display mode changed".into());
-        }
-        if texture_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
-            return Err("desktop frames are not 32-bit BGRA".into());
-        }
-        self.collect_source_rects(&frame_info)?;
-        if self.source_rects.is_empty() {
-            return Ok(());
-        }
+        state.changed = true;
+        shared.changed.notify_all();
+        Ok(())
+    }
+
+    /// Copy the changed regions of `texture` to the CPU-readable staging
+    /// texture.
+    fn copy_to_staging(
+        &mut self,
+        texture: &ID3D11Texture2D,
+    ) -> Result<ID3D11Texture2D, Box<dyn Error>> {
         let staging = self.staging_texture()?;
         if self.source_rects.len() > MAX_REGION_COPIES {
-            unsafe { self.context.CopyResource(&staging, &texture) };
+            unsafe { self.context.CopyResource(&staging, texture) };
         } else {
             for rect in &self.source_rects {
                 let region = D3D11_BOX {
@@ -1140,56 +1449,14 @@ impl DesktopCapture {
                         region.left,
                         region.top,
                         0,
-                        &texture,
+                        texture,
                         0,
                         Some(&region),
                     );
                 }
             }
         }
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-        }
-        let _mapped = MappedTexture {
-            context: &self.context,
-            texture: &staging,
-        };
-        let (width, height) = (
-            usize::from(self.source_width),
-            usize::from(self.source_height),
-        );
-        let row_pitch = mapped.RowPitch as usize;
-        if mapped.pData.is_null() || row_pitch < width * 4 {
-            return Err("Desktop Duplication returned an invalid row layout".into());
-        }
-        // SAFETY: the mapped staging texture holds `height` rows of
-        // `row_pitch` bytes, the last of which has at least `width` pixels.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                mapped.pData.cast::<u8>(),
-                row_pitch * (height - 1) + width * 4,
-            )
-        };
-        let surface = CaptureSurface {
-            bytes,
-            row_pitch,
-            width,
-            height,
-            rotation: self.rotation,
-        };
-        for rect in &self.source_rects {
-            let desktop = self.rotation.desktop_rect(
-                *rect,
-                i32::from(self.source_width),
-                i32::from(self.source_height),
-            );
-            image.copy_from(&surface, desktop);
-            captured.push(desktop);
-        }
-        self.full_frame_pending = false;
-        Ok(())
+        Ok(staging)
     }
 
     /// Collect changed regions of the captured image, clipped to its bounds.
@@ -1331,21 +1598,142 @@ fn read_metadata<T: Default + Clone>(
     Err("desktop frame metadata kept growing".into())
 }
 
-fn display_placement(desc: &DXGI_OUTPUT_DESC) -> Result<DisplayPlacement, Box<dyn Error>> {
-    let area = desc.DesktopCoordinates;
-    let width =
-        u16::try_from(area.right - area.left).map_err(|_| "display width is outside VNC limits")?;
-    let height = u16::try_from(area.bottom - area.top)
-        .map_err(|_| "display height is outside VNC limits")?;
-    validate_capture_dimensions(width, height)?;
-    Ok(DisplayPlacement {
-        left: area.left,
-        top: area.top,
+/// The pixels of a mapped staging texture of `width` x `height` pixels.
+fn mapped_surface(
+    mapped: &D3D11_MAPPED_SUBRESOURCE,
+    width: u16,
+    height: u16,
+    rotation: Rotation,
+) -> Result<CaptureSurface<'_>, Box<dyn Error>> {
+    let (width, height) = (usize::from(width), usize::from(height));
+    let row_pitch = mapped.RowPitch as usize;
+    if mapped.pData.is_null() || row_pitch < width * 4 || height == 0 {
+        return Err("Desktop Duplication returned an invalid row layout".into());
+    }
+    // SAFETY: the mapped staging texture holds `height` rows of `row_pitch`
+    // bytes, the last of which has at least `width` pixels, and stays mapped
+    // while `mapped` is borrowed.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            mapped.pData.cast::<u8>(),
+            row_pitch * (height - 1) + width * 4,
+        )
+    };
+    Ok(CaptureSurface {
+        bytes,
+        row_pitch,
         width,
         height,
-        served_width: width,
-        served_height: height,
+        rotation,
     })
+}
+
+fn device_name(name: &[u16]) -> String {
+    let len = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    String::from_utf16_lossy(&name[..len])
+}
+
+/// The displays `--display` and the Server tab number, in DXGI enumeration
+/// order, with their desktop areas in physical pixels. Empty when they
+/// cannot be listed.
+pub fn displays() -> Vec<DisplayArea> {
+    // The UI thread keeps its own DPI awareness; areas are read in physical
+    // pixels, as capture uses them.
+    let previous =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let displays = attached_outputs()
+        .map(|outputs| outputs.into_iter().map(|output| output.area).collect())
+        .unwrap_or_default();
+    if !previous.is_null() {
+        unsafe { SetThreadDpiAwarenessContext(previous as DPI_AWARENESS_CONTEXT) };
+    }
+    displays
+}
+
+/// Display outputs attached to the desktop, in DXGI enumeration order. The
+/// primary display is the one at the desktop origin.
+fn attached_outputs() -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
+    let mut outputs = Vec::new();
+    for adapter_index in 0..16 {
+        let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
+            Ok(adapter) => adapter,
+            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(error) => return Err(error.into()),
+        };
+        for output_index in 0..16 {
+            let output = match unsafe { adapter.EnumOutputs(output_index) } {
+                Ok(output) => output,
+                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(error) => return Err(error.into()),
+            };
+            let desc: DXGI_OUTPUT_DESC = unsafe { output.GetDesc()? };
+            if !desc.AttachedToDesktop.as_bool() {
+                continue;
+            }
+            let area = desc.DesktopCoordinates;
+            outputs.push(AttachedOutput {
+                adapter: adapter.clone(),
+                output,
+                area: DisplayArea {
+                    name: device_name(&desc.DeviceName),
+                    rect: Rect::new(area.left, area.top, area.right, area.bottom),
+                    primary: area.left == 0 && area.top == 0,
+                },
+                rotation: desc.Rotation,
+            });
+            if outputs.len() == MAX_DISPLAYS {
+                return Ok(outputs);
+            }
+        }
+    }
+    Ok(outputs)
+}
+
+/// The monitors on the desktop as GDI reports them. Cheap enough to compare
+/// twice a second, unlike enumerating DXGI outputs.
+fn monitor_layout() -> Vec<DisplayArea> {
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        // SAFETY: `data` is the vector passed to EnumDisplayMonitors below,
+        // which calls back synchronously.
+        let monitors = unsafe { &mut *(data.0 as *mut Vec<DisplayArea>) };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if unsafe {
+            GetMonitorInfoW(
+                monitor,
+                (&mut info as *mut MONITORINFOEXW).cast::<MONITORINFO>(),
+            )
+        }
+        .as_bool()
+        {
+            let area = info.monitorInfo.rcMonitor;
+            monitors.push(DisplayArea {
+                name: device_name(&info.szDevice),
+                rect: Rect::new(area.left, area.top, area.right, area.bottom),
+                primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            });
+        }
+        BOOL::from(monitors.len() < MAX_MONITORS)
+    }
+    let mut monitors = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut monitors as *mut Vec<DisplayArea> as isize),
+        );
+    }
+    monitors
 }
 
 fn rotation(rotation: DXGI_MODE_ROTATION) -> Result<Rotation, &'static str> {
@@ -1380,55 +1768,11 @@ impl Drop for FrameGuard {
     }
 }
 
-/// The attached output numbered `display` (1-based, in DXGI enumeration
-/// order), or else the primary output: the one at desktop origin (0, 0).
-fn find_output(
-    factory: &IDXGIFactory1,
-    display: Option<usize>,
-) -> Result<(IDXGIAdapter1, IDXGIOutput), Box<dyn Error>> {
-    let mut outputs = Vec::new();
-    let mut primary = None;
-    for adapter_index in 0..16 {
-        let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
-            Ok(adapter) => adapter,
-            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
-            Err(error) => return Err(error.into()),
-        };
-        for output_index in 0..16 {
-            let output = match unsafe { adapter.EnumOutputs(output_index) } {
-                Ok(output) => output,
-                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
-                Err(error) => return Err(error.into()),
-            };
-            let desc = unsafe { output.GetDesc()? };
-            if !desc.AttachedToDesktop.as_bool() {
-                continue;
-            }
-            if desc.DesktopCoordinates.left == 0 && desc.DesktopCoordinates.top == 0 {
-                primary.get_or_insert(outputs.len());
-            }
-            outputs.push((adapter.clone(), output));
-        }
-    }
-    let count = outputs.len();
-    let index = match display {
-        Some(number) if number <= count => number - 1,
-        Some(number) => {
-            return Err(
-                format!("display {number} not found; {count} display(s) are attached").into(),
-            );
-        }
-        None => primary.unwrap_or(0),
-    };
-    outputs
-        .into_iter()
-        .nth(index)
-        .ok_or_else(|| "no active display output was found".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desktop_host::{DisplaySelection, choose_displays};
+    use topvnc::ServedDisplays;
 
     #[test]
     fn input_injection_checks_partial_and_silent_windows_rejections() {
@@ -1520,5 +1864,367 @@ mod tests {
         .unwrap();
         assert_eq!((count, calls), (3, 2));
         assert_eq!(buffer[2].right, 3);
+    }
+
+    fn sorted(mut displays: Vec<DisplayArea>) -> Vec<DisplayArea> {
+        displays.sort_by(|a, b| a.name.cmp(&b.name));
+        displays
+    }
+
+    fn size(rect: Rect) -> (u16, u16) {
+        (
+            (rect.right - rect.left) as u16,
+            (rect.bottom - rect.top) as u16,
+        )
+    }
+
+    /// The cheap GDI layout must describe the same displays as DXGI, or
+    /// layout changes would be misread.
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn gdi_and_dxgi_agree_on_attached_displays() {
+        enable_thread_dpi_awareness();
+        let displays = displays();
+        assert!(!displays.is_empty());
+        assert_eq!(displays.iter().filter(|display| display.primary).count(), 1);
+        assert_eq!(sorted(monitor_layout()), sorted(displays));
+    }
+
+    /// Captures every display alone and all together, and checks that each
+    /// display's area of the combined image received pixels.
+    #[test]
+    #[ignore = "captures the live Windows desktop; run with --test-threads=1"]
+    fn captures_each_and_all_live_displays() {
+        enable_thread_dpi_awareness();
+        let displays = displays();
+        let mut selections = vec![DisplaySelection::Primary, DisplaySelection::All];
+        selections.extend((1..=displays.len()).map(DisplaySelection::Number));
+        for selection in selections {
+            let (capture, plan) = start_capture(&mut DisplayFollower::new(selection)).unwrap();
+            let chosen = choose_displays(selection, &displays).unwrap();
+            assert_eq!(plan.chosen, chosen);
+            assert_eq!(
+                (capture.placement.width, capture.placement.height),
+                size(chosen.bounds),
+                "{selection}"
+            );
+            let mut pixels = vec![
+                0;
+                usize::from(capture.placement.width)
+                    * usize::from(capture.placement.height)
+            ];
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(2) {
+                capture.next_frame(&mut pixels, &mut Vec::new()).unwrap();
+            }
+            let stride = usize::from(capture.placement.width);
+            for &index in &chosen.indices {
+                let area = displays[index]
+                    .rect
+                    .offset(-chosen.bounds.left, -chosen.bounds.top);
+                let colors = (area.top as usize..area.bottom as usize)
+                    .step_by(7)
+                    .flat_map(|y| {
+                        let row = &pixels[y * stride..][..stride];
+                        row[area.left as usize..area.right as usize]
+                            .iter()
+                            .step_by(7)
+                            .copied()
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                // A desktop with a taskbar or wallpaper has many colors; an
+                // area never copied stays black.
+                assert!(
+                    colors.len() > 1,
+                    "{selection}: {} received no pixels",
+                    displays[index].name
+                );
+            }
+        }
+        // With the real attached displays, naming the captured display
+        // differently keeps the capture; another display needs a new one.
+        let primary = displays.iter().position(|display| display.primary).unwrap();
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        let (_capture, _) = start_capture(&mut follower).unwrap();
+        assert_eq!(
+            follower.request(primary as u8 + 1, attached_areas),
+            DisplayChange::None
+        );
+        assert_eq!(
+            follower.plan().unwrap().announcement().served,
+            primary as u8 + 1
+        );
+        if displays.len() > 1 {
+            let other = (primary + 1) % displays.len();
+            assert_eq!(
+                follower.request(other as u8 + 1, attached_areas),
+                DisplayChange::Restart
+            );
+        }
+        // An unchanged layout never restarts capture.
+        for _ in 0..3 {
+            assert_eq!(
+                follower.layout_read(monitor_layout(), attached_areas),
+                DisplayChange::None
+            );
+        }
+    }
+
+    /// Proof on real hardware, with a person: serves the primary display on
+    /// loopback while you change the main display (Settings > System >
+    /// Display > Make this my main display) or unplug or plug in a monitor,
+    /// then checks that the viewer ends on what is now the primary display.
+    /// Waits up to `TOPVNC_MANUAL_SECONDS` (default 120) for the change:
+    ///
+    /// cargo test --bin topvnc -- --ignored follows_display_changes_made_by_hand --nocapture
+    #[test]
+    #[ignore = "needs someone to change the main display or unplug a monitor while it runs"]
+    fn follows_display_changes_made_by_hand() {
+        enable_thread_dpi_awareness();
+        let seconds = std::env::var("TOPVNC_MANUAL_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120);
+        // What the viewer must show for a layout: the primary display, its
+        // number, and the attached count.
+        let expected = |displays: &[DisplayArea]| {
+            let primary = displays.iter().position(|display| display.primary)?;
+            Some((
+                size(displays[primary].rect),
+                ServedDisplays {
+                    served: primary as u8 + 1,
+                    count: displays.len() as u8,
+                },
+            ))
+        };
+        let initial = displays();
+        let shutdown = AtomicBool::new(false);
+        let (notices, receiver) = std::sync::mpsc::channel();
+        let notices = Mutex::new(notices);
+        let report = |notice: ServerNotice| {
+            let _ = notices.lock().unwrap().send(notice);
+        };
+        let options = ServeOptions {
+            address: "127.0.0.1:0".into(),
+            allow_insecure: true,
+            ..parse_serve_arguments(&[]).unwrap()
+        };
+        thread::scope(|scope| {
+            let host = scope.spawn(|| {
+                serve(options, None, &shutdown, &report).map_err(|error| error.to_string())
+            });
+            let address = loop {
+                match receiver.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    ServerNotice::Serving { address, .. } => break address,
+                    _ => continue,
+                }
+            };
+            let mut session = topvnc::Session::connect_with_encoding(
+                &address.to_string(),
+                true,
+                topvnc::Encoding::Tight { quality: 6 },
+                || unreachable!(),
+            )
+            .unwrap();
+            let writer = session.writer();
+            // The viewer reads on its own thread, so a quiet desktop that
+            // sends nothing cannot stall the checks below.
+            let (views, seen) = std::sync::mpsc::channel();
+            let viewer = scope.spawn(move || {
+                let (width, height) = (session.info.width, session.info.height);
+                let mut framebuffer = Framebuffer::new(width, height).unwrap();
+                let writer = session.writer();
+                let _ = writer.request_update(false, width, height);
+                while session
+                    .read_update_pipelined(&mut Vec::new(), |x, y, w, h, bytes| {
+                        if bytes.is_empty() {
+                            framebuffer = Framebuffer::new(w, h)?;
+                            Ok(())
+                        } else {
+                            framebuffer.apply_raw(x, y, w, h, bytes)
+                        }
+                    })
+                    .is_ok()
+                {
+                    let view = (
+                        (session.info.width, session.info.height),
+                        writer.serve_display(),
+                    );
+                    if views.send(view).is_err() {
+                        break;
+                    }
+                }
+            });
+            eprintln!(
+                "\nServing the primary display; {} display(s) attached:",
+                initial.len()
+            );
+            for (index, display) in initial.iter().enumerate() {
+                eprintln!(
+                    "  {}: {} {:?}{}",
+                    index + 1,
+                    display.name,
+                    size(display.rect),
+                    if display.primary { " (main)" } else { "" }
+                );
+            }
+            eprintln!(
+                "Within {seconds} s, change the main display or unplug or plug in a monitor.\n"
+            );
+            let deadline = Instant::now() + Duration::from_secs(seconds);
+            let mut latest = None;
+            let mut outcome = None;
+            // Every layout the test itself reads, so a failure shows whether
+            // Windows reported a change at all.
+            let mut layout = initial.clone();
+            let mut layout_changes = 0;
+            while Instant::now() < deadline && outcome.is_none() {
+                if let Ok(view) = seen.recv_timeout(Duration::from_millis(500)) {
+                    if latest != Some(view) {
+                        eprintln!("viewer shows {:?}, host announces {:?}", view.0, view.1);
+                    }
+                    latest = Some(view);
+                }
+                while let Ok(notice) = receiver.try_recv() {
+                    eprintln!("host: {notice}");
+                }
+                let now = displays();
+                if now != layout {
+                    layout_changes += 1;
+                    eprintln!("Windows reports a new layout:");
+                    for (index, display) in now.iter().enumerate() {
+                        eprintln!(
+                            "  {}: {} {:?}{}",
+                            index + 1,
+                            display.name,
+                            size(display.rect),
+                            if display.primary { " (main)" } else { "" }
+                        );
+                    }
+                    layout = now.clone();
+                }
+                if now != initial
+                    && let (Some(view), Some((size, announced))) = (latest, expected(&now))
+                    && view == (size, Some(announced))
+                {
+                    outcome = Some((now, view));
+                }
+            }
+            shutdown.store(true, Ordering::Release);
+            let _ = writer.shutdown();
+            viewer.join().unwrap();
+            host.join().unwrap().unwrap();
+            let (now, view) = outcome.unwrap_or_else(|| {
+                assert!(
+                    layout_changes > 0,
+                    "Windows reported no display change within {seconds} s; change the main \
+                     display or unplug a monitor while the test runs"
+                );
+                let now = displays();
+                assert_ne!(
+                    now, initial,
+                    "the layout changed {layout_changes} time(s) but was back to the original \
+                     before the viewer followed; leave the change in place until PASS appears"
+                );
+                panic!(
+                    "Windows reported {layout_changes} layout change(s), but the viewer shows \
+                     {latest:?} instead of {:?}",
+                    expected(&now)
+                )
+            });
+            eprintln!(
+                "\nPASS: after the change the viewer shows {:?}, display {} of {}, the main display.",
+                view.0,
+                view.1.unwrap().served,
+                now.len()
+            );
+        });
+    }
+
+    /// Serves all displays on loopback, then has a viewer switch to each
+    /// display and back through the protocol.
+    #[test]
+    #[ignore = "captures the live Windows desktop; run with --test-threads=1"]
+    fn viewers_switch_between_live_displays() {
+        enable_thread_dpi_awareness();
+        let displays = displays();
+        let all = choose_displays(DisplaySelection::All, &displays).unwrap();
+        let shutdown = AtomicBool::new(false);
+        let (notices, receiver) = std::sync::mpsc::channel();
+        let notices = Mutex::new(notices);
+        let report = |notice: ServerNotice| {
+            let _ = notices.lock().unwrap().send(notice);
+        };
+        let options = ServeOptions {
+            address: "127.0.0.1:0".into(),
+            display: DisplaySelection::All,
+            allow_insecure: true,
+            ..parse_serve_arguments(&[]).unwrap()
+        };
+        thread::scope(|scope| {
+            let host = scope.spawn(|| {
+                serve(options, None, &shutdown, &report).map_err(|error| error.to_string())
+            });
+            let (address, width, height) = loop {
+                match receiver.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    ServerNotice::Serving {
+                        address,
+                        width,
+                        height,
+                        ..
+                    } => break (address, width, height),
+                    _ => continue,
+                }
+            };
+            assert_eq!((width, height), size(all.bounds));
+            let mut session = topvnc::Session::connect_with_encoding(
+                &address.to_string(),
+                true,
+                topvnc::Encoding::Tight { quality: 6 },
+                || unreachable!(),
+            )
+            .unwrap();
+            let writer = session.writer();
+            let mut framebuffer = Framebuffer::new(width, height).unwrap();
+            writer.request_update(false, width, height).unwrap();
+            let mut read_until =
+                |session: &mut topvnc::Session, done: &dyn Fn(&topvnc::Session) -> bool| {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !done(session) {
+                        assert!(Instant::now() < deadline, "timed out");
+                        session
+                            .read_update_pipelined(&mut Vec::new(), |x, y, w, h, bytes| {
+                                if bytes.is_empty() {
+                                    framebuffer = Framebuffer::new(w, h)?;
+                                    Ok(())
+                                } else {
+                                    framebuffer.apply_raw(x, y, w, h, bytes)
+                                }
+                            })
+                            .unwrap();
+                    }
+                };
+            let count = displays.len() as u8;
+            read_until(&mut session, &|_| {
+                writer.serve_display() == Some(ServedDisplays { served: 0, count })
+            });
+            for (index, display) in displays.iter().enumerate() {
+                let number = index as u8 + 1;
+                writer.request_serve_display(number).unwrap();
+                let expected = size(display.rect);
+                read_until(&mut session, &|session| {
+                    writer.serve_display().map(|displays| displays.served) == Some(number)
+                        && (session.info.width, session.info.height) == expected
+                });
+            }
+            writer.request_serve_display(0).unwrap();
+            read_until(&mut session, &|session| {
+                writer.serve_display().map(|displays| displays.served) == Some(0)
+                    && (session.info.width, session.info.height) == (width, height)
+            });
+            shutdown.store(true, Ordering::Release);
+            writer.shutdown().unwrap();
+            host.join().unwrap().unwrap();
+        });
     }
 }

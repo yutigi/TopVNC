@@ -26,6 +26,14 @@ fn main() -> io::Result<()> {
         } else {
             Some(50)
         },
+        if std::env::args().any(|arg| arg == "--unavailable") {
+            None
+        } else {
+            Some(topvnc::ServedDisplays {
+                served: 1,
+                count: 2,
+            })
+        },
     );
     let mut output = io::BufWriter::new(io::stdout().lock());
     write!(output, "P6\n{width} {height}\n255\n")?;
