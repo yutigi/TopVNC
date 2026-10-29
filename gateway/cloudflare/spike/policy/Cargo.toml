@@ -1,0 +1,22 @@
+[package]
+name = "topvnc-spike-policy"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+test-fixtures = ["dep:rand"]
+
+[dependencies]
+base64.workspace = true
+rsa.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+rand = { version = "0.8", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+rand = "0.8"

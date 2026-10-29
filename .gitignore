@@ -3,3 +3,13 @@
 /.env.*
 *.log
 /dist
+**/target/
+**/node_modules/
+**/.wrangler/
+**/.dev.vars
+**/wrangler.local.toml
+**/host.local.toml
+**/tunnel-token.txt
+/gateway/cloudflare/spike/worker/build/
+/gateway/cloudflare/spike/worker/public/probe.bundle.js
+/gateway/cloudflare/spike/.tools/
