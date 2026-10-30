@@ -99,7 +99,9 @@ function onHandshakeReply(current, reply) {
   }
   current.handshaking = false;
   report(`Encrypted channel to host ${fingerprint(current.pairing.host)} established. Sending one 1 KiB sample per second.`);
-  sendSample(current);
+  // bufferedAmount still counts the final handshake message in this tick, so
+  // start on the regular cadence instead of tripping the backpressure check.
+  current.next = setTimeout(() => sendSample(current), 1000);
 }
 
 function onSample(current, message) {

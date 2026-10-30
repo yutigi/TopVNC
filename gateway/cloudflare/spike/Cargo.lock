@@ -1715,6 +1715,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "topvnc-spike-tunnel"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "topvnc-spike-worker"
 version = "0.1.0"
 dependencies = [

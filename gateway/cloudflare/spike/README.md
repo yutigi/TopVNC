@@ -2,8 +2,9 @@
 
 This is an isolated feasibility harness, not the production TopVNC browser
 client. The root native package and session implementation are unchanged.
-The basic Workers VPC/WebSocket route passed in Edge; the encrypted probe and
-the iPhone gates have **not** been tested live.
+The basic Workers VPC/WebSocket route passed in Edge. The encrypted probe passed
+encrypted echo live in iPhone Safari and Edge; the remaining live checks, and
+the two-hour and resource gates, are listed in the feature's research.md.
 
 **Desktop deployment is blocked.** Current main requires browser-to-actual-host
 end-to-end encryption before Cloudflare carries RFB. The harness now has that
@@ -15,8 +16,8 @@ deployment state.
 
 The harness contains a native Rust WebSocket-to-loopback-TCP relay, shared
 RS256/JWKS policy, a shared Noise E2E crate (`e2e/`) with WASM bindings
-(`browser/`), a workers-rs upgrade forwarder, and a synthetic browser echo
-probe. The original noVNC password-only adapter and tests remain as local
+(`browser/`), a workers-rs upgrade forwarder, a synthetic browser echo probe,
+and a cloudflared launcher (`tunnel/`). The original noVNC password-only adapter and tests remain as local
 reference; noVNC is no longer imported into the browser bundle. This is not the
 planned Rust/WASM TopVNC client.
 
@@ -123,10 +124,13 @@ by the pinned wasm-bindgen packager. All generated build/tool files are ignored.
 
    ```powershell
    cargo run -p topvnc-spike-host -- --init-host-key host.local.toml
-   cargo run -p topvnc-spike-host -- --synthetic-echo --pair host.local.toml
+   cargo pair
    ```
 
-   Omit `--pair` once the browser is enrolled. Show the QR code only on the
+   Run `cargo gateway` instead once the browser is enrolled. Both are aliases
+   for `cargo run -p topvnc-spike-host -- --synthetic-echo [--pair] host.local.toml`,
+   defined in `.cargo/config.toml` here and at the repository root, so they
+   work from either directory. Show the QR code only on the
    host's own screen; use a dark console background if the camera does not
    detect it.
 
@@ -134,12 +138,87 @@ by the pinned wasm-bindgen packager. All generated build/tool files are ignored.
    account and owner-only Access configuration are confirmed. The deploy
    script uses the ignored local config, not the example's placeholders.
 10. Open the workers.dev URL and sign in through Access. Then scan the QR code
-    (an Access redirect can drop the `#pair=` fragment) and compare the
+    (an Access redirect can drop the `#pair=` fragment; reload if you pasted
+    the link into an already open probe tab) and compare the
     displayed host fingerprint with the console. Start the encrypted test. It
     verifies one generated 1 KiB sample at a time, once per second, handling
     arbitrary transport chunks with a five-second deadline. The first verified
     echo saves the pairing. Echo RTT is a transport diagnostic, not a desktop
     latency measurement.
+
+## Testing from an iPhone
+
+This repeats steps 8 and 10 for one test session after setup and deployment.
+It checks only the encrypted echo; the iPhone does not see or control a
+desktop. Run each long-lived command in its own console window that you watch
+yourself, never in a shell whose output is captured or logged: the QR code and
+invite link carry a one-time secret.
+
+1. From the repository root or this directory, start the connector:
+
+   ```powershell
+   cargo tunnel
+   ```
+
+   The `tunnel/` launcher checks that the protected token file from step 5
+   exists, without reading it, and runs
+   `cloudflared tunnel --no-autoupdate run --token-file tunnel-token.txt`. Set
+   `CLOUDFLARED` to the full path if `cloudflared` is not on `PATH`. Ctrl+C
+   reaches cloudflared directly; the launcher waits for it to exit. Wait for
+   `Registered tunnel connection` lines. Without them the page cannot reach the
+   gateway.
+
+2. In a second window, from the repository root or this directory, start the
+   gateway with a pairing invite:
+
+   ```powershell
+   cargo pair
+   ```
+
+   The console prints `Host key fingerprint: …`, the QR code, the invite link,
+   and `Phase 0 synthetic gateway listening on 127.0.0.1:6080 …`. Maximize the
+   window so the QR code does not wrap. The invite works once, for ten minutes;
+   stop and run `cargo pair` again for a new one.
+
+3. In iPhone Safari, open the `app_origin` URL and finish the Access sign-in
+   **before** scanning. The Access redirect drops the `#pair=` fragment, and the
+   page then says "Not paired".
+4. Scan the QR code with the Camera app and open the link. The page shows
+   `Pairing invite for host …`. A scanned invite takes priority over a saved
+   pairing, so **Forget pairing** is not needed first. Compare the host
+   fingerprint with the console, then press **Start encrypted test**. The first
+   verified echo saves the pairing, and the console prints
+   `enrolled browser key …`, which should match the browser fingerprint on the
+   page.
+5. For later runs, start the gateway with `cargo gateway`. The page shows
+   `Paired with host …`; press **Start encrypted test**.
+6. When finished, press Ctrl+C in both windows. Nothing should be listening on
+   port 6080 afterwards.
+
+Pairing again leaves the old browser key enrolled, and the limit is eight. To
+remove it, stop the gateway, delete its line from `browsers.txt`, and restart
+(see "Rotation and revocation" above).
+
+Behavior seen in iOS 27 Safari on 2026-10-30:
+
+- Switching apps or locking the phone ends the session, and the probe does not
+  reconnect by itself; press **Start encrypted test** again. After a lock, the
+  gateway may not see the drop, so its single session slot stays busy for about
+  60–80 s (60 s of silence plus up to 20 s until the heartbeat check). A
+  reconnect in that window gets HTTP 409, which the page shows only as
+  `Connection failed. Check Access and the private gateway.`
+- Safari can bring back the page with an already used `#pair=` link from tab or
+  history state. That invite overrides the saved pairing, and the page shows
+  `Disconnected (1008). The pairing invite expired or was already used…`. Open
+  the plain URL instead of running `cargo pair` again.
+- The gateway logs any abrupt disconnect, such as an app switch, as
+  `1009 Invalid or oversized message`. It is not a size problem.
+
+For the two-hour run, set Auto-Lock to Never, keep the phone on a charger, and
+keep Safari in front. The session ends at `max_session_seconds` (7200 in the
+example config), or earlier if the Access session expires. Record the
+gateway's `relay closed: code=… upstream_bytes=…` line and the page's last
+status line and recent round-trip times in research.md.
 
 ## What to prove before production work
 

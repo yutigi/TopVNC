@@ -99,6 +99,11 @@ async fn harness() -> Harness {
 async fn harness_with_lifetime(max_session_seconds: u64) -> Harness {
     let dir = TempDir::new();
     let browser = provision(&dir.0);
+    serve(dir, browser, max_session_seconds).await
+}
+
+/// Starts a gateway from the identity and enrollment files already in `dir`.
+async fn serve(dir: TempDir, browser: Keypair, max_session_seconds: u64) -> Harness {
     let rfb = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway = Gateway::new(config(
         &dir.0,
@@ -343,6 +348,55 @@ async fn pairing_enrolls_a_browser_once_persists_it_and_allows_reconnection() {
     let mut bytes = [0; 5];
     tcp.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"again");
+}
+
+#[tokio::test]
+async fn revokes_a_browser_whose_line_is_removed_before_restart() {
+    let h = harness().await;
+    let revoked = Keypair::generate().unwrap();
+    let invite = h.gateway.open_pairing().unwrap();
+    let (mut ws, _) = connect_as(&h, &revoked.private, Some(&invite.secret)).await;
+    let (mut tcp, _) = h.rfb.accept().await.unwrap();
+    ws.close(None).await.unwrap();
+    assert_tcp_closed(&mut tcp).await;
+    assert_eq!(h.gateway.enrolled_browsers(), 2);
+
+    // Revoke as the README says: stop the gateway, delete the line, restart.
+    let Harness {
+        dir,
+        browser,
+        _server: server,
+        ..
+    } = h;
+    drop(server);
+    let path = dir.0.join("browsers.txt");
+    let line_key = e2e::encode_key(&revoked.public);
+    let kept: String = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.contains(&line_key))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&path, kept).unwrap();
+    let h = serve(dir, browser, 7200).await;
+    assert_eq!(h.gateway.enrolled_browsers(), 1);
+
+    let mut ws = open(&h.url).await;
+    assert!(
+        handshake(&mut ws, &revoked.private, &h.gateway.host_public(), None)
+            .await
+            .is_some()
+    );
+    assert_closed(&mut ws, Some("browser key is not enrolled")).await;
+    assert_no_tcp(&h.rfb).await;
+
+    // The browser that stayed enrolled still connects.
+    let (mut ws, mut channel) = connect(&h).await;
+    let (mut tcp, _) = h.rfb.accept().await.unwrap();
+    send_sealed(&mut ws, &mut channel, b"kept").await;
+    let mut bytes = [0; 4];
+    tcp.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"kept");
 }
 
 #[tokio::test]
