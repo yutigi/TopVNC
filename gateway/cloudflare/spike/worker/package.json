@@ -8,7 +8,8 @@
     "deploy:check": "wrangler deploy --dry-run --config wrangler.local.toml",
     "deploy": "wrangler deploy --config wrangler.local.toml",
     "build": "node scripts/build.mjs",
-    "test": "node --test password-only.test.mjs probe-protocol.test.mjs"
+    "test": "node --test password-only.test.mjs probe-protocol.test.mjs pairing-store.test.mjs",
+    "test:wasm": "node --test e2e-wasm.test.mjs"
   },
   "devDependencies": {
     "@novnc/novnc": "1.7.0",

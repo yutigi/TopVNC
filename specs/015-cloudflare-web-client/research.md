@@ -14,6 +14,12 @@ The original noVNC password-only adapter remains locally tested but is not
 imported into the bundle. No production protocol extraction or native session
 change has started.
 
+Since that deployment, the probe gained the browser-to-host Noise channel
+(T023; design in plan.md). The browser now pairs by QR code and sends only
+ciphertext through the Worker, VPC service, and Tunnel; the gateway decrypts
+on the host. The deployed Worker still serves the earlier plaintext probe until
+it is redeployed for T026.
+
 ## Account observations
 
 - Wrangler OAuth sign-in succeeded. The account has a workers.dev subdomain.
@@ -111,8 +117,11 @@ resource/lifecycle gate remain open.
 Stopped the Edge session after approximately 4 minutes 22 seconds to free the
 single session slot for an iPhone test. The gateway logged normal closure
 (1000), with 264,192 bytes in each direction (258 full 1 KiB samples). The
-stopped state was visually verified. The synthetic service/connector remain
-running for the owner's device test.
+stopped state was visually verified. The synthetic service/connector remained
+running for the owner's device test. When the E2E work began later on
+2026-10-30, neither a gateway nor a `cloudflared` process was running and
+nothing listened on port 6080. No iPhone result was recorded. Restart both for
+T026 with the new gateway, which needs a host key and the two key-file settings.
 
 The GraphQL metrics API is readable with the existing Wrangler credential.
 Its first returned row records one successful invocation, no errors, and
@@ -127,7 +136,7 @@ Windows listener inspection confirmed only `127.0.0.1:6080` for the gateway.
 | --- | --- |
 | Workers Free account | Confirmed current plan in dashboard |
 | Zero Trust Free account setup | Confirmed active after owner completed checkout |
-| Browser-to-actual-host E2E | Not implemented; desktop deployment blocked |
+| Browser-to-actual-host E2E | Noise XK + QR pairing implemented and locally tested; owner accepted the code-delivery trust limit; live route check pending (T026); desktop still blocked |
 | Owner-only hostname-based Access for workers.dev | Saved; exact owner-email rule and six-hour duration verified; unauthenticated `/` and `/ws` redirect to team login; owner session passed, live wrong-owner session untested |
 | Private VPC binding + same-host Tunnel connector | Dedicated service running over healthy QUIC tunnel |
 | HTTP/WebSocket upgrade passthrough | Passed basic authenticated Edge echo test on deployed Rust Worker/VPC service |

@@ -2,8 +2,55 @@
 
 Date: 2026-10-30. Current branch `feat/cloudflare-web-client`, created from
 `main` at `03d1881`. Recovered the original uncommitted harness from its stash
-without dropping that backup. **Local synthetic harness validated; live
-Cloudflare/Safari and browser-to-host E2E gates remain open.**
+without dropping that backup. **Local synthetic harness and browser-to-host
+E2E channel validated locally; live encrypted-route, Cloudflare resource, and
+Safari gates remain open.**
+
+## Browser-to-host E2E checks (T023, 2026-10-30)
+
+Noise XK/XKpsk3 channel with QR pairing, in the isolated spike workspace only.
+The owner accepted the disclosed code-delivery trust limit (plan.md). Rust
+1.95.0, Node 22.18.0, `snow` 0.10.0, `wasm-bindgen` 0.2.129.
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test --workspace --locked`: pass, 34 tests: 10 E2E, 2 WASM-binding
+  (native), 16 gateway, 6 policy. Tests cover:
+  - session and pairing handshakes;
+  - wrong pinned host key, substituted or altered host reply, and an
+    unenrolled browser;
+  - wrong, expired, and reused invites, where a failed guess does not consume
+    the invite;
+  - header and mode tampering and fixed handshake sizes;
+  - transport replay, reordering, loss, tampering, and truncation, after which
+    the channel stays closed;
+  - plaintext and size bounds, and ciphertext-only relay output;
+  - no TCP connection before an authorized handshake, a ten-second handshake
+    timeout, and an offline-target close reason;
+  - enrollment persistence and key-file validation.
+  The earlier relay regressions were kept and now run inside the channel:
+  Access/Origin/query rejection, one active session, text, oversized and
+  fragmented messages, idle resume, and session expiry.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: pass.
+  `wasm32-unknown-unknown` clippy for the worker, browser, and E2E crates: pass.
+  The E2E dependency tree for WASM contains no `ring` or C build.
+- `npm test`: eight Node tests pass (adds bounded pairing storage and fragment
+  parsing). `node --check` passes for the probe and storage modules.
+- `npm run build`: pass. Browser WASM 149,787 bytes, probe bundle 12,088
+  bytes. `npm run test:wasm`: three smoke tests of the built bindings pass
+  (keys, fingerprints, invite parsing, bound headers, forged-reply failure).
+- `wrangler deploy --dry-run --config wrangler.example.toml`: pass, five static
+  assets, 609.22 KiB total upload (230.34 KiB gzip). Nothing was deployed.
+- Host CLI smoke test with fictional values and a loopback ephemeral port:
+  - help exits 0; the legacy config-only invocation exits 2;
+  - a missing host key fails with an `--init-host-key` hint;
+  - `--init-host-key` creates the key once and refuses to replace it;
+  - `--pair` prints the fingerprint, a terminal QR code, and the one-time link.
+  The process was then stopped; no listener remained.
+
+Not validated: the bundled page against the deployed route, QR scanning, Safari
+storage/WASM/CSP behavior, and Free-plan CPU with E2E traffic (T026, T011).
+The root native package is a separate Cargo package and is unchanged, so the
+native suite was not rerun.
 
 ## Recovery revision checks
 

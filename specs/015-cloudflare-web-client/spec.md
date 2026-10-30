@@ -14,9 +14,11 @@ live free-tier, private-Tunnel, authentication, and Safari gates pass.
 The current main branch also requires end-to-end encryption before Cloudflare
 carries a desktop session (feature 014). Apply that requirement here: the browser
 must authenticate the actual host independently, and RFB credentials, frames,
-input, and clipboard must stay encrypted through Cloudflare. The restored
-transport harness does not provide this encryption. Keep desktop deployment
-blocked; synthetic, non-sensitive transport tests can be designed separately.
+input, and clipboard must stay encrypted through Cloudflare. The harness now
+has a Noise XK browser-to-host channel with QR-provisioned host trust, tested
+locally only (plan.md, T023). On 2026-10-30 the owner accepted its disclosed
+limit: Cloudflare serves the client code and could substitute it. Keep desktop
+deployment blocked until the live encrypted route (T026) and device gates pass.
 
 ## User stories
 
@@ -69,7 +71,8 @@ loss tests, followed by a two-hour desktop-control soak.
 
 ## Validation
 
-The isolated Phase 0 harness passes its local Rust/Node tests and Worker
-packaging dry run. Actual results and the existing native-suite timeout are
-recorded in validation.md. The live Cloudflare/Safari gates in research.md
-remain pending; local or mocked tests do not prove those gates.
+The isolated Phase 0 harness, including its E2E channel, passes its local
+Rust/Node/WASM-binding tests and Worker packaging dry run. Actual results and
+the existing native-suite timeout are recorded in validation.md. The live
+encrypted-route, Cloudflare resource, and Safari gates in research.md remain
+pending; local or mocked tests do not prove those gates.
