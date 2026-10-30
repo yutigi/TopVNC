@@ -3,8 +3,27 @@
 Date: 2026-10-30. Current branch `feat/cloudflare-web-client`, created from
 `main` at `03d1881`. Recovered the original uncommitted harness from its stash
 without dropping that backup. **Local synthetic harness and browser-to-host
-E2E channel validated locally; live encrypted-route, Cloudflare resource, and
-Safari gates remain open.**
+E2E channel validated locally. The live encrypted route is partly validated
+(T026 open); Cloudflare resource and desktop gates remain open.**
+
+## Live encrypted probe checks (T026, 2026-10-30; in progress)
+
+Details and close reasons are in research.md.
+
+- Local checks before each deploy: `npm test` 8/8, `npm run build`,
+  `npm run test:wasm` 3/3, and `deploy:check` (5 assets, 609.22 KiB). The
+  second run followed the `probe.mjs` fix.
+- That fix makes the first sample wait one interval after the handshake. It has
+  no automated test: the page script has no DOM harness, and the Node tests
+  only cover its helper modules. The live route verified it.
+- Passed live on the deployed route:
+  - encrypted echo: iPhone Safari (iOS 27.0.1, 185 samples) and Edge 156
+    (46 samples);
+  - plaintext and forged-handshake clients rejected without data;
+  - wrong pinned host key rejected without data;
+  - consumed invite rejected.
+- Pending: unenrolled-browser rejection on the live route. Expired-invite
+  rejection is covered by local tests only.
 
 ## Browser-to-host E2E checks (T023, 2026-10-30)
 

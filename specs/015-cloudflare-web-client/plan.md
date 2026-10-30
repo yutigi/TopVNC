@@ -95,8 +95,10 @@ pinned host key, a substituted host reply, unenrolled keys, wrong, expired, and
 consumed invites, mode/header tampering, fixed sizes, and transport replay,
 reordering, loss, tampering, and size bounds. They also cover target
 opening only after authorization, handshake timeout, and persistence. A Node
-smoke test exercises the built WASM bindings. Interop of the bundled browser
-code with the deployed route and iPhone Safari is still pending (T026).
+smoke test exercises the built WASM bindings. On the deployed route, the
+bundled code interoperated with iPhone Safari and Edge. The live checks also
+showed that the `#pair=` link can survive in browser tab or history state
+despite being removed from the address bar (research.md). T026 is still open.
 
 **Before desktop traffic.** T026 must pass on the deployed route. The
 production client must then carry RFB, with VNC password authentication, only

@@ -1,6 +1,6 @@
 [workspace]
-members = ["policy", "e2e", "host", "browser", "worker"]
-default-members = ["policy", "e2e", "host", "browser"]
+members = ["policy", "e2e", "host", "tunnel", "browser", "worker"]
+default-members = ["policy", "e2e", "host", "tunnel", "browser"]
 resolver = "3"
 
 [workspace.package]

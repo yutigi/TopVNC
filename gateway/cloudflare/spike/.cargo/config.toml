@@ -1,0 +1,10 @@
+# Short commands for the gateway and its Tunnel connector; run them from this
+# directory. The gateway aliases keep --synthetic-echo explicit, so the gateway
+# never connects a desktop.
+[alias]
+# Gateway for an already enrolled browser.
+gateway = "run -p topvnc-spike-host -- --synthetic-echo host.local.toml"
+# Gateway plus a one-time pairing QR code on this console.
+pair = "run -p topvnc-spike-host -- --synthetic-echo --pair host.local.toml"
+# Private Tunnel connector (cloudflared) with the protected token file.
+tunnel = "run -p topvnc-spike-tunnel -- tunnel-token.txt"

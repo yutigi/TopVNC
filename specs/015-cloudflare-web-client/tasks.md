@@ -21,7 +21,7 @@
 - [X] T008 [US1] Add the browser connection probe, Free-plan Worker configuration, and private-Tunnel setup in gateway/cloudflare/spike/worker/public/, wrangler.example.toml, and gateway/cloudflare/spike/README.md.
 - [X] T009 [US1] Run native checks, Worker WASM build/deployment packaging, and browser-probe checks; document results in specs/015-cloudflare-web-client/validation.md.
 - [X] T010 [US1] Deploy only the authenticated synthetic Free-plan probe through the owner's account and verify VPC WebSocket upgrades/local routing in specs/015-cloudflare-web-client/research.md. Do not connect a desktop.
-- [ ] T026 [US1] Redeploy the encrypted synthetic probe, create the host key, pair the owner's browser by QR, and verify encrypted echo, rejection of an unenrolled browser, and no plaintext fallback over the live route; record in specs/015-cloudflare-web-client/research.md. Do not connect a desktop.
+- [ ] T026 [US1] Redeploy the encrypted synthetic probe, create the host key, pair the owner's browser by QR, and verify encrypted echo, rejection of an unenrolled browser, and no plaintext fallback over the live route; record in specs/015-cloudflare-web-client/research.md. Do not connect a desktop. (In progress 2026-10-30: deployed; iPhone and Edge encrypted echo, plaintext client, wrong host key, and reused-invite rejection passed live; a probe start bug was fixed and redeployed. Unenrolled-browser check remains.)
 - [ ] T011 [US1] Verify real iPhone Safari login/RFB traffic, Free CPU limits, slow consumers, and two-hour sessions; record the architecture gate in specs/015-cloudflare-web-client/research.md.
 
 ## US2: Production desktop control (P1; blocked until T010–T011 pass)
