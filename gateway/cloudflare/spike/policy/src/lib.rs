@@ -8,7 +8,6 @@ use url::Url;
 
 pub const MAX_TOKEN_BYTES: usize = 16 * 1024;
 pub const MAX_JWKS_BYTES: usize = 64 * 1024;
-pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const READ_CHUNK_BYTES: usize = 16 * 1024;
 pub const KEY_TTL_SECONDS: u64 = 300;
 pub const KEY_REFRESH_SECONDS: u64 = 10;

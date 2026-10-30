@@ -12,7 +12,7 @@
 
 ## US1: Secure connection feasibility (P1)
 
-- [ ] T023 [US1] Specify browser-to-actual-host E2E transport, independently provisioned host identity, and the trust limit of Cloudflare-served client code in specs/015-cloudflare-web-client/plan.md; implement and validate it before desktop traffic.
+- [X] T023 [US1] Specify browser-to-actual-host E2E transport, independently provisioned host identity, and the trust limit of Cloudflare-served client code in specs/015-cloudflare-web-client/plan.md; implement and validate it before desktop traffic. (Noise XK/XKpsk3 with QR pairing in gateway/cloudflare/spike/e2e/, browser/, host/, and worker/; owner accepted the trust limit on 2026-10-30; local Rust/WASM validation only, live check is T026.)
 - [X] T024 [US1] Reconcile the restored harness with current main and rerun relevant local checks; complete Workers Free / Zero Trust Free verification and owner-only hostname Access setup without exposing a desktop.
 - [X] T025 [US1] Replace the live browser password/desktop probe with bounded synthetic echo diagnostics and force a generated loopback target in the host CLI; retain local relay regression tests.
 - [X] T005 [US1] Add native WebSocket/TCP integration tests for auth rejection, ordered binary relay, size limits, busy sessions, and close propagation in gateway/cloudflare/spike/host/src/tests.rs.
@@ -21,6 +21,7 @@
 - [X] T008 [US1] Add the browser connection probe, Free-plan Worker configuration, and private-Tunnel setup in gateway/cloudflare/spike/worker/public/, wrangler.example.toml, and gateway/cloudflare/spike/README.md.
 - [X] T009 [US1] Run native checks, Worker WASM build/deployment packaging, and browser-probe checks; document results in specs/015-cloudflare-web-client/validation.md.
 - [X] T010 [US1] Deploy only the authenticated synthetic Free-plan probe through the owner's account and verify VPC WebSocket upgrades/local routing in specs/015-cloudflare-web-client/research.md. Do not connect a desktop.
+- [ ] T026 [US1] Redeploy the encrypted synthetic probe, create the host key, pair the owner's browser by QR, and verify encrypted echo, rejection of an unenrolled browser, and no plaintext fallback over the live route; record in specs/015-cloudflare-web-client/research.md. Do not connect a desktop.
 - [ ] T011 [US1] Verify real iPhone Safari login/RFB traffic, Free CPU limits, slow consumers, and two-hour sessions; record the architecture gate in specs/015-cloudflare-web-client/research.md.
 
 ## US2: Production desktop control (P1; blocked until T010–T011 pass)
@@ -47,7 +48,8 @@
 
 T001–T004 precede US1. T005 precedes T006; T004 precedes T007.
 T006–T008 precede T009; T009 precedes T010–T011. T023 is additionally required
-before any live task carries RFB credentials or desktop traffic. T025 allows
+before any live task carries RFB credentials or desktop traffic, and T026
+validates it on the deployed route before T011's device checks. T025 allows
 T010's synthetic routing diagnostics without desktop/E2E traffic. T024
 must establish current account/configuration and local evidence first.
 Cloudflare login, Free-account

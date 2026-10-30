@@ -1,10 +1,15 @@
 # Copy to host.local.toml (ignored). Configuration contains no VNC password.
 listen = "127.0.0.1:6080"
 # Required by the transport library; ignored/replaced by the synthetic-only CLI.
-# Do not point the live probe at a desktop. E2E is not implemented.
+# Do not point the live probe at a desktop; the desktop gates have not passed.
 rfb_target = "127.0.0.1:0"
 app_origin = "https://topvnc-connection-spike.YOUR_SUBDOMAIN.workers.dev"
 issuer = "https://YOUR_TEAM.cloudflareaccess.com"
 audience = "YOUR_ACCESS_APPLICATION_AUD"
 owner_email = "you@example.com"
 max_session_seconds = 7200
+# E2E identity, relative to this file. Both are ignored by Git. The host key is
+# secret: create it with --init-host-key and keep it readable only by you.
+host_key_file = "host.key"
+# Enrolled browser public keys (not secret); pairing appends to this file.
+browser_keys_file = "browsers.txt"

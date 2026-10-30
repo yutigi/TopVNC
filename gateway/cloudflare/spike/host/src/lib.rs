@@ -1,4 +1,6 @@
 //! Isolated Phase 0 transport. Never interprets RFB or accepts a remote target.
+//! Terminates the browser's Noise E2E channel on this host before opening the
+//! loopback target, so the relay only carries ciphertext.
 
 use axum::{
     Router,
@@ -12,8 +14,11 @@ use axum::{
 };
 use serde::Deserialize;
 use std::{
+    fs::{self, OpenOptions},
+    io::{self, Write},
     net::SocketAddr,
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -22,10 +27,19 @@ use tokio::{
     sync::{Mutex, Semaphore},
     time::{Instant, timeout, timeout_at},
 };
+use topvnc_spike_e2e::{
+    self as e2e, Channel, Key, Keypair, MAX_CIPHERTEXT_BYTES, MAX_PLAINTEXT_BYTES, Mode,
+    PairingInvite, Responder,
+};
 use topvnc_spike_policy::{
     AccessPolicy, Identity, KEY_REFRESH_SECONDS, KEY_TTL_SECONDS, KeySet, MAX_JWKS_BYTES,
-    MAX_MESSAGE_BYTES, READ_CHUNK_BYTES, token_key_id, validate_origin, validate_upgrade,
+    READ_CHUNK_BYTES, token_key_id, validate_origin, validate_upgrade,
 };
+
+pub const MAX_BROWSER_KEYS: usize = 8;
+pub const PAIRING_SECONDS: u64 = 600;
+const HANDSHAKE_SECONDS: u64 = 10;
+const MAX_BROWSER_KEYS_FILE_BYTES: u64 = 4096;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +51,10 @@ pub struct Config {
     pub audience: String,
     pub owner_email: String,
     pub max_session_seconds: u64,
+    /// The host's static Noise private key, created by `--init-host-key`.
+    pub host_key_file: PathBuf,
+    /// Enrolled browser public keys, one per line; written by pairing.
+    pub browser_keys_file: PathBuf,
 }
 
 #[derive(Default)]
@@ -46,6 +64,12 @@ struct KeyCache {
     last_attempt: Option<Instant>,
 }
 
+struct Enrollment {
+    keys: Vec<Key>,
+    /// At most one single-use invite secret and its expiry.
+    invite: Option<(Key, Instant)>,
+}
+
 pub struct Gateway {
     config: Config,
     policy: AccessPolicy,
@@ -53,6 +77,72 @@ pub struct Gateway {
     keys: Mutex<KeyCache>,
     handshakes: Semaphore,
     active: Arc<Semaphore>,
+    host: Keypair,
+    enrollment: StdMutex<Enrollment>,
+}
+
+/// Creates the host identity without replacing an existing one. Rotation is
+/// explicit: delete the file and pair every browser again.
+pub fn create_host_key(path: &Path) -> io::Result<Keypair> {
+    let keypair = Keypair::generate().map_err(io::Error::other)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    writeln!(file, "{}", e2e::encode_key(&keypair.private))?;
+    file.sync_all()?;
+    Ok(keypair)
+}
+
+fn load_host_key(path: &Path) -> Result<Keypair, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            return Err("host key file must be readable only by its owner".into());
+        }
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("cannot read host key file (run --init-host-key first): {e}"))?;
+    Ok(Keypair::from_private(e2e::decode_key(text.trim())?)?)
+}
+
+fn load_browser_keys(path: &Path) -> Result<Vec<Key>, Box<dyn std::error::Error>> {
+    let text = match fs::metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+        Ok(m) if m.len() > MAX_BROWSER_KEYS_FILE_BYTES => {
+            return Err("browser keys file is too large".into());
+        }
+        Ok(_) => fs::read_to_string(path)?,
+    };
+    let mut keys = Vec::new();
+    for line in text.lines() {
+        let key = line.split('#').next().unwrap_or_default().trim();
+        if key.is_empty() {
+            continue;
+        }
+        let key = e2e::decode_key(key)?;
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    if keys.len() > MAX_BROWSER_KEYS {
+        return Err("too many enrolled browser keys".into());
+    }
+    Ok(keys)
+}
+
+fn append_browser_key(path: &Path, key: &Key) -> io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(
+        file,
+        "{} # paired at unix time {}",
+        e2e::encode_key(key),
+        unix_now()
+    )?;
+    file.sync_all()
 }
 
 pub fn unix_now() -> u64 {
@@ -76,6 +166,8 @@ impl Gateway {
             );
         }
         let policy = AccessPolicy::new(&config.issuer, &config.audience, &config.owner_email)?;
+        let host = load_host_key(&config.host_key_file)?;
+        let keys = load_browser_keys(&config.browser_keys_file)?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
@@ -87,7 +179,70 @@ impl Gateway {
             keys: Mutex::new(KeyCache::default()),
             handshakes: Semaphore::new(8),
             active: Arc::new(Semaphore::new(1)),
+            host,
+            enrollment: StdMutex::new(Enrollment { keys, invite: None }),
         }))
+    }
+
+    pub fn host_public(&self) -> Key {
+        self.host.public
+    }
+
+    pub fn enrolled_browsers(&self) -> usize {
+        self.enrollment.lock().map_or(0, |e| e.keys.len())
+    }
+
+    /// Replaces any earlier invite. Show it only on the host itself.
+    pub fn open_pairing(&self) -> Result<PairingInvite, &'static str> {
+        let mut enrollment = self
+            .enrollment
+            .lock()
+            .map_err(|_| "enrollment unavailable")?;
+        if enrollment.keys.len() >= MAX_BROWSER_KEYS {
+            return Err("browser enrollment list is full");
+        }
+        let invite = PairingInvite::generate(self.host.public)?;
+        enrollment.invite = Some((
+            invite.secret,
+            Instant::now() + Duration::from_secs(PAIRING_SECONDS),
+        ));
+        Ok(invite)
+    }
+
+    fn pairing_secret(&self) -> Option<Key> {
+        let enrollment = self.enrollment.lock().ok()?;
+        enrollment
+            .invite
+            .filter(|(_, expires)| Instant::now() < *expires)
+            .map(|(secret, _)| secret)
+    }
+
+    fn authorize(&self, browser: Key, mode: Mode, secret: Option<Key>) -> Result<(), &'static str> {
+        let mut enrollment = self
+            .enrollment
+            .lock()
+            .map_err(|_| "enrollment unavailable")?;
+        if mode == Mode::Session {
+            return match enrollment.keys.contains(&browser) {
+                true => Ok(()),
+                false => Err("browser key is not enrolled"),
+            };
+        }
+        // Single use: the handshake proved this exact secret, so consume it.
+        if secret.is_none() || enrollment.invite.map(|(s, _)| s) != secret {
+            return Err("pairing invite expired or already used");
+        }
+        enrollment.invite = None;
+        if !enrollment.keys.contains(&browser) {
+            if enrollment.keys.len() >= MAX_BROWSER_KEYS {
+                return Err("browser enrollment list is full");
+            }
+            append_browser_key(&self.config.browser_keys_file, &browser)
+                .map_err(|_| "could not save browser enrollment")?;
+            enrollment.keys.push(browser);
+        }
+        eprintln!("enrolled browser key {}", e2e::fingerprint(&browser));
+        Ok(())
     }
 
     async fn authenticate(&self, token: &str) -> Result<Identity, &'static str> {
@@ -204,18 +359,6 @@ async fn upgrade(State(state): State<Arc<Gateway>>, request: axum::extract::Requ
         )
             .into_response();
     };
-    let tcp = match timeout(
-        Duration::from_secs(3),
-        TcpStream::connect(state.config.rfb_target),
-    )
-    .await
-    {
-        Ok(Ok(tcp)) => tcp,
-        _ => return (StatusCode::BAD_GATEWAY, "RFB host offline").into_response(),
-    };
-    if tcp.set_nodelay(true).is_err() {
-        return StatusCode::BAD_GATEWAY.into_response();
-    }
     let seconds = identity
         .expires_at
         .saturating_sub(unix_now())
@@ -223,23 +366,82 @@ async fn upgrade(State(state): State<Arc<Gateway>>, request: axum::extract::Requ
     if seconds == 0 {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let state = state.clone();
     ws.protocols(["binary"])
-        .max_message_size(MAX_MESSAGE_BYTES)
-        .max_frame_size(MAX_MESSAGE_BYTES)
+        .max_message_size(MAX_CIPHERTEXT_BYTES)
+        .max_frame_size(MAX_CIPHERTEXT_BYTES)
         .write_buffer_size(0)
-        .max_write_buffer_size(MAX_MESSAGE_BYTES * 2)
+        .max_write_buffer_size(MAX_CIPHERTEXT_BYTES * 2)
         .on_upgrade(move |socket| async move {
-            relay(socket, tcp, Duration::from_secs(seconds)).await;
+            session(socket, state, Duration::from_secs(seconds)).await;
             drop(permit);
         })
 }
 
-async fn relay(mut socket: WebSocket, mut tcp: TcpStream, lifetime: Duration) {
+/// Opens the target only after the browser proves an enrolled key (or a live
+/// invite) and the host proves the pinned key. There is no plaintext fallback.
+async fn session(mut socket: WebSocket, state: Arc<Gateway>, lifetime: Duration) {
     let expires = Instant::now() + lifetime;
+    let deadline = expires.min(Instant::now() + Duration::from_secs(HANDSHAKE_SECONDS));
+    let channel = match timeout_at(deadline, handshake(&mut socket, &state)).await {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(reason)) => return reject(socket, 1008, reason).await,
+        Err(_) => return reject(socket, 1008, "E2E handshake timed out").await,
+    };
+    let tcp = match timeout(
+        Duration::from_secs(3),
+        TcpStream::connect(state.config.rfb_target),
+    )
+    .await
+    {
+        Ok(Ok(tcp)) if tcp.set_nodelay(true).is_ok() => tcp,
+        _ => return reject(socket, 1011, "RFB host offline").await,
+    };
+    relay(socket, tcp, channel, expires).await;
+}
+
+async fn handshake(socket: &mut WebSocket, state: &Gateway) -> Result<Channel, &'static str> {
+    let first = receive_binary(socket).await?;
+    let secret = state.pairing_secret();
+    let (responder, reply) = Responder::accept(&state.host.private, &first, secret.as_ref())?;
+    socket
+        .send(Message::Binary(reply.into()))
+        .await
+        .map_err(|_| "browser disconnected")?;
+    let last = receive_binary(socket).await?;
+    let (channel, browser, mode) = responder.finish(&last)?;
+    state.authorize(browser, mode, secret)?;
+    Ok(channel)
+}
+
+async fn receive_binary(socket: &mut WebSocket) -> Result<Vec<u8>, &'static str> {
+    loop {
+        match socket.recv().await {
+            Some(Ok(Message::Binary(data))) => return Ok(data.to_vec()),
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Ok(Message::Text(_))) => return Err("binary messages required"),
+            _ => return Err("browser closed during E2E handshake"),
+        }
+    }
+}
+
+async fn reject(mut socket: WebSocket, code: u16, reason: &'static str) {
+    let _ = timeout(
+        Duration::from_secs(1),
+        socket.send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        }))),
+    )
+    .await;
+    eprintln!("session rejected: code={code} reason={reason}");
+}
+
+async fn relay(mut socket: WebSocket, mut tcp: TcpStream, mut channel: Channel, expires: Instant) {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     heartbeat.tick().await;
     let mut last_activity = Instant::now();
-    let mut bytes = vec![0; READ_CHUNK_BYTES];
+    let mut bytes = vec![0; MAX_PLAINTEXT_BYTES];
     let (mut upstream_bytes, mut downstream_bytes) = (0_u64, 0_u64);
     let (code, reason) = loop {
         let write_deadline = || expires.min(Instant::now() + Duration::from_secs(5));
@@ -255,11 +457,14 @@ async fn relay(mut socket: WebSocket, mut tcp: TcpStream, lifetime: Duration) {
                 last_activity = Instant::now();
                 match message {
                     Some(Ok(Message::Binary(data))) => {
-                        if data.len() > MAX_MESSAGE_BYTES { break (1009, "Message too large"); }
-                        if !matches!(timeout_at(write_deadline(), tcp.write_all(&data)).await, Ok(Ok(()))) {
+                        if data.len() > MAX_CIPHERTEXT_BYTES { break (1009, "Message too large"); }
+                        let Ok(plaintext) = channel.open(&data) else {
+                            break (1008, "E2E integrity check failed");
+                        };
+                        if !matches!(timeout_at(write_deadline(), tcp.write_all(&plaintext)).await, Ok(Ok(()))) {
                             break (1013, "Slow TCP peer");
                         }
-                        upstream_bytes = upstream_bytes.saturating_add(data.len() as u64);
+                        upstream_bytes = upstream_bytes.saturating_add(plaintext.len() as u64);
                     }
                     Some(Ok(Message::Ping(data))) => {
                         if !matches!(timeout_at(write_deadline(), socket.send(Message::Pong(data))).await, Ok(Ok(()))) {
@@ -277,7 +482,10 @@ async fn relay(mut socket: WebSocket, mut tcp: TcpStream, lifetime: Duration) {
                     Ok(0) => break (1000, "RFB connection closed"),
                     Ok(n) => {
                         last_activity = Instant::now();
-                        if !matches!(timeout_at(write_deadline(), socket.send(Message::Binary(bytes[..n].to_vec().into()))).await, Ok(Ok(()))) {
+                        let Ok(sealed) = channel.seal(&bytes[..n]) else {
+                            break (1011, "E2E encryption failed");
+                        };
+                        if !matches!(timeout_at(write_deadline(), socket.send(Message::Binary(sealed.into()))).await, Ok(Ok(()))) {
                             break (1013, "Slow WebSocket peer");
                         }
                         downstream_bytes = downstream_bytes.saturating_add(n as u64);

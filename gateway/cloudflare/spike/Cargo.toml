@@ -1,6 +1,6 @@
 [workspace]
-members = ["policy", "host", "worker"]
-default-members = ["policy", "host"]
+members = ["policy", "e2e", "host", "browser", "worker"]
+default-members = ["policy", "e2e", "host", "browser"]
 resolver = "3"
 
 [workspace.package]
@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 topvnc-spike-policy = { path = "policy" }
+topvnc-spike-e2e = { path = "e2e" }
 base64 = "0.22"
 rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
 serde = { version = "1", features = ["derive"] }

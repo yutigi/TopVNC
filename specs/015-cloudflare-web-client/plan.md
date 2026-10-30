@@ -1,6 +1,6 @@
 # Implementation Plan: Personal browser client on workers.dev (free tier)
 
-**Branch**: `feat/cloudflare-web-client` (created from `main` at `03d1881`) | **Date**: 2026-10-30 | **Status**: Live synthetic route passed in Edge; desktop deployment gated on E2E, resource, and Safari validation
+**Branch**: `feat/cloudflare-web-client` (created from `main` at `03d1881`) | **Date**: 2026-10-30 | **Status**: Live synthetic route passed in Edge; browser-to-host E2E implemented and locally tested; desktop deployment gated on live E2E, resource, and Safari validation
 
 ## Reconciliation with current main (2026-10-30)
 
@@ -18,16 +18,90 @@ echo target, and the browser sends generated samples without any password
 field. Do not deploy against a real desktop. Account and owner-only Access
 setup can proceed independently.
 
-Before a desktop test, design an authenticated browser-to-actual-host encrypted
-transport using a maintained protocol/library, independently provision host
-trust, specify bounded framing/replay/failure behavior, and test substitution,
-tampering, identity changes, and absence of plaintext fallback. A Worker-served
-browser bundle can be replaced by that hosting provider; disclose this trust
-limit and resolve whether the required threat model permits it before claiming
-confidentiality from Cloudflare. SSH from the native plan is not directly usable
-by Safari. Do not invent a bespoke cryptographic protocol or treat Access JWTs
-as payload encryption. Non-sensitive synthetic transport testing needs its own
-explicit mode; `--synthetic-echo` is that mode and cannot select an RFB target.
+The browser-to-actual-host encrypted transport is now specified below (T023),
+implemented in the isolated harness, and tested locally. The owner accepted its
+code-delivery trust limit. Live encrypted-route and iPhone validation remain
+open, so the harness still carries only synthetic echo. SSH from the native plan
+is not directly usable by Safari. Access JWTs are not payload encryption.
+`--synthetic-echo` remains the only mode and cannot select an RFB target.
+
+## Browser-to-host E2E design (T023)
+
+**Threat model and owner decision (2026-10-30).** Cloudflare must not receive
+readable RFB credentials, frames, input, or clipboard data. Two limits remain:
+
+- Cloudflare serves the browser's JS/WASM, so it, or whoever controls the
+  owner's Cloudflare account or Worker deployment, could serve modified code
+  that reads the session. No same-origin design can detect that.
+- Serving the client from another origin would need the workers.dev Access
+  cookie on a cross-site WebSocket, which Safari's third-party cookie blocking
+  is expected to prevent (not tested). iOS offers no browser-side code pin.
+
+The owner accepted this limit with disclosure. The channel protects against
+passive observation at the edge, Worker/VPC/Tunnel logs or misconfiguration,
+stolen Access JWTs or tunnel tokens, and host impersonation. It does not protect
+against active code substitution. The page and README say so; no stronger
+confidentiality claim is made.
+
+**Protocol.** Noise `XK_25519_ChaChaPoly_BLAKE2s` (Noise rev. 34) via the
+maintained `snow` crate's pure-Rust resolver, shared by the native gateway and
+the browser WASM (`gateway/cloudflare/spike/e2e/`). No bespoke primitives or
+handshake. XK authenticates the host before the browser sends anything
+sensitive and hides the browser's static key from the relay. The browser's
+identity is verified by the host only after a full round trip, so the gateway
+opens its TCP target only after an authorized handshake. The production RFB
+client must still perform VNC password authentication inside this channel.
+
+**Endpoints.** The Rust host gateway on the actual host is the responder and
+relays decrypted bytes to its loopback target. The Worker and the native relay
+never choose destinations; the Worker forwards the upgrade unchanged.
+
+**Bootstrap and identity.**
+
+- `--init-host-key` creates the host's static X25519 key once (create-new; no
+  silent replacement). Rotation is explicit: delete the key and re-pair.
+- `--pair` prints a terminal QR code on the host containing
+  `https://<origin>/#pair=v1.<host public key>.<256-bit one-time secret>`.
+  The secret is held only in gateway memory, expires after ten minutes, and is
+  consumed by the first successful pairing. The phone camera transfers it
+  independently of Cloudflare; browsers do not send fragments in requests, and
+  the page removes it from the address bar.
+- Pairing uses Noise `XKpsk3` with that secret: the browser pins the host key,
+  and the host learns the new browser key only with proof of the secret. The
+  gateway appends the key to `browser_keys_file`, at most eight keys.
+  Ordinary sessions use `XK` and require an enrolled key.
+- The browser keeps the pinned host key and its private key in `localStorage`.
+  Missing or altered state means "not paired". Safari's seven-day storage
+  expiry therefore fails closed and requires pairing again. Revocation means
+  removing the line on the host.
+
+**Framing and bounds.** The first message has a two-byte version/mode header
+bound into the Noise prologue, so changing the mode fails the handshake.
+Handshake messages are fixed at 50, 48, and 64 bytes with empty payloads and a
+ten-second deadline. After that, each binary WebSocket message is exactly one
+Noise transport message carrying 1–16 KiB of plaintext plus a 16-byte tag. The
+WebSocket message/fragment limit equals that maximum. Sequential implicit nonces
+make loss, reordering, replay, truncation, and tampering authentication
+failures; the channel is then poisoned.
+
+**Failure behavior.** The gateway closes with a reason (1008 for handshake,
+enrollment, or integrity failure; 1011 for an offline target) and never falls
+back to plaintext. The browser shows host-verification failure without a
+fallback, and offers re-pairing only for missing/unenrolled state or the
+owner's explicit rotation.
+
+**Validation.** Local Rust tests cover handshake and pairing success, a wrong
+pinned host key, a substituted host reply, unenrolled keys, wrong, expired, and
+consumed invites, mode/header tampering, fixed sizes, and transport replay,
+reordering, loss, tampering, and size bounds. They also cover target
+opening only after authorization, handshake timeout, and persistence. A Node
+smoke test exercises the built WASM bindings. Interop of the bundled browser
+code with the deployed route and iPhone Safari is still pending (T026).
+
+**Before desktop traffic.** T026 must pass on the deployed route. The
+production client must then carry RFB, with VNC password authentication, only
+through this channel. T011, the resource gates, and the US2 extraction remain
+as listed in tasks.md.
 
 ## Owner decisions (2026-10-29)
 
@@ -39,6 +113,7 @@ explicit mode; `--synthetic-echo` is that mode and cannot select an RFB target.
 | Host transport | An opt-in WebSocket listener inside TopVNC is acceptable. |
 | Relay language | Rust for native and edge relay code; workers-rs for the proposed Worker. |
 | Public address | No owned domain. Use Cloudflare's free workers.dev address; no custom-domain purchase is assumed. |
+| Browser code trust (2026-10-30) | Accept, with disclosure, that Cloudflare-served client code is trusted not to be substituted; E2E still keeps the relay path to ciphertext. |
 
 The owner authorized implementation on 2026-10-30. Begin the isolated Phase 0
 spike and complete its live gates before production refactoring. A free
@@ -98,12 +173,11 @@ opening `/ws`; an upgrade cannot perform an interactive login.
 [Workers Access configuration and WebSocket limitation](https://developers.cloudflare.com/workers/configuration/cloudflare-access/).
 Safari sign-in, expiry, and reauthentication are Phase 0 gates.
 
-**Wire format.** The current probe uses `binary` WebSocket messages containing
-generated echo samples only. The legacy library's byte-stream relay is tested
-locally with synthetic TCP fixtures. Production RFB must travel inside a
-separately specified authenticated E2E channel; its framing is not settled.
-The gateway validates framing/authentication but never parses RFB or accepts a
-destination from the browser. Transport message boundaries have no RFB meaning.
+**Wire format.** Each `binary` WebSocket message carries one Noise handshake
+or transport message (see the E2E design above); the probe's plaintext is
+generated echo samples only. Production RFB must travel inside that channel.
+The gateway terminates E2E and relays bytes but never parses RFB or accepts a
+destination from the browser. Message boundaries have no RFB meaning.
 
 ## Free-tier feasibility (documentation checked 2026-10-29)
 
@@ -140,18 +214,25 @@ the relay to TypeScript. The preferred route still needs a successful probe.
 **Primary Dependencies**: `wasm-bindgen`/`web-sys`, the existing `flate2`,
 `des`, and `zune-jpeg` (WASM compatibility to verify), plus a maintained Rust
 HTTP/WebSocket library and JWT verifier selected during implementation.
+The E2E channel uses `snow` 0.10 (pure-Rust X25519, ChaCha20-Poly1305,
+BLAKE2s) on both sides; browser randomness comes from `crypto.getRandomValues`
+through `getrandom`.
 Deployment uses workers-rs, Wrangler, cloudflared, and Cloudflare Access. Keep
 native networking and authentication dependencies out of the shared protocol crate.
 
 **Storage**: Static non-secret connection configuration for one host. No
 Cloudflare database. The browser never persists the VNC password or embeds
 Access service credentials in assets; non-secret display preferences may persist.
+The browser persists only its E2E pairing (pinned host key and its own private
+key) in origin storage. The host keeps its private key and the enrolled browser
+public keys in ignored local files.
 
 **Testing**: Native Rust unit/integration tests, WASM browser tests, and real
 iPhone Safari checks. Preserve the existing malformed-input and bounds tests.
 The isolated transport harness passes local tests and a deployed Edge echo
-smoke test. The production TopVNC browser client is not implemented; Safari,
-long-session resource behavior, and browser-to-host E2E remain unverified.
+smoke test (before E2E). Its Noise E2E channel passes local Rust and WASM
+binding tests. The production TopVNC browser client is not implemented; Safari,
+long-session resource behavior, and live E2E remain unverified.
 
 **Target Platform**: iPhone Safari first, with desktop-browser development
 checks. Start host validation on Windows. Record exact browser/OS/device
@@ -195,7 +276,7 @@ user administration, sharing, per-user host directory, or multi-tenant service.
 | Presentation separate from decoding | Decode in a browser Web Worker; render through a bounded dirty-region mailbox inspired by `src/presentation.rs`. Apply every update to the authoritative framebuffer before skipping intermediate presentations. |
 | Bounded allocations and explicit backpressure | Define byte/message/queue limits. Await native socket writes, throttle RFB update requests, and test negotiated ContinuousUpdates/Fence behavior. Do not assume those extensions alone bound every queue. Close cleanly when limits are exceeded. |
 | Untrusted server input | Same validation as native, because it is the same crate. Phase 5 adds fuzzing of the byte-stream parser. |
-| Never silently downgrade authentication | The routed browser client requires VNC password auth inside authenticated E2E, plus owner Access. No None or plaintext fallback. The current diagnostic accepts no VNC credentials. |
+| Never silently downgrade authentication | The routed browser client requires VNC password auth inside authenticated E2E, plus owner Access and an enrolled browser key. No None or plaintext fallback. The current diagnostic accepts no VNC credentials. |
 | Don't claim support before testing | The README and docs stay unchanged until each browser/device combination passes the acceptance criteria. |
 
 ## Security model
@@ -228,9 +309,10 @@ user administration, sharing, per-user host directory, or multi-tenant service.
   edge-to-host traffic. Run cloudflared and the Rust listener on the same
   host. Prove local-only routing for the HTTP/WebSocket hop in Phase 0;
   keep the RFB TCP hop on loopback. Those layers terminate at Cloudflare and
-  are insufficient for feature 014's confidentiality requirement. Add and
-  validate a separate browser-to-actual-host authenticated encrypted channel
-  before carrying RFB; retain VNC password authentication inside it.
+  are insufficient for feature 014's confidentiality requirement. The Noise
+  browser-to-host channel above provides it, subject to its stated code
+  delivery trust limit and live validation. Retain VNC password authentication
+  inside it.
 - **Host exposure**: prefer a loopback HTTP/WebSocket target, subject to VPC
   routing tests. If that is unavailable, explicitly validate a same-host
   address and firewall restrictions before choosing it; do not silently add
@@ -462,7 +544,8 @@ docs/cloudflare-gateway.md
 | TCP-over-WebSocket on lossy mobile links | Latency spikes and stalls | Lower quality and served size presets for mobile. Consider WebTransport later. |
 | Mobile keyboard/gesture differences | Desktop input incomplete | Real-device tests, trackpad/direct modes, modifier toolbar; defer gaming requirements. |
 | Phase 1 refactor regresses the native viewer | Native latency worse | A separate PR gated on the existing tests and benches. |
-| Transport alone would expose RFB plaintext to Cloudflare | Blocks desktop deployment | CLI is synthetic-only. Browser-to-actual-host E2E and independent host trust are required before RFB traffic. Resolve trust in provider-served browser code as well. |
+| Transport alone would expose RFB plaintext to Cloudflare | Blocks desktop deployment | Noise XK browser-to-host channel with QR-provisioned host trust is implemented and locally tested; CLI stays synthetic-only until the live E2E and device gates pass. |
+| Cloudflare-served client code is substituted | Session and stored browser key readable | Owner-accepted, disclosed limit. Keep account 2FA, sign Wrangler out when idle, and make no confidentiality claim beyond passive relay exposure. |
 
 ## Next action
 
@@ -475,3 +558,8 @@ Implementation is authorized. Build and validate Phase 0 in the existing
 worktree on the branch created from `main`. The production refactor remains
 gated on live Cloudflare and device results; record missing external
 prerequisites rather than silently skipping those gates.
+
+As of 2026-10-30, the E2E channel (T023) is implemented locally. Next comes
+T026: redeploy the encrypted synthetic probe and run the gateway with the
+connector. Then pair the owner's iPhone by QR and verify encrypted echo, which
+also covers T011's Safari checks. The resource and two-hour gates follow.

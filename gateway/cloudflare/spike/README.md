@@ -2,21 +2,57 @@
 
 This is an isolated feasibility harness, not the production TopVNC browser
 client. The root native package and session implementation are unchanged.
-The live Workers VPC/WebSocket and iPhone gates have **not** passed.
+The basic Workers VPC/WebSocket route passed in Edge; the encrypted probe and
+the iPhone gates have **not** been tested live.
 
 **Desktop deployment is blocked.** Current main requires browser-to-actual-host
-end-to-end encryption before Cloudflare carries RFB. This harness does not
-provide it. Its executable therefore only accepts `--synthetic-echo`, replaces
-the configured TCP target with its own loopback echo server, and never connects
-to a desktop. The browser sends generated samples and has no password field.
-Owner-only Access setup does not remove the E2E gate. See the feature's
-research.md for the current synthetic deployment and temporary connector state.
+end-to-end encryption before Cloudflare carries RFB. The harness now has that
+channel (below), tested locally only. The executable still accepts only
+`--synthetic-echo`, replaces the configured TCP target with its own loopback
+echo server, and never connects to a desktop. The browser sends generated
+samples and has no password field. See the feature's research.md for the live
+deployment state.
 
 The harness contains a native Rust WebSocket-to-loopback-TCP relay, shared
-RS256/JWKS policy, a workers-rs upgrade forwarder, and a synthetic browser echo
+RS256/JWKS policy, a shared Noise E2E crate (`e2e/`) with WASM bindings
+(`browser/`), a workers-rs upgrade forwarder, and a synthetic browser echo
 probe. The original noVNC password-only adapter and tests remain as local
 reference; noVNC is no longer imported into the browser bundle. This is not the
 planned Rust/WASM TopVNC client.
+
+## Browser-to-host encryption and its trust limit
+
+- **Protocol**: Noise `XK_25519_ChaChaPoly_BLAKE2s` through the `snow` crate's
+  pure-Rust resolver, in the gateway and in browser WASM. The gateway on the
+  host decrypts; Cloudflare's Worker, VPC service, and Tunnel carry only
+  ciphertext. One Noise message travels in each binary WebSocket message.
+- **Host identity**: `--init-host-key` creates the host's static key once and
+  never replaces it. The browser pins the public key from a pairing invite read
+  off the host's own screen, never from Cloudflare.
+- **Browser identity**: the gateway accepts only enrolled browser keys (at most
+  eight, in `browser_keys_file`). `--pair` prints a QR code containing the host
+  public key and a one-time 256-bit secret, valid for ten minutes. Scanning it
+  opens `#pair=...`, a fragment browsers do not send in requests. The browser
+  makes a new key and enrolls it with Noise `XKpsk3`. Failed guesses do not
+  consume the invite; success does.
+- **Failure**: any changed host key, unknown browser key, wrong or expired
+  secret, malformed or timed-out handshake, or altered, replayed, reordered, or
+  dropped message closes the session with a reason. The target opens only after
+  the handshake; there is no plaintext fallback.
+- **Trust limit (accepted by the owner on 2026-10-30)**: Cloudflare serves
+  the page's JS/WASM. Cloudflare, or anyone who controls the Cloudflare account
+  or Worker deployment, can serve modified code that reads the session and the
+  browser's stored key. E2E protects against passive observation at the edge,
+  logs, Worker/VPC/Tunnel misconfiguration, a stolen Access JWT or tunnel token,
+  and host impersonation. It does not protect against substituted client code.
+  Keep account 2FA on and sign Wrangler out when not deploying.
+- **Browser storage**: the pinned host key and browser private key live in
+  `localStorage` for the workers.dev origin. Safari may delete script-written
+  storage after seven days without a visit, unless the app was added to the
+  Home Screen; the client then refuses to connect until you pair again.
+- **Rotation and revocation**: delete `host_key_file` and run `--init-host-key`
+  to rotate (every browser must pair again). Delete a line from
+  `browser_keys_file` and restart the gateway to revoke a browser.
 
 ## Local checks
 
@@ -26,18 +62,22 @@ From this directory:
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo check -p topvnc-spike-worker --target wasm32-unknown-unknown
+cargo clippy -p topvnc-spike-worker -p topvnc-spike-browser --target wasm32-unknown-unknown -- -D warnings
 ```
 
-Install the packager locally, then build from `worker/`:
+Install the pinned packager and bindings generator locally, then build from
+`worker/`. The `wasm-bindgen-cli` version must equal `wasm-bindgen` in
+Cargo.lock:
 
 ```powershell
 rustup target add wasm32-unknown-unknown
 cargo install worker-build --version 0.8.7 --locked --root .tools
+cargo install wasm-bindgen-cli --version 0.2.129 --locked --root .tools
 Set-Location worker
 npm ci
 npm test
 npm run build
+npm run test:wasm
 npx wrangler deploy --dry-run --config wrangler.example.toml --outdir build/dry-run
 ```
 
@@ -76,21 +116,30 @@ by the pinned wasm-bindgen packager. All generated build/tool files are ignored.
 
 7. Copy `host.example.toml` to `host.local.toml` and
    `worker/wrangler.example.toml` to `worker/wrangler.local.toml`. Fill the
-   account, origin, Access issuer/AUD, owner email, and VPC service ID.
-8. From this directory, start the synthetic-only relay. Do not start TopVNC:
+   account, origin, Access issuer/AUD, owner email, and VPC service ID. An
+   older `host.local.toml` needs the two new key-file settings.
+8. From this directory, create the host identity once. Then start the
+   synthetic-only relay with a pairing invite. Do not start TopVNC:
 
    ```powershell
-   cargo run -p topvnc-spike-host -- --synthetic-echo host.local.toml
+   cargo run -p topvnc-spike-host -- --init-host-key host.local.toml
+   cargo run -p topvnc-spike-host -- --synthetic-echo --pair host.local.toml
    ```
+
+   Omit `--pair` once the browser is enrolled. Show the QR code only on the
+   host's own screen; use a dark console background if the camera does not
+   detect it.
 
 9. From `worker/`, run `npm run deploy:check`, then deploy only after the Free
    account and owner-only Access configuration are confirmed. The deploy
    script uses the ignored local config, not the example's placeholders.
-10. Open the workers.dev URL, sign in through Access, and start the connection
-    test. It verifies one generated 1 KiB sample at a time, once per second,
-    handling arbitrary transport chunks with a five-second deadline. Echo RTT
-    is a transport diagnostic, not a desktop latency measurement. Cloudflare
-    can read these non-sensitive generated samples.
+10. Open the workers.dev URL and sign in through Access. Then scan the QR code
+    (an Access redirect can drop the `#pair=` fragment) and compare the
+    displayed host fingerprint with the console. Start the encrypted test. It
+    verifies one generated 1 KiB sample at a time, once per second, handling
+    arbitrary transport chunks with a five-second deadline. The first verified
+    echo saves the pairing. Echo RTT is a transport diagnostic, not a desktop
+    latency measurement.
 
 ## What to prove before production work
 
@@ -102,9 +151,10 @@ by the pinned wasm-bindgen packager. All generated build/tool files are ignored.
 - Access protects assets and `/ws`, rejects other users, and recovers from expiry.
 - Cold/warm JWT verification, handshake, and a two-hour synthetic stream fit
   Workers Free. Verify that runtime passthrough does not invoke a message loop.
-- Safari login, echo, background/foreground, and reconnect work on the actual
-  device. Desktop authentication/display/input require an E2E design and a
-  separate later test. The harness is not a claim of product support.
+- Safari login, pairing, encrypted echo, background/foreground, and reconnect
+  work on the actual device. Desktop authentication/display/input require the
+  production client and a separate later test. The harness is not a claim of
+  product support.
 
 Write actual measurements and the selected architecture to
 `specs/015-cloudflare-web-client/research.md`. If the route fails, a separately
@@ -119,9 +169,12 @@ stable deployment.
   owner email; reject unknown critical JWT extensions.
 - Cache keys for five minutes; permit refresh attempts at most every ten
   seconds. Fail closed on unavailable/invalid keys.
-- Native relay: eight concurrent handshakes, one active session, 64 KiB maximum
-  message/fragment aggregate, 16 KiB TCP chunks, bounded WebSocket write buffer.
+- Native relay: eight concurrent HTTP upgrades, one active session, 16 KiB
+  plaintext per E2E message (16 KiB + 16-byte tag maximum message/fragment
+  aggregate), fixed-size handshake messages within ten seconds, bounded
+  WebSocket write buffer.
 - Await each write with a five-second deadline, capped by session expiry;
   heartbeat every 20 seconds and a two-hour maximum session lifetime.
 - No destination from a query/message, no redirect forwarding, no text payloads,
-  no persistent passwords or JWTs, and no payload logging.
+  no persistent passwords or JWTs, and no payload logging. The gateway logs
+  browser-key fingerprints at enrollment, close reasons, and byte counts.
