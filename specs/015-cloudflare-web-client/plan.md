@@ -1,6 +1,6 @@
 # Implementation Plan: Personal browser client on workers.dev (free tier)
 
-**Branch**: `feat/cloudflare-web-client` (created from `main` at `03d1881`) | **Date**: 2026-10-30 | **Status**: Live synthetic route passed in Edge; browser-to-host E2E implemented and locally tested; desktop deployment gated on live E2E, resource, and Safari validation
+**Branch**: `feat/cloudflare-web-client` (created from `main` at `03d1881`) | **Date**: 2026-10-31 | **Status**: Live encrypted echo passed in iPhone Safari and Edge; production client, gateway, and Worker implemented and locally validated; live desktop control, device, and resource gates open
 
 ## Reconciliation with current main (2026-10-30)
 
@@ -24,6 +24,45 @@ code-delivery trust limit. Live encrypted-route and iPhone validation remain
 open, so the harness still carries only synthetic echo. SSH from the native plan
 is not directly usable by Safari. Access JWTs are not payload encryption.
 `--synthetic-echo` remains the only mode and cannot select an RFB target.
+
+## Production implementation (2026-10-31)
+
+Phases 1-4 are implemented and validated locally (validation.md). The
+decisions that differ from, or narrow, the phases below:
+
+- **Crates.** `topvnc-rfb` (sans-IO protocol), `topvnc-e2e` and
+  `topvnc-access` (promoted from the spike's `e2e` and `policy`),
+  `topvnc-web-gateway`, and `topvnc-web` (the WASM client) are root workspace
+  members. The Worker, `gateway/cloudflare/worker`, is its own
+  WebAssembly-only workspace. It serves `web/dist` and is the spike forwarder
+  with production naming. The spike stays as the synthetic route probe.
+- **Gateway start.** The gateway is a separate opt-in binary
+  (`cargo web-gateway`) that relays to `topvnc --serve` on loopback. It is not
+  a `--serve` setting, which keeps tokio, axum, and the JWT stack out of the
+  native app. It reuses the Phase 0 Access application, VPC service, Tunnel,
+  host identity, and enrollments.
+- **Session slot.** The slot is claimed after the E2E handshake. A reconnect
+  from the same enrolled browser replaces its own stale session, which fixes
+  the 60-80 s busy window seen in T026. Another browser gets a readable 1013
+  close instead of an invisible HTTP 409.
+- **Presentation.** A dedicated module Worker owns the WebSocket, the WASM
+  session, and an OffscreenCanvas 2D context, and draws only the accumulated
+  damage with `putImageData` from a view of WebAssembly memory. Browsers
+  without OffscreenCanvas run the same module on the page. WebGL2 is deferred
+  until measurements show 2D drawing is a bottleneck.
+- **Encodings and flow.** The client advertises Tight (quality chosen by the
+  user, default 6), Zlib, Raw, DesktopSize, served size and display,
+  ContinuousUpdates, Fence, relative pointer, and extended buttons. Fence
+  replies leave after the preceding updates are applied, so the server's
+  flow control sees the browser's real speed.
+- **T026 usability findings, fixed in the production page.** A `#pair=`
+  pasted into an open tab is read and stripped. A link for the already paired
+  host does not replace the pairing. Gateway close reasons are shown, and an
+  expired Access sign-in is told apart from an offline gateway. Abrupt
+  disconnects are no longer logged as 1009.
+
+Live deployment, desktop control through Cloudflare, and the device checks
+are still open: T026's last check, T011, T017, T020, and T021's live steps.
 
 ## Browser-to-host E2E design (T023)
 

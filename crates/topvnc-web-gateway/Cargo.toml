@@ -1,0 +1,33 @@
+[package]
+name = "topvnc-web-gateway"
+version = "0.2.0"
+edition = "2024"
+description = "Opt-in host gateway: Access-authenticated, end-to-end encrypted browser sessions to a loopback TopVNC server"
+publish = false
+
+[features]
+# Test signing keys and key preloading, for tests and the local harness only.
+test-fixtures = ["topvnc-access/test-fixtures"]
+
+[dependencies]
+topvnc-access = { path = "../topvnc-access" }
+topvnc-e2e = { path = "../topvnc-e2e" }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = { version = "0.3", features = ["sink"] }
+qrcode = { version = "0.14", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal", "process"] }
+toml = "0.8"
+
+[dev-dependencies]
+topvnc-access = { path = "../topvnc-access", features = ["test-fixtures"] }
+topvnc-rfb = { path = "../topvnc-rfb" }
+# The local harness serves a synthetic, password-protected TopVNC scene.
+topvnc = { path = "../.." }
+tokio-tungstenite = "0.29"
+serde_json = "1"
+
+[[example]]
+name = "local_web"
+required-features = ["test-fixtures"]

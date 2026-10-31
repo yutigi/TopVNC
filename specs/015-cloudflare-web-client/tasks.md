@@ -26,22 +26,22 @@
 
 ## US2: Production desktop control (P1; blocked until T010–T011 pass)
 
-- [ ] T012 [US2] Capture native performance baselines in specs/015-cloudflare-web-client/validation.md before extracting crates/topvnc-rfb/.
-- [ ] T013 [US2] Extract the bounded incremental Rust protocol crate and preserve native TCP behavior in Cargo.toml, crates/topvnc-rfb/, and src/lib.rs.
-- [ ] T014 [US2] Integrate only the Phase 0-selected production gateway in crates/topvnc-web-gateway/ and gateway/cloudflare/.
-- [ ] T015 [US2] Implement the Rust/WASM decoder, accumulated dirty-region presentation, and one-host connect UI in crates/topvnc-web/ and web/.
-- [ ] T016 [US2] Implement touch modes, keyboard/modifier toolbar, zoom, and orientation handling in crates/topvnc-web/ and web/.
+- [X] T012 [US2] Capture native performance baselines in specs/015-cloudflare-web-client/validation.md before extracting crates/topvnc-rfb/.
+- [X] T013 [US2] Extract the bounded incremental Rust protocol crate and preserve native TCP behavior in Cargo.toml, crates/topvnc-rfb/, and src/lib.rs. (2026-10-31: started after T026's live encrypted echo passed; native tests and benchmarks unchanged, see validation.md.)
+- [X] T014 [US2] Integrate only the Phase 0-selected production gateway in crates/topvnc-web-gateway/ and gateway/cloudflare/. (2026-10-31: crates/topvnc-e2e, topvnc-access, topvnc-web-gateway and gateway/cloudflare/worker; relays to `topvnc --serve` on loopback; local tests and Wrangler dry run only, not deployed.)
+- [X] T015 [US2] Implement the Rust/WASM decoder, accumulated dirty-region presentation, and one-host connect UI in crates/topvnc-web/ and web/. (2026-10-31: Worker + OffscreenCanvas 2D with page-thread fallback; validated in Edge through the local harness only.)
+- [X] T016 [US2] Implement touch modes, keyboard/modifier toolbar, zoom, and orientation handling in crates/topvnc-web/ and web/. (2026-10-31: implemented and unit-tested; device behavior is T017.)
 - [ ] T017 [US2] Validate the complete desktop-control scenario on real iPhone Safari in specs/015-cloudflare-web-client/validation.md.
 
 ## US3: Interruption recovery and resource control (P2; depends on US2)
 
-- [ ] T018 [US3] Implement Access-expiry/reconnect and safe held-input release in crates/topvnc-web/ and the selected gateway.
-- [ ] T019 [US3] Test malformed/chunked protocol data, paused presentation, slow peers, and lifecycle interruptions in crates/topvnc-rfb/ and crates/topvnc-web/.
+- [X] T018 [US3] Implement Access-expiry/reconnect and safe held-input release in crates/topvnc-web/ and the selected gateway. (2026-10-31: same-browser reconnect replaces its stale session; release on blur, hide, cancel, and disconnect; expired sign-in detected; tested locally.)
+- [X] T019 [US3] Test malformed/chunked protocol data, paused presentation, slow peers, and lifecycle interruptions in crates/topvnc-rfb/ and crates/topvnc-web/.
 - [ ] T020 [US3] Record two-hour soak and Wi-Fi/mobile input latency, frame pacing, CPU, and memory results in specs/015-cloudflare-web-client/validation.md.
 
 ## Polish
 
-- [ ] T021 Write the tested Free-plan deployment runbook and supported-device matrix in docs/cloudflare-gateway.md; update README.md only for validated combinations.
+- [ ] T021 Write the tested Free-plan deployment runbook and supported-device matrix in docs/cloudflare-gateway.md; update README.md only for validated combinations. (2026-10-31: runbook and matrix written; the live deployment steps are not yet tested, so README.md is unchanged.)
 - [ ] T022 Run final workspace/WASM checks and compare native benchmarks in specs/015-cloudflare-web-client/validation.md.
 
 ## Dependencies and execution strategy

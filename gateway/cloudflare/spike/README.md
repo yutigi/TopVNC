@@ -1,5 +1,10 @@
 # Phase 0: Rust gateway through a free workers.dev URL
 
+> Superseded for desktop use by the production client and gateway:
+> `crates/topvnc-web`, `crates/topvnc-web-gateway`, `gateway/cloudflare/worker`,
+> and [docs/cloudflare-gateway.md](../../../docs/cloudflare-gateway.md). This
+> harness stays as the synthetic route probe.
+
 This is an isolated feasibility harness, not the production TopVNC browser
 client. The root native package and session implementation are unchanged.
 The basic Workers VPC/WebSocket route passed in Edge. The encrypted probe passed

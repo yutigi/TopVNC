@@ -1,0 +1,14 @@
+[package]
+name = "topvnc-web"
+version = "0.2.0"
+edition = "2024"
+description = "TopVNC's browser client: RFB over the end-to-end encrypted WebSocket channel, compiled to WebAssembly"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+topvnc-rfb = { path = "../topvnc-rfb" }
+topvnc-e2e = { path = "../topvnc-e2e" }
+wasm-bindgen = "0.2"
