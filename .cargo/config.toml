@@ -9,3 +9,8 @@ gateway = "run --manifest-path gateway/cloudflare/spike/Cargo.toml -p topvnc-spi
 pair = "run --manifest-path gateway/cloudflare/spike/Cargo.toml -p topvnc-spike-host -- --synthetic-echo --pair gateway/cloudflare/spike/host.local.toml"
 # Private Tunnel connector (cloudflared) with the protected token file.
 tunnel = "run --manifest-path gateway/cloudflare/spike/Cargo.toml -p topvnc-spike-tunnel -- gateway/cloudflare/spike/tunnel-token.txt"
+# The production web gateway (crates/topvnc-web-gateway) for `topvnc --serve`,
+# with the ignored gateway/cloudflare/gateway.local.toml. The Tunnel
+# connector is the same `cargo tunnel` as above.
+web-gateway = "run --release -p topvnc-web-gateway --bin topvnc-web-gateway -- gateway/cloudflare/gateway.local.toml"
+web-pair = "run --release -p topvnc-web-gateway --bin topvnc-web-gateway -- --pair gateway/cloudflare/gateway.local.toml"

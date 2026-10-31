@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#10161d">
+  <title>TopVNC</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main id="home">
+    <header>
+      <p class="eyebrow">TOPVNC</p>
+      <h1>Remote desktop</h1>
+    </header>
+    <p class="notice">The connection is encrypted from this browser to your host: Cloudflare relays only ciphertext.
+      Cloudflare also serves this page's code, so it could replace that code and read a session; the page cannot detect that.
+      The VNC password is sent only inside the encrypted channel and is never stored.</p>
+    <p id="identity">Loading the encryption module…</p>
+    <form id="connect-form">
+      <label for="quality">Picture quality</label>
+      <div class="controls">
+        <select id="quality">
+          <option value="2">Low (slow links)</option>
+          <option value="4">Medium</option>
+          <option value="6" selected>Good</option>
+          <option value="8">High</option>
+          <option value="9">Best</option>
+        </select>
+        <button id="connect" type="submit" disabled>Connect</button>
+        <button id="forget" type="button" disabled>Forget pairing</button>
+      </div>
+    </form>
+    <form id="password-form" hidden>
+      <label for="password">VNC password</label>
+      <div class="controls">
+        <input id="password" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" required>
+        <button type="submit">Sign in</button>
+      </div>
+    </form>
+    <p id="status" role="status">Sign in through Cloudflare Access, then connect.</p>
+    <details><summary>Connection log</summary><pre id="log"></pre></details>
+  </main>
+
+  <section id="viewer" hidden aria-label="Remote desktop">
+    <div id="screen">
+      <canvas id="canvas" width="1" height="1"></canvas>
+      <div id="cursor" hidden></div>
+      <p id="stats" hidden></p>
+    </div>
+    <div id="function-keys" class="keys" hidden>
+      <button type="button" data-keysym="65470">F1</button><button type="button" data-keysym="65471">F2</button><button type="button" data-keysym="65472">F3</button><button type="button" data-keysym="65473">F4</button><button type="button" data-keysym="65474">F5</button><button type="button" data-keysym="65475">F6</button><button type="button" data-keysym="65476">F7</button><button type="button" data-keysym="65477">F8</button><button type="button" data-keysym="65478">F9</button><button type="button" data-keysym="65479">F10</button><button type="button" data-keysym="65480">F11</button><button type="button" data-keysym="65481">F12</button>
+      <button type="button" data-keysym="65535">Del</button><button type="button" data-keysym="65360">Home</button><button type="button" data-keysym="65367">End</button><button type="button" data-keysym="65365">PgUp</button><button type="button" data-keysym="65366">PgDn</button>
+    </div>
+    <nav id="toolbar" class="keys" aria-label="Keys and viewer controls">
+      <button type="button" data-keysym="65307">Esc</button>
+      <button type="button" data-keysym="65289">Tab</button>
+      <button type="button" data-modifier="ctrl">Ctrl</button>
+      <button type="button" data-modifier="alt">Alt</button>
+      <button type="button" data-modifier="shift">Shift</button>
+      <button type="button" data-modifier="super">Win</button>
+      <button type="button" data-keysym="65361" aria-label="Left arrow">←</button>
+      <button type="button" data-keysym="65362" aria-label="Up arrow">↑</button>
+      <button type="button" data-keysym="65364" aria-label="Down arrow">↓</button>
+      <button type="button" data-keysym="65363" aria-label="Right arrow">→</button>
+      <button type="button" id="show-function-keys">Fn</button>
+      <button type="button" id="show-keyboard" aria-label="Show keyboard">⌨</button>
+      <button type="button" id="toggle-mode">Trackpad</button>
+      <button type="button" id="fit">Fit</button>
+      <button type="button" id="show-menu" aria-label="Menu">☰</button>
+    </nav>
+    <div id="menu" hidden>
+      <label>Picture quality
+        <select id="menu-quality">
+          <option value="2">Low</option><option value="4">Medium</option><option value="6">Good</option><option value="8">High</option><option value="9">Best</option>
+        </select>
+      </label>
+      <label hidden>Host served size
+        <select id="serve-scale">
+          <option value="25">25%</option><option value="50">50%</option><option value="75">75%</option><option value="100">100%</option>
+        </select>
+      </label>
+      <label hidden>Host display <select id="serve-display"></select></label>
+      <label class="check"><input id="stats-toggle" type="checkbox"> Show statistics</label>
+      <div class="controls">
+        <button type="button" id="disconnect">Disconnect</button>
+        <button type="button" id="close-menu">Close</button>
+      </div>
+    </div>
+    <textarea id="keyboard" aria-label="Type on the remote desktop" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="send"></textarea>
+  </section>
+</body>
+</html>

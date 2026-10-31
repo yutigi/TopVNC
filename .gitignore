@@ -16,3 +16,9 @@
 **/host.key
 **/browsers.txt
 /gateway/cloudflare/spike/.tools/
+/.tools/
+/web/build/
+/web/dist/
+/gateway/cloudflare/worker/build/
+**/gateway.local.toml
+/gateway/cloudflare/worker/.tools/

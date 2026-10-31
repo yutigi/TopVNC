@@ -72,7 +72,11 @@ loss tests, followed by a two-hour desktop-control soak.
 ## Validation
 
 The isolated Phase 0 harness, including its E2E channel, passes its local
-Rust/Node/WASM-binding tests and Worker packaging dry run. Actual results and
-the existing native-suite timeout are recorded in validation.md. The live
-encrypted-route, Cloudflare resource, and Safari gates in research.md remain
-pending; local or mocked tests do not prove those gates.
+Rust/Node/WASM-binding tests and Worker packaging dry run. Its encrypted echo
+passed live in iPhone Safari and Edge. On 2026-10-31 the production pieces
+(shared protocol crate, gateway, Worker, and WASM client) passed their local
+tests and a local Edge run through a test harness, with native behavior and
+benchmarks unchanged. Actual results and the existing native-suite timeout are
+recorded in validation.md. The live desktop-control, Cloudflare resource,
+two-hour, and iPhone gates remain pending; local or mocked tests do not prove
+those gates.

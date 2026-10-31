@@ -1,10 +1,149 @@
-# Validation: Cloudflare browser feasibility harness
+# Validation: Cloudflare browser client
 
-Date: 2026-10-30. Current branch `feat/cloudflare-web-client`, created from
-`main` at `03d1881`. Recovered the original uncommitted harness from its stash
-without dropping that backup. **Local synthetic harness and browser-to-host
-E2E channel validated locally. The live encrypted route is partly validated
-(T026 open); Cloudflare resource and desktop gates remain open.**
+Dates: 2026-10-30 to 2026-10-31. Branch `feat/cloudflare-web-client`, created
+from `main` at `03d1881`. **The production client, gateway, and Worker pass
+their local tests and a local browser run. The live encrypted route is partly
+validated (T026 open). Live desktop control, device, resource, and soak gates
+remain open (T011, T017, T020).**
+
+## Production client, gateway, and Worker (T014-T016, T018, T019; 2026-10-31)
+
+All of this is local evidence. Nothing new was deployed, no desktop was
+connected through Cloudflare, and no real device was used.
+
+**Rust** (`cargo test --workspace`, same toolchain as below):
+
+- `topvnc-e2e` 10, `topvnc-access` 6: the Phase 0 suites, unchanged.
+- `topvnc-web-gateway` 20 and the tunnel launcher 3. These are the Phase 0
+  gateway tests plus:
+  - the shared RFB handshake, with VNC password authentication, carried
+    inside the channel to a password-protected test server, with right and
+    wrong passwords;
+  - a same-browser reconnect replacing its own stale session;
+  - another browser refused with a readable reason, and no TCP connection
+    opened, while a session is active;
+  - a browser that stops reading: closed after the write deadline, with less
+    than 64 MiB accepted from the RFB side.
+- `topvnc-web` 11:
+  - pairing, the E2E handshake, the RFB handshake, and updates with the
+    server's bytes cut into 1-4096-byte pieces;
+  - None security refused and tampered messages rejected;
+  - continuous updates, fence replies after the preceding update, and resize
+    requests;
+  - fence round-trip measurement;
+  - input clamped to the framebuffer, with release of everything held;
+  - bounded message sealing;
+  - physical-key keysyms matching the native table, and Shift for text;
+  - damage that stays bounded while presentation is skipped and still covers
+    every changed pixel.
+- Clippy clean for the workspace (`--all-targets --all-features`), for
+  `topvnc-rfb`, `topvnc-e2e`, and `topvnc-web` on `wasm32-unknown-unknown`,
+  and for the Worker.
+
+**Web** (Node 22.18.0): `npm test` 9 pass (gestures, view transform, pairing
+storage); `npm run build` (WASM 409,317 bytes, page bundle 32 KB, Worker
+bundle 12 KB); `npm run test:wasm` 2 pass against the built bindings.
+
+**Worker**: `worker-build` 0.8.7 packaging passes. `wrangler deploy --dry-run`
+passes with the example config, and with the owner's ignored local config,
+which binds the existing VPC service: 6 assets, 609.03 KiB (230.32 KiB gzip).
+
+**Browser, local harness** (`local_web` example; Edge 156 on Windows 11,
+driven through the Claude in Chrome extension; loopback only):
+
+- pairing from a `#pair=` link pasted into an open tab (`hashchange`), with
+  the fragment removed from the address bar;
+- enrollment saved after the first decrypted host message;
+- password prompt and sign-in;
+- the animated scene drawn by the Worker through OffscreenCanvas;
+- the server received the mouse click, the keys, and the wheel notches;
+- statistics showed 30 updates and 30 draws per second, about 0.4 Mbit/s,
+  continuous updates, and a fence round trip;
+- the 50% served size applied through DesktopSize;
+- disconnect, then reconnect with the saved pairing;
+- a wrong password rejected with its reason;
+- a second tab replacing the first, which showed why;
+- the page-thread fallback (OffscreenCanvas removed) connected and drew;
+- no console errors.
+
+Bugs found and fixed during this run:
+
+- `display` rules overrode the `hidden` attribute, so the viewer covered the
+  page;
+- the harness's test signing keys went stale after five minutes;
+- the messages for a viewer-initiated close and a refused password were
+  misleading.
+
+Not validated: the live Cloudflare route with the production client, touch
+and the on-screen keyboard on a device, iOS lifecycle, and mobile networks.
+
+## Shared protocol crate extraction (T012, T013; 2026-10-31)
+
+Started after the live encrypted route had passed in iPhone Safari and Edge
+(T026, below), while T026's unenrolled-browser check and T011's resource and
+two-hour gates were still open. Phase 0 had already selected the route, so
+the gates no longer decide whether to extract; they still gate any desktop
+deployment. The extraction is local, and the native viewer keeps working
+throughout.
+
+**What moved.** `crates/topvnc-rfb` holds the client protocol without
+sockets, threads, or UI: a push state machine for the handshake
+(`ClientHandshake`, with the blocking `negotiate_with_encoding` rebuilt on
+it), incremental server-message framing (`MessageReader`), Raw/Zlib/Tight
+rectangle decoding (`RectDecoder`, Tight decoder, JPEG), `Framebuffer`,
+input state and encoding (`InputState`, message builders), and the protocol
+numbers the server shares. The root `topvnc` crate re-exports the same public
+names. It keeps the server, the Tight encoder, the TCP session, and the
+JPEG decoder threads, which now receive complete rectangles from the reader.
+`MessageReader` validates every header, length, encoding, and rectangle
+against the current framebuffer before it waits for the body. It can buffer
+at most one maximal rectangle plus a 256 KiB read-ahead, or less under a
+viewer pixel limit.
+
+**Tests** (Rust 1.95.0, Windows 11, Ryzen 9 9950X3D, 32 logical CPUs):
+
+- `cargo test -p topvnc-rfb`: 22 pass. The tests cover:
+  - a stream of every message kind, cut at every chunk size from 1 to 63 and
+    split at every byte offset, with identical messages and pixels;
+  - malformed headers rejected before their bodies arrive;
+  - DesktopSize bounds, a viewer pixel limit, and the buffer limit;
+  - exact reads that never consume past a message;
+  - handshake chunking, leftover bytes, None refusal, rejection reasons,
+    and oversize limits;
+  - Tight body lengths for every kind at every prefix;
+  - held-key release and its bound.
+- `cargo test --workspace`: the library has 82 pass, 1 fail, and 1 ignored;
+  the binary has 93 pass and 6 ignored. The one failure is the pre-existing
+  `clients_without_desktop_size_are_disconnected_on_resize` (`Timeout`).
+  Unchanged `HEAD` (`8321675`, exported to a scratch directory) gives the
+  same failure, with 85 library tests passing. The difference is the three
+  decoder-only Tight tests that moved into `topvnc-rfb`.
+- `cargo clippy --workspace --all-targets`: no warnings. `cargo check` and
+  clippy for `topvnc-rfb` on `wasm32-unknown-unknown`: pass.
+
+**Native benchmarks** (release, below-normal priority; the owner's
+`topvnc` session was running). The "before" binaries were built from
+`8321675` and kept frozen, then rerun after each "after" run to expose
+drift. The latency rows are `latency_bench` publish-to-decode: mean / p95
+latency and delivered fps, two runs each. They exclude capture, GPU, and
+display.
+
+| Case | Before (3 sessions) | After, first version | After, bounded read-ahead |
+| --- | --- | --- | --- |
+| 1080p framebuffer apply, mean | 0.382–0.397 ms | 0.387 ms | 0.383–0.384 ms |
+| Tight q6 push, direct, 120 fps | 4.27–4.33 / 5.24–5.33 ms | 4.42, 4.39 / 5.46, 5.39 ms | 4.24, 4.26 / 5.30, 5.31 ms |
+| Raw push, direct, 60 fps | 4.59–4.74 / 5.42–5.70 ms | 5.52, 5.90 / 15.5, 19.5 ms; 59.4 fps once | 4.61, 4.56 / 5.42, 5.49 ms |
+| Tight q6 adaptive, 100 Mbit/s | 34.6–35.0 / 42.1–42.9 ms, 35 fps | 34.5, 34.8 / 42.0, 42.5 ms | 34.6, 34.6 / 42.3, 42.3 ms |
+
+The first version regressed Raw: greedy reads could run far ahead of the
+current message, so large rectangles were moved and the buffer doubled.
+Reads now go at most 256 KiB past the next message, the old `BufReader`
+size. Room for a whole rectangle is reserved once, when it starts. The final
+version is within the before-run spread on every row. Process CPU seconds
+and peak working set were also within that spread, for example Tight 25.3–25.5
+CPU seconds after against 24.0–27.2 before. These are short loopback
+runs; no performance improvement is claimed. Raw logs are in ignored
+`target/bench-015-*.txt`.
 
 ## Live encrypted probe checks (T026, 2026-10-30; in progress)
 
