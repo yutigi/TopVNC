@@ -15,7 +15,6 @@ const identity = $("#identity");
 const connectForm = $("#connect-form");
 const connectButton = $("#connect");
 const forgetButton = $("#forget");
-const qualitySelect = $("#quality");
 const passwordForm = $("#password-form");
 const passwordInput = $("#password");
 const statusLine = $("#status");
@@ -83,6 +82,21 @@ function remember(name, value) {
   } catch {
     // Preferences are optional.
   }
+}
+
+// Radio groups drawn as the desktop app's rows of buttons.
+function chosen(name) {
+  return [...document.getElementsByName(name)].find((radio) => radio.checked)?.value;
+}
+
+function choose(name, value) {
+  const radio = [...document.getElementsByName(name)].find((input) => input.value === String(value));
+  if (radio) radio.checked = true;
+}
+
+function setQuality(value) {
+  choose("quality", value);
+  choose("menu-quality", value);
 }
 
 function report(message) {
@@ -221,6 +235,8 @@ async function onSessionMessage(message) {
       passwordForm.hidden = true;
       passwordInput.value = "";
       showViewer(false);
+      // The next host may not offer these controls.
+      showCapabilities({ serveScale: 0, displays: [] });
       describeIdentity();
       report(`${wasConnected ? "Disconnected" : "Connection failed"} (${message.code}). ${await closeReason(message)}`);
       connectButton.textContent = wasConnected ? "Reconnect" : "Connect";
@@ -247,10 +263,20 @@ function showViewer(visible) {
   document.body.classList.toggle("viewing", visible);
   if (visible) layout();
   else {
-    menu.hidden = true;
-    functionKeys.hidden = true;
+    showMenu(false);
+    showFunctionKeys(false);
     keyboard.blur();
   }
+}
+
+function showMenu(visible) {
+  menu.hidden = !visible;
+  $("#show-menu").setAttribute("aria-expanded", String(visible));
+}
+
+function showFunctionKeys(visible) {
+  functionKeys.hidden = !visible;
+  $("#show-function-keys").setAttribute("aria-expanded", String(visible));
 }
 
 function layout() {
@@ -269,19 +295,41 @@ function updateCursor() {
   cursor.style.transform = `translate(${at.x}px, ${at.y}px)`;
 }
 
+// Hosts that do not offer a control say so, as in the desktop app.
 function showCapabilities({ serveScale, displays }) {
-  const scale = $("#serve-scale");
-  scale.closest("label").hidden = !serveScale;
-  if (serveScale) scale.value = String(serveScale);
+  for (const element of [$("#serve-scale"), $("#serve-scale-ends")]) element.hidden = !serveScale;
+  $("#serve-scale-missing").hidden = Boolean(serveScale);
+  showServeScale(serveScale);
   const display = $("#serve-display");
-  display.closest("label").hidden = !displays.length;
+  display.hidden = !displays.length;
+  $("#serve-display-missing").hidden = displays.length > 0;
   if (displays.length) {
     const [served, count] = displays;
-    display.replaceChildren(
-      ...[...Array(count + 1).keys()].map((index) => new Option(index === 0 ? "All displays" : `Display ${index}`, String(index))),
-    );
-    display.value = String(served);
+    // Each display from 1, then all of them (0).
+    const choices = [...Array(count).keys()].map((index) => index + 1).concat(0);
+    display.replaceChildren(...choices.map((number) => displayChoice(number, served)));
   }
+}
+
+function displayChoice(number, served) {
+  const choice = document.createElement("label");
+  choice.className = "choice";
+  const radio = Object.assign(document.createElement("input"), {
+    type: "radio", name: "serve-display", value: String(number), checked: number === served,
+  });
+  radio.setAttribute("aria-label", number === 0 ? "All displays" : `Display ${number}`);
+  const text = document.createElement("span");
+  text.textContent = number === 0 ? "All" : String(number);
+  choice.append(radio, text);
+  return choice;
+}
+
+// The served percentage, or 0 when the host offers no control.
+function showServeScale(percent) {
+  const scale = $("#serve-scale");
+  if (percent) scale.value = String(percent);
+  scale.style.setProperty("--fill", `${((Number(scale.value) - 25) / 75) * 100}%`);
+  $("#serve-scale-value").textContent = percent ? `${scale.value}% shared` : "Unavailable";
 }
 
 // ---- Pointer input ------------------------------------------------------------
@@ -521,7 +569,7 @@ toolbar.addEventListener("click", (event) => {
   } else if (button.id === "show-keyboard") {
     keyboard.focus();
   } else if (button.id === "show-function-keys") {
-    functionKeys.hidden = !functionKeys.hidden;
+    showFunctionKeys(functionKeys.hidden);
     layout();
   } else if (button.id === "toggle-mode") {
     mode = mode === "trackpad" ? "direct" : "trackpad";
@@ -533,7 +581,7 @@ toolbar.addEventListener("click", (event) => {
     view.reset();
     layout();
   } else if (button.id === "show-menu") {
-    menu.hidden = !menu.hidden;
+    showMenu(menu.hidden);
   }
 });
 
@@ -558,15 +606,14 @@ $("#stats-toggle").addEventListener("change", (event) => {
   statsLine.hidden = !event.target.checked;
 });
 $("#menu-quality").addEventListener("change", (event) => {
-  qualitySelect.value = event.target.value;
+  choose("quality", event.target.value);
   remember("quality", event.target.value);
   input({ kind: "quality", quality: Number(event.target.value) });
 });
+$("#serve-scale").addEventListener("input", (event) => showServeScale(Number(event.target.value)));
 $("#serve-scale").addEventListener("change", (event) => input({ kind: "serveScale", percent: Number(event.target.value) }));
 $("#serve-display").addEventListener("change", (event) => input({ kind: "serveDisplay", display: Number(event.target.value) }));
-$("#close-menu").addEventListener("click", () => {
-  menu.hidden = true;
-});
+$("#close-menu").addEventListener("click", () => showMenu(false));
 
 // ---- Connecting -----------------------------------------------------------------
 
@@ -594,7 +641,7 @@ async function startSession() {
     browser: keys.browser,
     host: keys.host,
     secret: pending?.secret,
-    quality: Number(qualitySelect.value),
+    quality: Number(chosen("quality")),
   };
   if (worker && !transferred) {
     message.canvas = canvas.transferControlToOffscreen();
@@ -640,9 +687,9 @@ forgetButton.addEventListener("click", () => {
   report("Pairing removed from this browser. The host still lists its key until you remove it there.");
 });
 
-qualitySelect.addEventListener("change", () => {
-  remember("quality", qualitySelect.value);
-  $("#menu-quality").value = qualitySelect.value;
+$("#quality").addEventListener("change", (event) => {
+  remember("quality", event.target.value);
+  choose("menu-quality", event.target.value);
 });
 
 // ---- Page lifecycle ---------------------------------------------------------------
@@ -685,8 +732,7 @@ new ResizeObserver(layout).observe(screen);
 
 async function main() {
   await init({ module_or_path: "/topvnc_web_bg.wasm" });
-  qualitySelect.value = preference("quality", "6");
-  $("#menu-quality").value = qualitySelect.value;
+  setQuality(preference("quality", "6"));
   $("#toggle-mode").textContent = mode === "trackpad" ? "Trackpad" : "Direct";
   readInvite();
   describeIdentity();

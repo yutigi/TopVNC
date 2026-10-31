@@ -6,6 +6,35 @@ their local tests and a local browser run. The live encrypted route is partly
 validated (T026 open). Live desktop control, device, resource, and soak gates
 remain open (T011, T017, T020).**
 
+## Desktop-style page and session settings (2026-10-31)
+
+The home page and the viewer's settings panel now follow the desktop app
+(`src/ui.rs`): its palette, uppercase labels, square frames, and choices drawn
+as rows of buttons. The panel matches the desktop's F8 settings: display row,
+served-size slider, quality row, and statistics toggle. A host that does not
+offer display selection or served size says so instead of hiding the control.
+
+Local evidence only; nothing was deployed. `npm test` 9 pass and `npm run
+build` passes. In the `local_web` harness (Edge on Windows 11, loopback), at
+the full window width and at 390 CSS px (CSS zoom, because the maximized window
+could not be resized, so media queries still saw the desktop width):
+
+- the quality choice is remembered across a reload and applies in a session;
+- the served-size slider at 50% reached the host (harness log), and the panel
+  showed "50% shared" after reconnecting;
+- the statistics toggle works; the Fn row opens, and the panel moves above it;
+- at 390 px: no horizontal page scroll, the quality row wraps 3 + 2, the panel
+  scrolls within itself, and the keys scroll with the keyboard and menu
+  buttons pinned;
+- disconnect closes the panel and resets display and served size to
+  unavailable.
+
+Not validated: choosing a display (the harness serves one; only the row's
+styling was checked, with injected markup), iPhone Safari and its safe areas,
+and the live deployment. Enter in the password field was not checked because
+the extension's synthetic Enter produces no `keypress`; sign-in used the
+button.
+
 ## Production client, gateway, and Worker (T014-T016, T018, T019; 2026-10-31)
 
 All of this is local evidence. Nothing new was deployed, no desktop was
