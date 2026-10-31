@@ -50,13 +50,15 @@
       <div id="cursor" hidden></div>
       <p id="stats" hidden></p>
     </div>
-    <div id="function-keys" class="keys" hidden>
+    <div id="function-keys" class="keys scroller" hidden>
       <button type="button" data-keysym="65470">F1</button><button type="button" data-keysym="65471">F2</button><button type="button" data-keysym="65472">F3</button><button type="button" data-keysym="65473">F4</button><button type="button" data-keysym="65474">F5</button><button type="button" data-keysym="65475">F6</button><button type="button" data-keysym="65476">F7</button><button type="button" data-keysym="65477">F8</button><button type="button" data-keysym="65478">F9</button><button type="button" data-keysym="65479">F10</button><button type="button" data-keysym="65480">F11</button><button type="button" data-keysym="65481">F12</button>
       <button type="button" data-keysym="65535">Del</button><button type="button" data-keysym="65360">Home</button><button type="button" data-keysym="65367">End</button><button type="button" data-keysym="65365">PgUp</button><button type="button" data-keysym="65366">PgDn</button>
     </div>
-    <nav id="toolbar" class="keys" aria-label="Keys and viewer controls">
+    <nav id="toolbar" aria-label="Keys and viewer controls">
+      <div class="keys scroller">
       <button type="button" data-keysym="65307">Esc</button>
       <button type="button" data-keysym="65289">Tab</button>
+      <button type="button" data-keysym="65293">Enter</button>
       <button type="button" data-modifier="ctrl">Ctrl</button>
       <button type="button" data-modifier="alt">Alt</button>
       <button type="button" data-modifier="shift">Shift</button>
@@ -66,10 +68,14 @@
       <button type="button" data-keysym="65364" aria-label="Down arrow">↓</button>
       <button type="button" data-keysym="65363" aria-label="Right arrow">→</button>
       <button type="button" id="show-function-keys">Fn</button>
-      <button type="button" id="show-keyboard" aria-label="Show keyboard">⌨</button>
       <button type="button" id="toggle-mode">Trackpad</button>
       <button type="button" id="fit">Fit</button>
-      <button type="button" id="show-menu" aria-label="Menu">☰</button>
+      </div>
+      <!-- Always visible, whatever the scroll position of the keys. -->
+      <div class="keys pinned">
+        <button type="button" id="show-keyboard" aria-label="Show keyboard">⌨</button>
+        <button type="button" id="show-menu" aria-label="Menu">☰</button>
+      </div>
     </nav>
     <div id="menu" hidden>
       <label>Picture quality
