@@ -1,33 +1,113 @@
+/* The desktop app's look (src/ui.rs): flat navy panels, square 1px frames,
+   uppercase labels, and one teal accent for the selected choice. */
 :root {
   color-scheme: dark;
-  font: 16px/1.5 system-ui, sans-serif;
-  background: #10161d;
-  color: #e5edf4;
+  --bg: #0b1020;
+  --panel: #172238;
+  --field: #101a2c;
+  --border: #344761;
+  --text: #eaf2ff;
+  --muted: #9eafc5;
+  --accent: #54d6ba;
+  --accent-hover: #74e0c8;
+  --accent-active: #45bfa5;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --keyboard-inset: 0px;
+  font: 15px/1.5 var(--mono);
+  background: var(--bg);
+  color: var(--text);
+  -webkit-text-size-adjust: 100%;
 }
 * { box-sizing: border-box; }
 /* Display rules below must not override the hidden attribute. */
 [hidden] { display: none !important; }
 body {
   margin: 0;
-  padding: max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) 24px max(20px, env(safe-area-inset-left));
+  /* The accent strip along the top of the desktop window. */
+  border-top: 8px solid var(--accent);
+  padding: max(28px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
 }
-body.viewing { padding: 0; overflow: hidden; overscroll-behavior: none; }
-main { max-width: 760px; margin: auto; }
-.eyebrow { color: #93bcd3; letter-spacing: .12em; font-size: .75rem; margin-bottom: 0; }
-h1 { font-size: clamp(1.7rem, 5vw, 2.4rem); margin: 0 0 12px; }
-p { max-width: 70ch; }
-.notice { border-left: 3px solid #d5b56a; padding: 10px 14px; background: #26251e; }
-label { display: block; margin: 12px 0 6px; }
-.controls { display: flex; flex-wrap: wrap; gap: 10px; }
-input, button, select {
-  min-height: 44px; border: 1px solid #567083; border-radius: 6px; padding: 8px 14px; font: inherit;
+body.viewing { padding: 0; border: 0; overflow: hidden; overscroll-behavior: none; }
+main { max-width: 720px; margin: auto; }
+p { margin: 0; }
+
+h1 { margin: 0; line-height: 0; }
+/* Whole pixels of the 5x7 glyphs: 3 per glyph pixel, 4 on wider screens. */
+.wordmark { height: 21px; width: auto; fill: var(--text); shape-rendering: crispEdges; }
+@media (min-width: 600px) { .wordmark { height: 28px; } }
+
+.subtitle, .label, legend, .transport, .note, button, .choice span, summary, #menu-title {
+  text-transform: uppercase; letter-spacing: .08em;
 }
-input, select { background: #18222d; color: inherit; max-width: 100%; }
-button { background: #b6d9e8; color: #102330; cursor: pointer; touch-action: manipulation; }
-button:disabled { opacity: .45; cursor: default; }
-details { margin-top: 16px; }
-pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8rem; }
+.subtitle { margin: 10px 0 8px; color: var(--muted); }
+.label, legend { display: block; margin: 24px 0 8px; padding: 0; color: var(--muted); font-size: .85rem; font-weight: 400; }
+/* A floated legend lays out like any other block inside its fieldset. */
+legend { float: left; width: 100%; }
+legend + * { clear: both; }
+fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+
+.readout {
+  padding: 10px 12px; overflow-wrap: anywhere;
+  background: var(--field); border: 1px solid var(--border);
+}
+.notice { margin-top: 16px; color: var(--muted); font-size: .85rem; }
+.transport, .note { color: var(--muted); font-size: .8rem; }
+.transport { margin: 24px 0 8px; }
+#status { margin-top: 16px; min-height: 1.5em; }
+
+/* Buttons, and radio choices drawn as buttons, as on the desktop. */
+.row { display: flex; flex-wrap: wrap; gap: 8px; }
+.choice { position: relative; display: flex; flex: 1 1 0; min-width: max-content; }
+.choice input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+button, .choice span {
+  display: flex; align-items: center; justify-content: flex-start;
+  min-height: 44px; padding: 8px 12px;
+  border: 1px solid var(--border); border-radius: 0;
+  background: var(--panel); color: var(--text);
+  font: inherit; letter-spacing: .08em; white-space: nowrap;
+  cursor: pointer; touch-action: manipulation;
+}
+.choice span { flex: 1; }
+/* Even columns that wrap as whole rows on narrow screens. */
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(var(--cell, 96px), 1fr)); }
+.grid .choice { min-width: 0; }
+button:disabled { opacity: .4; cursor: default; }
+@media (hover: hover) {
+  button:hover:not(:disabled), .choice:hover span { border-color: var(--muted); }
+}
+button:active:not(:disabled), .choice input:active + span { background: var(--border); }
+button:focus-visible, .choice input:focus-visible + span, summary:focus-visible, input[type="range"]:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.primary, .choice input:checked + span, .keys button.latched, .keys button[aria-expanded="true"] {
+  background: var(--accent); border-color: var(--accent); color: var(--bg);
+}
+@media (hover: hover) {
+  .primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+}
+.primary:active:not(:disabled) { background: var(--accent-active); border-color: var(--accent-active); }
+
+#connect { width: 100%; }
+#forget { margin-top: 8px; }
+
+.controls { display: flex; gap: 8px; }
+input[type="password"] {
+  flex: 1; min-width: 0; min-height: 44px; padding: 8px 12px;
+  border: 1px solid var(--border); border-radius: 0;
+  background: var(--field); color: var(--text); caret-color: var(--accent);
+  /* 16px keeps iOS from zooming the page on focus. */
+  font: 16px/1.5 var(--mono);
+}
+input[type="password"]:focus { outline: none; border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+
+details { margin-top: 20px; color: var(--muted); }
+summary { padding: 10px 0; font-size: .8rem; cursor: pointer; }
+pre {
+  margin: 0; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--field); border: 1px solid var(--border); font: .75rem/1.5 var(--mono);
+}
+
+/* ---- Viewer ------------------------------------------------------------- */
 
 #viewer {
   position: fixed; inset: 0; max-width: 100vw; overflow: hidden;
@@ -44,7 +124,7 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8rem; }
 #canvas {
   position: absolute; transform-origin: 0 0;
   image-rendering: auto;
-  background: #080c10;
+  background: var(--bg);
 }
 #cursor {
   position: absolute; left: 0; top: 0; width: 0; height: 0; pointer-events: none;
@@ -56,37 +136,77 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8rem; }
   transform: skewY(25deg);
 }
 #stats {
-  position: absolute; top: 6px; left: 6px; margin: 0; padding: 2px 8px; border-radius: 4px;
-  background: rgba(0, 0, 0, .65); font: 12px/1.4 ui-monospace, monospace; pointer-events: none;
+  position: absolute; top: 8px; left: 8px; padding: 4px 8px;
+  background: rgba(11, 16, 32, .82); border: 1px solid var(--border);
+  font: 12px/1.4 var(--mono); pointer-events: none;
 }
 /* Toolbars never widen the page: keys scroll sideways inside a strip of
    the screen's width, with the keyboard and menu buttons pinned. */
 #toolbar {
   display: flex; align-items: stretch; min-width: 0; width: 100%;
-  padding-bottom: env(safe-area-inset-bottom); background: #10161d;
+  padding-bottom: env(safe-area-inset-bottom); background: var(--bg);
+  border-top: 1px solid var(--border);
 }
-.keys { display: flex; gap: 4px; padding: 4px; background: #10161d; }
+.keys { display: flex; gap: 4px; padding: 4px; background: var(--bg); }
 .scroller {
   flex: 1 1 auto; min-width: 0; width: 100%;
   overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch; touch-action: pan-x;
-  scrollbar-width: thin; scrollbar-color: #3b5163 transparent;
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
 }
 .scroller::-webkit-scrollbar { height: 3px; }
-.scroller::-webkit-scrollbar-thumb { background: #3b5163; border-radius: 2px; }
-.pinned { flex: none; border-left: 1px solid #233140; }
-.keys button { flex: none; min-width: 44px; min-height: 40px; padding: 4px 10px; background: #233140; color: #e5edf4; border-color: #3b5163; }
-.keys button.latched { background: #b6d9e8; color: #102330; }
-#function-keys { flex: none; }
+.scroller::-webkit-scrollbar-thumb { background: var(--border); }
+.pinned { flex: none; border-left: 1px solid var(--border); }
+.keys button { flex: none; justify-content: center; min-width: 44px; min-height: 40px; padding: 4px 10px; }
+#function-keys { flex: none; border-top: 1px solid var(--border); }
+
+/* The desktop's F8 session settings panel. */
 #menu {
-  position: absolute; right: max(8px, env(safe-area-inset-right)); bottom: calc(56px + env(safe-area-inset-bottom));
-  width: min(320px, calc(100vw - 16px)); padding: 12px 16px; border-radius: 8px;
-  background: #18222d; border: 1px solid #3b5163; box-shadow: 0 8px 30px rgba(0, 0, 0, .5);
+  position: absolute; right: max(8px, env(safe-area-inset-right)); bottom: calc(57px + env(safe-area-inset-bottom));
+  width: min(360px, calc(100vw - 16px));
+  max-height: calc(100% - 73px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  overflow-y: auto; overscroll-behavior: contain;
+  padding: 12px 16px 16px;
+  background: var(--bg); border: 1px solid var(--accent);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .55);
 }
-#menu label { margin-top: 0; }
-#menu select { width: 100%; }
-.check { display: flex; align-items: center; gap: 8px; }
-.check input { min-height: 0; }
+/* Above the function key row too, when it shows (49px like the toolbar). */
+#function-keys:not([hidden]) ~ #menu {
+  bottom: calc(106px + env(safe-area-inset-bottom));
+  max-height: calc(100% - 122px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+}
+.menu-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+#menu-title { margin: 0; font-size: 1.15rem; }
+#close-menu { min-height: 36px; padding: 4px 10px; }
+#menu .label, #menu legend { margin: 16px 0 8px; color: var(--accent); }
+#menu .row { --cell: 56px; gap: 6px; }
+#menu .choice span { min-height: 40px; padding: 6px 8px; }
+#menu .row > button { flex: 1 1 0; min-height: 40px; }
+#menu .transport { margin: 16px 0 8px; }
+.toggle span::after { content: ": off"; }
+.toggle input:checked + span::after { content: ": on"; }
+
+.slider { display: grid; grid-template-columns: 1fr auto; align-items: baseline; column-gap: 12px; }
+.slider output { color: var(--muted); font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; }
+.slider input, .slider .ends, .slider .note { grid-column: 1 / -1; }
+.ends { display: flex; justify-content: space-between; color: var(--muted); font-size: .7rem; }
+/* A square accent thumb on a flat track, filled up to the value. */
+input[type="range"] {
+  --fill: 100%;
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 36px; margin: 0; background: transparent; cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px; background: linear-gradient(var(--accent), var(--accent)) 0 / var(--fill) 100% no-repeat, var(--border);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 12px; height: 26px; margin-top: -10px; border: 0; border-radius: 0; background: var(--accent);
+}
+input[type="range"]::-moz-range-track { height: 6px; background: var(--border); }
+input[type="range"]::-moz-range-progress { height: 6px; background: var(--accent); }
+input[type="range"]::-moz-range-thumb { width: 12px; height: 26px; border: 0; border-radius: 0; background: var(--accent); }
+
 /* Present for the on-screen keyboard, but invisible. */
 #keyboard {
   position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0;
