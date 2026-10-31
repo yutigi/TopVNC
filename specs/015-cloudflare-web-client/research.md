@@ -1,6 +1,7 @@
 # Phase 0 feasibility research
 
-Date: 2026-10-30. **Live architecture gate: pending.**
+Dates: 2026-10-30 to 2026-10-31. **The live route carried desktop control to
+an iPhone (2026-10-31). The two-hour and Free-plan CPU gates are still open.**
 
 ## Implemented local probe
 
@@ -181,13 +182,14 @@ approval, it was redeployed at 10:35 (version `8ffe3b17`, bundle 12,115 bytes).
 - The gateway reports any WebSocket receive error, including an abrupt
   disconnect, as `1009 Invalid or oversized message`, which is misleading.
 
-**Still to do for T026:** the unenrolled-browser check on the live route.
-Stop the gateway and remove line 4 of `browsers.txt` (`1458-…`, the Edge
-extension profile, which still has its pairing saved) plus the leftover
-`ac28-…` and `6809-…` lines. Keep `e22b-…`, the iPhone. Restart without
-`--pair`, start the test in that Edge profile, and expect
-`1008 browser key is not enrolled`. An expired invite is covered only by local
-tests. A Worker CPU sample is optional.
+**Unenrolled browser (2026-10-31, completes T026).** `browsers.txt` held
+only `b76d-…` and `1191-…`, written at 01:28 when the owner restarted
+`cargo tunnel` and `cargo pair`. The Edge extension profile still had the
+`1458-…` pairing saved. The owner signed in to Access in that profile. At
+08:40:12 the probe completed the Noise handshake, because XK checks the browser
+key only after it, and the gateway then closed with
+`1008 browser key is not enrolled`. No sample was exchanged. The owner's
+gateway console was not read. An expired invite is covered only by local tests.
 
 **Cleanup.** At 10:59:24, stopped the gateway and `cloudflared`. No process
 remains and nothing listens on port 6080. A snapshot just before the stop
@@ -195,6 +197,54 @@ showed gateway working set 17,240,064 bytes and cloudflared 41,377,792 bytes;
 this is not peak memory. `host.key` and four enrolled keys remain on the host.
 The encrypted Worker stays deployed behind Access; with the gateway stopped,
 its page cannot connect.
+
+## Production client on the live route (2026-10-31)
+
+Times are +07:00. The owner approved deploying the production client and
+switching the host to the production gateway.
+
+- **Deploy.** Wrangler deployed `gateway/cloudflare/worker` with `web/dist`
+  under the same Worker name, Access application, and VPC service at 08:41
+  (version `9e792e97`, 609.03 KiB). This replaced the Phase 0 probe page. At
+  08:55 a toolbar fix was redeployed (version `31ffb4b5`).
+- **Host.** The spike gateway (`cargo pair`, started 01:28) was stopped.
+  `topvnc-web-gateway` (release build) was started with the ignored
+  `gateway.local.toml`, reusing host key `a1d1-…` and both enrolled keys. It
+  relays to `topvnc --serve` on `127.0.0.1:5900`, which the owner started with
+  a VNC password. `cloudflared` kept running from 01:28.
+- **Unenrolled Edge profile.** The production page showed "This browser is not
+  enrolled on the host…". The gateway logged
+  `session rejected: code=1008 reason=browser key is not enrolled`.
+- **iPhone Safari, desktop control (T017, owner-reported).** The connection
+  ran through cloudflared, the gateway on 127.0.0.1:6080, and
+  `topvnc --serve` on 127.0.0.1:5900. The owner confirmed:
+  - the desktop visible and updating;
+  - Trackpad pointer movement and tap clicks;
+  - two-finger scrolling and pinch zoom;
+  - typing with the on-screen keyboard;
+  - toolbar keys;
+  - disconnect and reconnect with the password.
+
+  Returning from the background was not confirmed. The iOS version was not
+  recorded for this run. The owner reported no problems, but asked for an
+  Enter key and said the toolbar ran off the screen. The toolbar now scrolls
+  inside a screen-width strip with the keyboard and menu buttons pinned. It
+  was checked at 390 px in Edge and redeployed; it has not been checked on the
+  phone. The gateway logged three relays: 23.9 MB down and 76.5 KB up (closed
+  1011, an abrupt browser disconnect), 1.07 MB (1000), and 0.86 MB (1011).
+  Three later attempts from unenrolled keys were rejected; they were not from
+  this session's Edge profile.
+- **Worker CPU (T011).** These are the Workers analytics for the Worker since
+  2026-10-30. Only `/ws` upgrades run Worker code. There were 88 invocations:
+  0 errors, statuses success, clientDisconnected, and
+  responseStreamDisconnected, and none `exceededCpu`. Warm upgrades used about
+  1.6-4 ms of CPU at p50. Seven invocations used 13.0-18.7 ms. The highest,
+  18.7 ms at 08:42, was the first upgrade after the 08:41 deploy, when a fresh
+  isolate fetches and parses the Access signing keys. The documented Workers
+  Free limit is 10 ms per invocation. These invocations were not terminated, but
+  that is not a guarantee, so the CPU gate is **not passed**. Possible
+  mitigations are measuring the key-parse cost and caching parsed keys across
+  requests (already done within an isolate). No paid fallback is assumed.
 
 ## Live gates that remain unproven
 
@@ -244,15 +294,15 @@ Windows listener inspection confirmed only `127.0.0.1:6080` for the gateway.
 | --- | --- |
 | Workers Free account | Confirmed current plan in dashboard |
 | Zero Trust Free account setup | Confirmed active after owner completed checkout |
-| Browser-to-actual-host E2E | Deployed; encrypted echo passed live on iPhone Safari and Edge; plaintext client, wrong pinned host key, and reused invite rejected on the deployed route; unenrolled-browser check pending (T026 open); owner accepted the code-delivery trust limit; desktop still blocked |
+| Browser-to-actual-host E2E | Passed live (T026): encrypted echo on iPhone Safari and Edge; plaintext client, wrong pinned host key, reused invite, and unenrolled browser rejected; owner accepted the code-delivery trust limit |
 | Owner-only hostname-based Access for workers.dev | Saved; exact owner-email rule and six-hour duration verified; unauthenticated `/` and `/ws` redirect to team login; owner session passed, live wrong-owner session untested |
 | Private VPC binding + same-host Tunnel connector | Dedicated service running over healthy QUIC tunnel |
 | HTTP/WebSocket upgrade passthrough | Passed basic authenticated Edge echo test on deployed Rust Worker/VPC service |
 | Loopback target reachability | Passed for `127.0.0.1:6080`; target stayed loopback-only |
 | Wrong-owner/unauthenticated request isolation at the edge | Pending |
-| Cold/warm Worker CPU within Free limits | One sampled successful invocation: 9.155 ms; repeated cold/warm and long-session validation pending |
+| Cold/warm Worker CPU within Free limits | 88 upgrades, 0 errors, none exceededCpu; warm about 2 ms; 7 cold upgrades 13.0-18.7 ms, above the documented 10 ms; not passed |
 | Two-hour session and slow-link memory behavior | Pending |
-| Real iPhone Safari auth/display/input/lifecycle | iOS 27.0.1: Access login, QR pairing, encrypted echo, app switch and lock with manual reconnect observed (T026); desktop display/input, two-hour, and CPU gates pending (T011) |
+| Real iPhone Safari auth/display/input/lifecycle | Echo on iOS 27.0.1 (T026). Desktop control through the production client on 2026-10-31: display, pointer, click, scroll, zoom, on-screen typing, toolbar, disconnect/reconnect owner-confirmed; background return and two hours not yet |
 
 The local tests do not establish any of these live results. No performance
 or supported-platform claim is made, and the production refactor stays gated.

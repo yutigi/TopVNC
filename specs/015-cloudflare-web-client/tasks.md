@@ -21,8 +21,8 @@
 - [X] T008 [US1] Add the browser connection probe, Free-plan Worker configuration, and private-Tunnel setup in gateway/cloudflare/spike/worker/public/, wrangler.example.toml, and gateway/cloudflare/spike/README.md.
 - [X] T009 [US1] Run native checks, Worker WASM build/deployment packaging, and browser-probe checks; document results in specs/015-cloudflare-web-client/validation.md.
 - [X] T010 [US1] Deploy only the authenticated synthetic Free-plan probe through the owner's account and verify VPC WebSocket upgrades/local routing in specs/015-cloudflare-web-client/research.md. Do not connect a desktop.
-- [ ] T026 [US1] Redeploy the encrypted synthetic probe, create the host key, pair the owner's browser by QR, and verify encrypted echo, rejection of an unenrolled browser, and no plaintext fallback over the live route; record in specs/015-cloudflare-web-client/research.md. Do not connect a desktop. (In progress 2026-10-30: deployed; iPhone and Edge encrypted echo, plaintext client, wrong host key, and reused-invite rejection passed live; a probe start bug was fixed and redeployed. Unenrolled-browser check remains.)
-- [ ] T011 [US1] Verify real iPhone Safari login/RFB traffic, Free CPU limits, slow consumers, and two-hour sessions; record the architecture gate in specs/015-cloudflare-web-client/research.md.
+- [X] T026 [US1] Redeploy the encrypted synthetic probe, create the host key, pair the owner's browser by QR, and verify encrypted echo, rejection of an unenrolled browser, and no plaintext fallback over the live route; record in specs/015-cloudflare-web-client/research.md. Do not connect a desktop. (Completed 2026-10-31: the unenrolled Edge profile got `1008 browser key is not enrolled` with no data exchanged.)
+- [ ] T011 [US1] Verify real iPhone Safari login/RFB traffic, Free CPU limits, slow consumers, and two-hour sessions; record the architecture gate in specs/015-cloudflare-web-client/research.md. (2026-10-31: iPhone Safari login and desktop RFB traffic passed; slow consumers tested locally; Worker CPU had 7 cold upgrades at 13-18.7 ms against the 10 ms Free limit, with none terminated; two-hour session pending.)
 
 ## US2: Production desktop control (P1; blocked until T010–T011 pass)
 
@@ -31,7 +31,7 @@
 - [X] T014 [US2] Integrate only the Phase 0-selected production gateway in crates/topvnc-web-gateway/ and gateway/cloudflare/. (2026-10-31: crates/topvnc-e2e, topvnc-access, topvnc-web-gateway and gateway/cloudflare/worker; relays to `topvnc --serve` on loopback; local tests and Wrangler dry run only, not deployed.)
 - [X] T015 [US2] Implement the Rust/WASM decoder, accumulated dirty-region presentation, and one-host connect UI in crates/topvnc-web/ and web/. (2026-10-31: Worker + OffscreenCanvas 2D with page-thread fallback; validated in Edge through the local harness only.)
 - [X] T016 [US2] Implement touch modes, keyboard/modifier toolbar, zoom, and orientation handling in crates/topvnc-web/ and web/. (2026-10-31: implemented and unit-tested; device behavior is T017.)
-- [ ] T017 [US2] Validate the complete desktop-control scenario on real iPhone Safari in specs/015-cloudflare-web-client/validation.md.
+- [ ] T017 [US2] Validate the complete desktop-control scenario on real iPhone Safari in specs/015-cloudflare-web-client/validation.md. (2026-10-31: the owner confirmed display, pointer, click, scroll, zoom, on-screen typing, toolbar, and disconnect/reconnect; still to do: background return, the iOS version, and a recheck of the redeployed toolbar.)
 
 ## US3: Interruption recovery and resource control (P2; depends on US2)
 

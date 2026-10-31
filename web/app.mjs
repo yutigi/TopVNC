@@ -545,7 +545,8 @@ functionKeys.addEventListener("click", (event) => {
 // Keep the toolbar from taking focus away from the on-screen keyboard.
 for (const bar of [toolbar, functionKeys]) {
   bar.addEventListener("pointerdown", (event) => {
-    if (event.target.closest("button")?.id !== "show-keyboard") event.preventDefault();
+    const button = event.target.closest("button");
+    if (button && button.id !== "show-keyboard") event.preventDefault();
   });
 }
 
