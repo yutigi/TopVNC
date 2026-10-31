@@ -16,7 +16,7 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 - Linux hosting is not implemented.
 - **Measurements.** Frame rate and latency have been measured end to end between TopVNC's own server and viewer over an emulated network link ([Performance](#performance)), not yet with live capture of a game.
 
-[Quick start](#quick-start) · [Controls](#controls-and-display-settings) · [Security](#security-and-saved-settings) · [Development](#development) · [Roadmap](#roadmap)
+[Quick start](#quick-start) · [Phone access](#phone-and-browser-access-experimental) · [Controls](#controls-and-display-settings) · [Security](#security-and-saved-settings) · [Development](#development) · [Roadmap](#roadmap)
 
 ## Features
 
@@ -141,6 +141,35 @@ Hosting a Mac needs macOS 12.3 or later and two permissions, which the Server ta
 - **Accessibility** (*System Settings → Privacy & Security → Accessibility*) lets viewers type and use the mouse. Without it the server runs view-only and shows a warning, and remote input starts as soon as access is granted, without a restart.
 
 When TopVNC runs from a terminal, including `cargo run`, macOS grants both permissions to the terminal app, not to TopVNC. The server shares the main display, following it when another display becomes main, or `--display NUMBER` in ScreenCaptureKit's display order. Serving all displays at once and switching displays from the viewer are not implemented for Mac hosts yet. The display is served at its native pixel size by default: a Retina display is then served at its full pixel resolution, which makes updates large. For games, serve at half size and use Tight JPEG in the viewer. ScreenCaptureKit scales the image on the GPU. The cursor is part of the captured image. If port 5900 is already taken, macOS Screen Sharing or Remote Management may be listening on it; choose another port such as 5901. A Mac that is locked cannot be captured or unlocked through this server: viewers keep the last image, and starting the server while the Mac is locked fails.
+
+## Phone and browser access (experimental)
+
+You can control your own TopVNC host from a phone's browser, over the internet, using only Cloudflare's free plans: no open port, domain, or phone VPN. The owner has controlled a Windows desktop this way from iPhone Safari; the two-hour soak and Free-plan CPU limits are still open. See the [full guide](docs/cloudflare-gateway.md) for status and the security model.
+
+```text
+Phone ── HTTPS ──> Cloudflare (Access sign-in, Worker) ── private tunnel ──> your host:
+                                                     cloudflared → topvnc-web-gateway → topvnc --serve
+```
+
+**Set up once** (about 30 minutes, [step by step](docs/cloudflare-gateway.md#one-time-setup)):
+
+1. Install the pinned build tools, Node.js 22, and `cloudflared`.
+2. Sign in to Cloudflare with Wrangler and pick your app URL, `https://<name>.<subdomain>.workers.dev`.
+3. Protect that URL with a Cloudflare Access application that allows only your email.
+4. Create a private Cloudflare Tunnel and a Workers VPC service pointing at `127.0.0.1:6080`.
+5. Copy the values into `wrangler.local.toml` and `gateway.local.toml`, create the host key, then build and deploy.
+
+**Pair your phone** (once per browser, [details](docs/cloudflare-gateway.md#pair-your-phone)): start the gateway with `cargo web-pair`, sign in to the app URL on the phone **first**, then scan the QR code on the host's screen, check that the fingerprints match, press **Connect**, and enter the VNC password.
+
+**Each session**, in three console windows on the host:
+
+```powershell
+cargo run --release -- --serve   # 1. the VNC server; asks for a password
+cargo web-tunnel                 # 2. wait for "Registered tunnel connection"
+cargo web-gateway                # 3. the gateway for already paired browsers
+```
+
+Then open the app URL on the phone and press **Connect**. If something fails, the page names the missing piece; the guide's [troubleshooting table](docs/cloudflare-gateway.md#troubleshooting) lists each message.
 
 ## Controls and display settings
 
@@ -362,8 +391,12 @@ cargo run
 | [`tools/screen_latency.swift`](tools/screen_latency.swift) | macOS tool that measures the time until benchmark frames are displayed in a viewer window. |
 | [`specs/004-vnc-server/spec.md`](specs/004-vnc-server/spec.md) | Server scope, security behavior, and limitations. |
 | [`specs/`](specs/) | Feature scope and acceptance criteria. |
+| [`crates/topvnc-rfb`](crates/topvnc-rfb) | Client RFB protocol without sockets or UI, shared by the native and browser viewers. |
+| [`crates/topvnc-web`](crates/topvnc-web) and [`web/`](web/) | Browser client: Rust/WASM session and the page. |
+| [`crates/topvnc-web-gateway`](crates/topvnc-web-gateway) | Host gateway between the encrypted browser channel and `topvnc --serve`. |
+| [`gateway/cloudflare/worker`](gateway/cloudflare/worker) | Cloudflare Worker that serves the page and forwards `/ws` into the private tunnel. |
 
-The native frontend uses TCP and a software window. Protocol and framebuffer code are kept separate from the UI so future frontends can reuse them. A browser frontend will need a browser-compatible transport and gateway because web pages cannot open raw VNC TCP sockets.
+The native frontend uses TCP and a native window. Browsers cannot open raw VNC TCP sockets, so the browser client reaches the host over a WebSocket through Cloudflare and the host gateway; see [Phone and browser access](#phone-and-browser-access-experimental).
 
 The project uses [GitHub Spec Kit](https://github.com/github/spec-kit) with Codex integration. Workflows live in `.agents/skills/`; templates and PowerShell scripts live in `.specify/`.
 
@@ -378,4 +411,4 @@ For contributions, read [AGENTS.md](AGENTS.md), record scope and acceptance crit
 - Validate macOS unlock transitions and full remote control against live servers, and the Linux viewer.
 - Add clipboard integration in the viewer, remote desktop resizing, layout-independent key codes, and a client-drawn cursor.
 - Expand authentication and transport security options.
-- Build a browser client and gateway sharing the native session behavior where web APIs allow it.
+- Finish validating the browser client: background return on iPhone, two-hour sessions, and Worker CPU within the Free plan.
