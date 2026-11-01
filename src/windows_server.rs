@@ -1355,7 +1355,7 @@ impl OutputCapture {
                 return Err("desktop frames are not 32-bit BGRA".into());
             }
             self.collect_source_rects(&frame_info)?;
-            Some(texture).filter(|_| !self.source_rects.is_empty())
+            (!self.source_rects.is_empty()).then_some(texture)
         } else {
             None
         };

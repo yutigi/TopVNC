@@ -1015,7 +1015,7 @@ impl VncServer {
             }
             if self
                 .active_clients
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::AcqRel,
                     std::sync::atomic::Ordering::Acquire,
                     |count| (count < 8).then_some(count + 1),
@@ -1512,8 +1512,10 @@ fn read_client_message(
             stream.read_exact(&mut encodings)?;
             let encodings = ClientEncodings::parse(
                 encodings
-                    .chunks_exact(4)
-                    .map(|encoding| i32::from_be_bytes(encoding.try_into().unwrap())),
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|encoding| i32::from_be_bytes(*encoding)),
             );
             state.encodings = encodings;
             session
@@ -3844,8 +3846,10 @@ mod tests {
         let mut body = vec![0; 800 * 800 * 4];
         reader.read_exact(&mut body).unwrap();
         assert!(
-            body.chunks_exact(4)
-                .all(|pixel| pixel == [0x33, 0x22, 0x11, 0])
+            body.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [0x33, 0x22, 0x11, 0])
         );
         sending.join().unwrap();
     }

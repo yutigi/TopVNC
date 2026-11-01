@@ -241,7 +241,7 @@ impl TightDecoder {
             Kind::Fill => {
                 output.resize(width * height * 4, 0);
                 let pixel = [body[3], body[2], body[1], 0];
-                for target in output.chunks_exact_mut(4) {
+                for target in output.as_chunks_mut::<4>().0.iter_mut() {
                     target.copy_from_slice(&pixel);
                 }
                 return Ok(TightRect::Pixels);
@@ -276,7 +276,12 @@ impl TightDecoder {
         };
         match filter {
             FILTER_COPY => {
-                for (target, source) in output.chunks_exact_mut(4).zip(data.chunks_exact(3)) {
+                for (target, source) in output
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(data.as_chunks::<3>().0.iter())
+                {
                     target.copy_from_slice(&[source[2], source[1], source[0], 0]);
                 }
             }
@@ -421,7 +426,9 @@ mod tests {
         let mut output = Vec::new();
         TightDecoder::new().decode_all(body, width, height, &mut output)?;
         Ok(output
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]))
             .collect())
     }
