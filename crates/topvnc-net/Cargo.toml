@@ -1,9 +1,0 @@
-[package]
-name = "topvnc-net"
-version = "0.2.0"
-edition = "2024"
-description = "Socket operations TopVNC's safe crates cannot express, kept small so the unsafe code is easy to audit"
-publish = false
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_IO"] }
