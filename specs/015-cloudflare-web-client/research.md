@@ -265,9 +265,26 @@ JavaScript. Its upload is 14.01 KiB instead of 649.51 KiB. The gateway still
 verifies every token with `topvnc-access`, and
 `gateway/cloudflare/worker/test/access-vectors.json` (generated and checked by
 that crate's tests) makes both implementations accept and reject the same
-tokens. These are local measurements only; the CPU gate stays **not passed**
-until Workers analytics for the redeployed Worker show cold upgrades under
-10 ms.
+tokens.
+
+**Live, after the redeploy (2026-11-01).** `npm run deploy` published version
+`d2962aca` at about 23:43 +07:00 (Wrangler reported 1 ms Worker startup,
+against 4 ms for the Rust Worker). The owner then connected from a desktop
+browser on the host through the live route; the iPhone was not paired yet.
+Workers analytics (`workersInvocationsAdaptive`, version `d2962aca`):
+
+| UTC | Status | CPU |
+| --- | --- | --- |
+| 16:44:15 | success | 0.59 ms |
+| 16:47:20 | responseStreamDisconnected | 5.87 ms |
+| 16:49:28 | responseStreamDisconnected | 4.39 ms |
+
+No errors and no `exceededCpu`. These were the first invocations of the new
+version, so the first that verified a token also fetched and parsed the
+Access keys in a fresh isolate. The highest was 5.87 ms, against 13.0-18.7 ms
+for cold upgrades of the Rust Worker. Three invocations from one browser are
+a small sample, so the gate (below) is recorded as passing so far and is
+rechecked with the iPhone connections and the soak.
 
 ## Live gates that remain unproven
 
@@ -323,7 +340,7 @@ Windows listener inspection confirmed only `127.0.0.1:6080` for the gateway.
 | HTTP/WebSocket upgrade passthrough | Passed basic authenticated Edge echo test on deployed Rust Worker/VPC service |
 | Loopback target reachability | Passed for `127.0.0.1:6080`; target stayed loopback-only |
 | Wrong-owner/unauthenticated request isolation at the edge | Pending |
-| Cold/warm Worker CPU within Free limits | 88 upgrades, 0 errors, none exceededCpu; warm about 2 ms; 7 cold upgrades 13.0-18.7 ms, above the documented 10 ms; not passed |
+| Cold/warm Worker CPU within Free limits | Rust Worker: 88 upgrades, 0 errors, none exceededCpu; warm about 2 ms; 7 cold upgrades 13.0-18.7 ms, above 10 ms. JavaScript Worker (T027, 2026-11-01): first 3 invocations after deploy 0.59-5.87 ms, 0 errors; passing so far, recheck during the iPhone run and soak |
 | Two-hour session and slow-link memory behavior | Pending |
 | Real iPhone Safari auth/display/input/lifecycle | Echo on iOS 27.0.1 (T026). Desktop control through the production client on 2026-10-31: display, pointer, click, scroll, zoom, on-screen typing, toolbar, disconnect/reconnect owner-confirmed; background return and two hours not yet |
 

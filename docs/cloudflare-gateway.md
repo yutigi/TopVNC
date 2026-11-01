@@ -414,8 +414,11 @@ JavaScript using WebCrypto, which runs in the runtime's native code. The
 upload shrank from 649.51 KiB to 14.01 KiB. The same fresh-process
 measurement is about 2.8 ms: 1.3 ms to import the module (mostly Node's
 module loader), 0.6 ms for the key parse, and 0.9 ms for the signature
-check. That is a local comparison only. Whether cold upgrades now stay under
-10 ms is unproven until the redeployed Worker's analytics show it.
+check. Deployed on 2026-11-01 (version `d2962aca`), its first three
+upgrades, including the first token check in a fresh isolate, used 0.59 ms,
+5.87 ms and 4.39 ms, with no errors. That is a small sample from one desktop
+browser, so the risk stays open until the iPhone run and the two-hour soak
+add more.
 
 The JavaScript checks mirror `crates/topvnc-access`, and the private gateway
 still repeats every check with that crate before it opens a session.
