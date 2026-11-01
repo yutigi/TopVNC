@@ -121,11 +121,13 @@ impl TlsOptions {
     }
 }
 
-/// Clones share TLS state and ordered ciphertext writes. Only one clone may
-/// read at a time, as with a split TCP connection. Blocking socket reads happen
-/// outside the TLS lock, so an idle framebuffer reader cannot delay input.
+/// Clones share TLS state, ordered ciphertext writes, and one socket handle,
+/// so `interrupt_reads` on any clone wakes a read blocked on another. Only one
+/// clone may read at a time, as with a split TCP connection. Blocking socket
+/// reads happen outside the TLS lock, so an idle framebuffer reader cannot
+/// delay input.
 pub(crate) struct NativeStream {
-    socket: TcpStream,
+    socket: Arc<TcpStream>,
     tls: Option<Arc<Mutex<Connection>>>,
     received: Arc<Mutex<Received>>,
 }
@@ -139,49 +141,53 @@ struct Received {
 
 impl From<TcpStream> for NativeStream {
     fn from(socket: TcpStream) -> Self {
+        Self::plain(Arc::new(socket))
+    }
+}
+
+impl NativeStream {
+    fn plain(socket: Arc<TcpStream>) -> Self {
         Self {
             socket,
             tls: None,
             received: Arc::default(),
         }
     }
-}
 
-impl NativeStream {
     pub fn client(
-        socket: TcpStream,
+        socket: impl Into<Arc<TcpStream>>,
         transport: ClientTransport,
         deadline: Instant,
     ) -> io::Result<Self> {
         match transport {
-            ClientTransport::Unencrypted => Ok(socket.into()),
+            ClientTransport::Unencrypted => Ok(Self::plain(socket.into())),
             ClientTransport::Tls {
                 config,
                 server_name,
             } => {
                 let name = ServerName::try_from(server_name).map_err(invalid)?;
                 let connection = ClientConnection::new(config, name).map_err(invalid)?;
-                Self::handshake(socket, Connection::Client(connection), deadline)
+                Self::handshake(socket.into(), Connection::Client(connection), deadline)
             }
         }
     }
 
     pub fn server(
-        socket: TcpStream,
+        socket: impl Into<Arc<TcpStream>>,
         config: Option<Arc<rustls::ServerConfig>>,
         deadline: Instant,
     ) -> io::Result<Self> {
         match config {
-            None => Ok(socket.into()),
+            None => Ok(Self::plain(socket.into())),
             Some(config) => {
                 let connection = ServerConnection::new(config).map_err(invalid)?;
-                Self::handshake(socket, Connection::Server(connection), deadline)
+                Self::handshake(socket.into(), Connection::Server(connection), deadline)
             }
         }
     }
 
     fn handshake(
-        mut socket: TcpStream,
+        socket: Arc<TcpStream>,
         mut connection: Connection,
         deadline: Instant,
     ) -> io::Result<Self> {
@@ -191,7 +197,7 @@ impl NativeStream {
             // complete_io can perform several reads internally. Bound every
             // operation by one deadline, including a peer trickling bytes.
             connection.complete_io(&mut DeadlineSocket {
-                socket: &mut socket,
+                socket: &socket,
                 deadline,
             })?;
         }
@@ -204,7 +210,7 @@ impl NativeStream {
 
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
-            socket: self.socket.try_clone()?,
+            socket: Arc::clone(&self.socket),
             tls: self.tls.clone(),
             received: self.received.clone(),
         })
@@ -212,6 +218,11 @@ impl NativeStream {
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.socket.shutdown(how)
+    }
+    /// Wakes a read blocked on any clone of this stream. Call it after
+    /// `shutdown`; Windows does not wake a blocked `recv` on shutdown alone.
+    pub fn interrupt_reads(&self) {
+        topvnc_net::interrupt_reads(&self.socket);
     }
     pub fn set_nodelay(&self, value: bool) -> io::Result<()> {
         self.socket.set_nodelay(value)
@@ -223,10 +234,10 @@ impl NativeStream {
         self.socket.set_write_timeout(timeout)
     }
 
-    fn flush_records(connection: &mut Connection, socket: &mut TcpStream) -> io::Result<()> {
+    fn flush_records(connection: &mut Connection, socket: &TcpStream) -> io::Result<()> {
         let result = (|| {
             while connection.wants_write() {
-                if connection.write_tls(socket)? == 0 {
+                if connection.write_tls(&mut &*socket)? == 0 {
                     return Err(io::ErrorKind::WriteZero.into());
                 }
             }
@@ -243,7 +254,7 @@ impl NativeStream {
 impl Read for NativeStream {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let Some(tls) = &self.tls else {
-            return self.socket.read(bytes);
+            return (&*self.socket).read(bytes);
         };
         if bytes.is_empty() {
             return Ok(0);
@@ -265,7 +276,7 @@ impl Read for NativeStream {
                 .map_err(|_| invalid("TLS receive lock poisoned"))?;
             if received.offset == received.end {
                 received.bytes.resize(16 * 1024, 0);
-                received.end = self.socket.read(&mut received.bytes)?;
+                received.end = (&*self.socket).read(&mut received.bytes)?;
                 received.offset = 0;
             }
             let mut connection = tls.lock().map_err(|_| invalid("TLS lock poisoned"))?;
@@ -273,11 +284,11 @@ impl Read for NativeStream {
                 connection.read_tls(&mut &received.bytes[received.offset..received.end])?;
             received.offset += consumed;
             if let Err(error) = connection.process_new_packets() {
-                let _ = Self::flush_records(&mut connection, &mut self.socket);
+                let _ = Self::flush_records(&mut connection, &self.socket);
                 let _ = self.socket.shutdown(Shutdown::Both);
                 return Err(invalid(error));
             }
-            Self::flush_records(&mut connection, &mut self.socket)?;
+            Self::flush_records(&mut connection, &self.socket)?;
         }
     }
 }
@@ -285,13 +296,13 @@ impl Read for NativeStream {
 impl Write for NativeStream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let Some(tls) = &self.tls else {
-            return self.socket.write(bytes);
+            return (&*self.socket).write(bytes);
         };
         let mut connection = tls.lock().map_err(|_| invalid("TLS lock poisoned"))?;
         let count = connection
             .writer()
             .write(&bytes[..bytes.len().min(16 * 1024)])?;
-        if let Err(error) = Self::flush_records(&mut connection, &mut self.socket) {
+        if let Err(error) = Self::flush_records(&mut connection, &self.socket) {
             // A partial ciphertext write is terminal. Never retry plaintext
             // with a new nonce after a socket timeout.
             let _ = self.socket.shutdown(Shutdown::Both);
@@ -303,14 +314,14 @@ impl Write for NativeStream {
     fn flush(&mut self) -> io::Result<()> {
         if let Some(tls) = &self.tls {
             let mut connection = tls.lock().map_err(|_| invalid("TLS lock poisoned"))?;
-            Self::flush_records(&mut connection, &mut self.socket)?;
+            Self::flush_records(&mut connection, &self.socket)?;
         }
-        self.socket.flush()
+        (&*self.socket).flush()
     }
 }
 
 struct DeadlineSocket<'a> {
-    socket: &'a mut TcpStream,
+    socket: &'a TcpStream,
     deadline: Instant,
 }
 impl DeadlineSocket<'_> {
@@ -324,16 +335,19 @@ impl DeadlineSocket<'_> {
 impl Read for DeadlineSocket<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.socket.set_read_timeout(Some(self.remaining()?))?;
-        self.socket.read(bytes)
+        let mut socket = self.socket;
+        socket.read(bytes)
     }
 }
 impl Write for DeadlineSocket<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.socket.set_write_timeout(Some(self.remaining()?))?;
-        self.socket.write(bytes)
+        let mut socket = self.socket;
+        socket.write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.socket.flush()
+        let mut socket = self.socket;
+        socket.flush()
     }
 }
 

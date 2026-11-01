@@ -79,7 +79,7 @@ fn idle_tls_reader_does_not_block_input_writer_and_shutdown_wakes_reader() {
 
 #[test]
 fn partial_tls_record_survives_read_timeout() {
-    let (mut client, mut server) = tls_pair();
+    let (mut client, server) = tls_pair();
     client
         .set_read_timeout(Some(Duration::from_millis(80)))
         .unwrap();
@@ -91,21 +91,21 @@ fn partial_tls_record_survives_read_timeout() {
             state.write_tls(&mut record).unwrap();
         }
     }
-    server.socket.write_all(&record[..3]).unwrap();
+    (&*server.socket).write_all(&record[..3]).unwrap();
     let mut received = [0; 16];
     let error = client.read(&mut received).unwrap_err();
     assert!(matches!(
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     ));
-    server.socket.write_all(&record[3..]).unwrap();
+    (&*server.socket).write_all(&record[3..]).unwrap();
     client.read_exact(&mut received).unwrap();
     assert_eq!(&received, b"fragmented frame");
 }
 
 #[test]
 fn tampered_ciphertext_is_terminal() {
-    let (mut client, mut server) = tls_pair();
+    let (mut client, server) = tls_pair();
     client
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -118,7 +118,7 @@ fn tampered_ciphertext_is_terminal() {
         }
     }
     *record.last_mut().unwrap() ^= 1;
-    server.socket.write_all(&record).unwrap();
+    (&*server.socket).write_all(&record).unwrap();
     let error = client.read(&mut [0; 64]).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(client.write_all(b"input").is_err());

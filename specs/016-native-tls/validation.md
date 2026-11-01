@@ -12,6 +12,8 @@ The large Raw wire test exposed loss of ciphertext when rustls accepted only par
 
 The complete suite exposed the previously documented Windows `clients_without_desktop_size_are_disconnected_on_resize` failure. Windows shutdown does not cancel an already pending receive. The server input reader now uses a 100 ms idle wait and checks its stop signal while preserving partial messages, so disconnect cleanup can join the reader. The original regression passes without weakening its assertions or excluding it. Encrypted sessions also assert prompt disconnect events.
 
+Update after merging with `specs/017-ci-matrix`: the 100 ms idle wait was replaced. Winsock documents a connection as indeterminate after a receive timeout, so the reader now blocks without one, and every server-side close shuts the socket down and cancels the pending receive on the shared handle. See `specs/017-ci-matrix/spec.md`.
+
 The first Windows PR run passed formatting and all workspace tests, then failed Clippy: the runner installed Rust 1.99.0 while initial local checks used Rust 1.95.0. Rust 1.99 flags constant-size `chunks_exact` calls, deprecates atomic `fetch_update` in favor of `try_update`, and suggests `then_some` for `Some(...).filter(...)`.
 
 The follow-up replaces those expressions without changing chunk remainder handling, validation, authentication, or capture behavior. `rust-toolchain.toml` now selects the stable 1.99.0 release with rustfmt/Clippy, and the workflow uses that same repository-selected toolchain. Follow-up local validation on Rust/Clippy 1.99.0: formatting passes; all 259 workspace tests pass with the same 7 existing ignored tests; Clippy passes with warnings denied; diff checks pass. The next PR run verifies these fixes on the hosted Windows runner.

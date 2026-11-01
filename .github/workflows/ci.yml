@@ -24,8 +24,11 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       # rust-toolchain.toml pins the compiler, Clippy and rustfmt.
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
@@ -41,8 +44,11 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       # display-info links libxcb with RandR and Render. winit loads Wayland,
       # X11 and xkbcommon at run time, so they need no headers to build.
       - name: Install Linux build libraries
@@ -62,8 +68,11 @@ jobs:
   web:
     name: Browser client and Worker
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       # rust-toolchain.toml pins the compiler, Clippy and rustfmt.
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install

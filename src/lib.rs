@@ -640,9 +640,18 @@ impl SessionWaker {
     }
 }
 
+/// Ends a client's session from the server side. The socket is the one its
+/// reader thread blocks on, and Windows does not wake a blocked `recv` on
+/// `shutdown` alone, so the pending read is cancelled as well.
+fn shut_down_client(stream: &TcpStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    topvnc_net::interrupt_reads(stream);
+}
+
 #[derive(Default)]
 struct ServerSessions {
-    streams: std::collections::HashMap<u64, TcpStream>,
+    /// The socket handle each session reads from, shared with its stream.
+    streams: std::collections::HashMap<u64, Arc<TcpStream>>,
     wakers: std::collections::HashMap<u64, SessionWaker>,
     exclusive_client: Option<u64>,
 }
@@ -658,14 +667,14 @@ impl ServerSessions {
         }
     }
 
-    fn register(&mut self, client_id: u64, stream: TcpStream) -> io::Result<()> {
+    fn register(&mut self, client_id: u64, stream: impl Into<Arc<TcpStream>>) -> io::Result<()> {
         if self.exclusive_client.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "an exclusive RFB session is active",
             ));
         }
-        self.streams.insert(client_id, stream);
+        self.streams.insert(client_id, stream.into());
         Ok(())
     }
 
@@ -692,7 +701,7 @@ impl ServerSessions {
             (false, _) => {
                 for (other_id, stream) in &self.streams {
                     if *other_id != client_id {
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        shut_down_client(stream);
                     }
                 }
                 self.exclusive_client = Some(client_id);
@@ -712,7 +721,7 @@ impl ServerSessions {
 
     fn shutdown_all(&self) {
         for stream in self.streams.values() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            shut_down_client(stream);
         }
     }
 }
@@ -1029,12 +1038,13 @@ impl VncServer {
                 .next_client_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let sessions = Arc::clone(&self.sessions);
-            let registration = stream.try_clone().and_then(|session_stream| {
-                sessions
-                    .lock()
-                    .map_err(|_| invalid("session registry lock is poisoned"))?
-                    .register(client_id, session_stream)
-            });
+            // The registry and the session share one socket handle, so a
+            // server-side close can cancel the session's blocked read.
+            let stream = Arc::new(stream);
+            let registration = sessions
+                .lock()
+                .map_err(|_| invalid("session registry lock is poisoned"))
+                .and_then(|mut sessions| sessions.register(client_id, Arc::clone(&stream)));
             if registration.is_err() {
                 self.active_clients
                     .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -1314,14 +1324,10 @@ fn serve_client(
         );
     // The pointer mode last announced to the client, which its reader uses.
     let announced_relative = Arc::new(AtomicBool::new(false));
-    let reader_stopped = Arc::new(AtomicBool::new(false));
     let reader = {
-        let input_stream = stream.try_clone()?;
-        input_stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-        let mut stream = ServerInputReader {
-            stream: input_stream,
-            stopped: Arc::clone(&reader_stopped),
-        };
+        // The clone shares the socket handle, so interrupt_reads below
+        // reaches the read this thread blocks in.
+        let mut stream = stream.try_clone()?;
         let mut state = ClientReader {
             client_id,
             focus: Arc::clone(&shared.focus),
@@ -1360,36 +1366,22 @@ fn serve_client(
     );
     // Unblock the reader, then wait for it so every input event from this
     // client is queued before the caller reports the disconnect.
-    reader_stopped.store(true, Ordering::Release);
+    // Windows does not wake a blocked recv on shutdown, so cancel it too. No
+    // receive timeout is used: Winsock leaves a connection indeterminate after
+    // one, and cancelling only at close cannot lose input the session needs.
     let _ = stream.shutdown(std::net::Shutdown::Both);
     drop(session_receiver);
+    // A read that starts just as the socket shuts down can miss one
+    // cancellation, so repeat it briefly until the reader leaves the socket.
+    for _ in 0..200 {
+        if reader.is_finished() {
+            break;
+        }
+        stream.interrupt_reads();
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let _ = reader.join();
     result
-}
-
-// A bounded idle wait lets server shutdown join a pending Windows recv.
-// Retrying within Read preserves read_exact's partial RFB message progress.
-struct ServerInputReader {
-    stream: NativeStream,
-    stopped: Arc<AtomicBool>,
-}
-
-impl Read for ServerInputReader {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        loop {
-            if self.stopped.load(Ordering::Acquire) {
-                return Err(io::ErrorKind::ConnectionAborted.into());
-            }
-            match self.stream.read(bytes) {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) => {}
-                result => return result,
-            }
-        }
-    }
 }
 
 /// Input state of one client on its reader thread, which sees the client's
