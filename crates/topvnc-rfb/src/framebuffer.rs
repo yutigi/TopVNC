@@ -89,7 +89,7 @@ impl Framebuffer {
             // Validated row slices let the compiler vectorize the conversion
             // without a separate bounds check for each pixel. Wire byte 3 is
             // padding, even when a server sends a nonzero value there.
-            for (pixel, bgra) in target.iter_mut().zip(source.chunks_exact(4)) {
+            for (pixel, bgra) in target.iter_mut().zip(source.as_chunks::<4>().0.iter()) {
                 *pixel = u32::from_le_bytes([bgra[0], bgra[1], bgra[2], 0]);
             }
         }

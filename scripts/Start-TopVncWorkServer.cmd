@@ -21,16 +21,18 @@ if not exist "%TOPVNC_SERVER%" (
 )
 
 echo TopVNC work server: %TOPVNC_BIND%
-echo Command: "%TOPVNC_SERVER%" --serve %TOPVNC_BIND%
+echo Command: "%TOPVNC_SERVER%" --serve %TOPVNC_BIND% --tls-cert TOPVNC_TLS_CERT --tls-key TOPVNC_TLS_KEY
 if /I "%~1"=="/check" (
     echo CHECK ONLY: executable found; server was not started.
-    echo This does not verify Meshnet, WARP policy, firewall rules, or port availability.
+    echo TLS hosting requires TOPVNC_TLS_CERT and TOPVNC_TLS_KEY PEM file paths.
+    echo This does not verify certificates, VPN policy, firewall rules, or port availability.
     exit /b 0
 )
 echo Enter the VNC password at the local prompt. Do not share it in chat.
 echo Keep this terminal open. Press Ctrl+C to stop the server.
 echo Meshnet and permitted WARP settings must already be ready.
-"%TOPVNC_SERVER%" --serve %TOPVNC_BIND%
+rem Pass credential paths as PowerShell argument values, never expanded cmd code.
+powershell.exe -NoProfile -Command "if (-not $env:TOPVNC_TLS_CERT -or -not $env:TOPVNC_TLS_KEY) { Write-Error 'Set TOPVNC_TLS_CERT and TOPVNC_TLS_KEY to your PEM files.'; exit 2 }; & $env:TOPVNC_SERVER --serve $env:TOPVNC_BIND --tls-cert $env:TOPVNC_TLS_CERT --tls-key $env:TOPVNC_TLS_KEY; exit $LASTEXITCODE"
 exit /b %ERRORLEVEL%
 
 :usage

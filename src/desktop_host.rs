@@ -24,7 +24,7 @@ pub const WHEEL_DELTA: i32 = 120;
 pub const CAPTURE_RETRY_MIN: Duration = Duration::from_millis(250);
 pub const CAPTURE_RETRY_MAX: Duration = Duration::from_secs(2);
 
-pub const SERVE_USAGE: &str = "usage: topvnc --serve [HOST:PORT] [--display primary|NUMBER|all] [--scale 0.25-1] [--mouse auto|relative|absolute] [--priority whole|center|mouse|changes] [--ultra] [--allow-insecure]";
+pub const SERVE_USAGE: &str = "usage: topvnc --serve [HOST:PORT] [--display primary|NUMBER|all] [--scale 0.25-1] [--mouse auto|relative|absolute] [--priority whole|center|mouse|changes] [--ultra] [--tls-cert CERT.pem --tls-key KEY.pem | --unencrypted] [--allow-insecure]";
 
 /// The smallest served size, as a fraction of the display's pixel size.
 pub const MIN_SERVE_SCALE: f32 = 0.25;
@@ -411,6 +411,7 @@ impl PointerOwner {
 /// Options for `topvnc --serve`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServeOptions {
+    pub tls: topvnc::transport::TlsOptions,
     pub performance: PerformanceMode,
     pub address: String,
     pub display: DisplaySelection,
@@ -592,7 +593,7 @@ impl std::fmt::Display for ServerNotice {
             } => write!(
                 formatter,
                 "Serving {display} ({width}x{height}) on {address}. \
-                 TCP is unencrypted; use a trusted LAN or secure tunnel."
+                 Transport security is reported separately."
             ),
             Self::Resized { width, height } => {
                 write!(formatter, "Display size changed to {width}x{height}.")
@@ -612,6 +613,7 @@ impl std::fmt::Display for ServerNotice {
 
 pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'static str> {
     let mut options = ServeOptions {
+        tls: Default::default(),
         performance: PerformanceMode::Standard,
         address: "127.0.0.1:5900".to_owned(),
         display: DisplaySelection::Primary,
@@ -629,6 +631,13 @@ pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'sta
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--ultra" => options.performance = PerformanceMode::Ultra,
+            "--unencrypted" => options.tls.unencrypted = true,
+            "--tls-cert" if options.tls.cert.is_none() => {
+                options.tls.cert = Some(arguments.next().ok_or(SERVE_USAGE)?.into())
+            }
+            "--tls-key" if options.tls.key.is_none() => {
+                options.tls.key = Some(arguments.next().ok_or(SERVE_USAGE)?.into())
+            }
             "--allow-insecure" => options.allow_insecure = true,
             "--display" if !display_set => {
                 options.display = arguments
@@ -1626,8 +1635,8 @@ impl CaptureSurface<'_> {
             if self.rotation == Rotation::Identity {
                 let start = y * self.row_pitch + rect.left as usize * 4;
                 let source = &self.bytes[start..start + rect.width() * 4];
-                for (target, bytes) in row.iter_mut().zip(source.chunks_exact(4)) {
-                    *target = u32::from_le_bytes(bytes.try_into().unwrap()) & 0x00ff_ffff;
+                for (target, bytes) in row.iter_mut().zip(source.as_chunks::<4>().0.iter()) {
+                    *target = u32::from_le_bytes(*bytes) & 0x00ff_ffff;
                 }
             } else {
                 for (column, target) in row.iter_mut().enumerate() {
@@ -1929,6 +1938,7 @@ mod tests {
         assert_eq!(
             parse_serve_arguments(&[]),
             Ok(ServeOptions {
+                tls: Default::default(),
                 address: "127.0.0.1:5900".into(),
                 performance: PerformanceMode::Standard,
                 display: DisplaySelection::Primary,
@@ -1946,6 +1956,7 @@ mod tests {
                 "--allow-insecure"
             ])),
             Ok(ServeOptions {
+                tls: Default::default(),
                 address: "0.0.0.0:5901".into(),
                 performance: PerformanceMode::Standard,
                 display: DisplaySelection::Number(2),

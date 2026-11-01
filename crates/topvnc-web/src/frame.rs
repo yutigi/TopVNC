@@ -93,7 +93,12 @@ impl RgbaFrame {
         for (line, source) in bytes.chunks_exact(row).enumerate() {
             let start = (usize::from(y) + line) * stride + usize::from(x) * 4;
             let target = &mut self.pixels[start..start + row];
-            for (rgba, bgrx) in target.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+            for (rgba, bgrx) in target
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(source.as_chunks::<4>().0.iter())
+            {
                 rgba.copy_from_slice(&[bgrx[2], bgrx[1], bgrx[0], 255]);
             }
         }
