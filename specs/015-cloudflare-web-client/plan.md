@@ -183,6 +183,13 @@ bounded queues. HTTP documentation alone did not establish WebSocket support;
 the deployed synthetic probe has now passed upgrade/passthrough and loopback
 routing in Edge. See research.md for the limited evidence and remaining gates.
 
+**2026-11-01:** the production Worker is now plain JavaScript with WebCrypto
+instead of Rust compiled to WebAssembly (T027). Cold upgrades of the Rust
+Worker used 13.0-18.7 ms of CPU against the Free plan's 10 ms, and local
+measurement put most of that in loading and warming the WebAssembly module.
+The JavaScript checks mirror `crates/topvnc-access`, are tested against tokens
+signed by that crate, and the gateway still repeats them in Rust.
+
 ```text
 iPhone Safari
    │
@@ -190,7 +197,7 @@ iPhone Safari
 topvnc.<account-subdomain>.workers.dev
    │  hostname-based Access application (owner only)
    ├─ / and assets ── Workers Static Assets (HTML / JS / WASM)
-   └─ /ws ── Rust Worker (JWT + fixed destination + upgrade forwarding)
+   └─ /ws ── Worker (JWT + fixed destination + upgrade forwarding)
                  │ Workers VPC fetch() / WebSocket upgrade: TO VERIFY
                  ▼
              private Cloudflare Tunnel (no public Tunnel hostname)

@@ -14,19 +14,21 @@ release cannot fail the run without a code change. Moving to 1.99 required the
 `as_chunks` and `try_update` lint fixes that the native TLS branch also carries.
 
 
-- **Format** (Ubuntu): `cargo fmt --all --check` for the workspace and for the
-  separate Cloudflare Worker workspace.
+- **Format** (Ubuntu): `cargo fmt --all --check` for the workspace. (It also
+  checked the separate Rust Worker workspace until spec 015 T027 removed it.)
 - **Rust** (Windows, macOS, Ubuntu): `cargo clippy --locked --workspace
   --all-targets -- -D warnings` and `cargo test --locked --workspace`. Ubuntu
   installs only the libxcb development packages that `display-info` links;
   winit loads Wayland, X11 and xkbcommon at run time.
-- **Browser client and Worker** (Ubuntu): wasm32 Clippy for `topvnc-web` and the
-  Worker, a wasm32 release build of the Worker, then `npm ci`, `npm run build`,
-  `npm test` and `npm run test:wasm` in `web/`. The wasm-bindgen CLI version is
+- **Browser client and Worker** (Ubuntu): wasm32 Clippy for `topvnc-web`, then
+  `npm ci`, `npm run build`, `npm test` and `npm run test:wasm` in `web/`, and
+  `npm test` for the Worker. (Until 2026-11-01 the Worker was Rust, and this job
+  ran its wasm32 Clippy and release build; spec 015 T027 replaced it with
+  JavaScript.) The wasm-bindgen CLI version is
   read from the root `Cargo.lock` and cached under `.tools`, which
   `web/scripts/build.mjs` already requires.
 
-Out of scope: packaging the Worker with `worker-build` and deploying it, the
+Out of scope: deploying the Worker, the
 `gateway/cloudflare/spike` feasibility workspace, release artifacts, live GUI or
 desktop-capture runs, and performance measurement. CI results do not by
 themselves make a platform "supported": a passing Linux or macOS build shows the

@@ -246,6 +246,29 @@ switching the host to the production gateway.
   mitigations are measuring the key-parse cost and caching parsed keys across
   requests (already done within an isolate). No paid fallback is assumed.
 
+## Worker cold-start CPU (2026-11-01, T027)
+
+Measured locally in Node 22.18.0 on the Ryzen 9 9950X3D host, which is faster
+per core than Cloudflare's servers. Each figure is a fresh process, median of
+three to five runs.
+
+| Path | Load or import | First key parse | First RS256 check | Total | Warm check |
+| --- | --- | --- | --- | --- | --- |
+| `topvnc-access` compiled to WebAssembly (as in the Rust Worker) | 3.3 ms | 1.1 ms | 3.0 ms | about 7.3 ms | 0.44 ms |
+| JavaScript Worker with WebCrypto | 1.3 ms | 0.6 ms | 0.9 ms | about 2.8 ms | not measured |
+
+Compiling the 625 KB Worker module eagerly with Liftoff took 3.8-4.0 ms, and
+V8 compiles lazily, so the first calls pay for the code they reach. This fits
+the live pattern: warm upgrades about 2 ms, the first upgrade in a fresh
+isolate 13.0-18.7 ms. The owner chose to replace the Worker with plain
+JavaScript. Its upload is 14.01 KiB instead of 649.51 KiB. The gateway still
+verifies every token with `topvnc-access`, and
+`gateway/cloudflare/worker/test/access-vectors.json` (generated and checked by
+that crate's tests) makes both implementations accept and reject the same
+tokens. These are local measurements only; the CPU gate stays **not passed**
+until Workers analytics for the redeployed Worker show cold upgrades under
+10 ms.
+
 ## Live gates that remain unproven
 
 The Rust Worker and synthetic static page are now deployed at the planned
