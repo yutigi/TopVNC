@@ -43,6 +43,7 @@ pub const DEFAULT_JPEG_QUALITY: u8 = 6;
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub tls: topvnc::transport::TlsOptions,
     pub performance: PerformanceMode,
     pub motion: MotionPresentation,
     pub host: String,
@@ -73,6 +74,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            tls: Default::default(),
             performance: PerformanceMode::Standard,
             motion: MotionPresentation::Smooth,
             host: String::new(),
@@ -117,6 +119,7 @@ pub const ALL_NETWORKS_HOST: &str = "0.0.0.0";
 /// The Server tab form. Like the client's security choices, it is never saved.
 #[derive(Clone, Debug)]
 pub struct ServeForm {
+    pub tls: topvnc::transport::TlsOptions,
     pub performance: PerformanceMode,
     pub host: String,
     pub port: String,
@@ -133,6 +136,7 @@ pub struct ServeForm {
 impl Default for ServeForm {
     fn default() -> Self {
         Self {
+            tls: Default::default(),
             performance: PerformanceMode::Standard,
             host: LOCAL_ONLY_HOST.into(),
             port: "5900".into(),
@@ -149,6 +153,7 @@ impl Default for ServeForm {
 /// A validated request to start serving this desktop.
 #[derive(Debug, PartialEq)]
 pub struct ServeRequest {
+    pub tls: topvnc::transport::TlsOptions,
     pub performance: PerformanceMode,
     pub address: String,
     pub display: DisplaySelection,
@@ -175,6 +180,7 @@ impl ServeForm {
             Some(self.password.clone())
         };
         Ok(ServeRequest {
+            tls: self.tls.clone(),
             performance: self.performance,
             address,
             display: self.display,
@@ -1391,7 +1397,11 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
     canvas.text(
         40,
         331,
-        "VNC PASSWORD TRAFFIC IS UNENCRYPTED. USE A SECURE TUNNEL.",
+        if config.tls.unencrypted {
+            "UNENCRYPTED: USE A SEPARATELY SECURED TUNNEL."
+        } else {
+            "TLS REQUIRED. CERTIFICATE AND HOST NAME ARE VERIFIED."
+        },
         MUTED,
         2,
     );
@@ -1429,7 +1439,13 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
         let short: String = error.chars().take(62).collect();
         canvas.text(40, 537, &short, ERROR, 2);
     } else {
-        canvas.text(40, 537, "TCP TRANSPORT  /  UNENCRYPTED", MUTED, 2);
+        canvas.text(
+            40,
+            537,
+            config.tls.label(),
+            if config.tls.unencrypted { ERROR } else { MUTED },
+            2,
+        );
     }
     canvas.button(
         CONNECT,
@@ -1503,7 +1519,11 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     canvas.text(
         40,
         331,
-        "ONLY 8 PASSWORD CHARACTERS ARE USED. TCP IS UNENCRYPTED.",
+        if form.tls.unencrypted {
+            "UNENCRYPTED. ONLY 8 PASSWORD CHARACTERS ARE USED."
+        } else {
+            "TLS REQUIRES --tls-cert AND --tls-key PEM FILES."
+        },
         MUTED,
         2,
     );
@@ -1639,7 +1659,17 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     } else if let Some(message) = &server.message {
         status_message(canvas, message, MUTED);
     } else {
-        canvas.text(40, 537, "TCP TRANSPORT  /  UNENCRYPTED", MUTED, 2);
+        canvas.text(
+            40,
+            537,
+            if form.tls.unencrypted {
+                "TCP / UNENCRYPTED (EXPLICIT)"
+            } else {
+                "TLS 1.3 / ENCRYPTED TRANSPORT"
+            },
+            if form.tls.unencrypted { ERROR } else { MUTED },
+            2,
+        );
     }
     match server.phase {
         ServerPhase::Stopped => canvas.button(CONNECT, "START SERVER", true),

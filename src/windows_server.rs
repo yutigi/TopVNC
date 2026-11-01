@@ -189,6 +189,7 @@ impl ServedImage {
 /// Run `topvnc --serve` until the console asks the server to stop.
 pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let options = parse_serve_arguments(arguments)?;
+    options.tls.server()?;
     // Capture sizes, cursor positions, and injected pointer coordinates must
     // all be physical pixels, even on scaled displays.
     enable_dpi_awareness();
@@ -226,7 +227,14 @@ pub fn serve(
     shutdown: &AtomicBool,
     report: &(dyn Fn(ServerNotice) + Sync),
 ) -> Result<(), Box<dyn Error>> {
+    let tls = options.tls.server()?;
+    report(ServerNotice::Message(if tls.is_some() {
+        "TLS 1.3 encrypted transport enabled.".into()
+    } else {
+        "WARNING: explicit unencrypted TCP transport.".into()
+    }));
     let ServeOptions {
+        tls: _,
         address,
         display,
         allow_insecure,
@@ -267,6 +275,7 @@ pub fn serve(
     );
     let (served_width, served_height) = served.size(&framebuffer);
     let config = ServerConfig {
+        tls,
         priority,
         performance,
         name: "TopVNC Windows Desktop".into(),
@@ -2005,6 +2014,10 @@ mod tests {
             let _ = notices.lock().unwrap().send(notice);
         };
         let options = ServeOptions {
+            tls: topvnc::transport::TlsOptions {
+                unencrypted: true,
+                ..Default::default()
+            },
             address: "127.0.0.1:0".into(),
             allow_insecure: true,
             ..parse_serve_arguments(&[]).unwrap()
@@ -2156,6 +2169,10 @@ mod tests {
             let _ = notices.lock().unwrap().send(notice);
         };
         let options = ServeOptions {
+            tls: topvnc::transport::TlsOptions {
+                unencrypted: true,
+                ..Default::default()
+            },
             address: "127.0.0.1:0".into(),
             display: DisplaySelection::All,
             allow_insecure: true,

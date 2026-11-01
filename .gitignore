@@ -22,3 +22,6 @@
 /gateway/cloudflare/worker/build/
 **/gateway.local.toml
 /gateway/cloudflare/worker/.tools/
+
+/.worktrees/
+/certs.local/
