@@ -1626,8 +1626,8 @@ impl CaptureSurface<'_> {
             if self.rotation == Rotation::Identity {
                 let start = y * self.row_pitch + rect.left as usize * 4;
                 let source = &self.bytes[start..start + rect.width() * 4];
-                for (target, bytes) in row.iter_mut().zip(source.chunks_exact(4)) {
-                    *target = u32::from_le_bytes(bytes.try_into().unwrap()) & 0x00ff_ffff;
+                for (target, bytes) in row.iter_mut().zip(source.as_chunks::<4>().0.iter()) {
+                    *target = u32::from_le_bytes(*bytes) & 0x00ff_ffff;
                 }
             } else {
                 for (column, target) in row.iter_mut().enumerate() {
