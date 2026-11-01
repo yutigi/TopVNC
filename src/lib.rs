@@ -23,6 +23,8 @@ pub use topvnc_rfb::{
 use topvnc_rfb::{Decoded, InputState, MessageReader, RectDecoder, ServerMessage};
 
 pub mod presentation;
+pub mod transport;
+use transport::NativeStream;
 mod tight;
 use tight::TightSettings;
 
@@ -167,7 +169,7 @@ impl<R: Read> Read for WaitTimer<R> {
 }
 
 struct HandshakeStream<'a> {
-    stream: &'a mut TcpStream,
+    stream: &'a mut NativeStream,
     deadline: Instant,
 }
 
@@ -541,6 +543,8 @@ pub enum PerformanceMode {
 /// default; `None` security must be selected explicitly.
 #[derive(Clone)]
 pub struct ServerConfig {
+    /// TLS before RFB. None is explicit legacy TCP for embedded integrations.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
     pub priority: UpdatePriority,
     pub performance: PerformanceMode,
     pub name: String,
@@ -557,6 +561,7 @@ impl Default for ServerConfig {
         Self {
             priority: UpdatePriority::Whole,
             performance: PerformanceMode::Standard,
+            tls: None,
             name: "TopVNC".into(),
             password: None,
             allow_insecure: false,
@@ -1079,7 +1084,11 @@ impl VncServer {
                     if let Some(setup) = shared.thread_setup {
                         setup();
                     }
-                    let mut stream = stream;
+                    let deadline = Instant::now() + SERVER_HANDSHAKE_TIMEOUT;
+                    let Ok(mut stream) = NativeStream::server(stream, config.tls.clone(), deadline)
+                    else {
+                        return;
+                    };
                     let _ = stream.set_nodelay(true);
                     let _ = serve_client(
                         &mut stream,
@@ -1088,6 +1097,7 @@ impl VncServer {
                         &config,
                         &client_sessions,
                         client_id,
+                        deadline,
                     );
                     let _ = events.send(ClientEvent::ClientDisconnected { client_id });
                 });
@@ -1163,7 +1173,7 @@ fn update_server_framebuffer_regions(
 }
 
 fn send_pending_clipboard(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     clipboard: &Arc<Mutex<ServerClipboard>>,
     seen_revision: &mut u64,
 ) -> io::Result<()> {
@@ -1206,19 +1216,21 @@ struct SessionShared {
     thread_setup: Option<fn()>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_client(
-    stream: &mut TcpStream,
+    stream: &mut NativeStream,
     shared: &SessionShared,
     events: &SyncSender<ClientEvent>,
     config: &ServerConfig,
     sessions: &Arc<Mutex<ServerSessions>>,
     client_id: u64,
+    deadline: Instant,
 ) -> io::Result<()> {
-    // Bound the whole handshake, not each read, so a client that trickles
+    // Bound the whole TLS/RFB handshake, not each read, so a client that trickles
     // bytes cannot hold one of the few connection slots indefinitely.
     let mut handshake = HandshakeStream {
         stream: &mut *stream,
-        deadline: Instant::now() + SERVER_HANDSHAKE_TIMEOUT,
+        deadline,
     };
     handshake.write_all(b"RFB 003.008\n")?;
     let mut version = [0; 12];
@@ -1266,7 +1278,7 @@ fn serve_client(
         .map_err(|_| invalid("session registry lock is poisoned"))?
         .admit(client_id, share_flag[0] != 0)?;
     stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
+    stream.set_write_timeout(Some(UPDATE_IDLE_TIMEOUT))?;
     let name = config.name.as_bytes();
     if name.len() > MAX_NAME_BYTES {
         return Err(invalid("server name is too long"));
@@ -1302,8 +1314,14 @@ fn serve_client(
         );
     // The pointer mode last announced to the client, which its reader uses.
     let announced_relative = Arc::new(AtomicBool::new(false));
+    let reader_stopped = Arc::new(AtomicBool::new(false));
     let reader = {
-        let mut stream = stream.try_clone()?;
+        let input_stream = stream.try_clone()?;
+        input_stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let mut stream = ServerInputReader {
+            stream: input_stream,
+            stopped: Arc::clone(&reader_stopped),
+        };
         let mut state = ClientReader {
             client_id,
             focus: Arc::clone(&shared.focus),
@@ -1342,10 +1360,36 @@ fn serve_client(
     );
     // Unblock the reader, then wait for it so every input event from this
     // client is queued before the caller reports the disconnect.
+    reader_stopped.store(true, Ordering::Release);
     let _ = stream.shutdown(std::net::Shutdown::Both);
     drop(session_receiver);
     let _ = reader.join();
     result
+}
+
+// A bounded idle wait lets server shutdown join a pending Windows recv.
+// Retrying within Read preserves read_exact's partial RFB message progress.
+struct ServerInputReader {
+    stream: NativeStream,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Read for ServerInputReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            match self.stream.read(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
 }
 
 /// Input state of one client on its reader thread, which sees the client's
@@ -1436,7 +1480,7 @@ impl ClientReader {
 }
 
 fn read_client_message(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     session: &SyncSender<SessionInput>,
     events: &SyncSender<ClientEvent>,
     state: &mut ClientReader,
@@ -1794,7 +1838,7 @@ fn server_wait_timeout(
 }
 
 fn write_client_updates(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     session: &SessionShared,
     announced_relative: &AtomicBool,
     receiver: &std::sync::mpsc::Receiver<SessionInput>,
@@ -2098,7 +2142,7 @@ fn write_client_updates(
 /// Raw. Returns the bytes written.
 #[allow(clippy::too_many_arguments)]
 fn write_prepared_update(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     shared: &Arc<Mutex<ServerFramebuffer>>,
     seen_revisions: &mut [u64],
     output: &mut Vec<u8>,
@@ -2148,7 +2192,7 @@ fn write_prepared_update(
     }
 }
 
-fn write_desktop_size(stream: &mut TcpStream, width: u16, height: u16) -> io::Result<()> {
+fn write_desktop_size(stream: &mut (impl Read + Write), width: u16, height: u16) -> io::Result<()> {
     write_pseudo_update(
         stream,
         &[PseudoRect {
@@ -2484,7 +2528,7 @@ fn prepare_update(
 /// into an update or block capture on network backpressure.
 #[allow(clippy::too_many_arguments)]
 fn write_update(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     shared: &Arc<Mutex<ServerFramebuffer>>,
     seen_revisions: &mut [u64],
     output: &mut Vec<u8>,
@@ -2810,7 +2854,7 @@ struct SessionEncoder {
 /// is ready.
 #[allow(clippy::too_many_arguments)]
 fn write_tight_update(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     shared: &Arc<Mutex<ServerFramebuffer>>,
     seen_revisions: &mut [u64],
     output: &mut Vec<u8>,
@@ -3095,7 +3139,7 @@ pub fn read_update(
 pub struct InputWriter(Arc<Mutex<WriterState>>);
 
 struct WriterState {
-    stream: TcpStream,
+    stream: NativeStream,
     input: InputState,
     /// The messages of one call, reused.
     out: Vec<u8>,
@@ -3117,9 +3161,9 @@ impl WriterState {
 }
 
 impl InputWriter {
-    fn new(stream: TcpStream, encodings: Vec<i32>) -> Self {
+    fn new(stream: impl Into<NativeStream>, encodings: Vec<i32>) -> Self {
         Self(Arc::new(Mutex::new(WriterState {
-            stream,
+            stream: stream.into(),
             input: InputState::new(encodings),
             out: Vec::new(),
         })))
@@ -3237,7 +3281,7 @@ impl InputWriter {
 
 pub struct Session {
     pub info: ServerInfo,
-    reader: WaitTimer<TcpStream>,
+    reader: WaitTimer<NativeStream>,
     stats: SessionStats,
     /// Whether the next update should be requested as soon as the current
     /// one starts arriving.
@@ -3275,6 +3319,29 @@ impl Session {
         )
     }
 
+    /// Connect using an explicit transport. TLS validation completes before
+    /// any RFB authentication or framebuffer/input bytes are sent.
+    pub fn connect_with_transport(
+        address: &str,
+        transport: transport::ClientTransport,
+        allow_insecure: bool,
+        encoding: Encoding,
+        password_prompt: impl FnMut() -> io::Result<String>,
+    ) -> io::Result<Self> {
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let stream = NativeStream::client(connect_tcp(address)?, transport, deadline)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| timed_out("Connection handshake timed out"))?;
+        Self::from_stream_with_encoding(
+            stream,
+            allow_insecure,
+            encoding,
+            password_prompt,
+            remaining,
+        )
+    }
+
     #[cfg(test)]
     fn from_stream(
         stream: TcpStream,
@@ -3292,12 +3359,13 @@ impl Session {
     }
 
     fn from_stream_with_encoding(
-        mut stream: TcpStream,
+        stream: impl Into<NativeStream>,
         allow_insecure: bool,
         encoding: Encoding,
         password_prompt: impl FnMut() -> io::Result<String>,
         timeout: Duration,
     ) -> io::Result<Self> {
+        let mut stream = stream.into();
         stream.set_nodelay(true)?;
         let info = negotiate_with_encoding(
             &mut HandshakeStream {
@@ -3521,7 +3589,7 @@ mod tests {
     };
 
     fn send_framebuffer_update(
-        stream: &mut TcpStream,
+        stream: &mut (impl Read + Write),
         shared: &Arc<Mutex<ServerFramebuffer>>,
         seen_revisions: &mut [u64],
         output: &mut Vec<u8>,
@@ -4903,14 +4971,23 @@ mod tests {
         let sessions = Arc::new(Mutex::new(ServerSessions::default()));
         let server_sessions = Arc::clone(&sessions);
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (stream, _) = listener.accept().unwrap();
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             server_sessions
                 .lock()
                 .unwrap()
                 .register(44, stream.try_clone().unwrap())
                 .unwrap();
-            let result = serve_client(&mut stream, &session, &tx, &config, &server_sessions, 44);
+            let mut stream = NativeStream::from(stream);
+            let result = serve_client(
+                &mut stream,
+                &session,
+                &tx,
+                &config,
+                &server_sessions,
+                44,
+                Instant::now() + SERVER_HANDSHAKE_TIMEOUT,
+            );
             let _ = tx.send(ClientEvent::ClientDisconnected { client_id: 44 });
             result
         });
@@ -5806,9 +5883,18 @@ mod tests {
         };
         let session = session_shared(&framebuffer);
         let server_thread = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (stream, _) = listener.accept().unwrap();
             let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-            serve_client(&mut stream, &session, &events, &config, &sessions, 7)
+            let mut stream = NativeStream::from(stream);
+            serve_client(
+                &mut stream,
+                &session,
+                &events,
+                &config,
+                &sessions,
+                7,
+                Instant::now() + SERVER_HANDSHAKE_TIMEOUT,
+            )
         });
 
         let mut client = TcpStream::connect(address).unwrap();

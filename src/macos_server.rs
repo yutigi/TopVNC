@@ -89,6 +89,7 @@ extern "C" fn request_shutdown(_signal: c_int) {
 /// Run `topvnc --serve` until interrupted.
 pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let options = parse_serve_arguments(arguments)?;
+    options.tls.server()?;
     let password = if options.allow_insecure {
         eprintln!("WARNING: RFB clients will be unauthenticated. Bind only to a trusted network.");
         None
@@ -213,7 +214,14 @@ pub fn serve(
     shutdown: &AtomicBool,
     report: &(dyn Fn(ServerNotice) + Sync),
 ) -> Result<(), Box<dyn Error>> {
+    let tls = options.tls.server()?;
+    report(ServerNotice::Message(if tls.is_some() {
+        "TLS 1.3 encrypted transport enabled.".into()
+    } else {
+        "WARNING: explicit unencrypted TCP transport.".into()
+    }));
     let ServeOptions {
+        tls: _,
         address,
         display,
         allow_insecure,
@@ -250,6 +258,7 @@ pub fn serve(
         }
     }
     let config = ServerConfig {
+        tls,
         priority,
         performance,
         name: "TopVNC macOS Desktop".into(),
