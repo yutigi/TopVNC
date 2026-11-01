@@ -100,7 +100,20 @@ workflow runs passes locally:
 - `npm run build`, `npm test` (9 passed) and `npm run test:wasm` (2 passed) in
   `web/`.
 
-Not yet validated: the workflow itself has not run on GitHub, so the macOS and
-Ubuntu jobs, the Linux package list, and the action versions are unconfirmed.
-README notes that macOS capture wiring has not been compiled, so the macOS job
-may fail on its first run; record the result here rather than assume it.
+### First GitHub run
+
+Run 41318680312 on commit `14a7b0e` (draft PR #7, 2026-11-01):
+
+- Passed: Format, Rust (windows-latest) and Browser client and Worker. Every
+  action version resolved, and the pinned toolchain installed on all runners.
+- Rust (ubuntu-latest): the Linux package step passed; Clippy failed to compile
+  the `hosted_server_reports_unsupported_platforms_and_stops` test in
+  `src/main.rs`, which still passed `display: None` after `ServeRequest.display`
+  became a `DisplaySelection`.
+- Rust (macos-latest): Clippy failed with dead code in `src/helpers.rs`. The
+  text of `Action::Copy` is read only by the Windows helper runner.
+
+Neither error came from this feature: both are in code compiled only on
+non-Windows targets, which no automated build had compiled before. Tests did not
+run on either system because Clippy runs first. Both errors are fixed in the
+next commit, whose run is recorded below.

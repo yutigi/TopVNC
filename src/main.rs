@@ -2304,7 +2304,7 @@ mod tests {
             tls: Default::default(),
             performance: PerformanceMode::Standard,
             address: "127.0.0.1:0".into(),
-            display: None,
+            display: desktop_host::DisplaySelection::Primary,
             password: Some("secret".into()),
             allow_insecure: false,
             scale: 1.0,
