@@ -1,0 +1,112 @@
+# Repository gates from AGENTS.md on every pull request and on main:
+# formatting, Clippy and workspace tests on Windows, macOS and Linux, plus the
+# WebAssembly browser client, its Node tests, and the Cloudflare Worker.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # rust-toolchain.toml pins the compiler, Clippy and rustfmt.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Workspace
+        run: cargo fmt --all --check
+      - name: Cloudflare Worker
+        run: cargo fmt --all --check --manifest-path gateway/cloudflare/worker/Cargo.toml
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      # display-info links libxcb with RandR and Render. winit loads Wayland,
+      # X11 and xkbcommon at run time, so they need no headers to build.
+      - name: Install Linux build libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxcb1-dev libxcb-randr0-dev libxcb-render0-dev
+      # rust-toolchain.toml pins the compiler, Clippy and rustfmt.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace
+
+  web:
+    name: Browser client and Worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # rust-toolchain.toml pins the compiler, Clippy and rustfmt.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Add the WebAssembly target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            gateway/cloudflare/worker -> target
+      - name: Clippy, browser client (wasm32)
+        run: cargo clippy --locked --target wasm32-unknown-unknown -p topvnc-web -- -D warnings
+      - name: Clippy, Cloudflare Worker (wasm32)
+        run: cargo clippy --locked --target wasm32-unknown-unknown --manifest-path gateway/cloudflare/worker/Cargo.toml -- -D warnings
+      - name: Build Cloudflare Worker (wasm32)
+        run: cargo build --locked --release --target wasm32-unknown-unknown --manifest-path gateway/cloudflare/worker/Cargo.toml
+      # web/scripts/build.mjs requires the wasm-bindgen CLI that matches the
+      # root Cargo.lock, installed under .tools.
+      - name: Read the pinned wasm-bindgen version
+        id: bindgen
+        run: echo "version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: tools
+        with:
+          path: .tools
+          key: wasm-bindgen-cli-${{ steps.bindgen.outputs.version }}-${{ runner.os }}
+      - name: Install wasm-bindgen CLI
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version "${{ steps.bindgen.outputs.version }}" --locked --root .tools
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+      - name: Build browser client
+        working-directory: web
+        run: npm run build
+      - name: Test browser client
+        working-directory: web
+        run: npm test
+      - name: Test WebAssembly bindings
+        working-directory: web
+        run: npm run test:wasm
