@@ -10,7 +10,7 @@ members = [
 ]
 # The Cloudflare feasibility harness and the Worker (WASM only) are their own
 # workspaces.
-exclude = ["gateway/cloudflare/spike", "gateway/cloudflare/worker"]
+exclude = ["gateway/cloudflare/spike"]
 
 [package]
 name = "topvnc"

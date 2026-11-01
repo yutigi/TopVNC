@@ -3,14 +3,12 @@
 # Paid. The Worker name decides the workers.dev hostname that the Access
 # application must protect.
 name = "topvnc"
-main = "build/index.js"
+main = "src/index.mjs"
 compatibility_date = "2026-10-29"
 workers_dev = true
 preview_urls = false
 account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"
 
-[build]
-command = "node scripts/build.mjs"
 
 # The browser client, built by `npm run build` in web/. Matching files are
 # served without running Worker code; only /ws reaches the Worker.

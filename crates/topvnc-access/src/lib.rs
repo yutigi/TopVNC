@@ -453,6 +453,70 @@ mod tests {
         }
     }
 
+    /// The Cloudflare Worker reimplements these checks in JavaScript and is
+    /// tested against the same tokens. Regenerate the file after changing
+    /// the fixtures with `TOPVNC_WRITE_ACCESS_VECTORS=1 cargo test -p topvnc-access`.
+    #[test]
+    fn worker_test_vectors_match_rust_fixtures_and_verdicts() {
+        let policy = fixtures::policy();
+        let keys = KeySet::parse(fixtures::jwks().as_bytes()).unwrap();
+        let now = fixtures::NOW;
+        let claims = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut c = serde_json::json!({"iss":policy.issuer,"aud":[policy.audience],
+                "email":policy.owner_email,"exp":now + 300});
+            edit(&mut c);
+            fixtures::sign(c)
+        };
+        let valid = claims(&|_| {});
+        let forged = {
+            let mut parts: Vec<_> = valid.split('.').map(str::to_owned).collect();
+            parts[1] = URL_SAFE_NO_PAD.encode(br#"{"exp":9999999999,"email":"owner@example.com"}"#);
+            parts.join(".")
+        };
+        let accepted = serde_json::json!({
+            "array_audience": valid,
+            "single_audience": claims(&|c| c["aud"] = policy.audience.clone().into()),
+            "email_ascii_case": claims(&|c| c["email"] = "OWNER@Example.COM".into()),
+            "nbf_now": claims(&|c| c["nbf"] = now.into()),
+        });
+        let rejected = serde_json::json!({
+            "expired": claims(&|c| c["exp"] = now.into()),
+            "wrong_issuer": claims(&|c| c["iss"] = "https://another.cloudflareaccess.com".into()),
+            "wrong_audience": claims(&|c| c["aud"] = serde_json::json!(["different-app"])),
+            "wrong_email": claims(&|c| c["email"] = "other@example.com".into()),
+            "future_nbf": claims(&|c| c["nbf"] = (now + 1).into()),
+            "missing_exp": claims(&|c| { c.as_object_mut().unwrap().remove("exp"); }),
+            "forged_payload": forged,
+            "unknown_key": valid.replacen(
+                &URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"test-key"}"#),
+                &URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"other-key"}"#), 1),
+        });
+        for token in accepted.as_object().unwrap().values() {
+            assert!(keys.verify(token.as_str().unwrap(), &policy, now).is_ok());
+        }
+        for (name, token) in rejected.as_object().unwrap() {
+            assert!(
+                keys.verify(token.as_str().unwrap(), &policy, now).is_err(),
+                "{name}"
+            );
+        }
+        let vectors = serde_json::json!({
+            "now": now, "origin": ORIGIN, "issuer": policy.issuer,
+            "audience": policy.audience, "owner_email": policy.owner_email,
+            "jwks": fixtures::jwks(), "accepted": accepted, "rejected": rejected,
+        });
+        let text = serde_json::to_string_pretty(&vectors).unwrap() + "\n";
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../gateway/cloudflare/worker/test/access-vectors.json"
+        );
+        if std::env::var_os("TOPVNC_WRITE_ACCESS_VECTORS").is_some() {
+            std::fs::write(path, &text).unwrap();
+        }
+        let saved = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+        assert_eq!(saved, text, "regenerate {path}");
+    }
+
     #[test]
     fn rejects_signed_tokens_with_wrong_issuer_future_nbf_or_missing_expiry() {
         let policy = fixtures::policy();

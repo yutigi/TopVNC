@@ -96,26 +96,26 @@ The tunnel token (step 5) goes in its own file, not in either config.
 
 ### 1. Install the pinned build tools
 
-These exact versions must match the lock files:
+The browser client's bindings must match the version in `Cargo.lock`. The
+Worker is plain JavaScript and needs only Wrangler:
 
 ```powershell
 # Repository root: bindings for the browser client.
 cargo install wasm-bindgen-cli --version 0.2.128 --locked --root .tools
 
-# Worker directory: the Worker packager and its bindings.
+# Worker directory: Wrangler.
 cd gateway/cloudflare/worker
-cargo install worker-build --version 0.8.7 --locked --root .tools
-cargo install wasm-bindgen-cli --version 0.2.129 --locked --root .tools
 npm ci
 cd ../../..
 ```
 
-The build scripts refuse to run with a missing or different tool and print
-the `cargo install` command to fix it.
+The browser client's build refuses to run with a missing or different tool
+and prints the `cargo install` command to fix it.
 
-**Verified 2026-11-01, locally:** the versions match `Cargo.lock` (0.2.128),
-`gateway/cloudflare/worker/Cargo.lock` (0.2.129), and the Worker's
-`worker = "=0.8.7"`; the installed tools and both `npm ci` runs worked.
+**Verified 2026-11-01, locally:** the version matches `Cargo.lock` (0.2.128);
+the installed tool and both `npm ci` runs worked. The Worker was Rust
+compiled to WebAssembly until 2026-11-01 and needed two more pinned tools;
+see [Free-plan Worker CPU](#free-plan-worker-cpu).
 
 ### 2. Sign in to Cloudflare
 
@@ -270,8 +270,8 @@ npm test
 npm run build
 npm run test:wasm
 cd ../gateway/cloudflare/worker
-npm run deploy:check   # dry run: builds everything and checks the config
-npm run deploy         # publishes the page and the Worker
+npm run deploy:check   # dry run: Worker tests, page build, config check
+npm run deploy         # the same, then publishes the page and the Worker
 cd ../../..
 ```
 
@@ -286,9 +286,11 @@ a future date during the first live deploy (API error 10021).
 `npm ci`, `npm test` (9 pass), `npm run build`, `npm run test:wasm` (2 pass),
 and `npm run deploy:check` with the owner's config, plus
 `npx wrangler deploy --dry-run --config wrangler.example.toml`. Both dry runs
-read 6 assets (649.51 KiB, 224.53 KiB gzip) and list the `HOST_NET` VPC
-binding and the five variables. `npm run deploy` itself last ran live on
-2026-10-31 (versions `9e792e97` and `31ffb4b5`), with the Phase 0 Worker name.
+read 6 assets and list the `HOST_NET` VPC binding and the five variables.
+With the JavaScript Worker, `deploy:check` also runs the Worker's tests
+(17 pass) and the upload is 14.01 KiB (4.71 KiB gzip); the Rust Worker's was
+649.51 KiB. `npm run deploy` itself last ran live on 2026-10-31 (versions
+`9e792e97` and `31ffb4b5`), with the Rust Worker and the Phase 0 Worker name.
 
 ## Pair your phone
 
@@ -380,7 +382,7 @@ Ctrl+C in all three windows.
 | The gateway stops with `app origin must be an exact HTTPS workers.dev origin` | `app_origin` in `gateway.local.toml` still holds a placeholder, has uppercase letters, or ends with `/`. |
 | `cargo run` says it `could not determine which binary to run` | Add `--bin topvnc-web-gateway`, as in [step 7](#7-create-the-host-key). |
 | Connect fails right after a deploy or a long idle period | Possibly the [cold-start CPU risk](#free-plan-worker-cpu). Press **Connect** again, and look for `exceededCpu` in the Worker's analytics. |
-| A build asks you to install a pinned tool | Run the `cargo install` command it prints, from the directory it names ([step 1](#1-install-the-pinned-build-tools)). |
+| A build asks you to install a pinned tool | Run the `cargo install` command it prints, from the repository root ([step 1](#1-install-the-pinned-build-tools)). |
 | The QR code does not scan | Maximize the console and use a dark background. |
 
 The gateway console logs why each session ended (`relay closed: code=…` or
@@ -391,14 +393,35 @@ appear as `1011` there.
 
 This is an **open risk, not a passed check.** Workers Free allows 10 ms of
 CPU per invocation. Only `/ws` upgrades run Worker code; the page's files are
-served without it. Workers analytics from 2026-10-30 to 2026-10-31 counted 88
+served without it. No paid plan is assumed.
+
+**Rust Worker, 2026-10-30 to 2026-10-31.** Workers analytics counted 88
 upgrades with no errors and none marked `exceededCpu`. Warm upgrades used
 about 1.6-4 ms. The 7 cold upgrades, where a fresh isolate fetches and parses
 the Access signing keys, used 13.0-18.7 ms; the highest was the first upgrade
 after a deploy. None was terminated, but Cloudflare does not promise that it
-will not terminate them. If it does, that connection attempt fails; a retry
-is the expected workaround but has not been observed. No paid plan is
-assumed.
+will not terminate them. If it does, that connection attempt fails.
+
+**Why, measured locally on 2026-11-01** (Node 22.18.0 on the Ryzen 9 9950X3D
+host, which is faster than Cloudflare's servers). The same key parse and
+RS256 check as the Worker, compiled to WebAssembly, cost about 7.3 ms in a
+fresh process: 3.3 ms to load and instantiate the module, 1.1 ms for the
+first key parse, and 3.0 ms for the first signature check, most of it
+compiling and warming the WebAssembly code. Warm, the check took 0.44 ms.
+
+**JavaScript Worker, since 2026-11-01.** The Worker was rewritten in plain
+JavaScript using WebCrypto, which runs in the runtime's native code. The
+upload shrank from 649.51 KiB to 14.01 KiB. The same fresh-process
+measurement is about 2.8 ms: 1.3 ms to import the module (mostly Node's
+module loader), 0.6 ms for the key parse, and 0.9 ms for the signature
+check. That is a local comparison only. Whether cold upgrades now stay under
+10 ms is unproven until the redeployed Worker's analytics show it.
+
+The JavaScript checks mirror `crates/topvnc-access`, and the private gateway
+still repeats every check with that crate before it opens a session.
+`gateway/cloudflare/worker/test/access-vectors.json` holds tokens signed by
+the crate's fixtures; the crate's tests keep the file current, and the
+Worker's tests must accept and reject the same tokens.
 
 ## Runbook verification
 
@@ -411,14 +434,14 @@ probe's Worker, tunnel, and VPC service names (`topvnc-connection-spike`,
 
 | Step | Checked 2026-11-01 | Live evidence | Still needs a live run |
 | --- | --- | --- | --- |
-| 1. Tools | Versions match the lock files; `npm ci` in both directories | Used for the live deploys | |
+| 1. Tools | Version matches `Cargo.lock`; `npm ci` in both directories | Used for the live deploys | |
 | 2. Sign in | `wrangler whoami` (4.155.0) | Free plans confirmed in the dashboard, 2026-10-30 | |
 | 3. Config files | Keys match what the Worker and gateway read; dry runs with both configs | Owner's files deployed, 2026-10-31 | |
 | 4. Access | Unauthenticated `/` and `/ws` get 302 to Access | Application saved, 2026-10-30 | Sign in with a different email and confirm Access refuses it |
 | 5. Tunnel | `cargo web-tunnel` stops cleanly without the token file; cloudflared 2026.10.3 has `--token-file` | Phase 0 tunnel and `cargo tunnel` | Token at `gateway/cloudflare/tunnel-token.txt` and `cargo web-tunnel` reaching `Registered tunnel connection` |
 | 6. VPC service | Flags match `vpc service create --help`; `vpc service list` shows the live service | Created as `topvnc-spike`, 2026-10-30 | |
 | 7. Host key | Created, refused to overwrite, and restricted in a scratch directory; `--bin` fix | Phase 0 key `a1d1-…`, made by the probe's CLI | |
-| 8. Build and deploy | Everything up to and including `deploy:check` | `npm run deploy`, 2026-10-31 | Deploy the current branch, which has changed since |
+| 8. Build and deploy | Everything up to and including `deploy:check`; JavaScript Worker dry run | `npm run deploy`, 2026-10-31 (Rust Worker) | Deploy the current branch, which has changed since, and read cold-upgrade CPU |
 | Pair your phone | Pairing through **Connect** in the local harness (2026-10-31) | Phase 0 `cargo pair` | `cargo web-pair`, then pair a browser over the live route |
 | Each session | Plain `--serve` fails without TLS; gateway ready line | Desktop control from iPhone Safari, 2026-10-31, with plain `--serve` | One session with `--serve 127.0.0.1:5900 --unencrypted`, `cargo web-tunnel`, and `cargo web-gateway` |
 

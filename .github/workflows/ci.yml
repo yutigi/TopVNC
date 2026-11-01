@@ -34,8 +34,6 @@ jobs:
         run: rustup toolchain install
       - name: Workspace
         run: cargo fmt --all --check
-      - name: Cloudflare Worker
-        run: cargo fmt --all --check --manifest-path gateway/cloudflare/worker/Cargo.toml
 
   rust:
     name: Rust (${{ matrix.os }})
@@ -79,16 +77,8 @@ jobs:
       - name: Add the WebAssembly target
         run: rustup target add wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            gateway/cloudflare/worker -> target
       - name: Clippy, browser client (wasm32)
         run: cargo clippy --locked --target wasm32-unknown-unknown -p topvnc-web -- -D warnings
-      - name: Clippy, Cloudflare Worker (wasm32)
-        run: cargo clippy --locked --target wasm32-unknown-unknown --manifest-path gateway/cloudflare/worker/Cargo.toml -- -D warnings
-      - name: Build Cloudflare Worker (wasm32)
-        run: cargo build --locked --release --target wasm32-unknown-unknown --manifest-path gateway/cloudflare/worker/Cargo.toml
       # web/scripts/build.mjs requires the wasm-bindgen CLI that matches the
       # root Cargo.lock, installed under .tools.
       - name: Read the pinned wasm-bindgen version
@@ -119,3 +109,7 @@ jobs:
       - name: Test WebAssembly bindings
         working-directory: web
         run: npm run test:wasm
+      # Plain JavaScript with node:test; it needs no npm install.
+      - name: Test Cloudflare Worker
+        working-directory: gateway/cloudflare/worker
+        run: npm test

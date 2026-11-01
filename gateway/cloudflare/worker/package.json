@@ -4,9 +4,10 @@
   "scripts": {
     "login": "wrangler login",
     "whoami": "wrangler whoami",
+    "test": "node --test",
     "build:web": "npm --prefix ../../../web run build",
-    "deploy:check": "npm run build:web && wrangler deploy --dry-run --config wrangler.local.toml",
-    "deploy": "npm run build:web && wrangler deploy --config wrangler.local.toml"
+    "deploy:check": "npm test && npm run build:web && wrangler deploy --dry-run --config wrangler.local.toml",
+    "deploy": "npm test && npm run build:web && wrangler deploy --config wrangler.local.toml"
   },
   "devDependencies": {
     "wrangler": "4.155.0"
