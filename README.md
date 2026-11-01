@@ -41,7 +41,7 @@ The protocol implementation handles RFB 3.3, 3.7, and 3.8. Apple's `RFB 003.889`
 
 ## Quick start
 
-You need a stable Rust toolchain with Cargo and native build tools for your platform. Windows and macOS are the currently tested client platforms. To connect, you also need a reachable TLS-wrapped VNC server configured for standard VNC password authentication. Native connections now require TLS 1.3 by default; see [Native TLS setup](docs/native-tls.md) for certificates and legacy compatibility.
+You need native build tools and rustup. The repository selects stable Rust 1.99.0 through `rust-toolchain.toml`, matching CI. Windows and macOS are the currently tested client platforms. To connect, you also need a reachable TLS-wrapped VNC server configured for standard VNC password authentication. Native connections now require TLS 1.3 by default; see [Native TLS setup](docs/native-tls.md) for certificates and legacy compatibility.
 
 ```sh
 git clone https://github.com/yutigi/TopVNC.git
