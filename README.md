@@ -396,6 +396,7 @@ cargo run
 | [`specs/004-vnc-server/spec.md`](specs/004-vnc-server/spec.md) | Server scope, security behavior, and limitations. |
 | [`specs/`](specs/) | Feature scope and acceptance criteria. |
 | [`crates/topvnc-rfb`](crates/topvnc-rfb) | Client RFB protocol without sockets or UI, shared by the native and browser viewers. |
+| [`crates/topvnc-net`](crates/topvnc-net) | The few socket system calls the safe crates cannot make, such as waking a Windows reader thread when the server closes a client. |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Formatting, Clippy, and tests on Windows, macOS, and Ubuntu, plus the WebAssembly browser client and Worker. |
 | [`crates/topvnc-web`](crates/topvnc-web) and [`web/`](web/) | Browser client: Rust/WASM session and the page. |
 | [`crates/topvnc-web-gateway`](crates/topvnc-web-gateway) | Host gateway between the encrypted browser channel and `topvnc --serve`. |

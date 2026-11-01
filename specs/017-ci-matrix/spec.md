@@ -60,24 +60,31 @@ vanished kept its thread and one of the eight connection slots, and
 `ClientDisconnected` never arrived. A standalone probe confirmed that a blocked
 read is still blocked two seconds after `shutdown(Both)`.
 
-Fix: the native TLS work (`specs/016-native-tls`, PR #6) fixed the same bug
-independently, and its fix is the one kept. The reader thread reads a clone of
-the session's `NativeStream` with a 100 ms receive timeout, through
-`ServerInputReader`, which retries timed-out reads inside `Read` so a partial
-RFB message is not lost, and returns `ConnectionAborted` once the session sets
-its stop flag. A first fix on this branch cancelled the reader's pending I/O
-with `CancelIoEx` instead. It was dropped when the branches merged, because it
-only wakes a read issued on the same socket handle, and the TLS reader reads
-through its own cloned handle.
+Fix: the session registry, the session's `NativeStream` and every clone of it
+share one socket handle (`Arc<TcpStream>`), and every server-side close goes
+through `shut_down_client` or `NativeStream::interrupt_reads`, which shut the
+socket down and then call `topvnc_net::interrupt_reads`. On Windows that cancels
+the handle's pending I/O (`CancelIoEx`); elsewhere it does nothing. The one
+unsafe call lives in `crates/topvnc-net`, so `src/lib.rs` keeps
+`#![forbid(unsafe_code)]`. A read that starts just as the socket shuts down can
+miss one cancellation, so the session repeats it for up to about 200 ms until
+the reader thread has finished. The probe also confirmed that bytes received
+before the shutdown are still read in order and that a read started afterwards
+returns at once.
 
-Known trade-off: Winsock documents a connection as indeterminate after a
-blocking receive times out (`SO_RCVTIMEO`). The automated tests, including
-the TLS session tests, have not shown lost or reordered input, but that is not
-a guarantee.
+The native TLS work (`specs/016-native-tls`) fixed the same bug independently
+with a 100 ms receive timeout that let the reader poll a stop flag. That was
+replaced when the branches merged. Winsock documents a connection as
+indeterminate after a blocking receive times out (`SO_RCVTIMEO`), and an idle
+session timed out ten times a second. A cancellation happens only when the
+session is already closing, so it cannot lose input the session still needs.
+Sharing the handle is what lets the cancellation reach the TLS reader, which
+reads through a clone of the session stream.
 
-Regression tests: the resize test above and
-`stopping_the_server_disconnects_a_client_that_keeps_its_socket_open`, which
-both pass on Windows with the polling reader.
+Regression tests: the resize test above,
+`stopping_the_server_disconnects_a_client_that_keeps_its_socket_open`, and three
+`topvnc-net` tests. With `interrupt_reads` temporarily made a no-op, both server
+tests fail on Windows; with it, they pass.
 
 ## Validation
 
