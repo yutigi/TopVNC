@@ -1,10 +1,85 @@
 # Validation: Cloudflare browser client
 
-Dates: 2026-10-30 to 2026-10-31. Branch `feat/cloudflare-web-client`, created
+Dates: 2026-10-30 to 2026-11-01. Branch `feat/cloudflare-web-client`, created
 from `main` at `03d1881`. **The production client, gateway, and Worker pass
 their local tests and a local browser run. The live encrypted route is partly
 validated (T026 open). Live desktop control, device, resource, and soak gates
 remain open (T011, T017, T020).**
+
+## Final workspace, WASM, and benchmark checks (T022, 2026-11-01)
+
+At `692835a`, clean apart from another agent's uncommitted
+`docs/cloudflare-gateway.md` edit. Windows 11 Pro (build 26200), Ryzen 9
+9950X3D, 32 logical CPUs: the machine used for the T012/T013 benchmarks. Rust
+1.99.0 and Cargo 1.99.0 (pinned by `rust-toolchain.toml`; T012/T013 used
+1.95.0), `wasm32-unknown-unknown` installed, `wasm-bindgen` CLI 0.2.128 under
+`.tools`, Node 22.18.0, npm 11.6.0, Wrangler 4.155.0. The commands are the CI
+workflow's (`.github/workflows/ci.yml`). Nothing was changed to make them
+pass.
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo fmt --all --check --manifest-path gateway/cloudflare/worker/Cargo.toml` | pass |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | pass |
+| `cargo test --locked --workspace` | pass: 263 passed, 7 ignored, 0 failed |
+| `cargo clippy --locked --target wasm32-unknown-unknown -p topvnc-web -- -D warnings` | pass |
+| `cargo clippy --locked --target wasm32-unknown-unknown -p topvnc-rfb -p topvnc-e2e -- -D warnings` (not in CI) | pass |
+| `cargo clippy --locked --target wasm32-unknown-unknown --manifest-path gateway/cloudflare/worker/Cargo.toml -- -D warnings` | pass |
+| `cargo build --locked --release --target wasm32-unknown-unknown --manifest-path gateway/cloudflare/worker/Cargo.toml` | pass |
+| `npm ci`, `npm run build` (in `web/`) | pass; WASM 417,852 bytes, `app.js` 33,742, `session-worker.js` 12,474 |
+| `npm test` (in `web/`) | pass, 9 |
+| `npm run test:wasm` (in `web/`) | pass, 2 |
+| `npx wrangler deploy --dry-run --config wrangler.example.toml` (in the Worker directory; not in CI) | pass: worker-build, 6 assets, 649.51 KiB (224.53 KiB gzip); nothing deployed |
+
+Workspace tests by target: `topvnc` library 89 (1 ignored), `topvnc` binary 94
+(6 ignored), `native_tls` 5, `topvnc-access` 6, `topvnc-e2e` 10, `topvnc-net`
+3, `topvnc-rfb` 22, `topvnc-web` 11, `topvnc-web-gateway` 20, tunnel launcher
+3. The Windows timeout in
+`clients_without_desktop_size_are_disconnected_on_resize`, recorded under
+T012/T013 and in the historical baseline, no longer occurs; spec 016 fixed it.
+The isolated `gateway/cloudflare/spike` workspace was not rerun.
+
+**Native benchmarks.** The T012/T013 method: the T012 driver script, the same
+four cases, release builds, below-normal priority, CPU time and peak working
+set sampled every 100 ms. "Before" is the frozen T012 build of `8321675`
+(Rust 1.95.0, `target/baseline-015/frozen`). "Now" is `692835a` built with
+Rust 1.99.0, copied to `target/bench-022/now`. They ran alternately in
+sessions a to d (before-a, now-a, before-b, now-b, and so on), two runs per
+session, giving eight runs per side. The two binaries differ in compiler as
+well as code, so a difference is not attributable to the code alone.
+
+Sessions a and b were not checked for other load. Right after them, another
+agent's `rustc` build was using about two CPU cores. Two "now-a" runs were
+outliers: Tight push at 111.0 fps, 7.05 / 15.6 ms, and Tight adaptive at
+27.2 fps, 43.0 / 90.4 ms. In "before-a", Tight fell to 118.6 fps and Raw to
+59.4 fps. Sessions c and d were started after 30 s with no compiler process,
+and none was seen before or after each session. The table gives the median of
+the eight runs and, in brackets, the range without the two outliers. Latency is `latency_bench` publish-to-decode, mean / p95; it
+excludes capture, GPU, and display.
+
+| Case | Before (`8321675`) | Now (`692835a`) | Median delta |
+| --- | --- | --- | --- |
+| 1080p framebuffer apply, row-slice mean | 0.389 ms [0.382–0.393] | 0.387 ms [0.383–0.406] | −0.002 ms |
+| Tight q6 push, direct, 120 fps, mean | 4.29 ms [4.21–4.68] | 4.40 ms [4.17–4.75] | +0.11 ms |
+| Tight q6 push, p95 | 5.40 ms [5.28–5.66] | 5.51 ms [5.09–6.09] | +0.11 ms |
+| Raw push, direct, 60 fps, mean | 4.95 ms [4.08–5.46] | 5.06 ms [4.34–6.27] | +0.11 ms |
+| Raw push, p95 | 5.85 ms [4.49–6.61] | 6.35 ms [4.64–7.17] | +0.50 ms |
+| Tight q6 adaptive, 100 Mbit/s, mean | 34.79 ms [34.39–35.12] | 35.07 ms [34.80–35.54] | +0.28 ms |
+| Tight q6 adaptive, p95 | 42.48 ms [41.88–42.78] | 42.90 ms [42.38–43.27] | +0.42 ms |
+| Tight q6 adaptive, delivered fps | 34.2–35.0 | 33.8–35.0 | — |
+| Tight push CPU seconds; peak working set | 25.7 [21.8–27.1]; 84.7–88.3 MiB | 26.2 [23.7–29.9]; 84.5–87.4 MiB | +0.5 s |
+| Raw push CPU seconds; peak working set | 2.25–2.92; 61.9 MiB | 2.36–3.22; 61.8–62.0 MiB | — |
+| Tight adaptive CPU seconds; peak working set | 6.59–8.92; 73.2–77.1 MiB | 7.50–9.97; 72.8–77.5 MiB | — |
+
+Every median delta is smaller than the spread between sessions of the same
+binary. One example: "now" Raw push averaged 6.27 and 5.83 ms in session c
+and 4.42 and 4.34 ms in session d. Session d had the lowest "now" latency on
+both direct-loopback cases. Today's "before" spread is also
+wider than on 2026-10-31 (Raw mean 4.08–5.46 ms against 4.59–4.74 ms). These
+short loopback runs show neither a regression nor an improvement, and none is
+claimed. Raw logs are in ignored `target/bench-022-*.txt` and
+`target/bench-022/`.
 
 ## Desktop-style page and session settings (2026-10-31)
 
