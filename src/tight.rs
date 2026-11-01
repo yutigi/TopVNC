@@ -214,7 +214,9 @@ mod tests {
         let mut output = Vec::new();
         TightDecoder::new().decode_all(body, width, height, &mut output)?;
         Ok(output
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]))
             .collect())
     }

@@ -46,7 +46,18 @@ fn encoding(config: &Config) -> Encoding {
     }
 }
 
-const USAGE: &str = "usage: topvnc [HOST:PORT] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--quality 0-9] [--progressive] [--ultra] [--smooth-motion | --immediate] [--input-debug]";
+fn connect_native(config: &Config) -> std::io::Result<Session> {
+    let address = config.address().map_err(std::io::Error::other)?;
+    Session::connect_with_transport(
+        &address,
+        config.tls.client(&config.host)?,
+        config.allow_insecure,
+        encoding(config),
+        || Ok(config.password.clone()),
+    )
+}
+
+const USAGE: &str = "usage: topvnc [HOST:PORT] [--tls-ca CA.pem] [--tls-server-name NAME] [--tls-cert CERT.pem --tls-key KEY.pem] [--unencrypted] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--quality 0-9] [--progressive] [--ultra] [--smooth-motion | --immediate] [--input-debug]";
 
 fn parse_quality(value: &str) -> Result<u8, Box<dyn Error>> {
     match value.parse::<u8>() {
@@ -503,6 +514,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut args = arguments.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--unencrypted" => config.tls.unencrypted = true,
+            "--tls-ca" => {
+                config.tls.ca = Some(args.next().ok_or("--tls-ca requires CA.pem")?.into())
+            }
+            "--tls-server-name" => {
+                config.tls.server_name = Some(args.next().ok_or("--tls-server-name requires NAME")?)
+            }
+            "--tls-cert" => {
+                config.tls.cert = Some(args.next().ok_or("--tls-cert requires CERT.pem")?.into())
+            }
+            "--tls-key" => {
+                config.tls.key = Some(args.next().ok_or("--tls-key requires KEY.pem")?.into())
+            }
             "--allow-insecure" => config.allow_insecure = true,
             "--fit" => config.window_mode = WindowMode::Fit,
             "--native-size" => config.window_mode = WindowMode::Native,
@@ -534,6 +558,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.host = host.to_string();
         config.port = port.to_string();
     }
+
+    config.serve.tls = config.tls.clone();
+    config.tls.client(&config.host)?;
 
     #[cfg(windows)]
     let _timer = TimerResolution::new();
@@ -658,6 +685,7 @@ impl HostedServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (events, receiver) = mpsc::channel();
         let options = ServeOptions {
+            tls: request.tls,
             performance: request.performance,
             address: request.address,
             display: request.display,
@@ -1169,21 +1197,14 @@ fn show_landing(
         }
         if connect_clicked && !connecting {
             match config.address() {
-                Ok(address) => {
+                Ok(_) => {
                     state.error = None;
                     connecting = true;
                     let sender = result_tx.clone();
-                    let password = config.password.clone();
-                    let allow_insecure = config.allow_insecure;
-                    let encoding = encoding(&config);
+                    let connection_config = config.clone();
                     thread::spawn(move || {
-                        let result = Session::connect_with_encoding(
-                            &address,
-                            allow_insecure,
-                            encoding,
-                            || Ok(password.clone()),
-                        )
-                        .map_err(|error| error.to_string());
+                        let result =
+                            connect_native(&connection_config).map_err(|error| error.to_string());
                         let _ = sender.send(result);
                     });
                 }
@@ -2280,6 +2301,7 @@ mod tests {
     fn hosted_server_reports_unsupported_platforms_and_stops() {
         let mut server = HostedServer::default();
         server.start(ServeRequest {
+            tls: Default::default(),
             performance: PerformanceMode::Standard,
             address: "127.0.0.1:0".into(),
             display: None,
@@ -2377,3 +2399,7 @@ mod stage_timing {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/native/app.rs"]
+mod native_connection_tests;
