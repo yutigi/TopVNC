@@ -117,3 +117,21 @@ Neither error came from this feature: both are in code compiled only on
 non-Windows targets, which no automated build had compiled before. Tests did not
 run on either system because Clippy runs first. Both errors are fixed in the
 next commit, whose run is recorded below.
+
+### Second GitHub run
+
+Run 41320175274 on commit `344af48`: all five jobs passed.
+
+| Job | Clippy (`-D warnings`) | Tests |
+| --- | --- | --- |
+| Rust (windows-latest) | clean | 263 passed, 7 ignored, 0 failed |
+| Rust (macos-latest) | clean | 259 passed, 2 ignored, 0 failed |
+| Rust (ubuntu-latest) | clean | 255 passed, 2 ignored, 0 failed |
+| Format | clean | n/a |
+| Browser client and Worker | clean | `npm test` and `npm run test:wasm` passed |
+
+The counts differ because some tests are compiled only for one platform. This
+shows that the workspace compiles and its automated tests pass on hosted macOS
+and Ubuntu runners. It does not show that live desktop capture, input
+injection or GPU presentation work there, and the README's platform claims are
+unchanged.
