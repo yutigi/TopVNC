@@ -103,7 +103,8 @@ pub enum Action {
     Firewall,
     SetFirewall,
     ResetFirewall,
-    Copy(String),
+    // Only the Windows runner pipes this text into PowerShell.
+    Copy(#[cfg_attr(not(windows), allow(dead_code))] String),
 }
 
 impl Action {
