@@ -3272,6 +3272,7 @@ dependencies = [
  "objc2-screen-capture-kit",
  "pollster",
  "rpassword",
+ "topvnc-net",
  "topvnc-rfb",
  "wgpu",
  "windows",
@@ -3300,6 +3301,13 @@ dependencies = [
  "blake2",
  "getrandom 0.3.4",
  "snow",
+]
+
+[[package]]
+name = "topvnc-net"
+version = "0.2.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
