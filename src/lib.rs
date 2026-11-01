@@ -4809,6 +4809,22 @@ mod tests {
     }
 
     #[test]
+    fn stopping_the_server_disconnects_a_client_that_keeps_its_socket_open() {
+        let (server, address) = start_insecure_server(Framebuffer::new(2, 1).unwrap());
+        // The client never closes or sends again, like a peer that dropped
+        // off the network, so only the server can end its reader thread.
+        let (mut client, _, _) = raw_client(address, &[0]);
+        request(&mut client, false, 2, 1);
+        read_rectangles(&mut client);
+        server.stop();
+        assert_eq!(
+            server.recv_event_timeout(Duration::from_secs(1)).unwrap(),
+            ClientEvent::ClientDisconnected { client_id: 1 }
+        );
+        drop(client);
+    }
+
+    #[test]
     fn pending_incremental_request_is_answered_by_the_next_change() {
         let (server, address) = start_insecure_server(Framebuffer::new(2, 1).unwrap());
         let (mut client, _, _) = raw_client(address, &[0]);

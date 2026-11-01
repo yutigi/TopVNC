@@ -2,7 +2,6 @@
 members = [
     ".",
     "crates/topvnc-rfb",
-    "crates/topvnc-net",
     "crates/topvnc-e2e",
     "crates/topvnc-access",
     "crates/topvnc-web-gateway",
@@ -19,7 +18,6 @@ edition = "2024"
 
 [dependencies]
 topvnc-rfb = { path = "crates/topvnc-rfb" }
-topvnc-net = { path = "crates/topvnc-net" }
 bytemuck = "1"
 display-info = "0.5.9"
 flate2 = "1.1"
