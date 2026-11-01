@@ -635,9 +635,20 @@ impl SessionWaker {
     }
 }
 
+/// Shuts a client socket down and wakes the reader thread blocked on it. The
+/// stream must be the handle that reader uses: on Windows, a shutdown alone
+/// leaves an already blocked read waiting for the peer, which would hold the
+/// client's connection slot until the peer closes.
+fn shut_down_client(stream: &TcpStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    topvnc_net::interrupt_reads(stream);
+}
+
 #[derive(Default)]
 struct ServerSessions {
-    streams: std::collections::HashMap<u64, TcpStream>,
+    /// Each client's reader handle, shared with its reader thread so that
+    /// closing the session can wake that thread.
+    streams: std::collections::HashMap<u64, Arc<TcpStream>>,
     wakers: std::collections::HashMap<u64, SessionWaker>,
     exclusive_client: Option<u64>,
 }
@@ -653,7 +664,7 @@ impl ServerSessions {
         }
     }
 
-    fn register(&mut self, client_id: u64, stream: TcpStream) -> io::Result<()> {
+    fn register(&mut self, client_id: u64, stream: Arc<TcpStream>) -> io::Result<()> {
         if self.exclusive_client.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -664,13 +675,15 @@ impl ServerSessions {
         Ok(())
     }
 
-    fn admit(&mut self, client_id: u64, shared: bool) -> io::Result<()> {
-        if !self.streams.contains_key(&client_id) {
+    /// Admits a registered client and returns the stream its reader thread
+    /// must use.
+    fn admit(&mut self, client_id: u64, shared: bool) -> io::Result<Arc<TcpStream>> {
+        let Some(stream) = self.streams.get(&client_id).map(Arc::clone) else {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "RFB session is no longer registered",
             ));
-        }
+        };
         match (shared, self.exclusive_client) {
             (true, Some(exclusive)) if exclusive != client_id => {
                 return Err(io::Error::new(
@@ -687,14 +700,14 @@ impl ServerSessions {
             (false, _) => {
                 for (other_id, stream) in &self.streams {
                     if *other_id != client_id {
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        shut_down_client(stream);
                     }
                 }
                 self.exclusive_client = Some(client_id);
             }
             _ => {}
         }
-        Ok(())
+        Ok(stream)
     }
 
     fn remove(&mut self, client_id: u64) {
@@ -707,7 +720,7 @@ impl ServerSessions {
 
     fn shutdown_all(&self) {
         for stream in self.streams.values() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            shut_down_client(stream);
         }
     }
 }
@@ -1028,7 +1041,7 @@ impl VncServer {
                 sessions
                     .lock()
                     .map_err(|_| invalid("session registry lock is poisoned"))?
-                    .register(client_id, session_stream)
+                    .register(client_id, Arc::new(session_stream))
             });
             if registration.is_err() {
                 self.active_clients
@@ -1261,7 +1274,7 @@ fn serve_client(
     if share_flag[0] > 1 {
         return Err(invalid("invalid ClientInit shared flag"));
     }
-    sessions
+    let reader_stream = sessions
         .lock()
         .map_err(|_| invalid("session registry lock is poisoned"))?
         .admit(client_id, share_flag[0] != 0)?;
@@ -1303,7 +1316,7 @@ fn serve_client(
     // The pointer mode last announced to the client, which its reader uses.
     let announced_relative = Arc::new(AtomicBool::new(false));
     let reader = {
-        let mut stream = stream.try_clone()?;
+        let stream = Arc::clone(&reader_stream);
         let mut state = ClientReader {
             client_id,
             focus: Arc::clone(&shared.focus),
@@ -1321,6 +1334,7 @@ fn serve_client(
                 if let Some(setup) = thread_setup {
                     setup();
                 }
+                let mut stream: &TcpStream = &stream;
                 let error = loop {
                     if let Err(error) =
                         read_client_message(&mut stream, &session_sender, &events, &mut state)
@@ -1342,7 +1356,7 @@ fn serve_client(
     );
     // Unblock the reader, then wait for it so every input event from this
     // client is queued before the caller reports the disconnect.
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    shut_down_client(&reader_stream);
     drop(session_receiver);
     let _ = reader.join();
     result
@@ -1436,7 +1450,7 @@ impl ClientReader {
 }
 
 fn read_client_message(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     session: &SyncSender<SessionInput>,
     events: &SyncSender<ClientEvent>,
     state: &mut ClientReader,
@@ -4021,18 +4035,18 @@ mod tests {
         let (server_two, _peer_two) = tcp_pair();
         let (server_three, _peer_three) = tcp_pair();
         let mut sessions = ServerSessions::default();
-        sessions.register(1, server_one).unwrap();
-        sessions.register(2, server_two).unwrap();
+        sessions.register(1, Arc::new(server_one)).unwrap();
+        sessions.register(2, Arc::new(server_two)).unwrap();
         sessions.admit(1, true).unwrap();
         sessions.admit(2, false).unwrap();
 
         let mut byte = [0];
         assert_eq!(peer_one.read(&mut byte).unwrap(), 0);
-        assert!(sessions.register(3, server_three).is_err());
+        assert!(sessions.register(3, Arc::new(server_three)).is_err());
         sessions.remove(2);
 
         let (server_four, _) = tcp_pair();
-        sessions.register(4, server_four).unwrap();
+        sessions.register(4, Arc::new(server_four)).unwrap();
         sessions.admit(4, true).unwrap();
     }
 
@@ -4741,6 +4755,22 @@ mod tests {
     }
 
     #[test]
+    fn stopping_the_server_disconnects_a_client_that_keeps_its_socket_open() {
+        let (server, address) = start_insecure_server(Framebuffer::new(2, 1).unwrap());
+        // The client never closes or sends again, like a peer that dropped
+        // off the network, so only the server can end its reader thread.
+        let (mut client, _, _) = raw_client(address, &[0]);
+        request(&mut client, false, 2, 1);
+        read_rectangles(&mut client);
+        server.stop();
+        assert_eq!(
+            server.recv_event_timeout(Duration::from_secs(1)).unwrap(),
+            ClientEvent::ClientDisconnected { client_id: 1 }
+        );
+        drop(client);
+    }
+
+    #[test]
     fn pending_incremental_request_is_answered_by_the_next_change() {
         let (server, address) = start_insecure_server(Framebuffer::new(2, 1).unwrap());
         let (mut client, _, _) = raw_client(address, &[0]);
@@ -4912,7 +4942,7 @@ mod tests {
             server_sessions
                 .lock()
                 .unwrap()
-                .register(44, stream.try_clone().unwrap())
+                .register(44, Arc::new(stream.try_clone().unwrap()))
                 .unwrap();
             let result = serve_client(&mut stream, &session, &tx, &config, &server_sessions, 44);
             let _ = tx.send(ClientEvent::ClientDisconnected { client_id: 44 });
