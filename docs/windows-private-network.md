@@ -28,6 +28,8 @@ scope to check its state before retrying. Existing execution policy is respected
 
    ```powershell
    $env:TOPVNC_BIND = '192.168.50.10:5900' # Replace with your local VPN IPv4 and port
+   $env:TOPVNC_TLS_CERT = 'C:\TopVNC-certs\server.pem'
+   $env:TOPVNC_TLS_KEY = 'C:\TopVNC-certs\server-key.pem'
    .\scripts\Start-TopVncWorkServer.cmd
    ```
 
@@ -46,12 +48,11 @@ scope to check its state before retrying. Existing execution policy is respected
    ```
 
    Check `TcpTestSucceeded`, then connect the viewer to that address with the
-   password entered on the server. Ping alone does not establish TCP access.
+   password entered on the server. Use `--tls-ca server.pem` for a private host certificate, with a matching DNS/IP identity (see [Native TLS setup](native-tls.md)). Ping alone does not establish TCP access.
 
 Review existing firewall scope before proposing a new rule. An allow rule may
 still be overridden by managed policy or a VPN filter. The launcher does not
-control VPNs, firewall rules, audit settings, or execution policy. TopVNC traffic
-is unencrypted; retain a trusted private transport. Keep actual deployment
+control VPNs, firewall rules, audit settings, or execution policy. Native TopVNC traffic uses TLS 1.3 by default; the launcher requires the two PEM credential paths and never falls back to plaintext. Keep actual deployment
 addresses, machine names, and firewall-rule identifiers out of shared runbooks.
 
 ## Inspect the server
@@ -84,7 +85,7 @@ A successful test on the server itself does not establish remote reachability.
 A timeout can involve routing, VPN permissions, filtering, or a stopped server;
 it does not identify the firewall as the cause. TCP success proves only TCP
 reachability, not RFB authentication, desktop capture, or remote input.
-TopVNC's TCP traffic is unencrypted: use a trusted private network or secure tunnel.
+TCP reachability also does not establish TLS identity validation. TLS certificates must match the name/IP the viewer verifies; plaintext requires an explicit `--unencrypted` launch outside this launcher.
 
 ## Preview a scoped firewall proposal
 
