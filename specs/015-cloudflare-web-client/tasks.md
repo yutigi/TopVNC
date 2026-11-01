@@ -42,7 +42,7 @@
 ## Polish
 
 - [ ] T021 Write the tested Free-plan deployment runbook and supported-device matrix in docs/cloudflare-gateway.md; update README.md only for validated combinations. (2026-10-31: runbook and matrix written; the live deployment steps are not yet tested, so README.md is unchanged.)
-- [ ] T022 Run final workspace/WASM checks and compare native benchmarks in specs/015-cloudflare-web-client/validation.md.
+- [X] T022 Run final workspace/WASM checks and compare native benchmarks in specs/015-cloudflare-web-client/validation.md. (2026-11-01: fmt, clippy -D warnings, 263 tests, wasm32 clippy, web build and tests, and a Worker dry run all passed at 692835a; benchmark differences were within run-to-run noise.)
 
 ## Dependencies and execution strategy
 
