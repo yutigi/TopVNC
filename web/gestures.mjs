@@ -84,6 +84,8 @@ export class TouchGestures {
         // Notches already sent.
         scrolledX: 0,
         scrolledY: 0,
+        // Fingers that moved since the gesture was last judged.
+        reported: new Set(),
       };
     }
   }
@@ -119,12 +121,20 @@ export class TouchGestures {
     }
     // One finger of a two-finger gesture lifted; the other does nothing.
     if (this.touches.size < 2) return;
+    // Fingers report one at a time, so between their reports the pair is
+    // half-updated: two fingers moving together look like a pinch. Judge
+    // the gesture once both have reported, or when one reports again before
+    // the other, which means the other is still.
+    if (!gesture.reported.has(id)) {
+      gesture.reported.add(id);
+      if (gesture.reported.size < 2) return;
+    }
+    gesture.reported.clear();
     const [a, b] = [...this.touches.values()];
     const centerX = (a.x + b.x) / 2;
     const centerY = (a.y + b.y) / 2;
     const span = Math.max(1, distance(a, b));
-    // Fingers report one at a time, so compare with the span at the start,
-    // not the previous event.
+    // Compare with the span at the start, so a slow pinch adds up.
     if (!gesture.pinch && Math.abs(span / gesture.startDistance - 1) > PINCH_RATIO) gesture.pinch = true;
     if (!gesture.moved && Math.hypot(centerX - gesture.startX, centerY - gesture.startY) >= SLOP_PX) {
       gesture.moved = true;

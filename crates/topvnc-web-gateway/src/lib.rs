@@ -28,7 +28,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Notify, Semaphore},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore},
     time::{Instant, timeout, timeout_at},
 };
 use topvnc_access::{
@@ -43,6 +43,9 @@ use topvnc_e2e::{
 pub const MAX_BROWSER_KEYS: usize = 8;
 pub const PAIRING_SECONDS: u64 = 600;
 const HANDSHAKE_SECONDS: u64 = 10;
+/// Upgrades still authenticating or in the Noise handshake. Established
+/// sessions do not count against it.
+const MAX_PENDING_HANDSHAKES: usize = 8;
 const MAX_BROWSER_KEYS_FILE_BYTES: u64 = 4096;
 
 #[derive(Clone, Deserialize)]
@@ -86,7 +89,7 @@ pub struct Gateway {
     policy: AccessPolicy,
     http: reqwest::Client,
     keys: Mutex<KeyCache>,
-    handshakes: Semaphore,
+    handshakes: Arc<Semaphore>,
     active: StdMutex<Option<ActiveSession>>,
     next_session: std::sync::atomic::AtomicU64,
     host: Keypair,
@@ -206,7 +209,7 @@ impl Gateway {
             policy,
             http,
             keys: Mutex::new(KeyCache::default()),
-            handshakes: Semaphore::new(8),
+            handshakes: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
             active: StdMutex::new(None),
             next_session: std::sync::atomic::AtomicU64::new(1),
             host,
@@ -409,7 +412,9 @@ async fn upgrade(State(state): State<Arc<Gateway>>, request: axum::extract::Requ
     {
         return (StatusCode::FORBIDDEN, "WebSocket request rejected").into_response();
     }
-    let Ok(_pending) = state.handshakes.try_acquire() else {
+    // Owned, so it stays held through the upgrade and the Noise handshake,
+    // not just until this response is returned.
+    let Ok(pending) = state.handshakes.clone().try_acquire_owned() else {
         return (StatusCode::TOO_MANY_REQUESTS, "Too many handshakes").into_response();
     };
     let Some(token) = header("cf-access-jwt-assertion").map(str::to_owned) else {
@@ -438,19 +443,26 @@ async fn upgrade(State(state): State<Arc<Gateway>>, request: axum::extract::Requ
         .write_buffer_size(0)
         .max_write_buffer_size(MAX_CIPHERTEXT_BYTES * 2)
         .on_upgrade(move |socket| async move {
-            session(socket, state, Duration::from_secs(seconds)).await;
+            session(socket, state, Duration::from_secs(seconds), pending).await;
         })
 }
 
 /// Opens the target only after the browser proves an enrolled key (or a live
 /// invite) and the host proves the pinned key. There is no plaintext fallback.
-async fn session(mut socket: WebSocket, state: Arc<Gateway>, lifetime: Duration) {
+async fn session(
+    mut socket: WebSocket,
+    state: Arc<Gateway>,
+    lifetime: Duration,
+    pending: OwnedSemaphorePermit,
+) {
     let expires = Instant::now() + lifetime;
     let deadline = expires.min(Instant::now() + Duration::from_secs(HANDSHAKE_SECONDS));
     let started = Instant::now();
     let started_unix_s = unix_now();
     let mut stage = "waiting for message 1";
     let result = timeout_at(deadline, handshake(&mut socket, &state, &mut stage)).await;
+    // Finished, failed, or timed out: the handshake slot is free again.
+    drop(pending);
     // Only protocol stages and elapsed time: no message contents or credentials.
     eprintln!(
         "E2E handshake: started_unix_s={started_unix_s} stage={stage} elapsed_ms={}",

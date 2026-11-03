@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test tests/gestures.test.mjs tests/view.test.mjs tests/pairing-store.test.mjs",
+    "test": "node --test tests/gestures.test.mjs tests/view.test.mjs tests/pairing-store.test.mjs tests/session-input.test.mjs tests/text-input.test.mjs",
     "test:wasm": "node --test tests/wasm.test.mjs"
   },
   "devDependencies": {

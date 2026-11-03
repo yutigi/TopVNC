@@ -7,6 +7,7 @@
 import init, { fingerprint, newBrowserKey, parseInvite, publicKey } from "./build/pkg/topvnc_web.js";
 import { forgetPairing, inviteFromHash, loadPairing, savePairing } from "./pairing-store.mjs";
 import { TouchGestures } from "./gestures.mjs";
+import { attachTextInput } from "./text-input.mjs";
 import { View } from "./view.mjs";
 
 const $ = (selector) => document.querySelector(selector);
@@ -512,35 +513,13 @@ window.addEventListener("keyup", (event) => {
   if (!MODIFIER_CODES.test(event.code)) releaseLatched();
 });
 
-// The on-screen keyboard: text arrives as input events, which iOS reports
-// reliably, unlike its key events.
-keyboard.addEventListener("beforeinput", (event) => {
-  if (state !== "connected") return;
-  const special = {
-    insertLineBreak: 0xff0d,
-    insertParagraph: 0xff0d,
-    deleteContentBackward: 0xff08,
-    deleteWordBackward: 0xff08,
-    deleteContentForward: 0xffff,
-  }[event.inputType];
-  if (special) {
-    event.preventDefault();
-    tapKeysym(special);
-  } else if ((event.inputType === "insertText" || event.inputType === "insertReplacementText") && event.data) {
-    event.preventDefault();
-    input({ kind: "text", text: event.data });
+attachTextInput(keyboard, {
+  active: () => state === "connected",
+  text: (text) => {
+    input({ kind: "text", text });
     releaseLatched();
-  }
-});
-
-// Composed text (dictation, input methods) and anything not cancelable.
-keyboard.addEventListener("input", (event) => {
-  if (state !== "connected" || event.isComposing) return;
-  if (keyboard.value) {
-    input({ kind: "text", text: keyboard.value });
-    releaseLatched();
-  }
-  keyboard.value = "";
+  },
+  tap: tapKeysym,
 });
 
 keyboard.addEventListener("keydown", (event) => {
