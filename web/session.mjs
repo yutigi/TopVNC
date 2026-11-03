@@ -32,11 +32,24 @@ const later = (callback) =>
 export function createSession(post) {
   let wasm;
   let session;
+  // A connect request still setting up, before it becomes the session. A
+  // newer connect or a close supersedes it.
+  let starting;
   // The OffscreenCanvas arrives once and is reused by later connections.
   let canvas;
 
   async function ready() {
     wasm ??= await init({ module_or_path: "/topvnc_web_bg.wasm" });
+  }
+
+  // Ends the session, or a connection still setting up. Either way the page
+  // hears "closed" once, so it never waits on a connection that is gone.
+  function stop(code, reason) {
+    if (starting) {
+      starting = undefined;
+      post({ type: "closed", code, reason, connected: false, secure: false });
+    }
+    close(code, reason);
   }
 
   function close(code, reason, detail) {
@@ -165,30 +178,50 @@ export function createSession(post) {
   }
 
   async function connect({ url, browser, host, secret, quality, canvas: transferred }) {
-    if (session) close(4000, "Replaced by a new connection.");
+    stop(4000, "Replaced by a new connection.");
+    const attempt = (starting = {});
     canvas = transferred ?? canvas;
-    await ready();
-    const connection = new Connection(browser, host, secret ?? undefined, quality);
-    const socket = new WebSocket(url, ["binary"]);
-    socket.binaryType = "arraybuffer";
-    const current = {
-      connection,
-      socket,
-      canvas,
-      context: canvas?.getContext("2d", { alpha: false }),
-      secure: false,
-      verified: false,
-      connected: false,
-      renderPending: false,
-      presented: 0,
-      statsAt: performance.now(),
-      statsBytes: 0,
-      statsFrames: 0,
-    };
-    current.input = createInput(connection, socket, {
-      send: () => sendAll(current),
-      fail: (error) => session === current && close(4006, "The viewer failed.", String(error)),
-    });
+    let connection;
+    let socket;
+    let current;
+    try {
+      await ready();
+      if (starting !== attempt) return;
+      connection = new Connection(browser, host, secret ?? undefined, quality);
+      socket = new WebSocket(url, ["binary"]);
+      socket.binaryType = "arraybuffer";
+      current = {
+        connection,
+        socket,
+        canvas,
+        context: canvas?.getContext("2d", { alpha: false }),
+        secure: false,
+        verified: false,
+        connected: false,
+        renderPending: false,
+        presented: 0,
+        statsAt: performance.now(),
+        statsBytes: 0,
+        statsFrames: 0,
+      };
+      current.input = createInput(connection, socket, {
+        send: () => sendAll(current),
+        fail: (error) => session === current && close(4006, "The viewer failed.", String(error)),
+      });
+    } catch (error) {
+      // Release whatever this attempt created; nothing else refers to it.
+      try {
+        socket?.close(1000, "Viewer closed");
+      } catch {
+        // Never opened.
+      }
+      connection?.free();
+      if (starting !== attempt) return;
+      starting = undefined;
+      post({ type: "closed", code: 4007, reason: "The viewer failed to start.", detail: String(error), connected: false, secure: false });
+      return;
+    }
+    starting = undefined;
     session = current;
     current.deadline = setTimeout(() => close(4002, "The host did not answer in time."), HANDSHAKE_TIMEOUT_MS);
     socket.onopen = () => {
@@ -228,7 +261,7 @@ export function createSession(post) {
   return async function onMessage(message) {
     try {
       if (message.type === "connect") return await connect(message);
-      if (message.type === "close") return close(4000, "Disconnected.");
+      if (message.type === "close") return stop(4000, "Disconnected.");
       const current = session;
       if (!current) return;
       if (message.type === "password") {

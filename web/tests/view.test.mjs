@@ -33,3 +33,26 @@ test("zooms around the pinch point and keeps the image covering the viewer", () 
   assert.deepEqual([view.zoom, view.x, view.y], [1, 0, 0]);
   assert.equal(view.framePerViewPixel(1920), 1920 / 400);
 });
+
+test("zoom keeps the pinched remote point fixed on a letterboxed image", () => {
+  // Bars above and below (landscape frame), then beside (portrait frame).
+  for (const [frameWidth, frameHeight, cx, cy] of [[1920, 1080, 200, 190], [1080, 1920, 190, 200]]) {
+    const view = new View();
+    view.layout(400, 400, frameWidth, frameHeight);
+    const before = view.toFrame(cx, cy, frameWidth, frameHeight);
+    view.zoomAt(2, cx, cy);
+    assert.deepEqual(view.toFrame(cx, cy, frameWidth, frameHeight), before);
+    // A second pinch elsewhere, now from a translated view.
+    const next = view.toFrame(cy, cx, frameWidth, frameHeight);
+    view.zoomAt(1.5, cy, cx);
+    assert.equal(view.zoom, 3);
+    assert.deepEqual(view.toFrame(cy, cx, frameWidth, frameHeight), next);
+  }
+  // At an edge clamping wins over the anchor: the zoomed image, now taller
+  // than the viewer, covers it from the top edge with no bar left above.
+  const view = new View();
+  view.layout(400, 400, 1920, 1080);
+  view.zoomAt(2, 0, 87.5);
+  assert.deepEqual([view.x, view.y], [0, -87.5]);
+  assert.deepEqual(view.toFrame(0, 0, 1920, 1080), { x: 0, y: 0 });
+});

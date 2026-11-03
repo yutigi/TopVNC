@@ -168,12 +168,20 @@ impl<R: Read> Read for WaitTimer<R> {
     }
 }
 
+/// Bounds RFB negotiation by one absolute deadline. The stream applies it to
+/// each socket operation, including TLS ciphertext that yields no plaintext,
+/// until this guard drops. Callers then set their session timeouts.
 struct HandshakeStream<'a> {
     stream: &'a mut NativeStream,
     deadline: Instant,
 }
 
-impl HandshakeStream<'_> {
+impl<'a> HandshakeStream<'a> {
+    fn new(stream: &'a mut NativeStream, deadline: Instant) -> Self {
+        stream.set_deadline(Some(deadline));
+        Self { stream, deadline }
+    }
+
     fn remaining(&self) -> io::Result<Duration> {
         self.deadline
             .checked_duration_since(Instant::now())
@@ -182,16 +190,22 @@ impl HandshakeStream<'_> {
     }
 }
 
+impl Drop for HandshakeStream<'_> {
+    fn drop(&mut self) {
+        self.stream.set_deadline(None);
+    }
+}
+
 impl Read for HandshakeStream<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.remaining()?;
         self.stream.read(bytes)
     }
 }
 
 impl Write for HandshakeStream<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.remaining()?;
         self.stream.write(bytes)
     }
 
@@ -1238,10 +1252,7 @@ fn serve_client(
 ) -> io::Result<()> {
     // Bound the whole TLS/RFB handshake, not each read, so a client that trickles
     // bytes cannot hold one of the few connection slots indefinitely.
-    let mut handshake = HandshakeStream {
-        stream: &mut *stream,
-        deadline,
-    };
+    let mut handshake = HandshakeStream::new(&mut *stream, deadline);
     handshake.write_all(b"RFB 003.008\n")?;
     let mut version = [0; 12];
     handshake.read_exact(&mut version)?;
@@ -1287,6 +1298,7 @@ fn serve_client(
         .lock()
         .map_err(|_| invalid("session registry lock is poisoned"))?
         .admit(client_id, share_flag[0] != 0)?;
+    drop(handshake);
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(Some(UPDATE_IDLE_TIMEOUT))?;
     let name = config.name.as_bytes();
@@ -3362,10 +3374,7 @@ impl Session {
         let mut stream = stream.into();
         stream.set_nodelay(true)?;
         let info = negotiate_with_encoding(
-            &mut HandshakeStream {
-                stream: &mut stream,
-                deadline: Instant::now() + timeout,
-            },
+            &mut HandshakeStream::new(&mut stream, Instant::now() + timeout),
             allow_insecure,
             encoding,
             password_prompt,

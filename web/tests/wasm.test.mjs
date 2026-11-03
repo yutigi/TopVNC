@@ -76,3 +76,99 @@ for (const delay of [0, 999, 1001, 5000]) {
     assert.equal(socket.sent.length, 1, "statistics must not duplicate the handshake");
   });
 }
+
+function fakeSockets(t, { refuse } = {}) {
+  const sockets = [];
+  class FakeSocket {
+    static OPEN = 1;
+    readyState = 0;
+    protocol = "binary";
+    bufferedAmount = 0;
+    sent = [];
+    closed = false;
+    constructor() {
+      if (refuse?.()) throw new SyntaxError("The WebSocket URL is invalid.");
+      sockets.push(this);
+    }
+    send(message) { this.sent.push(new Uint8Array(message)); }
+    close() { this.readyState = 3; this.closed = true; }
+  }
+  const originalSocket = globalThis.WebSocket;
+  globalThis.WebSocket = FakeSocket;
+  t.after(() => { globalThis.WebSocket = originalSocket; });
+  return sockets;
+}
+
+const request = (extra) => ({
+  type: "connect", url: "wss://example.invalid/ws",
+  browser: newBrowserKey(), host: publicKey(newBrowserKey()), quality: 6, ...extra,
+});
+
+test("each startup failure reaches the page, releases its resources, and allows a retry", async (t) => {
+  let refuse = false;
+  const sockets = fakeSockets(t, { refuse: () => refuse });
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const freed = t.mock.method(Connection.prototype, "free");
+  const events = [];
+  const message = createSession((event) => events.push(event));
+  t.after(() => message({ type: "close" }));
+  const closed = () => events.filter((event) => event.type === "closed");
+
+  // The WebAssembly connection rejects its keys before any socket exists.
+  await message(request({ browser: "bad" }));
+  assert.equal(sockets.length, 0);
+  // The WebSocket constructor throws: the new connection is freed.
+  refuse = true;
+  await message(request());
+  refuse = false;
+  assert.equal(freed.mock.callCount(), 1);
+  // Drawing setup fails after the socket exists: both are released.
+  await message(request({ canvas: { getContext() { throw new Error("No 2D context."); } } }));
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].closed, true);
+  assert.equal(freed.mock.callCount(), 2);
+
+  assert.deepEqual(
+    closed().map(({ code, reason, connected }) => [code, reason, connected]),
+    Array(3).fill([4007, "The viewer failed to start.", false]),
+  );
+  assert.match(closed()[1].detail, /WebSocket URL is invalid/);
+  assert.match(closed()[2].detail, /No 2D context/);
+  // A failed attempt leaves no handshake timer or statistics behind.
+  const count = events.length;
+  t.mock.timers.tick(20_000);
+  assert.equal(events.length, count);
+
+  // The retry connects normally and gets its own handshake deadline.
+  await message(request({ canvas: { getContext: () => undefined } }));
+  const socket = sockets[1];
+  socket.readyState = 1;
+  socket.onopen();
+  assert.equal(socket.sent.length, 1);
+  t.mock.timers.tick(15_000);
+  assert.equal(closed().length, 4);
+  assert.equal(closed()[3].code, 4002);
+  assert.equal(socket.closed, true);
+});
+
+test("a close or a newer connect supersedes a connection still starting", async (t) => {
+  const sockets = fakeSockets(t);
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const events = [];
+  const message = createSession((event) => events.push(event));
+  t.after(() => message({ type: "close" }));
+  const closed = () => events.filter((event) => event.type === "closed").map(({ code, reason }) => [code, reason]);
+
+  // Setup waits for WebAssembly at least one turn; close during that wait.
+  const first = message(request());
+  await message({ type: "close" });
+  await first;
+  assert.equal(sockets.length, 0, "a closed request must not connect afterwards");
+  assert.deepEqual(closed(), [[4000, "Disconnected."]]);
+
+  const second = message(request());
+  const third = message(request());
+  await Promise.all([second, third]);
+  assert.equal(sockets.length, 1, "only the newest request connects");
+  assert.deepEqual(closed(), [[4000, "Disconnected."], [4000, "Replaced by a new connection."]]);
+});

@@ -130,6 +130,9 @@ pub(crate) struct NativeStream {
     socket: Arc<TcpStream>,
     tls: Option<Arc<Mutex<Connection>>>,
     received: Arc<Mutex<Received>>,
+    /// Absolute bound on every socket operation while set; see
+    /// [`NativeStream::set_deadline`]. Not shared with clones.
+    deadline: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -151,6 +154,7 @@ impl NativeStream {
             socket,
             tls: None,
             received: Arc::default(),
+            deadline: None,
         }
     }
 
@@ -216,6 +220,7 @@ impl NativeStream {
             socket,
             tls: Some(Arc::new(Mutex::new(connection))),
             received: Arc::default(),
+            deadline: None,
         })
     }
 
@@ -224,7 +229,24 @@ impl NativeStream {
             socket: Arc::clone(&self.socket),
             tls: self.tls.clone(),
             received: self.received.clone(),
+            deadline: None,
         })
+    }
+
+    /// Bounds every blocking socket operation this handle performs, including
+    /// ciphertext reads and record flushes inside one TLS read or write, by an
+    /// absolute deadline. A peer trickling a partial record therefore cannot
+    /// restart a relative timeout. `None` ends the bound but leaves the last
+    /// socket timeouts in place; callers then set their session timeouts.
+    pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
+    fn io(&self) -> BoundedSocket<'_> {
+        BoundedSocket {
+            socket: &self.socket,
+            deadline: self.deadline,
+        }
     }
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
@@ -245,10 +267,11 @@ impl NativeStream {
         self.socket.set_write_timeout(timeout)
     }
 
-    fn flush_records(connection: &mut Connection, socket: &TcpStream) -> io::Result<()> {
+    fn flush_records(connection: &mut Connection, mut io: BoundedSocket) -> io::Result<()> {
+        let socket = io.socket;
         let result = (|| {
             while connection.wants_write() {
-                if connection.write_tls(&mut &*socket)? == 0 {
+                if connection.write_tls(&mut io)? == 0 {
                     return Err(io::ErrorKind::WriteZero.into());
                 }
             }
@@ -265,7 +288,7 @@ impl NativeStream {
 impl Read for NativeStream {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let Some(tls) = &self.tls else {
-            return (&*self.socket).read(bytes);
+            return self.io().read(bytes);
         };
         if bytes.is_empty() {
             return Ok(0);
@@ -287,7 +310,7 @@ impl Read for NativeStream {
                 .map_err(|_| invalid("TLS receive lock poisoned"))?;
             if received.offset == received.end {
                 received.bytes.resize(16 * 1024, 0);
-                received.end = (&*self.socket).read(&mut received.bytes)?;
+                received.end = self.io().read(&mut received.bytes)?;
                 received.offset = 0;
             }
             let mut connection = tls.lock().map_err(|_| invalid("TLS lock poisoned"))?;
@@ -295,11 +318,11 @@ impl Read for NativeStream {
                 connection.read_tls(&mut &received.bytes[received.offset..received.end])?;
             received.offset += consumed;
             if let Err(error) = connection.process_new_packets() {
-                let _ = Self::flush_records(&mut connection, &self.socket);
+                let _ = Self::flush_records(&mut connection, self.io());
                 let _ = self.socket.shutdown(Shutdown::Both);
                 return Err(invalid(error));
             }
-            Self::flush_records(&mut connection, &self.socket)?;
+            Self::flush_records(&mut connection, self.io())?;
         }
     }
 }
@@ -307,13 +330,13 @@ impl Read for NativeStream {
 impl Write for NativeStream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let Some(tls) = &self.tls else {
-            return (&*self.socket).write(bytes);
+            return self.io().write(bytes);
         };
         let mut connection = tls.lock().map_err(|_| invalid("TLS lock poisoned"))?;
         let count = connection
             .writer()
             .write(&bytes[..bytes.len().min(16 * 1024)])?;
-        if let Err(error) = Self::flush_records(&mut connection, &self.socket) {
+        if let Err(error) = Self::flush_records(&mut connection, self.io()) {
             // A partial ciphertext write is terminal. Never retry plaintext
             // with a new nonce after a socket timeout.
             let _ = self.socket.shutdown(Shutdown::Both);
@@ -325,7 +348,7 @@ impl Write for NativeStream {
     fn flush(&mut self) -> io::Result<()> {
         if let Some(tls) = &self.tls {
             let mut connection = tls.lock().map_err(|_| invalid("TLS lock poisoned"))?;
-            Self::flush_records(&mut connection, &self.socket)?;
+            Self::flush_records(&mut connection, self.io())?;
         }
         (&*self.socket).flush()
     }
@@ -337,6 +360,45 @@ const RFB_GREETING: &[u8] = b"RFB ";
 pub const PLAINTEXT_SERVER: &str = "Server answered with unencrypted VNC, not TLS. \
      Enable TLS on the host, or use --unencrypted on a trusted network only.";
 
+fn remaining(deadline: Instant, message: &'static str) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, message))
+}
+
+/// One socket operation at a time. While a deadline is set, each operation
+/// waits at most for the time left, recomputed immediately before it blocks.
+#[derive(Clone, Copy)]
+struct BoundedSocket<'a> {
+    socket: &'a TcpStream,
+    deadline: Option<Instant>,
+}
+impl Read for BoundedSocket<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let left = remaining(deadline, "Connection handshake timed out")?;
+            self.socket.set_read_timeout(Some(left))?;
+        }
+        let mut socket = self.socket;
+        socket.read(bytes)
+    }
+}
+impl Write for BoundedSocket<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let left = remaining(deadline, "Connection handshake timed out")?;
+            self.socket.set_write_timeout(Some(left))?;
+        }
+        let mut socket = self.socket;
+        socket.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let mut socket = self.socket;
+        socket.flush()
+    }
+}
+
 struct DeadlineSocket<'a> {
     socket: &'a TcpStream,
     deadline: Instant,
@@ -345,10 +407,7 @@ struct DeadlineSocket<'a> {
 }
 impl DeadlineSocket<'_> {
     fn remaining(&self) -> io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))
+        remaining(self.deadline, "TLS handshake timed out")
     }
 }
 impl Read for DeadlineSocket<'_> {
