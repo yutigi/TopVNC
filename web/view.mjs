@@ -40,12 +40,16 @@ export class View {
     this.y = 0;
   }
 
-  // Zoom by `factor` keeping the viewer point (cx, cy) fixed.
+  // Zoom by `factor` keeping the viewer point (cx, cy) fixed. The transform
+  // scales from the fitted image's corner, so anchor relative to it; a
+  // letterboxed image starts at (left, top), not at the viewer's corner.
   zoomAt(factor, cx, cy) {
     const zoom = Math.min(MAX_ZOOM, Math.max(1, this.zoom * factor));
     const applied = zoom / this.zoom;
-    this.x = cx - (cx - this.x) * applied;
-    this.y = cy - (cy - this.y) * applied;
+    const ax = cx - this.base.left;
+    const ay = cy - this.base.top;
+    this.x = ax - (ax - this.x) * applied;
+    this.y = ay - (ay - this.y) * applied;
     this.zoom = zoom;
     this.clamp();
   }

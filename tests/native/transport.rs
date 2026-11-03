@@ -3,6 +3,7 @@ use super::*;
 #[path = "../support/identity.rs"]
 mod support;
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use support::Identity;
@@ -154,6 +155,92 @@ fn tampered_ciphertext_is_terminal() {
     let error = client.read(&mut [0; 64]).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(client.write_all(b"input").is_err());
+}
+
+/// After TLS completes, sends an application record one byte at a time and
+/// never its last byte: ciphertext keeps arriving, plaintext never does.
+fn trickle_partial_record(peer: NativeStream, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut record = Vec::new();
+        {
+            let mut state = peer.tls.as_ref().unwrap().lock().unwrap();
+            state.writer().write_all(&[0; 64]).unwrap();
+            while state.wants_write() {
+                state.write_tls(&mut record).unwrap();
+            }
+        }
+        // About 85 bytes at 20 ms each outlasts the test's budget several
+        // times over, and still ends if the bound regresses.
+        for byte in &record[..record.len() - 1] {
+            if stop.load(Ordering::Relaxed)
+                || (&*peer.socket)
+                    .write_all(std::slice::from_ref(byte))
+                    .is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Stay connected so only the deadline, not EOF, ends the read.
+        while !stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(5));
+        }
+    })
+}
+
+const HANDSHAKE_BUDGET: Duration = Duration::from_millis(150);
+
+#[test]
+fn handshake_deadline_bounds_trickled_tls_ciphertext_on_client_and_server() {
+    for client_reads in [true, false] {
+        let (client, server) = tls_pair();
+        let (mut reader, peer) = if client_reads {
+            (client, server)
+        } else {
+            (server, client)
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let trickler = trickle_partial_record(peer, stop.clone());
+        let start = Instant::now();
+        let mut handshake = crate::HandshakeStream::new(&mut reader, start + HANDSHAKE_BUDGET);
+        let error = handshake.read_exact(&mut [0; 12]).unwrap_err();
+        let elapsed = start.elapsed();
+        drop(handshake);
+        stop.store(true, Ordering::Relaxed);
+        trickler.join().unwrap();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "{error}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        // The bound ends with negotiation; session timeouts take over.
+        assert!(reader.deadline.is_none());
+    }
+}
+
+#[test]
+fn session_negotiation_times_out_on_trickled_tls_ciphertext() {
+    let (client, server) = tls_pair();
+    let stop = Arc::new(AtomicBool::new(false));
+    let trickler = trickle_partial_record(server, stop.clone());
+    let start = Instant::now();
+    let result = crate::Session::from_stream_with_encoding(
+        client,
+        false,
+        crate::Encoding::Raw,
+        || panic!("no RFB greeting was decrypted"),
+        HANDSHAKE_BUDGET,
+    );
+    let elapsed = start.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    trickler.join().unwrap();
+    let error = result.err().expect("trickled ciphertext must time out");
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains("handshake timed out"), "{error}");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
 }
 
 #[test]
