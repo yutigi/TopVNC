@@ -65,8 +65,10 @@ export function createSession(post) {
 
   function sendAll(current) {
     const socket = current.socket;
+    // Keep the first Noise message queued while the upgrade is pending.
+    // Statistics and input can call this before the socket opens.
+    if (socket.readyState !== WebSocket.OPEN) return;
     for (let message; (message = current.connection.takeOutgoing()); ) {
-      if (socket.readyState !== WebSocket.OPEN) continue;
       socket.send(message);
     }
     if (socket.bufferedAmount > MAX_BACKLOG_BYTES) {

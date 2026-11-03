@@ -447,7 +447,16 @@ async fn upgrade(State(state): State<Arc<Gateway>>, request: axum::extract::Requ
 async fn session(mut socket: WebSocket, state: Arc<Gateway>, lifetime: Duration) {
     let expires = Instant::now() + lifetime;
     let deadline = expires.min(Instant::now() + Duration::from_secs(HANDSHAKE_SECONDS));
-    let (channel, browser) = match timeout_at(deadline, handshake(&mut socket, &state)).await {
+    let started = Instant::now();
+    let started_unix_s = unix_now();
+    let mut stage = "waiting for message 1";
+    let result = timeout_at(deadline, handshake(&mut socket, &state, &mut stage)).await;
+    // Only protocol stages and elapsed time: no message contents or credentials.
+    eprintln!(
+        "E2E handshake: started_unix_s={started_unix_s} stage={stage} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    let (channel, browser) = match result {
         Ok(Ok(established)) => established,
         Ok(Err(reason)) => return reject(socket, 1008, reason).await,
         Err(_) => return reject(socket, 1008, "E2E handshake timed out").await,
@@ -472,17 +481,24 @@ async fn session(mut socket: WebSocket, state: Arc<Gateway>, lifetime: Duration)
 async fn handshake(
     socket: &mut WebSocket,
     state: &Gateway,
+    stage: &mut &'static str,
 ) -> Result<(Channel, Key), &'static str> {
     let first = receive_binary(socket).await?;
+    *stage = "validating message 1";
     let secret = state.pairing_secret();
     let (responder, reply) = Responder::accept(&state.host.private, &first, secret.as_ref())?;
+    *stage = "sending message 2";
     socket
         .send(Message::Binary(reply.into()))
         .await
         .map_err(|_| "browser disconnected")?;
+    *stage = "waiting for message 3";
     let last = receive_binary(socket).await?;
+    *stage = "validating message 3";
     let (channel, browser, mode) = responder.finish(&last)?;
+    *stage = "authorizing browser";
     state.authorize(browser, mode, secret)?;
+    *stage = "complete";
     Ok((channel, browser))
 }
 
@@ -516,6 +532,8 @@ async fn relay(
     expires: Instant,
     stop: &Notify,
 ) {
+    let started = Instant::now();
+    eprintln!("relay opened: started_unix_s={}", unix_now());
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     heartbeat.tick().await;
     let mut last_activity = Instant::now();
@@ -585,7 +603,9 @@ async fn relay(
     .await;
     let _ = tcp.shutdown().await;
     eprintln!(
-        "relay closed: code={code} reason={reason} upstream_bytes={upstream_bytes} downstream_bytes={downstream_bytes}"
+        "relay closed: code={code} reason={reason} upstream_bytes={upstream_bytes} downstream_bytes={downstream_bytes} duration_ms={} ended_unix_s={}",
+        started.elapsed().as_millis(),
+        unix_now()
     );
 }
 

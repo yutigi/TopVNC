@@ -41,6 +41,38 @@ fn stalled_tls_handshake_has_one_deadline() {
     assert!(start.elapsed() < Duration::from_secs(2));
 }
 
+fn handshake_against_peer_sending(greeting: &'static [u8]) -> io::Error {
+    let (client, mut peer) = socket_pair();
+    let writer = thread::spawn(move || {
+        peer.write_all(greeting).unwrap();
+        // Hold the socket open so only the greeting decides the outcome.
+        let mut sink = [0; 1024];
+        while matches!(peer.read(&mut sink), Ok(n) if n > 0) {}
+    });
+    let error = NativeStream::client(
+        client,
+        Identity::new().client("localhost"),
+        Instant::now() + Duration::from_secs(3),
+    )
+    .err()
+    .unwrap();
+    writer.join().unwrap();
+    error
+}
+
+#[test]
+fn plaintext_rfb_server_is_named_instead_of_a_corrupt_record() {
+    let error = handshake_against_peer_sending(b"RFB 003.008\n");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), PLAINTEXT_SERVER);
+}
+
+#[test]
+fn other_non_tls_replies_keep_the_tls_error() {
+    let error = handshake_against_peer_sending(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+    assert_ne!(error.to_string(), PLAINTEXT_SERVER);
+}
+
 #[test]
 fn idle_tls_reader_does_not_block_input_writer_and_shutdown_wakes_reader() {
     let (mut client, mut server) = tls_pair();

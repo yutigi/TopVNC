@@ -193,13 +193,24 @@ impl NativeStream {
     ) -> io::Result<Self> {
         socket.set_nodelay(true)?;
         connection.set_buffer_limit(Some(64 * 1024));
+        let is_client = matches!(connection, Connection::Client(_));
+        let mut io = DeadlineSocket {
+            socket: &socket,
+            deadline,
+            greeting: Vec::new(),
+        };
         while connection.is_handshaking() {
             // complete_io can perform several reads internally. Bound every
             // operation by one deadline, including a peer trickling bytes.
-            connection.complete_io(&mut DeadlineSocket {
-                socket: &socket,
-                deadline,
-            })?;
+            if let Err(error) = connection.complete_io(&mut io) {
+                // rustls reports a plaintext greeting as a corrupt record.
+                // Name the real cause; never fall back to plaintext.
+                if is_client && io.greeting.starts_with(RFB_GREETING) {
+                    let _ = socket.shutdown(Shutdown::Both);
+                    return Err(invalid(PLAINTEXT_SERVER));
+                }
+                return Err(error);
+            }
         }
         Ok(Self {
             socket,
@@ -320,9 +331,17 @@ impl Write for NativeStream {
     }
 }
 
+/// A plain RFB server opens with "RFB 003.00x\n" where TLS expects a record.
+const RFB_GREETING: &[u8] = b"RFB ";
+/// Kept to two lines of the settings status area; see docs/native-tls.md.
+pub const PLAINTEXT_SERVER: &str = "Server answered with unencrypted VNC, not TLS. \
+     Enable TLS on the host, or use --unencrypted on a trusted network only.";
+
 struct DeadlineSocket<'a> {
     socket: &'a TcpStream,
     deadline: Instant,
+    /// The peer's first bytes, kept only to explain a failed handshake.
+    greeting: Vec<u8>,
 }
 impl DeadlineSocket<'_> {
     fn remaining(&self) -> io::Result<Duration> {
@@ -336,7 +355,10 @@ impl Read for DeadlineSocket<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.socket.set_read_timeout(Some(self.remaining()?))?;
         let mut socket = self.socket;
-        socket.read(bytes)
+        let count = socket.read(bytes)?;
+        let wanted = RFB_GREETING.len().saturating_sub(self.greeting.len());
+        self.greeting.extend_from_slice(&bytes[..count.min(wanted)]);
+        Ok(count)
     }
 }
 impl Write for DeadlineSocket<'_> {
