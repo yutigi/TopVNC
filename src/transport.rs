@@ -115,7 +115,7 @@ impl TlsOptions {
         match (&self.cert, &self.key) {
             (Some(cert), Some(key)) => server_config(cert, key).map(Some),
             _ => Err(invalid(
-                "TLS hosting needs --tls-cert CERT.pem and --tls-key KEY.pem",
+                "TLS hosting needs --tls-cert and --tls-key, or tick PLAIN TCP (NO TLS) on a trusted network.",
             )),
         }
     }

@@ -499,16 +499,11 @@ impl Drop for TimerResolution {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments
-        .first()
-        .is_some_and(|argument| argument == "--serve")
-    {
-        return run_server(&arguments[1..]);
-    }
-    let mut config = Config::default();
-    settings::load(&mut config);
+/// Apply launch-only options to the form without persisting security choices.
+fn apply_viewer_arguments(
+    config: &mut Config,
+    arguments: impl IntoIterator<Item = String>,
+) -> Result<bool, Box<dyn Error>> {
     let mut input_debug = false;
     let mut address = None;
     let mut args = arguments.into_iter();
@@ -560,6 +555,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     config.serve.tls = config.tls.clone();
+    Ok(input_debug)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--serve")
+    {
+        return run_server(&arguments[1..]);
+    }
+    let mut config = Config::default();
+    settings::load(&mut config);
+    let input_debug = apply_viewer_arguments(&mut config, arguments)?;
     config.tls.client(&config.host)?;
 
     #[cfg(windows)]
@@ -1070,6 +1079,9 @@ fn show_landing(
                         if editable && ui::INSECURE.contains(x, y) {
                             serve.allow_insecure = !serve.allow_insecure;
                         }
+                        if editable && ui::SERVE_UNENCRYPTED_TRANSPORT.contains(x, y) {
+                            serve.tls.unencrypted = !serve.tls.unencrypted;
+                        }
                         if editable && ui::LOCAL_ONLY.contains(x, y) {
                             serve.host = ui::LOCAL_ONLY_HOST.into();
                         }
@@ -1120,6 +1132,9 @@ fn show_landing(
                         }
                         if ui::INSECURE.contains(x, y) {
                             config.allow_insecure = !config.allow_insecure;
+                        }
+                        if ui::UNENCRYPTED_TRANSPORT.contains(x, y) {
+                            config.tls.unencrypted = !config.tls.unencrypted;
                         }
                         if ui::RAW.contains(x, y) {
                             config.compression = Compression::Raw;
