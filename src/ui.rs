@@ -679,6 +679,15 @@ pub const INSECURE: Box2 = Box2 {
     w: 24,
     h: 24,
 };
+/// Transport is a separate, explicit choice from RFB authentication.
+pub const UNENCRYPTED_TRANSPORT: Box2 = Box2 {
+    x: 40,
+    y: 325,
+    w: 24,
+    h: 24,
+};
+pub const SERVE_UNENCRYPTED_TRANSPORT: Box2 = UNENCRYPTED_TRANSPORT;
+const UNENCRYPTED_LABEL: &str = "PLAIN TCP (NO TLS)";
 pub const FIT: Box2 = Box2 {
     x: 40,
     y: 386,
@@ -1349,6 +1358,21 @@ fn helper_tab(
     canvas.button(REPORT_COPY, "COPY REPORT", false);
 }
 
+fn transport_checkbox(canvas: &mut Canvas<'_>, area: Box2, unencrypted: bool) {
+    canvas.fill(area, if unencrypted { ACCENT } else { FIELD });
+    canvas.frame(area, BORDER);
+    if unencrypted {
+        canvas.text(area.x + 5, area.y + 4, "X", BG, 2);
+    }
+    canvas.text(
+        area.x + area.w + 12,
+        area.y + 4,
+        UNENCRYPTED_LABEL,
+        if unencrypted { ERROR } else { TEXT },
+        2,
+    );
+}
+
 fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connecting: bool) {
     canvas.text(42, 76, "CONNECT TO A REMOTE DESKTOP", MUTED, 2);
     ultra_button(canvas, ULTRA_MODE, config.performance);
@@ -1394,16 +1418,17 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
             config.compression == Compression::Tight && config.jpeg_quality == level,
         );
     }
+    transport_checkbox(canvas, UNENCRYPTED_TRANSPORT, config.tls.unencrypted);
     canvas.text(
-        40,
+        400,
         331,
         if config.tls.unencrypted {
             "UNENCRYPTED: USE A SEPARATELY SECURED TUNNEL."
         } else {
-            "TLS REQUIRED. CERTIFICATE AND HOST NAME ARE VERIFIED."
+            "TLS: CERTIFICATE AND HOST NAME VERIFIED."
         },
-        MUTED,
-        2,
+        if config.tls.unencrypted { ERROR } else { MUTED },
+        1,
     );
     canvas.label(40, 362, "WINDOW SIZE");
     canvas.button(FIT, "FIT", config.window_mode == WindowMode::Fit);
@@ -1516,16 +1541,17 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     for (area, mode, name) in SERVE_MOUSE {
         canvas.button(area, name, form.mouse == mode);
     }
+    transport_checkbox(canvas, SERVE_UNENCRYPTED_TRANSPORT, form.tls.unencrypted);
     canvas.text(
-        40,
+        400,
         331,
         if form.tls.unencrypted {
             "UNENCRYPTED. ONLY 8 PASSWORD CHARACTERS ARE USED."
         } else {
             "TLS REQUIRES --tls-cert AND --tls-key PEM FILES."
         },
-        MUTED,
-        2,
+        if form.tls.unencrypted { ERROR } else { MUTED },
+        1,
     );
     canvas.label(40, 362, "LISTEN ON");
     canvas.button(
@@ -2583,6 +2609,147 @@ mod tests {
         assert!(levels.contains(&DEFAULT_JPEG_QUALITY));
         assert!(levels.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(levels.iter().all(|level| *level <= 9));
+    }
+
+    #[test]
+    fn transport_forms_default_to_tls_and_accept_the_unencrypted_launch_flag() {
+        let mut config = Config::default();
+        crate::apply_viewer_arguments(&mut config, []).unwrap();
+        assert!(!config.tls.unencrypted);
+        assert!(!config.serve.tls.unencrypted);
+        crate::apply_viewer_arguments(&mut config, ["--unencrypted".into()]).unwrap();
+        assert!(config.tls.unencrypted);
+        assert!(config.serve.tls.unencrypted);
+        assert!(!config.allow_insecure);
+        assert!(!config.serve.allow_insecure);
+    }
+
+    #[test]
+    fn serve_requests_preserve_transport_and_tls_option_conflicts() {
+        let mut form = ServeForm {
+            password: "secret".into(),
+            ..ServeForm::default()
+        };
+        assert!(!form.request().unwrap().tls.unencrypted);
+        form.tls.unencrypted = true;
+        let request = form.request().unwrap();
+        assert!(request.tls.unencrypted);
+        assert_eq!(request.password.as_deref(), Some("secret"));
+        form.tls.cert = Some("host.pem".into());
+        form.tls.key = Some("host.key".into());
+        let request = form.request().unwrap();
+        assert_eq!(request.tls, form.tls);
+        assert!(
+            request
+                .tls
+                .server()
+                .unwrap_err()
+                .to_string()
+                .contains("TLS credentials")
+        );
+
+        let mut config = Config::default();
+        crate::apply_viewer_arguments(
+            &mut config,
+            ["--tls-ca", "ca.pem", "--tls-server-name", "host"].map(String::from),
+        )
+        .unwrap();
+        config.tls.unencrypted = true;
+        assert!(
+            config
+                .tls
+                .client("host")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("TLS trust options")
+        );
+        assert_eq!(
+            config.tls.ca.as_deref(),
+            Some(std::path::Path::new("ca.pem"))
+        );
+        assert_eq!(config.tls.server_name.as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn missing_host_credentials_hint_fits_the_error_area() {
+        let error = ServeForm::default().tls.server().unwrap_err().to_string();
+        assert!(error.contains("--tls-cert"));
+        assert!(error.contains("--tls-key"));
+        assert!(error.contains(UNENCRYPTED_LABEL));
+        assert!(wrap(&error, MESSAGE_LINE).len() <= 2);
+    }
+
+    #[test]
+    fn transport_controls_fit_between_authentication_and_window_rows() {
+        for (transport, controls) in [
+            (
+                UNENCRYPTED_TRANSPORT,
+                vec![
+                    HOST,
+                    PORT,
+                    PASSWORD,
+                    INSECURE,
+                    RAW,
+                    ZLIB,
+                    JPEG_PRESETS[0].0,
+                    JPEG_PRESETS[1].0,
+                    JPEG_PRESETS[2].0,
+                    FIT,
+                    NATIVE,
+                    CUSTOM,
+                    SIZE,
+                    FPS60,
+                    FPS120,
+                    FPS_NO_LIMIT,
+                    SMOOTH,
+                    SHARP,
+                    CONNECT,
+                ],
+            ),
+            (
+                SERVE_UNENCRYPTED_TRANSPORT,
+                vec![
+                    HOST,
+                    PORT,
+                    SERVE_PASSWORD,
+                    SERVE_DISPLAY,
+                    INSECURE,
+                    SERVE_MOUSE[0].0,
+                    SERVE_MOUSE[1].0,
+                    SERVE_MOUSE[2].0,
+                    LOCAL_ONLY,
+                    ALL_NETWORKS,
+                    SERVE_SCALE_SLIDER,
+                    SERVE_FULL_SIZE,
+                    SERVE_HALF_SIZE,
+                    SERVE_PRIORITY[0].0,
+                    SERVE_PRIORITY[1].0,
+                    SERVE_PRIORITY[2].0,
+                    SERVE_PRIORITY[3].0,
+                    SERVER_STATUS,
+                    CONNECT,
+                ],
+            ),
+        ] {
+            let row = Box2 {
+                w: PASSWORD.w,
+                ..transport
+            };
+            for control in controls {
+                assert!(
+                    row.x + row.w <= control.x
+                        || control.x + control.w <= row.x
+                        || row.y + row.h <= control.y
+                        || control.y + control.h <= row.y,
+                    "transport row overlaps control at {}, {}",
+                    control.x,
+                    control.y
+                );
+            }
+            assert!(transport.x + transport.w + 12 + UNENCRYPTED_LABEL.len() * 12 < 400);
+            assert!(transport.y + transport.h < 362); // next section's labels
+        }
     }
 
     #[test]
