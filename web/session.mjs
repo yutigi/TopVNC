@@ -5,6 +5,7 @@
 // Messages to and from the page are small plain objects.
 
 import init, { Connection } from "./build/pkg/topvnc_web.js";
+import { createInput } from "./session-input.mjs";
 
 // Bits returned by Connection.receive (crates/topvnc-web/src/session.rs).
 export const EVENT = {
@@ -19,9 +20,6 @@ export const EVENT = {
   RTT: 1 << 8,
 };
 
-// Pointer motion is dropped (the latest position is kept) while this much is
-// waiting to be sent; buttons and keys are never dropped.
-const MOTION_BACKLOG_BYTES = 64 * 1024;
 // A link this far behind is not usable for interactive control.
 const MAX_BACKLOG_BYTES = 4 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
@@ -47,6 +45,8 @@ export function createSession(post) {
     session = undefined;
     clearInterval(current.timers);
     clearTimeout(current.deadline);
+    // Held motion must not follow the release, or outlive the connection.
+    current.input.discard();
     try {
       current.connection.releaseAll();
       sendAll(current);
@@ -185,6 +185,10 @@ export function createSession(post) {
       statsBytes: 0,
       statsFrames: 0,
     };
+    current.input = createInput(connection, socket, {
+      send: () => sendAll(current),
+      fail: (error) => session === current && close(4006, "The viewer failed.", String(error)),
+    });
     session = current;
     current.deadline = setTimeout(() => close(4002, "The host did not answer in time."), HANDSHAKE_TIMEOUT_MS);
     socket.onopen = () => {
@@ -221,59 +225,6 @@ export function createSession(post) {
     current.timers = setInterval(() => stats(current), STATS_INTERVAL_MS);
   }
 
-  // Input from the page. Motion is coalesced under backpressure.
-  function input(current, message) {
-    const connection = current.connection;
-    switch (message.kind) {
-      case "pointer":
-        if (message.motion && current.socket.bufferedAmount > MOTION_BACKLOG_BYTES) {
-          current.pendingPointer = message;
-          return;
-        }
-        current.pendingPointer = undefined;
-        connection.pointer(message.buttons, message.x, message.y);
-        break;
-      case "motion":
-        if (current.socket.bufferedAmount > MOTION_BACKLOG_BYTES && !message.buttonsChanged) return;
-        connection.pointerMotion(message.buttons, message.dx, message.dy);
-        break;
-      case "code":
-        connection.keyCode(message.code, message.down);
-        break;
-      case "keysym":
-        connection.keySym(message.keysym, message.down);
-        break;
-      case "text":
-        connection.typeText(message.text);
-        break;
-      case "release":
-        connection.releaseAll();
-        break;
-      case "quality":
-        connection.setQuality(message.quality);
-        break;
-      case "serveScale":
-        connection.requestServeScale(message.percent);
-        break;
-      case "serveDisplay":
-        connection.requestServeDisplay(message.display);
-        break;
-      default:
-        return;
-    }
-    sendAll(current);
-  }
-
-  function flushPending() {
-    const current = session;
-    if (current?.pendingPointer && current.socket.bufferedAmount <= MOTION_BACKLOG_BYTES) {
-      const pending = current.pendingPointer;
-      current.pendingPointer = undefined;
-      current.connection.pointer(pending.buttons, pending.x, pending.y);
-      sendAll(current);
-    }
-  }
-
   return async function onMessage(message) {
     try {
       if (message.type === "connect") return await connect(message);
@@ -286,8 +237,7 @@ export function createSession(post) {
         handle(current, events);
         sendAll(current);
       } else if (message.type === "input") {
-        input(current, message);
-        flushPending();
+        current.input.handle(message);
       } else if (message.type === "redraw") {
         // The page was hidden and may have lost the canvas contents.
         const frame = image(current);

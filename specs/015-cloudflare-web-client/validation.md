@@ -6,6 +6,45 @@ their local tests and a local browser run. The live encrypted route is partly
 validated (T026 open). Live desktop control, device, resource, and soak gates
 remain open (T011, T017, T020).**
 
+## Branch review fixes (2026-11-03)
+
+A local review of `73b8746` against `main` reproduced four defects. Each now
+has a regression test that fails against the previous code and passes with
+the fix. Local evidence only; no device, live Cloudflare, or soak claim.
+
+- **Held pointer motion re-pressed released buttons.** Absolute motion held
+  under WebSocket backpressure kept its button mask and was sent after a
+  focus-loss release. Input dispatch moved to `web/session-input.mjs`; a
+  release or close discards held motion, and held motion is retried every
+  16 ms until the socket drains instead of waiting for the next input.
+  `web/tests/session-input.test.mjs`: 8 tests.
+- **Uncancelable text was typed twice.** `beforeinput` sent insertions even
+  when cancelling failed, and the `input` event sent the field again. The
+  handlers moved to `web/text-input.mjs`: insertions are sent from
+  `beforeinput` only when cancelled, deletions always (the field is empty, so
+  no `input` follows), and composed text once at `compositionend`.
+  `web/tests/text-input.test.mjs`: 5 tests.
+- **Parallel two-finger scrolling became a pinch.** The span was judged after
+  each single-finger report, so a half-updated pair crossed the 8% threshold.
+  Two-finger gestures are now judged once both fingers have reported, or when
+  one reports twice (the other is still). The exact diagonal, 10 px-step
+  reproduction is a test; the pinch test now moves both fingers in steps.
+- **Gateway handshake limit ended at the HTTP upgrade.** The borrowed
+  semaphore permit dropped when the 101 response returned, so unfinished
+  Noise handshakes were unbounded (12 of 12 held open). The permit is now
+  owned and held until the handshake succeeds, fails, or times out; established
+  sessions do not hold one. The test holds 8, gets 429 for a ninth, and sees
+  slots return after a disconnect, a completed handshake, and timeouts.
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | pass |
+| `cargo test --workspace` (separate `CARGO_TARGET_DIR`; `target/debug/topvnc.exe` was locked by a running server) | pass: 271 passed, 7 ignored, 0 failed |
+| `npm test` (in `web/`, Node 22.18.0) | pass, 24 |
+| `npm run build`, `npm run test:wasm` (in `web/`) | pass; 6 |
+| `npm test` (in `gateway/cloudflare/worker/`) | pass, 17 |
+
 ## Final workspace, WASM, and benchmark checks (T022, 2026-11-01)
 
 At `692835a`, clean apart from another agent's uncommitted

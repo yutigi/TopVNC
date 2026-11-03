@@ -468,6 +468,57 @@ async fn times_out_an_incomplete_handshake_without_tcp() {
     assert_no_tcp(&h.rfb).await;
 }
 
+/// Waits for state that a gateway task updates.
+async fn eventually(mut check: impl FnMut() -> bool) {
+    timeout(Duration::from_secs(5), async {
+        while !check() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("condition not reached");
+}
+
+#[tokio::test]
+async fn bounds_unfinished_handshakes_until_they_fail_succeed_or_time_out() {
+    let h = harness().await;
+    let free = || h.gateway.handshakes.available_permits();
+    // Authenticated upgrades that never start the Noise handshake hold their
+    // slots after the 101 response.
+    let mut waiting = Vec::new();
+    for _ in 0..MAX_PENDING_HANDSHAKES {
+        waiting.push(open(&h.url).await);
+    }
+    assert_eq!(free(), 0);
+    let token = fixtures::token(unix_now() + 3600);
+    match connect_async(request(&h.url, Some(&token))).await {
+        Err(tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS)
+        }
+        Err(other) => panic!("expected 429, got {other}"),
+        Ok(_) => panic!("admitted more than {MAX_PENDING_HANDSHAKES} unfinished handshakes"),
+    }
+
+    // A browser that leaves mid-handshake frees its slot.
+    drop(waiting.pop());
+    eventually(|| free() == 1).await;
+
+    // A completed handshake frees its slot; the session stays open.
+    let (mut ws, mut channel) = connect(&h).await;
+    let (mut tcp, _) = h.rfb.accept().await.unwrap();
+    eventually(|| free() == 1).await;
+
+    // The rest time out and free theirs.
+    for mut stalled in waiting {
+        assert_closed(&mut stalled, Some("E2E handshake timed out")).await;
+    }
+    eventually(|| free() == MAX_PENDING_HANDSHAKES).await;
+    send_sealed(&mut ws, &mut channel, b"still open").await;
+    let mut bytes = [0; 10];
+    tcp.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"still open");
+}
+
 #[tokio::test]
 async fn reports_an_offline_target_after_the_handshake() {
     let Harness {
