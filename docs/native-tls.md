@@ -32,6 +32,8 @@ For GUI hosting, launch with `--tls-cert CERT.pem --tls-key KEY.pem`, then use t
 
 ## Explicit legacy TCP
 
+If the viewer reports "Server answered with unencrypted VNC, not TLS", the host sent a plaintext RFB greeting. It is a third-party VNC server, an older TopVNC, or a host started with `--unencrypted`. Earlier builds showed rustls' `received corrupt message of type InvalidContentType` for the same case.
+
 `--unencrypted` selects plaintext for that launch and is labeled in the UI. It never follows a TLS failure automatically. It applies to both the viewer and GUI host, or to a `--serve` invocation. It cannot be combined with TLS credentials/trust settings for that endpoint. `--allow-insecure` separately permits RFB None authentication; it does not turn off TLS.
 
 The browser gateway already encrypts browser-to-host traffic with its Noise channel and connects to a loopback-only raw RFB target. Start that target explicitly:

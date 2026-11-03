@@ -267,7 +267,10 @@ fn native_tls_never_falls_back_to_a_plaintext_peer() {
         Encoding::Raw,
         || panic!("password leaked to plaintext host"),
     );
-    assert!(result.is_err());
+    // The user sees the cause, not rustls' "corrupt message" text.
+    let message = result.err().unwrap().to_string();
+    assert!(message.contains("unencrypted VNC, not TLS"), "{message}");
+    assert!(message.contains("--unencrypted"), "{message}");
     // Legacy interoperability is an independent, explicit choice.
     Session::connect_with_transport(
         &host.address().to_string(),

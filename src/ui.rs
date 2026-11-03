@@ -1461,8 +1461,7 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
     canvas.button(SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(SHARP, "SHARP", config.quality == Quality::Sharp);
     if let Some(error) = &state.error {
-        let short: String = error.chars().take(62).collect();
-        canvas.text(40, 537, &short, ERROR, 2);
+        status_message(canvas, error, ERROR);
     } else {
         canvas.text(
             40,
@@ -2384,6 +2383,8 @@ mod tests {
         let message = "Screen Recording access is required. Allow TopVNC in System Settings → \
                        Privacy & Security → Screen & System Audio Recording, then relaunch it";
         assert!(wrap(message, MESSAGE_LINE * 2).len() <= 4);
+        // The plaintext-server error stays in the large two-line form.
+        assert!(wrap(topvnc::transport::PLAINTEXT_SERVER, MESSAGE_LINE).len() <= 2);
     }
 
     #[test]
