@@ -31,8 +31,9 @@ lists what still needs a live run by the owner.
 
 ## How it works
 
-Four programs take part. Three of them run on the host computer, each in its
-own console window:
+Four programs take part. Three of them run on the host computer, either in
+three console windows or from TopVNC's **WEB** tab
+([Each session](#each-session)):
 
 | Program | Runs on | What it does |
 | --- | --- | --- |
@@ -311,6 +312,12 @@ screen: never send the link through chat or email.
 
    It prints the host key fingerprint, a QR code, and the link. Maximize the
    window so the QR code does not wrap.
+
+   With the WEB tab instead of consoles, press **Pair a browser**. TopVNC
+   draws the QR code, the fingerprint, and the minutes left in its own window,
+   and removes the code when a browser enrolls, after ten minutes, or on
+   **Cancel pairing**. The link is never shown as text. Pairing this way does
+   not restart the gateway, so a connected phone stays connected.
 3. On the phone, open the app URL and **finish the Access sign-in first**.
    The sign-in redirect loses the pairing part of the link, so scanning before
    signing in leaves the page at "Not paired".
@@ -330,6 +337,42 @@ gateway reuses; the sign-in-before-scanning rule above comes from that live
 run. `cargo web-pair` has not yet paired a browser over the live route.
 
 ## Each session
+
+### From the WEB tab
+
+TopVNC can run all three programs itself. Build the gateway next to TopVNC
+once, with the same profile you run TopVNC with:
+
+```powershell
+cargo build --release -p topvnc-web-gateway
+cargo run --release
+```
+
+On the **WEB** tab, type the VNC password and press **Start browser access**.
+The Server, Tunnel, and Gateway rows turn **Ready** in that order, on the same
+ready signals as the console table below. TopVNC serves this desktop as plain
+RFB on the gateway's `rfb_target` (loopback) with your password, using the
+Server tab's display, size, mouse, and priority choices; it never uses All
+networks or no password, and `--unencrypted` is not needed on the command
+line. It runs cloudflared and the gateway without console windows; click a
+row to see its recent output. **Stop browser access**, or closing TopVNC, ends
+all three. On Windows the children are tied to TopVNC, so they also end if
+TopVNC crashes or is killed.
+
+If the Server tab is already serving, the WEB tab uses that server only when it
+listens on `rfb_target` with a password and plain RFB; otherwise it asks you
+to stop it first. Before starting anything, the tab checks
+`gateway.local.toml` with the gateway's own rules, the token file, the host
+key, the gateway program, and cloudflared, and names the setup step that
+fixes the first problem it finds.
+
+**Verified 2026-11-04, locally only:** the start and stop order, time limits,
+failures, server reuse rules, pairing, and output handling with simulated
+programs; the gateway's supervised mode with the real gateway binary; and
+child shutdown when the parent process is killed. The WEB tab has not yet
+carried a live browser session.
+
+### From three consoles
 
 Open three console windows at the repository root and watch them yourself.
 Start them in this order:
@@ -376,6 +419,9 @@ Ctrl+C in all three windows.
 | "Another browser is connected" | Only one session runs at a time. Disconnect the other one, or wait about a minute if it was a phone that went to sleep. |
 | "The pinned host key or the pairing secret does not match" | The host key changed. Pair this browser again, after checking the fingerprint. |
 | "Your Cloudflare Access sign-in expired" | Reload the page and sign in. |
+| The WEB tab says `topvnc-web-gateway is not built next to TopVNC` | Run `cargo build --release -p topvnc-web-gateway` (or without `--release` if you run a debug TopVNC). |
+| The WEB tab names a setup step | Fix that step of [One-time setup](#one-time-setup), then press **Start browser access** again. |
+| A WEB tab row shows **Failed** | Click the row to see the program's last output. Nothing restarts by itself; press **Stop browser access**, fix the cause, and start again. |
 | `cargo web-tunnel` says the token file is not found | Save the token in `gateway/cloudflare/tunnel-token.txt` ([step 5](#5-create-the-private-tunnel)). |
 | `cargo web-tunnel` says `cloudflared` is not found | Install cloudflared, or set `CLOUDFLARED` to its full path. |
 | Window 1 stops with `TLS hosting needs --tls-cert CERT.pem and --tls-key KEY.pem` | Add `--unencrypted` and keep the address `127.0.0.1:5900` ([Each session](#each-session)). |
@@ -579,6 +625,7 @@ must stay on loopback.
 | Live route, Phase 0 encrypted echo | iPhone, iOS 27.0.1, Safari; Edge 156 | Passed (2026-10-30); unenrolled browser rejected (2026-10-31) |
 | Live route, desktop control of a Windows host | iPhone Safari | Owner-reported (2026-10-31): display, pointer, tap clicks, two-finger scroll, pinch zoom, on-screen typing, toolbar keys, disconnect and reconnect. Background return not confirmed; iOS version not recorded. Host ran plain `--serve`, before native TLS became the default; the page deployed then predates the 2026-10-31 restyle |
 | Worker CPU within the Free plan's 10 ms | Workers analytics | **Not passed; open risk.** Warm upgrades about 1.6-4 ms; 7 of 88 upgrades, the cold ones, used 13.0-18.7 ms. None was terminated. See [Free-plan Worker CPU](#free-plan-worker-cpu) |
+| WEB tab start, stop, and pairing | Windows 11 | Locally tested with simulated programs and the real gateway binary (2026-11-04); live route not run |
 | This runbook, end to end on a fresh account | Any | Not run. Steps checked locally and by dry run on 2026-11-01; see [Runbook verification](#runbook-verification) |
 | Two-hour soak, mobile link latency | iPhone Safari | Not tested |
 | macOS or Linux host | Any | Not tested |

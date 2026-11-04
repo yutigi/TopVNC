@@ -20,14 +20,19 @@ edition = "2024"
 [dependencies]
 topvnc-rfb = { path = "crates/topvnc-rfb" }
 topvnc-net = { path = "crates/topvnc-net" }
+# Checks gateway.local.toml with the gateway's own Access rules (WEB tab).
+topvnc-access = { path = "crates/topvnc-access" }
 bytemuck = "1"
 display-info = "0.5.9"
 flate2 = "1.1"
 getrandom = "0.4"
 jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 pollster = "0.4"
+qrcode = { version = "0.14", default-features = false }
 rpassword = "7.5"
 rustls = { version = "0.23.46", default-features = false, features = ["std", "ring"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 webpki-roots = "1"
 wgpu = "30"
 winit = "0.30.13"
@@ -36,7 +41,7 @@ winit = "0.30.13"
 rcgen = "0.14"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Media", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Media", "Win32_System_Console", "Win32_Security", "Win32_System_DataExchange", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

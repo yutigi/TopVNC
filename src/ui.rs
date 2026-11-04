@@ -3,6 +3,7 @@ use crate::desktop_host::{
     choose_displays, normalize_serve_scale,
 };
 use crate::helpers::{Helper, HelperForm, HelperRuntime};
+use crate::web_access::runtime::{Row, RowState, WebRuntime};
 use topvnc::presentation::MotionPresentation;
 use topvnc::{PerformanceMode, ServedDisplays, UpdatePriority};
 use winit::keyboard::KeyCode;
@@ -326,6 +327,8 @@ pub enum Field {
     ServeHost,
     ServePort,
     ServePassword,
+    /// The WEB tab's VNC password; the same value as the Server tab's.
+    WebPassword,
     WorkHost,
     WorkPort,
     NetworkPort,
@@ -341,6 +344,7 @@ pub enum Tab {
     #[default]
     Connect,
     Server,
+    Web,
     Work,
     Network,
     Firewall,
@@ -352,6 +356,7 @@ impl Tab {
         match self {
             Self::Connect => &[Field::Host, Field::Port, Field::Password, Field::WindowSize],
             Self::Server => &[Field::ServeHost, Field::ServePort, Field::ServePassword],
+            Self::Web => &[Field::WebPassword],
             Self::Work => &[Field::WorkHost, Field::WorkPort],
             Self::Network => &[Field::NetworkPort],
             Self::Firewall => &[
@@ -380,6 +385,8 @@ pub struct UiState {
     pub menu_open: bool,
     pub focus: Option<Field>,
     pub error: Option<String>,
+    /// The WEB tab row whose output is shown; `None` picks one.
+    pub web_row: Option<Row>,
 }
 
 impl UiState {
@@ -438,7 +445,7 @@ impl UiState {
             Field::WindowSize => Some(&mut config.window_size),
             Field::ServeHost => Some(&mut config.serve.host),
             Field::ServePort => Some(&mut config.serve.port),
-            Field::ServePassword => Some(&mut config.serve.password),
+            Field::ServePassword | Field::WebPassword => Some(&mut config.serve.password),
             Field::WorkHost => Some(&mut config.helpers.work_host),
             Field::WorkPort => Some(&mut config.helpers.work_port),
             Field::NetworkPort => Some(&mut config.helpers.network_port),
@@ -761,26 +768,32 @@ pub const TAB_SERVER: Box2 = Box2 {
     w: 98,
     h: 36,
 };
-pub const TAB_MORE: Box2 = Box2 {
+pub const TAB_WEB: Box2 = Box2 {
     x: 402,
     y: 34,
     w: 72,
     h: 36,
 };
+pub const TAB_MORE: Box2 = Box2 {
+    x: 482,
+    y: 34,
+    w: 72,
+    h: 36,
+};
 pub const MENU_WORK: Box2 = Box2 {
-    x: 402,
+    x: 482,
     y: 78,
     w: 150,
     h: 36,
 };
 pub const MENU_NETWORK: Box2 = Box2 {
-    x: 402,
+    x: 482,
     y: 118,
     w: 150,
     h: 36,
 };
 pub const MENU_FIREWALL: Box2 = Box2 {
-    x: 402,
+    x: 482,
     y: 158,
     w: 150,
     h: 36,
@@ -790,9 +803,10 @@ pub const MENU_TABS: [(Box2, Tab, &str); 3] = [
     (MENU_NETWORK, Tab::Network, "NETWORK"),
     (MENU_FIREWALL, Tab::Firewall, "FIREWALL"),
 ];
-pub const TABS: [(Box2, Tab, &str); 2] = [
+pub const TABS: [(Box2, Tab, &str); 3] = [
     (TAB_CONNECT, Tab::Connect, "CONNECT"),
     (TAB_SERVER, Tab::Server, "SERVER"),
+    (TAB_WEB, Tab::Web, "WEB"),
 ];
 pub const HELPER_RUN: Box2 = Box2 {
     x: 40,
@@ -1077,6 +1091,7 @@ pub fn landing(
     connecting: bool,
     server: &ServerView,
     helpers: &HelperRuntime,
+    web: &WebRuntime,
 ) {
     canvas.fill(
         Box2 {
@@ -1108,6 +1123,7 @@ pub fn landing(
     match state.tab {
         Tab::Connect => connect_tab(canvas, config, state, connecting),
         Tab::Server => server_tab(canvas, &config.serve, state, server),
+        Tab::Web => web_tab(canvas, &config.serve, state, server, web),
         Tab::Work | Tab::Network | Tab::Firewall => {
             helper_tab(canvas, &config.helpers, state, helpers)
         }
@@ -1704,6 +1720,283 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     }
 }
 
+pub const WEB_PASSWORD: Box2 = Box2 {
+    x: 40,
+    y: 130,
+    w: 420,
+    h: 40,
+};
+/// The status rows, clickable to choose the output shown below them.
+pub const WEB_ROWS: [(Box2, Row); 3] = [
+    (
+        Box2 {
+            x: 40,
+            y: 192,
+            w: 420,
+            h: 44,
+        },
+        Row::Server,
+    ),
+    (
+        Box2 {
+            x: 40,
+            y: 242,
+            w: 420,
+            h: 44,
+        },
+        Row::Tunnel,
+    ),
+    (
+        Box2 {
+            x: 40,
+            y: 292,
+            w: 420,
+            h: 44,
+        },
+        Row::Gateway,
+    ),
+];
+pub const WEB_START: Box2 = Box2 {
+    x: 40,
+    y: 574,
+    w: 420,
+    h: 40,
+};
+pub const WEB_PAIR: Box2 = Box2 {
+    x: 480,
+    y: 574,
+    w: 278,
+    h: 40,
+};
+/// The right side: help, or the pairing QR code.
+const WEB_PANEL: Box2 = Box2 {
+    x: 480,
+    y: 96,
+    w: 278,
+    h: 420,
+};
+const WEB_OUTPUT_Y: usize = 352;
+const WEB_OUTPUT_ROWS: usize = 14;
+/// Characters per small output line in the 420-pixel column.
+const WEB_OUTPUT_CHARS: usize = 70;
+const WARN: u32 = 0xf2c94c;
+
+/// The output the WEB tab shows: the chosen row's, else the first failed
+/// child's, else the gateway's once it runs, else the tunnel's.
+pub fn web_output_row(state: &UiState, web: &WebRuntime) -> Row {
+    state.web_row.unwrap_or_else(|| {
+        [Row::Tunnel, Row::Gateway]
+            .into_iter()
+            .find(|row| matches!(web.row(*row), RowState::Failed(_)))
+            .unwrap_or(if *web.row(Row::Gateway) == RowState::Stopped {
+                Row::Tunnel
+            } else {
+                Row::Gateway
+            })
+    })
+}
+
+fn web_tab(
+    canvas: &mut Canvas<'_>,
+    form: &ServeForm,
+    state: &UiState,
+    server: &ServerView,
+    web: &WebRuntime,
+) {
+    canvas.text(42, 76, "BROWSER ACCESS THROUGH CLOUDFLARE", MUTED, 2);
+    canvas.label(40, 108, "VNC PASSWORD");
+    canvas.field(
+        WEB_PASSWORD,
+        &form.password,
+        "REQUIRED",
+        state.focus == Some(Field::WebPassword),
+        true,
+    );
+    let shown = web_output_row(state, web);
+    for (area, row) in WEB_ROWS {
+        let row_state = web.row(row);
+        canvas.fill(area, PANEL);
+        canvas.frame(area, if row == shown { ACCENT } else { BORDER });
+        let (word, color) = match row_state {
+            RowState::Stopped => ("STOPPED", BORDER),
+            RowState::Waiting => ("WAITING", WARN),
+            RowState::Starting => ("STARTING", WARN),
+            RowState::Ready => ("READY", ACCENT),
+            RowState::Stopping => ("STOPPING", WARN),
+            RowState::Failed(_) => ("FAILED", ERROR),
+        };
+        canvas.fill(
+            Box2 {
+                x: area.x + 12,
+                y: area.y + 9,
+                w: 14,
+                h: 14,
+            },
+            color,
+        );
+        canvas.text(area.x + 38, area.y + 9, row.label(), TEXT, 2);
+        canvas.text(
+            area.x + 148,
+            area.y + 9,
+            word,
+            if matches!(row_state, RowState::Failed(_)) {
+                ERROR
+            } else {
+                MUTED
+            },
+            2,
+        );
+        let detail = match row_state {
+            RowState::Failed(reason) => Some(reason.clone()),
+            _ => web.detail(row),
+        };
+        if let Some(line) =
+            detail.and_then(|detail| wrap(&detail, (area.w - 50) / 6).into_iter().next())
+        {
+            canvas.text(area.x + 38, area.y + 30, &line, MUTED, 1);
+        }
+    }
+    canvas.label(40, WEB_OUTPUT_Y, &format!("{} OUTPUT", shown.label()));
+    let output: Vec<String> = match shown {
+        Row::Server => server.message.iter().cloned().collect(),
+        row => web.output(row),
+    };
+    let lines: Vec<String> = output
+        .iter()
+        .flat_map(|line| wrap(line, WEB_OUTPUT_CHARS))
+        .collect();
+    if lines.is_empty() {
+        canvas.text(40, WEB_OUTPUT_Y + 24, "NOTHING YET", MUTED, 1);
+    }
+    let first = lines.len().saturating_sub(WEB_OUTPUT_ROWS);
+    for (index, line) in lines[first..].iter().enumerate() {
+        canvas.text(40, WEB_OUTPUT_Y + 24 + index * 10, line, TEXT, 1);
+    }
+    web_panel(canvas, web);
+    if let Some(error) = &state.error {
+        status_message(canvas, error, ERROR);
+    } else if let Some(message) = web.message() {
+        status_message(canvas, message, TEXT);
+    }
+    let (start, active) = if web.is_idle() {
+        ("START BROWSER ACCESS", true)
+    } else if web.is_stopping() {
+        ("STOPPING...", false)
+    } else {
+        ("STOP BROWSER ACCESS", false)
+    };
+    canvas.button(WEB_START, start, active);
+    canvas.button(
+        WEB_PAIR,
+        if web.pairing_active() {
+            "CANCEL PAIRING"
+        } else {
+            "PAIR A BROWSER"
+        },
+        false,
+    );
+}
+
+fn web_panel(canvas: &mut Canvas<'_>, web: &WebRuntime) {
+    let panel = WEB_PANEL;
+    let small = |canvas: &mut Canvas<'_>, y: &mut usize, text: &str, color| {
+        for line in wrap(text, panel.w / 6) {
+            canvas.text(panel.x, *y, &line, color, 1);
+            *y += 10;
+        }
+    };
+    if let Some(code) = web.pairing() {
+        // Dark modules on a light square with a four-module quiet zone, the
+        // contrast phone cameras expect.
+        let side = code.width + 8;
+        let module = (panel.w / side).clamp(1, 6);
+        let size = side * module;
+        let left = panel.x + (panel.w.saturating_sub(size)) / 2;
+        canvas.fill(
+            Box2 {
+                x: left,
+                y: panel.y,
+                w: size,
+                h: size,
+            },
+            0xffffff,
+        );
+        for y in 0..code.width {
+            for x in 0..code.width {
+                if code.dark(x, y) {
+                    canvas.fill(
+                        Box2 {
+                            x: left + (x + 4) * module,
+                            y: panel.y + (y + 4) * module,
+                            w: module,
+                            h: module,
+                        },
+                        0x000000,
+                    );
+                }
+            }
+        }
+        let mut y = panel.y + size + 10;
+        if let Some(fingerprint) = web.fingerprint() {
+            canvas.text(panel.x, y, &format!("KEY {fingerprint}"), TEXT, 2);
+            y += 22;
+        }
+        let minutes = code.minutes_left(std::time::Instant::now());
+        canvas.text(
+            panel.x,
+            y,
+            &format!("{minutes} MIN LEFT, ONE USE"),
+            MUTED,
+            2,
+        );
+        y += 24;
+        small(
+            canvas,
+            &mut y,
+            "SIGN IN TO THE APP URL ON THE PHONE FIRST, THEN SCAN THIS CODE AND CHECK THAT THE PHONE SHOWS THE SAME KEY. SHOW IT ONLY ON THIS SCREEN.",
+            MUTED,
+        );
+        return;
+    }
+    let mut y = panel.y;
+    if web.pairing_active() {
+        canvas.text(panel.x, y, "PAIRING", TEXT, 2);
+        y += 24;
+        small(
+            canvas,
+            &mut y,
+            "THE QR CODE APPEARS HERE WHEN THE GATEWAY IS READY.",
+            MUTED,
+        );
+        return;
+    }
+    canvas.text(panel.x, y, "HOW IT WORKS", TEXT, 2);
+    y += 24;
+    small(
+        canvas,
+        &mut y,
+        "START RUNS THIS DESKTOP SERVER ON LOOPBACK WITH YOUR PASSWORD, THEN THE CLOUDFLARE TUNNEL, THEN THE WEB GATEWAY. STOP, OR CLOSING TOPVNC, ENDS ALL THREE.",
+        MUTED,
+    );
+    y += 10;
+    if let Some(origin) = web.app_origin() {
+        canvas.text(panel.x, y, "APP URL", TEXT, 2);
+        y += 22;
+        small(canvas, &mut y, origin, ACCENT);
+        y += 10;
+    }
+    small(
+        canvas,
+        &mut y,
+        "SETTINGS: GATEWAY/CLOUDFLARE/GATEWAY.LOCAL.TOML. FIRST-TIME SETUP: DOCS/CLOUDFLARE-GATEWAY.MD.",
+        MUTED,
+    );
+    if !cfg!(windows) {
+        y += 10;
+        small(canvas, &mut y, "NOT YET TESTED ON THIS PLATFORM.", ERROR);
+    }
+}
+
 fn stopped_status(permissions: Option<HostPermissions>) -> String {
     let answer = |allowed| if allowed { "YES" } else { "NO" };
     match permissions {
@@ -2282,6 +2575,34 @@ mod tests {
         const { assert!(LIVE_PROGRESSIVE.y + LIVE_PROGRESSIVE.h < SCALE_SLIDER.y) };
         const { assert!(DISCONNECT.y + DISCONNECT.h <= SETTINGS_PANEL.y + SETTINGS_PANEL.h) };
         assert!(!Config::default().progressive);
+    }
+
+    #[test]
+    fn web_tab_layout_and_shared_password() {
+        let tabs = [TAB_CONNECT, TAB_SERVER, TAB_WEB, TAB_MORE];
+        for pair in tabs.windows(2) {
+            assert!(pair[0].x + pair[0].w < pair[1].x);
+        }
+        for (area, _, _) in MENU_TABS {
+            assert!(area.x + area.w <= 800);
+        }
+        for pair in WEB_ROWS.windows(2) {
+            assert!(pair[0].0.y + pair[0].0.h < pair[1].0.y);
+        }
+        assert!(WEB_ROWS[2].0.y + WEB_ROWS[2].0.h < WEB_OUTPUT_Y);
+        const { assert!(WEB_OUTPUT_Y + 24 + WEB_OUTPUT_ROWS * 10 < 525) };
+        const { assert!(WEB_PANEL.x > WEB_PASSWORD.x + WEB_PASSWORD.w) };
+        const { assert!(WEB_PANEL.y + WEB_PANEL.h < 525) };
+        const { assert!(WEB_START.x + WEB_START.w < WEB_PAIR.x) };
+
+        // The WEB tab edits the Server tab's password; neither is saved.
+        let mut state = UiState::default();
+        let mut config = Config::default();
+        state.switch_tab(Tab::Web);
+        state.key(&mut config, KeyCode::Tab);
+        assert_eq!(state.focus, Some(Field::WebPassword));
+        state.character(&mut config, 'p');
+        assert_eq!(config.serve.password, "p");
     }
 
     #[test]

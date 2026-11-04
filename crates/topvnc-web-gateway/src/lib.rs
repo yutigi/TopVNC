@@ -253,6 +253,13 @@ impl Gateway {
         Ok(invite)
     }
 
+    /// Withdraws the open invite, if any. Returns whether one was open.
+    pub fn cancel_pairing(&self) -> bool {
+        self.enrollment
+            .lock()
+            .is_ok_and(|mut enrollment| enrollment.invite.take().is_some())
+    }
+
     fn pairing_secret(&self) -> Option<Key> {
         let enrollment = self.enrollment.lock().ok()?;
         enrollment
