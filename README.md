@@ -16,7 +16,7 @@ TopVNC can also serve a Windows or macOS display over RFB 3.8. The reusable serv
 - Linux hosting is not implemented.
 - **Measurements.** Frame rate and latency have been measured end to end between TopVNC's own server and viewer over an emulated network link ([Performance](#performance)), not yet with live capture of a game.
 
-[Quick start](#quick-start) · [Controls](#controls-and-display-settings) · [Security](#security-and-saved-settings) · [Development](#development) · [Roadmap](#roadmap)
+[Quick start](#quick-start) · [Phone access](#phone-and-browser-access-experimental) · [Controls](#controls-and-display-settings) · [Security](#security-and-saved-settings) · [Development](#development) · [Roadmap](#roadmap)
 
 ## Features
 
@@ -41,7 +41,7 @@ The protocol implementation handles RFB 3.3, 3.7, and 3.8. Apple's `RFB 003.889`
 
 ## Quick start
 
-You need a stable Rust toolchain with Cargo and native build tools for your platform. Windows and macOS are the currently tested client platforms. To connect, you also need a reachable VNC server configured for standard VNC password authentication.
+You need native build tools and rustup. The repository selects stable Rust 1.99.0 through `rust-toolchain.toml`, matching CI. Windows and macOS are the currently tested client platforms. To connect, you also need a reachable TLS-wrapped VNC server configured for standard VNC password authentication. Native connections now require TLS 1.3 by default; see [Native TLS setup](docs/native-tls.md) for certificates and legacy compatibility.
 
 ```sh
 git clone https://github.com/yutigi/TopVNC.git
@@ -54,7 +54,7 @@ cargo run --release
 3. Choose the compression, the initial window size, presentation rate, and scaling mode. For games and video, pick a **Tight JPEG** quality: **Low** (level 3) for Wi-Fi or slow links, **Med** (level 6, the default), or **High** (level 9) for a fast wired link. **Raw** and **Zlib** are lossless but far larger.
 4. Click **Connect**. Press **F8** during the session to adjust display settings or disconnect.
 
-> **Transport security:** TopVNC currently uses unencrypted TCP. VNC password authentication does not encrypt the framebuffer or input traffic. Use an isolated network or a separately secured tunnel for sensitive sessions. See [Security and saved settings](#security-and-saved-settings).
+> **Transport security:** Native connections use TLS 1.3 with certificate and hostname verification before VNC authentication. Supply `--tls-ca CA.pem` for a private/self-signed host. Plain VNC requires an explicit `--unencrypted` option and is labeled in the UI; TLS failures never fall back. See [Native TLS setup](docs/native-tls.md).
 
 ### Command-line options
 
@@ -71,6 +71,10 @@ cargo run --release -- 127.0.0.1:5900 --window 1280x720
 | `--fit` | Fit the remote image to the viewer window. |
 | `--native-size` | Show native pixels; center and crop if the image is larger than the window. |
 | `--window WIDTHxHEIGHT` | Set a custom initial window size, such as `1280x720`. |
+| `--tls-ca CA.pem` | Trust the PEM certificates in this file instead of public roots; verification remains enabled. |
+| `--tls-server-name NAME` | Verify this DNS/IP certificate identity while connecting to the entered host address. |
+| `--tls-cert CERT.pem --tls-key KEY.pem` | Configure TLS credentials for the GUI Server tab; also required by `--serve`. |
+| `--unencrypted` | Explicit legacy TCP for this launch, on viewer and GUI server; never selected automatically. |
 | `--allow-insecure` | Explicitly allow a server offering unauthenticated `None` security. |
 | `--quality LEVEL` | JPEG quality level for Tight, from 0 (smallest) to 9 (best); default 6. Lower it on a slow link. The form shows the level and offers 3, 6, and 9 as presets. |
 | `--ultra` | Enable Ultra performance mode: keep complete images coherent and remove the local FPS cap. Also selectable in the connection form and F8 panel. |
@@ -82,17 +86,17 @@ Do not use `--input-debug` while typing passwords: it logs key events.
 
 ### Serve this desktop
 
-Open the **Server** tab in the TopVNC window, enter a password, and click **Start server**. The tab binds to `127.0.0.1:5900` by default; click **All networks** to listen on every interface. Click **Display** to choose what to share: each click moves to the next choice, from **MAIN** (the primary display) to each detected display with its pixel size, then **ALL** displays side by side on Windows. **Served size** scales the image viewers receive, from 0.25× to 1.00× of the display's pixel size: drag the slider, or click **Full** or **Half**. Half size serves a Retina display at its size in points, a quarter of the pixels, which cuts encoding time and bandwidth for games. **Game mouse** chooses when viewers are asked for relative mouse motion, as `--mouse` does below: **Auto**, **Relative**, or **Absolute**. The tab shows the served size, address, and number of connected viewers, and keeps running while you use TopVNC as a viewer. Closing TopVNC stops the server. Server settings and passwords are not saved.
+Launch with `--tls-cert CERT.pem --tls-key KEY.pem`, open the **Server** tab, enter a password, and click **Start server**. Missing TLS credentials produce an error before capture starts. The tab binds to `127.0.0.1:5900` by default; click **All networks** to listen on every interface. Click **Display** to choose what to share: each click moves to the next choice, from **MAIN** (the primary display) to each detected display with its pixel size, then **ALL** displays side by side on Windows. **Served size** scales the image viewers receive, from 0.25× to 1.00× of the display's pixel size: drag the slider, or click **Full** or **Half**. Half size serves a Retina display at its size in points, a quarter of the pixels, which cuts encoding time and bandwidth for games. **Game mouse** chooses when viewers are asked for relative mouse motion, as `--mouse` does below: **Auto**, **Relative**, or **Absolute**. The tab shows the served size, address, and number of connected viewers, and keeps running while you use TopVNC as a viewer. Closing TopVNC stops the server. Server settings and passwords are not saved.
 
 You can also run the server as a separate console mode. It binds to localhost by default and prompts for a VNC password:
 
 ```sh
-cargo run --release -- --serve
-cargo run --release -- --serve 0.0.0.0:5900
-cargo run --release -- --serve 0.0.0.0:5900 --display 2
-cargo run --release -- --serve 0.0.0.0:5900 --display all
-cargo run --release -- --serve 0.0.0.0:5900 --scale 0.5
-cargo run --release -- --serve 0.0.0.0:5900 --mouse relative
+cargo run --release -- --serve --tls-cert certs.local/server.pem --tls-key certs.local/server-key.pem
+cargo run --release -- --serve 0.0.0.0:5900 --tls-cert certs.local/server.pem --tls-key certs.local/server-key.pem
+cargo run --release -- --serve 0.0.0.0:5900 --display 2 --tls-cert certs.local/server.pem --tls-key certs.local/server-key.pem
+cargo run --release -- --serve 0.0.0.0:5900 --display all --tls-cert certs.local/server.pem --tls-key certs.local/server-key.pem
+cargo run --release -- --serve 0.0.0.0:5900 --scale 0.5 --tls-cert certs.local/server.pem --tls-key certs.local/server-key.pem
+cargo run --release -- --serve 0.0.0.0:5900 --mouse relative --tls-cert certs.local/server.pem --tls-key certs.local/server-key.pem
 ```
 
 The second and later commands listen on all network interfaces, and `--scale` sets the served size (0.25 to 1). `--mouse` chooses when the server asks viewers for relative mouse motion:
@@ -118,7 +122,7 @@ In the viewer, **F8 → Present updates → Whole** (the default) and **Ultra** 
 
 ```sh
 cargo run --release -- HOST:5900 --ultra --smooth-motion
-cargo run --release -- --serve --ultra
+cargo run --release -- --serve --ultra --tls-cert certs.local/server.pem --tls-key certs.local/server-key.pem
 ```
 
 The Server tab has its own **ULTRA: ON** choice, set before starting the host. Server Ultra flushes each encoded Tight band immediately and honors future pacing deadlines below 1 ms without deliberately rounding them up to 1 ms. The viewer's mode works with other servers too, but cannot change their capture or encoding behavior. Both ends retain normal authentication and flow control. Encoding, JPEG quality, and served resolution remain explicit choices.
@@ -129,9 +133,9 @@ The decoder and renderer communicate through one pending image and two reusable 
 
 **Below 0.5 ms input-to-screen is an unachieved target.** Ultra does not guarantee it. Capture waits for an available desktop image, and GPU presentation can still depend on the driver and compositor. See [Microsoft's capture API](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-acquirenextframe) and [wgpu's presentation modes](https://docs.rs/wgpu/30.0.0/wgpu/enum.PresentMode.html). Physical input-to-visible-response requires measurement with real capture and display hardware.
 
-The Server tab's **Game mouse** buttons set the same three modes, starting at Auto. Standard VNC password authentication uses only the first eight password bytes. TCP is unencrypted, so use a trusted network or a secure tunnel. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
+The Server tab's **Game mouse** buttons set the same three modes, starting at Auto. Standard VNC password authentication uses only the first eight password bytes. Native hosting requires TLS credentials by default. Use `--unencrypted` only for explicitly secured legacy integrations, including the browser gateway’s loopback-only RFB target. To intentionally disable authentication, add `--allow-insecure`; do this only on an isolated trusted network. Clipboard text is synchronized between remote clients and the Windows system clipboard; characters outside Latin-1 are replaced with `?` when sent to viewers.
 
-The server shares the primary display unless `--display NUMBER` selects another attached display (numbered from 1, as the Server tab lists them) or `--display all` shares every display in one image arranged as on the desktop. On Windows, the server follows display changes within about a second. If another display becomes primary, the primary choice switches to it. If a chosen display is unplugged, the primary display is served until it returns. Plugging in or removing a monitor under **ALL** recomputes the layout. If all displays together exceed VNC's 8192-pixel limit, the primary is served instead, with a notice. Viewers can switch displays during a session with **F8 → Display**; like the served size, the choice is shared by all viewers. To give each display its own port, run one server per display, such as `--serve 0.0.0.0:5900 --display 1` and `--serve 0.0.0.0:5901 --display 2`. See [`specs/013-multi-monitor/spec.md`](specs/013-multi-monitor/spec.md) for what has been validated. Run it in an interactive, unlocked session: services and disconnected Remote Desktop sessions cannot capture the desktop. While Windows shows the secure desktop (UAC prompts, the lock screen), viewers keep the last image and capture resumes automatically afterward. If the display resolution changes, viewers that support the DesktopSize extension follow the new size; others are disconnected and can reconnect. TopVNC's viewer now handles live size changes without reconnecting.
+The server shares the primary display unless `--display NUMBER` selects another attached display (numbered from 1, as the Server tab lists them) or `--display all` shares every display in one image arranged as on the desktop. On Windows, the server follows display changes within about a second. If another display becomes primary, the primary choice switches to it. If a chosen display is unplugged, the primary display is served until it returns. Plugging in or removing a monitor under **ALL** recomputes the layout. If all displays together exceed VNC's 8192-pixel limit, the primary is served instead, with a notice. Viewers can switch displays during a session with **F8 → Display**; like the served size, the choice is shared by all viewers. To give each display its own port, run one server per display, such as `--serve 0.0.0.0:5900 --display 1` and `--serve 0.0.0.0:5901 --display 2`, each with `--tls-cert` and `--tls-key`. See [`specs/013-multi-monitor/spec.md`](specs/013-multi-monitor/spec.md) for what has been validated. Run it in an interactive, unlocked session: services and disconnected Remote Desktop sessions cannot capture the desktop. While Windows shows the secure desktop (UAC prompts, the lock screen), viewers keep the last image and capture resumes automatically afterward. If the display resolution changes, viewers that support the DesktopSize extension follow the new size; others are disconnected and can reconnect. TopVNC's viewer now handles live size changes without reconnecting.
 
 #### On macOS
 
@@ -141,6 +145,35 @@ Hosting a Mac needs macOS 12.3 or later and two permissions, which the Server ta
 - **Accessibility** (*System Settings → Privacy & Security → Accessibility*) lets viewers type and use the mouse. Without it the server runs view-only and shows a warning, and remote input starts as soon as access is granted, without a restart.
 
 When TopVNC runs from a terminal, including `cargo run`, macOS grants both permissions to the terminal app, not to TopVNC. The server shares the main display, following it when another display becomes main, or `--display NUMBER` in ScreenCaptureKit's display order. Serving all displays at once and switching displays from the viewer are not implemented for Mac hosts yet. The display is served at its native pixel size by default: a Retina display is then served at its full pixel resolution, which makes updates large. For games, serve at half size and use Tight JPEG in the viewer. ScreenCaptureKit scales the image on the GPU. The cursor is part of the captured image. If port 5900 is already taken, macOS Screen Sharing or Remote Management may be listening on it; choose another port such as 5901. A Mac that is locked cannot be captured or unlocked through this server: viewers keep the last image, and starting the server while the Mac is locked fails.
+
+## Phone and browser access (experimental)
+
+You can control your own TopVNC host from a phone's browser, over the internet, using only Cloudflare's free plans: no open port, domain, or phone VPN. The owner has controlled a Windows desktop this way from iPhone Safari; the two-hour soak and Free-plan CPU limits are still open. See the [full guide](docs/cloudflare-gateway.md) for status and the security model.
+
+```text
+Phone ── HTTPS ──> Cloudflare (Access sign-in, Worker) ── private tunnel ──> your host:
+                                                     cloudflared → topvnc-web-gateway → topvnc --serve
+```
+
+**Set up once** (about 30 minutes, [step by step](docs/cloudflare-gateway.md#one-time-setup)):
+
+1. Install the pinned build tools, Node.js 22, and `cloudflared`.
+2. Sign in to Cloudflare with Wrangler and pick your app URL, `https://<name>.<subdomain>.workers.dev`.
+3. Protect that URL with a Cloudflare Access application that allows only your email.
+4. Create a private Cloudflare Tunnel and a Workers VPC service pointing at `127.0.0.1:6080`.
+5. Copy the values into `wrangler.local.toml` and `gateway.local.toml`, create the host key, then build and deploy.
+
+**Pair your phone** (once per browser, [details](docs/cloudflare-gateway.md#pair-your-phone)): start the gateway with `cargo web-pair`, sign in to the app URL on the phone **first**, then scan the QR code on the host's screen, check that the fingerprints match, press **Connect**, and enter the VNC password.
+
+**Each session**, in three console windows on the host:
+
+```powershell
+cargo run --release -- --serve --unencrypted   # 1. loopback RFB for the encrypted browser gateway
+cargo web-tunnel                 # 2. wait for "Registered tunnel connection"
+cargo web-gateway                # 3. the gateway for already paired browsers
+```
+
+Then open the app URL on the phone and press **Connect**. If something fails, the page names the missing piece; the guide's [troubleshooting table](docs/cloudflare-gateway.md#troubleshooting) lists each message.
 
 ## Controls and display settings
 
@@ -171,7 +204,7 @@ When TopVNC runs from a terminal, including `cargo run`, macOS grants both permi
 
 ![F8 served-size controls disabled until an updated TopVNC host advertises support](docs/images/topvnc-session-settings-unavailable.png)
 
-For a local synthetic preview that captures no desktop, run `cargo run --example served_size_demo`, then open TopVNC, connect to `127.0.0.1:5998` with **Allow insecure** explicitly enabled, choose a `1280x720` window, and open F8. The demo binds only to loopback, discards input, and stops after five minutes. Windows protocol tests cover repeated resize and full refresh with Raw/Tight and requested/pushed updates. macOS capture wiring is implemented but has not been compiled or run here; live desktop capture and GUI click validation remain pending.
+For a local synthetic preview that captures no desktop, run `cargo run --example served_size_demo`, launch TopVNC in another terminal with `cargo run -- --unencrypted`, and connect to `127.0.0.1:5998` with **Allow insecure** explicitly enabled, choose a `1280x720` window, and open F8. The demo binds only to loopback, discards input, and stops after five minutes. Windows protocol tests cover repeated resize and full refresh with Raw/Tight and requested/pushed updates. macOS capture wiring is implemented but has not been compiled or run here; live desktop capture and GUI click validation remain pending.
 
 The initial viewer fits within the primary display by default when the remote screen is larger. Scaling happens on the GPU at the display's full resolution. The network thread requests updates independently of the presentation limit.
 
@@ -264,7 +297,7 @@ These settings and the Windows host's mouse handling have not yet been validated
 
 ## Security and saved settings
 
-Standard VNC password authentication (security type 2) is implemented. Unauthenticated `None` security (type 1) requires an explicit checkbox or `--allow-insecure`; TopVNC does not silently downgrade to it. Both modes leave framebuffer and input traffic unencrypted. Username authentication and encrypted transport are not implemented.
+Standard VNC password authentication (security type 2) is implemented. Unauthenticated `None` security (type 1) requires an explicit checkbox or `--allow-insecure`; TopVNC does not silently downgrade to it. The native executable requires direct TLS 1.3 before RFB and verifies the host certificate chain and DNS/IP name. TLS failures do not fall back. Plain VNC is available only with `--unencrypted`, independently of `--allow-insecure`; the reusable library’s legacy TCP APIs remain available for embedded/loopback integrations. This is direct TLS wrapping, not VeNCrypt negotiation. Username authentication is not implemented. See [Native TLS setup and automated checks](docs/native-tls.md).
 
 The last successfully connected address and port are restored on the next launch. Authentication and transport security choices are never restored automatically.
 
@@ -290,8 +323,8 @@ without starting a server.
 
 Test TCP reachability from the other computer using your configured address and
 port, then connect the viewer. The launcher does not change VPN or firewall
-settings. Review existing firewall scope separately and retain a trusted private
-transport because VNC traffic is unencrypted.
+settings. Review existing firewall scope separately and retain the reviewed private-network
+policy. Native traffic is encrypted by default; configure `TOPVNC_TLS_CERT` and `TOPVNC_TLS_KEY` PEM paths for the launcher, and trust the host certificate in the viewer with `--tls-ca`.
 
 See the [startup guide](docs/windows-private-network.md#workhome-startup-order)
 for generic examples and diagnostic limits. Replace example addresses locally;
@@ -322,7 +355,7 @@ The VNC password opens the screen-sharing connection. The macOS lock screen asks
 
 If framebuffer data stops arriving, TopVNC requests a full refresh after five seconds, preserving partially received messages. If another five-second read wait expires during that update, it returns to the connection form with an error. This recovery is covered by simulated TCP server tests on Windows.
 
-Address lookup/TCP connection and the RFB handshake each have a ten-second deadline. Connection and session failures are shown in the connection form.
+The native TLS path shares a ten-second deadline across address lookup, TCP, TLS, and the RFB handshake. Connection and session failures are shown in the connection form.
 
 ### Input appears to be ignored
 
@@ -362,8 +395,14 @@ cargo run
 | [`tools/screen_latency.swift`](tools/screen_latency.swift) | macOS tool that measures the time until benchmark frames are displayed in a viewer window. |
 | [`specs/004-vnc-server/spec.md`](specs/004-vnc-server/spec.md) | Server scope, security behavior, and limitations. |
 | [`specs/`](specs/) | Feature scope and acceptance criteria. |
+| [`crates/topvnc-rfb`](crates/topvnc-rfb) | Client RFB protocol without sockets or UI, shared by the native and browser viewers. |
+| [`crates/topvnc-net`](crates/topvnc-net) | The few socket system calls the safe crates cannot make, such as waking a Windows reader thread when the server closes a client. |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Formatting, Clippy, and tests on Windows and Ubuntu, plus the WebAssembly browser client and Worker. macOS is checked locally, not in CI. |
+| [`crates/topvnc-web`](crates/topvnc-web) and [`web/`](web/) | Browser client: Rust/WASM session and the page. |
+| [`crates/topvnc-web-gateway`](crates/topvnc-web-gateway) | Host gateway between the encrypted browser channel and `topvnc --serve`. |
+| [`gateway/cloudflare/worker`](gateway/cloudflare/worker) | Cloudflare Worker that serves the page and forwards `/ws` into the private tunnel. |
 
-The native frontend uses TCP and a software window. Protocol and framebuffer code are kept separate from the UI so future frontends can reuse them. A browser frontend will need a browser-compatible transport and gateway because web pages cannot open raw VNC TCP sockets.
+The native frontend uses TLS over TCP and a native window; legacy plaintext requires explicit opt-in. Browsers cannot open raw VNC TCP sockets, so the browser client reaches the host over a WebSocket through Cloudflare and the host gateway; see [Phone and browser access](#phone-and-browser-access-experimental).
 
 The project uses [GitHub Spec Kit](https://github.com/github/spec-kit) with Codex integration. Workflows live in `.agents/skills/`; templates and PowerShell scripts live in `.specify/`.
 
@@ -378,4 +417,4 @@ For contributions, read [AGENTS.md](AGENTS.md), record scope and acceptance crit
 - Validate macOS unlock transitions and full remote control against live servers, and the Linux viewer.
 - Add clipboard integration in the viewer, remote desktop resizing, layout-independent key codes, and a client-drawn cursor.
 - Expand authentication and transport security options.
-- Build a browser client and gateway sharing the native session behavior where web APIs allow it.
+- Finish validating the browser client: background return on iPhone, two-hour sessions, and Worker CPU within the Free plan.

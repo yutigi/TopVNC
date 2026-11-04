@@ -1,0 +1,30 @@
+# Copy to wrangler.local.toml (ignored), then set your non-secret account
+# values. Verify Workers Free in the dashboard before deploying; never select
+# Paid. The Worker name decides the workers.dev hostname that the Access
+# application must protect.
+name = "topvnc"
+main = "src/index.mjs"
+compatibility_date = "2026-10-29"
+workers_dev = true
+preview_urls = false
+account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+
+
+# The browser client, built by `npm run build` in web/. Matching files are
+# served without running Worker code; only /ws reaches the Worker.
+[assets]
+directory = "../../../web/dist"
+run_worker_first = ["/ws"]
+
+[vars]
+APP_ORIGIN = "https://topvnc.YOUR_SUBDOMAIN.workers.dev"
+ACCESS_ISSUER = "https://YOUR_TEAM.cloudflareaccess.com"
+ACCESS_AUD = "YOUR_ACCESS_APPLICATION_AUD"
+OWNER_EMAIL = "you@example.com"
+UPSTREAM_URL = "http://127.0.0.1:6080/ws"
+
+# One private HTTP service bound to one tunnel/host/port. Not a public hostname.
+[[vpc_services]]
+binding = "HOST_NET"
+service_id = "00000000-0000-0000-0000-000000000000"
+remote = true

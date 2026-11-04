@@ -106,7 +106,7 @@ impl FrameMailbox {
             ));
         }
         let mut state = self.state()?;
-        let dimensions = (source.width, source.height);
+        let dimensions = source.dimensions();
         let resized = state.dimensions != dimensions;
         let full = DamageRect {
             x: 0,
@@ -150,7 +150,7 @@ impl FrameMailbox {
                 completed,
             }
         };
-        if (ready.slot.framebuffer.width, ready.slot.framebuffer.height) != dimensions {
+        if ready.slot.framebuffer.dimensions() != dimensions {
             ready.slot.framebuffer = Framebuffer::new(dimensions.0, dimensions.1)?;
             ready.slot.stale = Some(full);
             ready.damage = full;
@@ -253,7 +253,7 @@ fn copy_area(source: &Framebuffer, target: &mut Framebuffer, area: DamageRect) {
     for row in usize::from(area.y)..usize::from(area.y) + usize::from(area.height) {
         let start = row * stride + usize::from(area.x);
         let end = start + usize::from(area.width);
-        target.pixels[start..end].copy_from_slice(&source.pixels[start..end]);
+        target.pixels_mut()[start..end].copy_from_slice(&source.pixels()[start..end]);
     }
 }
 

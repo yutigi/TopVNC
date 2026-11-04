@@ -1,0 +1,16 @@
+[package]
+name = "topvnc-e2e"
+version = "0.2.0"
+edition = "2024"
+description = "Noise XK browser-to-host channel for TopVNC's web client and gateway"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+blake2 = { version = "0.10", default-features = false }
+getrandom = "0.3"
+# Pure-Rust resolver only; snow's `std` feature would also enable ring.
+snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }

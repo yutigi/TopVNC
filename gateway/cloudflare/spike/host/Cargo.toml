@@ -1,0 +1,21 @@
+[package]
+name = "topvnc-spike-host"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+topvnc-spike-policy.workspace = true
+topvnc-spike-e2e.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+futures-util = { version = "0.3", features = ["sink"] }
+qrcode = { version = "0.14", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
+toml = "0.8"
+
+[dev-dependencies]
+topvnc-spike-policy = { workspace = true, features = ["test-fixtures"] }
+tokio-tungstenite = "0.29"
+serde_json.workspace = true

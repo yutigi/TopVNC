@@ -3,6 +3,7 @@ use crate::desktop_host::{
     choose_displays, normalize_serve_scale,
 };
 use crate::helpers::{Helper, HelperForm, HelperRuntime};
+use crate::web_access::runtime::{Row, RowState, WebRuntime};
 use topvnc::presentation::MotionPresentation;
 use topvnc::{PerformanceMode, ServedDisplays, UpdatePriority};
 use winit::keyboard::KeyCode;
@@ -43,6 +44,7 @@ pub const DEFAULT_JPEG_QUALITY: u8 = 6;
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub tls: topvnc::transport::TlsOptions,
     pub performance: PerformanceMode,
     pub motion: MotionPresentation,
     pub host: String,
@@ -73,6 +75,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            tls: Default::default(),
             performance: PerformanceMode::Standard,
             motion: MotionPresentation::Smooth,
             host: String::new(),
@@ -117,6 +120,7 @@ pub const ALL_NETWORKS_HOST: &str = "0.0.0.0";
 /// The Server tab form. Like the client's security choices, it is never saved.
 #[derive(Clone, Debug)]
 pub struct ServeForm {
+    pub tls: topvnc::transport::TlsOptions,
     pub performance: PerformanceMode,
     pub host: String,
     pub port: String,
@@ -133,6 +137,7 @@ pub struct ServeForm {
 impl Default for ServeForm {
     fn default() -> Self {
         Self {
+            tls: Default::default(),
             performance: PerformanceMode::Standard,
             host: LOCAL_ONLY_HOST.into(),
             port: "5900".into(),
@@ -149,6 +154,7 @@ impl Default for ServeForm {
 /// A validated request to start serving this desktop.
 #[derive(Debug, PartialEq)]
 pub struct ServeRequest {
+    pub tls: topvnc::transport::TlsOptions,
     pub performance: PerformanceMode,
     pub address: String,
     pub display: DisplaySelection,
@@ -175,6 +181,7 @@ impl ServeForm {
             Some(self.password.clone())
         };
         Ok(ServeRequest {
+            tls: self.tls.clone(),
             performance: self.performance,
             address,
             display: self.display,
@@ -320,6 +327,8 @@ pub enum Field {
     ServeHost,
     ServePort,
     ServePassword,
+    /// The WEB tab's VNC password; the same value as the Server tab's.
+    WebPassword,
     WorkHost,
     WorkPort,
     NetworkPort,
@@ -335,6 +344,7 @@ pub enum Tab {
     #[default]
     Connect,
     Server,
+    Web,
     Work,
     Network,
     Firewall,
@@ -346,6 +356,7 @@ impl Tab {
         match self {
             Self::Connect => &[Field::Host, Field::Port, Field::Password, Field::WindowSize],
             Self::Server => &[Field::ServeHost, Field::ServePort, Field::ServePassword],
+            Self::Web => &[Field::WebPassword],
             Self::Work => &[Field::WorkHost, Field::WorkPort],
             Self::Network => &[Field::NetworkPort],
             Self::Firewall => &[
@@ -374,6 +385,11 @@ pub struct UiState {
     pub menu_open: bool,
     pub focus: Option<Field>,
     pub error: Option<String>,
+    /// A WEB tab confirmation, such as a copied app URL, shown until the
+    /// next WEB action.
+    pub notice: Option<String>,
+    /// The WEB tab row whose output is shown; `None` picks one.
+    pub web_row: Option<Row>,
 }
 
 impl UiState {
@@ -432,7 +448,7 @@ impl UiState {
             Field::WindowSize => Some(&mut config.window_size),
             Field::ServeHost => Some(&mut config.serve.host),
             Field::ServePort => Some(&mut config.serve.port),
-            Field::ServePassword => Some(&mut config.serve.password),
+            Field::ServePassword | Field::WebPassword => Some(&mut config.serve.password),
             Field::WorkHost => Some(&mut config.helpers.work_host),
             Field::WorkPort => Some(&mut config.helpers.work_port),
             Field::NetworkPort => Some(&mut config.helpers.network_port),
@@ -673,6 +689,15 @@ pub const INSECURE: Box2 = Box2 {
     w: 24,
     h: 24,
 };
+/// Transport is a separate, explicit choice from RFB authentication.
+pub const UNENCRYPTED_TRANSPORT: Box2 = Box2 {
+    x: 40,
+    y: 325,
+    w: 24,
+    h: 24,
+};
+pub const SERVE_UNENCRYPTED_TRANSPORT: Box2 = UNENCRYPTED_TRANSPORT;
+const UNENCRYPTED_LABEL: &str = "PLAIN TCP (NO TLS)";
 pub const FIT: Box2 = Box2 {
     x: 40,
     y: 386,
@@ -746,26 +771,32 @@ pub const TAB_SERVER: Box2 = Box2 {
     w: 98,
     h: 36,
 };
-pub const TAB_MORE: Box2 = Box2 {
+pub const TAB_WEB: Box2 = Box2 {
     x: 402,
     y: 34,
     w: 72,
     h: 36,
 };
+pub const TAB_MORE: Box2 = Box2 {
+    x: 482,
+    y: 34,
+    w: 72,
+    h: 36,
+};
 pub const MENU_WORK: Box2 = Box2 {
-    x: 402,
+    x: 482,
     y: 78,
     w: 150,
     h: 36,
 };
 pub const MENU_NETWORK: Box2 = Box2 {
-    x: 402,
+    x: 482,
     y: 118,
     w: 150,
     h: 36,
 };
 pub const MENU_FIREWALL: Box2 = Box2 {
-    x: 402,
+    x: 482,
     y: 158,
     w: 150,
     h: 36,
@@ -775,9 +806,10 @@ pub const MENU_TABS: [(Box2, Tab, &str); 3] = [
     (MENU_NETWORK, Tab::Network, "NETWORK"),
     (MENU_FIREWALL, Tab::Firewall, "FIREWALL"),
 ];
-pub const TABS: [(Box2, Tab, &str); 2] = [
+pub const TABS: [(Box2, Tab, &str); 3] = [
     (TAB_CONNECT, Tab::Connect, "CONNECT"),
     (TAB_SERVER, Tab::Server, "SERVER"),
+    (TAB_WEB, Tab::Web, "WEB"),
 ];
 pub const HELPER_RUN: Box2 = Box2 {
     x: 40,
@@ -1062,6 +1094,7 @@ pub fn landing(
     connecting: bool,
     server: &ServerView,
     helpers: &HelperRuntime,
+    web: &WebRuntime,
 ) {
     canvas.fill(
         Box2 {
@@ -1093,6 +1126,7 @@ pub fn landing(
     match state.tab {
         Tab::Connect => connect_tab(canvas, config, state, connecting),
         Tab::Server => server_tab(canvas, &config.serve, state, server),
+        Tab::Web => web_tab(canvas, &config.serve, state, server, web),
         Tab::Work | Tab::Network | Tab::Firewall => {
             helper_tab(canvas, &config.helpers, state, helpers)
         }
@@ -1343,6 +1377,21 @@ fn helper_tab(
     canvas.button(REPORT_COPY, "COPY REPORT", false);
 }
 
+fn transport_checkbox(canvas: &mut Canvas<'_>, area: Box2, unencrypted: bool) {
+    canvas.fill(area, if unencrypted { ACCENT } else { FIELD });
+    canvas.frame(area, BORDER);
+    if unencrypted {
+        canvas.text(area.x + 5, area.y + 4, "X", BG, 2);
+    }
+    canvas.text(
+        area.x + area.w + 12,
+        area.y + 4,
+        UNENCRYPTED_LABEL,
+        if unencrypted { ERROR } else { TEXT },
+        2,
+    );
+}
+
 fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connecting: bool) {
     canvas.text(42, 76, "CONNECT TO A REMOTE DESKTOP", MUTED, 2);
     ultra_button(canvas, ULTRA_MODE, config.performance);
@@ -1388,12 +1437,17 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
             config.compression == Compression::Tight && config.jpeg_quality == level,
         );
     }
+    transport_checkbox(canvas, UNENCRYPTED_TRANSPORT, config.tls.unencrypted);
     canvas.text(
-        40,
+        400,
         331,
-        "VNC PASSWORD TRAFFIC IS UNENCRYPTED. USE A SECURE TUNNEL.",
-        MUTED,
-        2,
+        if config.tls.unencrypted {
+            "UNENCRYPTED: USE A SEPARATELY SECURED TUNNEL."
+        } else {
+            "TLS: CERTIFICATE AND HOST NAME VERIFIED."
+        },
+        if config.tls.unencrypted { ERROR } else { MUTED },
+        1,
     );
     canvas.label(40, 362, "WINDOW SIZE");
     canvas.button(FIT, "FIT", config.window_mode == WindowMode::Fit);
@@ -1426,10 +1480,15 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
     canvas.button(SMOOTH, "SMOOTH", config.quality == Quality::Smooth);
     canvas.button(SHARP, "SHARP", config.quality == Quality::Sharp);
     if let Some(error) = &state.error {
-        let short: String = error.chars().take(62).collect();
-        canvas.text(40, 537, &short, ERROR, 2);
+        status_message(canvas, error, ERROR);
     } else {
-        canvas.text(40, 537, "TCP TRANSPORT  /  UNENCRYPTED", MUTED, 2);
+        canvas.text(
+            40,
+            537,
+            config.tls.label(),
+            if config.tls.unencrypted { ERROR } else { MUTED },
+            2,
+        );
     }
     canvas.button(
         CONNECT,
@@ -1500,12 +1559,17 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     for (area, mode, name) in SERVE_MOUSE {
         canvas.button(area, name, form.mouse == mode);
     }
+    transport_checkbox(canvas, SERVE_UNENCRYPTED_TRANSPORT, form.tls.unencrypted);
     canvas.text(
-        40,
+        400,
         331,
-        "ONLY 8 PASSWORD CHARACTERS ARE USED. TCP IS UNENCRYPTED.",
-        MUTED,
-        2,
+        if form.tls.unencrypted {
+            "UNENCRYPTED. ONLY 8 PASSWORD CHARACTERS ARE USED."
+        } else {
+            "TLS REQUIRES --tls-cert AND --tls-key PEM FILES."
+        },
+        if form.tls.unencrypted { ERROR } else { MUTED },
+        1,
     );
     canvas.label(40, 362, "LISTEN ON");
     canvas.button(
@@ -1639,13 +1703,319 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     } else if let Some(message) = &server.message {
         status_message(canvas, message, MUTED);
     } else {
-        canvas.text(40, 537, "TCP TRANSPORT  /  UNENCRYPTED", MUTED, 2);
+        canvas.text(
+            40,
+            537,
+            if form.tls.unencrypted {
+                "TCP / UNENCRYPTED (EXPLICIT)"
+            } else {
+                "TLS 1.3 / ENCRYPTED TRANSPORT"
+            },
+            if form.tls.unencrypted { ERROR } else { MUTED },
+            2,
+        );
     }
     match server.phase {
         ServerPhase::Stopped => canvas.button(CONNECT, "START SERVER", true),
         ServerPhase::Starting => canvas.button(CONNECT, "STARTING...", true),
         ServerPhase::Serving { .. } => canvas.button(CONNECT, "STOP SERVER", false),
         ServerPhase::Stopping => canvas.button(CONNECT, "STOPPING...", false),
+    }
+}
+
+pub const WEB_PASSWORD: Box2 = Box2 {
+    x: 40,
+    y: 130,
+    w: 420,
+    h: 40,
+};
+/// The status rows, clickable to choose the output shown below them.
+pub const WEB_ROWS: [(Box2, Row); 3] = [
+    (
+        Box2 {
+            x: 40,
+            y: 192,
+            w: 420,
+            h: 44,
+        },
+        Row::Server,
+    ),
+    (
+        Box2 {
+            x: 40,
+            y: 242,
+            w: 420,
+            h: 44,
+        },
+        Row::Tunnel,
+    ),
+    (
+        Box2 {
+            x: 40,
+            y: 292,
+            w: 420,
+            h: 44,
+        },
+        Row::Gateway,
+    ),
+];
+pub const WEB_START: Box2 = Box2 {
+    x: 40,
+    y: 574,
+    w: 420,
+    h: 40,
+};
+pub const WEB_PAIR: Box2 = Box2 {
+    x: 480,
+    y: 574,
+    w: 278,
+    h: 40,
+};
+/// The right side: help, or the pairing QR code.
+const WEB_PANEL: Box2 = Box2 {
+    x: 480,
+    y: 96,
+    w: 278,
+    h: 420,
+};
+/// Below the help text in the panel, while the app URL is known and no
+/// pairing code is shown.
+pub const WEB_COPY_URL: Box2 = Box2 {
+    x: 480,
+    y: 476,
+    w: 278,
+    h: 36,
+};
+
+/// Whether the WEB tab offers [`WEB_COPY_URL`]: the app URL to copy is known
+/// and the panel is not showing pairing.
+pub fn web_copy_url_shown(web: &WebRuntime) -> bool {
+    web.app_origin().is_some() && !web.pairing_active()
+}
+const WEB_OUTPUT_Y: usize = 352;
+const WEB_OUTPUT_ROWS: usize = 14;
+/// Characters per small output line in the 420-pixel column.
+const WEB_OUTPUT_CHARS: usize = 70;
+const WARN: u32 = 0xf2c94c;
+
+/// The output the WEB tab shows: the chosen row's, else the first failed
+/// child's, else the gateway's once it runs, else the tunnel's.
+pub fn web_output_row(state: &UiState, web: &WebRuntime) -> Row {
+    state.web_row.unwrap_or_else(|| {
+        [Row::Tunnel, Row::Gateway]
+            .into_iter()
+            .find(|row| matches!(web.row(*row), RowState::Failed(_)))
+            .unwrap_or(if *web.row(Row::Gateway) == RowState::Stopped {
+                Row::Tunnel
+            } else {
+                Row::Gateway
+            })
+    })
+}
+
+fn web_tab(
+    canvas: &mut Canvas<'_>,
+    form: &ServeForm,
+    state: &UiState,
+    server: &ServerView,
+    web: &WebRuntime,
+) {
+    canvas.text(42, 76, "BROWSER ACCESS THROUGH CLOUDFLARE", MUTED, 2);
+    canvas.label(40, 108, "VNC PASSWORD");
+    canvas.field(
+        WEB_PASSWORD,
+        &form.password,
+        "REQUIRED",
+        state.focus == Some(Field::WebPassword),
+        true,
+    );
+    let shown = web_output_row(state, web);
+    for (area, row) in WEB_ROWS {
+        let row_state = web.row(row);
+        canvas.fill(area, PANEL);
+        canvas.frame(area, if row == shown { ACCENT } else { BORDER });
+        let (word, color) = match row_state {
+            RowState::Stopped => ("STOPPED", BORDER),
+            RowState::Waiting => ("WAITING", WARN),
+            RowState::Starting => ("STARTING", WARN),
+            RowState::Ready => ("READY", ACCENT),
+            RowState::Stopping => ("STOPPING", WARN),
+            RowState::Failed(_) => ("FAILED", ERROR),
+        };
+        canvas.fill(
+            Box2 {
+                x: area.x + 12,
+                y: area.y + 9,
+                w: 14,
+                h: 14,
+            },
+            color,
+        );
+        canvas.text(area.x + 38, area.y + 9, row.label(), TEXT, 2);
+        canvas.text(
+            area.x + 148,
+            area.y + 9,
+            word,
+            if matches!(row_state, RowState::Failed(_)) {
+                ERROR
+            } else {
+                MUTED
+            },
+            2,
+        );
+        let detail = match row_state {
+            RowState::Failed(reason) => Some(reason.clone()),
+            _ => web.detail(row),
+        };
+        if let Some(line) =
+            detail.and_then(|detail| wrap(&detail, (area.w - 50) / 6).into_iter().next())
+        {
+            canvas.text(area.x + 38, area.y + 30, &line, MUTED, 1);
+        }
+    }
+    canvas.label(40, WEB_OUTPUT_Y, &format!("{} OUTPUT", shown.label()));
+    let output: Vec<String> = match shown {
+        Row::Server => server.message.iter().cloned().collect(),
+        row => web.output(row),
+    };
+    let lines: Vec<String> = output
+        .iter()
+        .flat_map(|line| wrap(line, WEB_OUTPUT_CHARS))
+        .collect();
+    if lines.is_empty() {
+        canvas.text(40, WEB_OUTPUT_Y + 24, "NOTHING YET", MUTED, 1);
+    }
+    let first = lines.len().saturating_sub(WEB_OUTPUT_ROWS);
+    for (index, line) in lines[first..].iter().enumerate() {
+        canvas.text(40, WEB_OUTPUT_Y + 24 + index * 10, line, TEXT, 1);
+    }
+    web_panel(canvas, web);
+    if let Some(error) = &state.error {
+        status_message(canvas, error, ERROR);
+    } else if let Some(notice) = &state.notice {
+        status_message(canvas, notice, TEXT);
+    } else if let Some(message) = web.message() {
+        status_message(canvas, message, TEXT);
+    }
+    let (start, active) = if web.is_idle() {
+        ("START BROWSER ACCESS", true)
+    } else if web.is_stopping() {
+        ("STOPPING...", false)
+    } else {
+        ("STOP BROWSER ACCESS", false)
+    };
+    canvas.button(WEB_START, start, active);
+    canvas.button(
+        WEB_PAIR,
+        if web.pairing_active() {
+            "CANCEL PAIRING"
+        } else {
+            "PAIR A BROWSER"
+        },
+        false,
+    );
+}
+
+fn web_panel(canvas: &mut Canvas<'_>, web: &WebRuntime) {
+    let panel = WEB_PANEL;
+    let small = |canvas: &mut Canvas<'_>, y: &mut usize, text: &str, color| {
+        for line in wrap(text, panel.w / 6) {
+            canvas.text(panel.x, *y, &line, color, 1);
+            *y += 10;
+        }
+    };
+    if let Some(code) = web.pairing() {
+        // Dark modules on a light square with a four-module quiet zone, the
+        // contrast phone cameras expect.
+        let side = code.width + 8;
+        let module = (panel.w / side).clamp(1, 6);
+        let size = side * module;
+        let left = panel.x + (panel.w.saturating_sub(size)) / 2;
+        canvas.fill(
+            Box2 {
+                x: left,
+                y: panel.y,
+                w: size,
+                h: size,
+            },
+            0xffffff,
+        );
+        for y in 0..code.width {
+            for x in 0..code.width {
+                if code.dark(x, y) {
+                    canvas.fill(
+                        Box2 {
+                            x: left + (x + 4) * module,
+                            y: panel.y + (y + 4) * module,
+                            w: module,
+                            h: module,
+                        },
+                        0x000000,
+                    );
+                }
+            }
+        }
+        let mut y = panel.y + size + 10;
+        if let Some(fingerprint) = web.fingerprint() {
+            canvas.text(panel.x, y, &format!("KEY {fingerprint}"), TEXT, 2);
+            y += 22;
+        }
+        let minutes = code.minutes_left(std::time::Instant::now());
+        canvas.text(
+            panel.x,
+            y,
+            &format!("{minutes} MIN LEFT, ONE USE"),
+            MUTED,
+            2,
+        );
+        y += 24;
+        small(
+            canvas,
+            &mut y,
+            "SIGN IN TO THE APP URL ON THE PHONE FIRST, THEN SCAN THIS CODE AND CHECK THAT THE PHONE SHOWS THE SAME KEY. SHOW IT ONLY ON THIS SCREEN.",
+            MUTED,
+        );
+        return;
+    }
+    let mut y = panel.y;
+    if web.pairing_active() {
+        canvas.text(panel.x, y, "PAIRING", TEXT, 2);
+        y += 24;
+        small(
+            canvas,
+            &mut y,
+            "THE QR CODE APPEARS HERE WHEN THE GATEWAY IS READY.",
+            MUTED,
+        );
+        return;
+    }
+    canvas.text(panel.x, y, "HOW IT WORKS", TEXT, 2);
+    y += 24;
+    small(
+        canvas,
+        &mut y,
+        "START RUNS THIS DESKTOP SERVER ON LOOPBACK WITH YOUR PASSWORD, THEN THE CLOUDFLARE TUNNEL, THEN THE WEB GATEWAY. STOP, OR CLOSING TOPVNC, ENDS ALL THREE.",
+        MUTED,
+    );
+    y += 10;
+    if let Some(origin) = web.app_origin() {
+        canvas.text(panel.x, y, "APP URL", TEXT, 2);
+        y += 22;
+        small(canvas, &mut y, origin, ACCENT);
+        y += 10;
+    }
+    small(
+        canvas,
+        &mut y,
+        "SETTINGS: GATEWAY/CLOUDFLARE/GATEWAY.LOCAL.TOML. FIRST-TIME SETUP: DOCS/CLOUDFLARE-GATEWAY.MD.",
+        MUTED,
+    );
+    if !cfg!(windows) {
+        y += 10;
+        small(canvas, &mut y, "NOT YET TESTED ON THIS PLATFORM.", ERROR);
+    }
+    if web_copy_url_shown(web) {
+        canvas.button(WEB_COPY_URL, "COPY APP URL", false);
     }
 }
 
@@ -2230,6 +2600,36 @@ mod tests {
     }
 
     #[test]
+    fn web_tab_layout_and_shared_password() {
+        let tabs = [TAB_CONNECT, TAB_SERVER, TAB_WEB, TAB_MORE];
+        for pair in tabs.windows(2) {
+            assert!(pair[0].x + pair[0].w < pair[1].x);
+        }
+        for (area, _, _) in MENU_TABS {
+            assert!(area.x + area.w <= 800);
+        }
+        for pair in WEB_ROWS.windows(2) {
+            assert!(pair[0].0.y + pair[0].0.h < pair[1].0.y);
+        }
+        assert!(WEB_ROWS[2].0.y + WEB_ROWS[2].0.h < WEB_OUTPUT_Y);
+        const { assert!(WEB_OUTPUT_Y + 24 + WEB_OUTPUT_ROWS * 10 < 525) };
+        const { assert!(WEB_PANEL.x > WEB_PASSWORD.x + WEB_PASSWORD.w) };
+        const { assert!(WEB_PANEL.y + WEB_PANEL.h < 525) };
+        const { assert!(WEB_START.x + WEB_START.w < WEB_PAIR.x) };
+        const { assert!(WEB_COPY_URL.y >= WEB_PANEL.y) };
+        const { assert!(WEB_COPY_URL.y + WEB_COPY_URL.h <= WEB_PANEL.y + WEB_PANEL.h) };
+
+        // The WEB tab edits the Server tab's password; neither is saved.
+        let mut state = UiState::default();
+        let mut config = Config::default();
+        state.switch_tab(Tab::Web);
+        state.key(&mut config, KeyCode::Tab);
+        assert_eq!(state.focus, Some(Field::WebPassword));
+        state.character(&mut config, 'p');
+        assert_eq!(config.serve.password, "p");
+    }
+
+    #[test]
     fn helper_tabs_keep_field_focus_and_values_separate() {
         let mut state = UiState::default();
         let mut config = Config::default();
@@ -2328,6 +2728,8 @@ mod tests {
         let message = "Screen Recording access is required. Allow TopVNC in System Settings → \
                        Privacy & Security → Screen & System Audio Recording, then relaunch it";
         assert!(wrap(message, MESSAGE_LINE * 2).len() <= 4);
+        // The plaintext-server error stays in the large two-line form.
+        assert!(wrap(topvnc::transport::PLAINTEXT_SERVER, MESSAGE_LINE).len() <= 2);
     }
 
     #[test]
@@ -2553,6 +2955,147 @@ mod tests {
         assert!(levels.contains(&DEFAULT_JPEG_QUALITY));
         assert!(levels.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(levels.iter().all(|level| *level <= 9));
+    }
+
+    #[test]
+    fn transport_forms_default_to_tls_and_accept_the_unencrypted_launch_flag() {
+        let mut config = Config::default();
+        crate::apply_viewer_arguments(&mut config, []).unwrap();
+        assert!(!config.tls.unencrypted);
+        assert!(!config.serve.tls.unencrypted);
+        crate::apply_viewer_arguments(&mut config, ["--unencrypted".into()]).unwrap();
+        assert!(config.tls.unencrypted);
+        assert!(config.serve.tls.unencrypted);
+        assert!(!config.allow_insecure);
+        assert!(!config.serve.allow_insecure);
+    }
+
+    #[test]
+    fn serve_requests_preserve_transport_and_tls_option_conflicts() {
+        let mut form = ServeForm {
+            password: "secret".into(),
+            ..ServeForm::default()
+        };
+        assert!(!form.request().unwrap().tls.unencrypted);
+        form.tls.unencrypted = true;
+        let request = form.request().unwrap();
+        assert!(request.tls.unencrypted);
+        assert_eq!(request.password.as_deref(), Some("secret"));
+        form.tls.cert = Some("host.pem".into());
+        form.tls.key = Some("host.key".into());
+        let request = form.request().unwrap();
+        assert_eq!(request.tls, form.tls);
+        assert!(
+            request
+                .tls
+                .server()
+                .unwrap_err()
+                .to_string()
+                .contains("TLS credentials")
+        );
+
+        let mut config = Config::default();
+        crate::apply_viewer_arguments(
+            &mut config,
+            ["--tls-ca", "ca.pem", "--tls-server-name", "host"].map(String::from),
+        )
+        .unwrap();
+        config.tls.unencrypted = true;
+        assert!(
+            config
+                .tls
+                .client("host")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("TLS trust options")
+        );
+        assert_eq!(
+            config.tls.ca.as_deref(),
+            Some(std::path::Path::new("ca.pem"))
+        );
+        assert_eq!(config.tls.server_name.as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn missing_host_credentials_hint_fits_the_error_area() {
+        let error = ServeForm::default().tls.server().unwrap_err().to_string();
+        assert!(error.contains("--tls-cert"));
+        assert!(error.contains("--tls-key"));
+        assert!(error.contains(UNENCRYPTED_LABEL));
+        assert!(wrap(&error, MESSAGE_LINE).len() <= 2);
+    }
+
+    #[test]
+    fn transport_controls_fit_between_authentication_and_window_rows() {
+        for (transport, controls) in [
+            (
+                UNENCRYPTED_TRANSPORT,
+                vec![
+                    HOST,
+                    PORT,
+                    PASSWORD,
+                    INSECURE,
+                    RAW,
+                    ZLIB,
+                    JPEG_PRESETS[0].0,
+                    JPEG_PRESETS[1].0,
+                    JPEG_PRESETS[2].0,
+                    FIT,
+                    NATIVE,
+                    CUSTOM,
+                    SIZE,
+                    FPS60,
+                    FPS120,
+                    FPS_NO_LIMIT,
+                    SMOOTH,
+                    SHARP,
+                    CONNECT,
+                ],
+            ),
+            (
+                SERVE_UNENCRYPTED_TRANSPORT,
+                vec![
+                    HOST,
+                    PORT,
+                    SERVE_PASSWORD,
+                    SERVE_DISPLAY,
+                    INSECURE,
+                    SERVE_MOUSE[0].0,
+                    SERVE_MOUSE[1].0,
+                    SERVE_MOUSE[2].0,
+                    LOCAL_ONLY,
+                    ALL_NETWORKS,
+                    SERVE_SCALE_SLIDER,
+                    SERVE_FULL_SIZE,
+                    SERVE_HALF_SIZE,
+                    SERVE_PRIORITY[0].0,
+                    SERVE_PRIORITY[1].0,
+                    SERVE_PRIORITY[2].0,
+                    SERVE_PRIORITY[3].0,
+                    SERVER_STATUS,
+                    CONNECT,
+                ],
+            ),
+        ] {
+            let row = Box2 {
+                w: PASSWORD.w,
+                ..transport
+            };
+            for control in controls {
+                assert!(
+                    row.x + row.w <= control.x
+                        || control.x + control.w <= row.x
+                        || row.y + row.h <= control.y
+                        || control.y + control.h <= row.y,
+                    "transport row overlaps control at {}, {}",
+                    control.x,
+                    control.y
+                );
+            }
+            assert!(transport.x + transport.w + 12 + UNENCRYPTED_LABEL.len() * 12 < 400);
+            assert!(transport.y + transport.h < 362); // next section's labels
+        }
     }
 
     #[test]
