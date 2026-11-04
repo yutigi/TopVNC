@@ -25,12 +25,14 @@ mod windows_server;
 mod helpers;
 mod settings;
 mod ui;
+mod web_access;
 mod window;
 use desktop_host::{DisplayArea, HostPermissions, ServeOptions, ServerNotice};
 use ui::{
     Box2, Canvas, Compression, Config, Field, Quality, ServeRequest, ServerPhase, ServerView, Tab,
     UiState, WindowMode,
 };
+use web_access::runtime::{HostServer, ServerRequest, WebRuntime};
 use window::{Draw, Layer, Presenter, Ui, UiEvent};
 mod session_render;
 use session_render::{RenderOptions, RenderWorker};
@@ -577,9 +579,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut connection_error = None;
     // Lives across viewer sessions; dropping it stops the server.
     let mut server = HostedServer::default();
+    // Declared after the server so it is dropped first: the gateway and the
+    // tunnel stop before the server they relay to.
+    let mut web = WebRuntime::new(Box::new(web_access::process::ProcessSpawner));
     loop {
-        let Some((next_config, session)) =
-            show_landing(&mut ui, config, connection_error.take(), &mut server)?
+        let Some((next_config, session)) = show_landing(
+            &mut ui,
+            config,
+            connection_error.take(),
+            &mut server,
+            &mut web,
+        )?
         else {
             return Ok(());
         };
@@ -684,13 +694,34 @@ struct HostedServer {
         thread::JoinHandle<()>,
     )>,
     authenticated: bool,
+    /// Plain RFB, which the browser gateway's loopback target needs.
+    plain: bool,
 }
 
 impl HostedServer {
+    /// The server as the WEB tab sees it.
+    fn web_view(&self) -> HostServer {
+        match &self.view.phase {
+            ServerPhase::Stopped => HostServer::Stopped,
+            ServerPhase::Starting => HostServer::Starting,
+            ServerPhase::Stopping => HostServer::Stopping,
+            ServerPhase::Serving {
+                address,
+                authenticated,
+                ..
+            } => HostServer::Serving {
+                address: address.clone(),
+                authenticated: *authenticated,
+                plain: self.plain,
+            },
+        }
+    }
+
     fn start(&mut self, request: ServeRequest) {
         if self.running.is_some() {
             return;
         }
+        self.plain = request.tls.unencrypted;
         let shutdown = Arc::new(AtomicBool::new(false));
         let (events, receiver) = mpsc::channel();
         let options = ServeOptions {
@@ -835,6 +866,7 @@ fn show_landing(
     mut config: Config,
     error: Option<String>,
     server: &mut HostedServer,
+    web: &mut WebRuntime,
 ) -> Result<Option<(Config, Session)>, Box<dyn Error>> {
     const WIDTH: usize = 800;
     const HEIGHT: usize = 640;
@@ -875,8 +907,24 @@ fn show_landing(
             permissions_checked = Some(Instant::now());
         }
         if let Some(error) = server.poll() {
-            state.switch_tab(Tab::Server);
+            // A server the WEB tab started reports there.
+            if state.tab != Tab::Web {
+                state.switch_tab(Tab::Server);
+            }
             state.error = Some(error);
+        }
+        match web.poll(&server.web_view(), Instant::now()) {
+            Some(ServerRequest::Start(address)) => {
+                match web_serve_request(&config.serve, address) {
+                    Ok(request) => server.start(request),
+                    Err(error) => {
+                        state.error = Some(error);
+                        web.stop();
+                    }
+                }
+            }
+            Some(ServerRequest::Stop) => server.stop(),
+            None => {}
         }
         ui::landing(
             &mut Canvas::new(&mut pixels, WIDTH, HEIGHT),
@@ -885,6 +933,7 @@ fn show_landing(
             connecting,
             &server.view,
             &helpers,
+            web,
         );
         if redraw || pixels != shown {
             layer.upload(&pixels, WIDTH, 0, 0, WIDTH, HEIGHT);
@@ -914,6 +963,8 @@ fn show_landing(
         }
         let mut connect_clicked = false;
         let mut server_clicked = false;
+        let mut web_clicked = false;
+        let mut pair_clicked = false;
         let mut helper_action = None;
         // Woken by input; the timeout picks up server status and the
         // connection result.
@@ -942,6 +993,8 @@ fn show_landing(
                                 Tab::Server => {
                                     server_clicked = server.view.phase == ServerPhase::Stopped;
                                 }
+                                // Enter only starts browser access too.
+                                Tab::Web => web_clicked = web.is_idle(),
                                 Tab::Work => helper_action = Some(helpers::Action::CheckWork),
                                 Tab::Network => helper_action = Some(helpers::Action::Network),
                                 Tab::Firewall => helper_action = Some(helpers::Action::Firewall),
@@ -1114,6 +1167,21 @@ fn show_landing(
                         if ui::CONNECT.contains(x, y) {
                             server_clicked = true;
                         }
+                    } else if state.tab == Tab::Web
+                        && !ui::TAB_MORE.contains(x, y)
+                        && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                        && !ui::MENU_TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                    {
+                        // The password describes the next start.
+                        state.focus = (web.is_idle() && ui::WEB_PASSWORD.contains(x, y))
+                            .then_some(Field::WebPassword);
+                        for (area, row) in ui::WEB_ROWS {
+                            if area.contains(x, y) {
+                                state.web_row = Some(row);
+                            }
+                        }
+                        web_clicked |= ui::WEB_START.contains(x, y);
+                        pair_clicked |= ui::WEB_PAIR.contains(x, y);
                     } else if state.tab == Tab::Connect
                         && !ui::TAB_MORE.contains(x, y)
                         && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
@@ -1210,6 +1278,33 @@ fn show_landing(
                 ServerPhase::Starting | ServerPhase::Stopping => {}
             }
         }
+        if web_clicked || pair_clicked {
+            let start = web.is_idle() && (web_clicked || (pair_clicked && !web.pairing_active()));
+            let started = if start {
+                state.web_row = None;
+                start_web(web, &config, server)
+            } else {
+                Ok(())
+            };
+            match started {
+                Err(error) => state.error = Some(error),
+                Ok(()) => {
+                    if start {
+                        state.error = None;
+                        state.focus = None;
+                    } else if web_clicked && !web.is_stopping() {
+                        web.stop();
+                    }
+                    if pair_clicked {
+                        if web.pairing_active() {
+                            web.cancel_pair();
+                        } else if let Err(error) = web.pair() {
+                            state.error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
         if connect_clicked && !connecting {
             match config.address() {
                 Ok(_) => {
@@ -1227,6 +1322,41 @@ fn show_landing(
             }
         }
     }
+}
+
+/// Check the browser-access files and start the WEB tab's run.
+fn start_web(web: &mut WebRuntime, config: &Config, server: &HostedServer) -> Result<(), String> {
+    let launch = web_access::config::prepare().map_err(|problem| problem.to_string())?;
+    web.start(
+        launch,
+        &config.serve.password,
+        &server.web_view(),
+        Instant::now(),
+    )
+}
+
+/// The WEB tab's desktop server: the Server tab's display, size, mouse,
+/// priority, and performance choices, but always plain RFB on the gateway's
+/// loopback target with a password, never All networks or no password.
+fn web_serve_request(
+    form: &ui::ServeForm,
+    address: std::net::SocketAddr,
+) -> Result<ServeRequest, String> {
+    if !address.ip().is_loopback() {
+        return Err("Browser access serves on loopback only.".into());
+    }
+    let mut form = form.clone();
+    form.host = match address.ip() {
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        ip => ip.to_string(),
+    };
+    form.port = address.port().to_string();
+    form.allow_insecure = false;
+    form.tls = topvnc::transport::TlsOptions {
+        unencrypted: true,
+        ..Default::default()
+    };
+    form.request()
 }
 
 /// How often the title bar's statistics refresh.
@@ -1885,6 +2015,33 @@ fn run_session_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_serve_request_is_plain_loopback_with_a_password() {
+        let mut form = ui::ServeForm {
+            host: ui::ALL_NETWORKS_HOST.into(),
+            port: "1".into(),
+            allow_insecure: true,
+            scale: 0.5,
+            ..ui::ServeForm::default()
+        };
+        form.tls.cert = Some("cert.pem".into());
+        form.tls.key = Some("key.pem".into());
+        // An empty password is refused even though the Server tab allows none.
+        assert!(web_serve_request(&form, "127.0.0.1:5900".parse().unwrap()).is_err());
+        form.password = "pw".into();
+        let request = web_serve_request(&form, "127.0.0.1:5900".parse().unwrap()).unwrap();
+        assert_eq!(request.address, "127.0.0.1:5900");
+        assert_eq!(request.password.as_deref(), Some("pw"));
+        assert!(!request.allow_insecure);
+        assert!(request.tls.unencrypted);
+        assert_eq!((request.tls.cert, request.tls.key), (None, None));
+        // The Server tab's other choices carry over.
+        assert_eq!(request.scale, 0.5);
+        let v6 = web_serve_request(&form, "[::1]:5900".parse().unwrap()).unwrap();
+        assert_eq!(v6.address, "[::1]:5900");
+        assert!(web_serve_request(&form, "192.168.1.2:5900".parse().unwrap()).is_err());
+    }
 
     /// Requires a real interactive Windows desktop and GPU. Opens a small
     /// two-second window, then tests worker shutdown with no UI pumping.

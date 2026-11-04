@@ -9,10 +9,14 @@ const USAGE: &str = "Usage:
   topvnc-web-gateway --init-host-key <gateway.toml>
   topvnc-web-gateway [--pair] <gateway.toml>
   topvnc-web-gateway --synthetic-echo [--pair] <gateway.toml>
+  topvnc-web-gateway --supervised <gateway.toml>
 Relays Cloudflare Access-authenticated, end-to-end encrypted browser sessions
 to the configured loopback rfb_target, normally `topvnc --serve` with a VNC
 password. --pair shows a one-time enrollment QR code on this console.
---synthetic-echo replaces the target with a loopback echo, for route tests.";
+--synthetic-echo replaces the target with a loopback echo, for route tests.
+--supervised is for the TopVNC window: it reads `pair` and `cancel-pair`
+commands on stdin, stops when stdin closes, and reports `fingerprint`,
+`ready`, `pair`, and `pair-error` lines on stdout instead of a QR code.";
 
 /// Key paths are resolved relative to the configuration file.
 fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
@@ -48,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ["--pair", path] => (false, true, *path),
         ["--synthetic-echo", path] => (true, false, *path),
         ["--synthetic-echo", "--pair", path] => (true, true, *path),
+        ["--supervised", path] => return supervised(path).await,
         ["--help"] => {
             eprintln!("{USAGE}");
             return Ok(());
@@ -110,4 +115,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     result?;
     Ok(())
+}
+
+/// A command from the supervising TopVNC window.
+#[derive(Debug, PartialEq)]
+enum Command {
+    Pair,
+    CancelPair,
+    Unknown,
+}
+
+fn parse_command(line: &str) -> Command {
+    match line.trim() {
+        "pair" => Command::Pair,
+        "cancel-pair" => Command::CancelPair,
+        _ => Command::Unknown,
+    }
+}
+
+/// Runs under the TopVNC window. stdout carries the line protocol in
+/// specs/018-cloudflare-setup-ui/plan.md and is the only place the pairing
+/// link is written; stderr stays the human log. Closing stdin, which also
+/// happens when the supervisor dies, shuts the gateway down.
+async fn supervised(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config(config_path)?;
+    let listen = config.listen;
+    let target = config.rfb_target;
+    let origin = config.app_origin.clone();
+    let gateway = Gateway::new(config)?;
+    let fingerprint = e2e::fingerprint(&gateway.host_public());
+    eprintln!(
+        "Host key fingerprint: {fingerprint} ({} enrolled browser key(s))",
+        gateway.enrolled_browsers()
+    );
+    println!("fingerprint {fingerprint}");
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let address = listener.local_addr()?;
+    eprintln!(
+        "Gateway listening on {address} for the RFB server at {target} (Access JWT, an enrolled browser, and the VNC password required)"
+    );
+    println!("ready {address}");
+
+    // A plain thread: a blocked tokio stdin read would hold up runtime
+    // shutdown, and this thread simply ends with the process.
+    let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("supervisor-stdin".into())
+        .spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if commands.send(Some(parse_command(&line))).is_err() {
+                    return;
+                }
+            }
+            let _ = commands.send(None);
+        })?;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let control = std::sync::Arc::clone(&gateway);
+    let control_task = tokio::spawn(async move {
+        while let Some(Some(command)) = received.recv().await {
+            match command {
+                Command::Pair => match control.open_pairing() {
+                    Ok(invite) => {
+                        println!("pair {PAIRING_SECONDS} {origin}/#pair={}", invite.encode());
+                        eprintln!("Pairing invite open for {} minutes.", PAIRING_SECONDS / 60);
+                    }
+                    Err(reason) => println!("pair-error {reason}"),
+                },
+                Command::CancelPair => {
+                    if control.cancel_pairing() {
+                        eprintln!("Pairing invite cancelled.");
+                    }
+                }
+                Command::Unknown => eprintln!("ignored an unknown supervisor command"),
+            }
+        }
+        let _ = stop.send(());
+    });
+    let result = axum::serve(listener, routes(gateway))
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = stopped => {}
+            }
+            eprintln!("Gateway stopping.");
+        })
+        .await;
+    control_task.abort();
+    result?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::{Command, parse_command};
+
+    #[test]
+    fn commands_are_exact_words() {
+        assert_eq!(parse_command("pair"), Command::Pair);
+        assert_eq!(parse_command(" pair "), Command::Pair);
+        assert_eq!(parse_command("cancel-pair"), Command::CancelPair);
+        assert_eq!(parse_command("pair now"), Command::Unknown);
+        assert_eq!(parse_command(""), Command::Unknown);
+    }
 }
