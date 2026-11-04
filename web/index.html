@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#0b1020">
+  <title>TopVNC</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main id="home">
+    <header>
+      <!-- The desktop app's TOPVNC title, drawn from its 5x7 glyphs. -->
+      <h1><svg class="wordmark" viewBox="0 0 35 7" role="img" aria-label="TopVNC"><path d="M0 0h5v1h-5zM2 1h1v6h-1zM7 0h3v1h-3zM6 1h1v5h-1zM10 1h1v5h-1zM7 6h3v1h-3zM12 0h4v1h-4zM12 1h1v6h-1zM16 1h1v2h-1zM13 3h3v1h-3zM18 0h1v5h-1zM22 0h1v5h-1zM19 5h1v1h-1zM21 5h1v1h-1zM20 6h1v1h-1zM24 0h1v7h-1zM28 0h1v7h-1zM25 1h1v1h-1zM26 2h1v1h-1zM27 3h1v1h-1zM31 0h3v1h-3zM30 1h1v5h-1zM34 1h1v1h-1zM34 5h1v1h-1zM31 6h3v1h-3z"/></svg></h1>
+      <p class="subtitle">Connect to a remote desktop</p>
+    </header>
+    <h2 class="label">Pairing</h2>
+    <p id="identity" class="readout">Loading the encryption module…</p>
+    <p class="notice">The connection is encrypted from this browser to your host: Cloudflare relays only ciphertext.
+      Cloudflare also serves this page's code, so it could replace that code and read a session; the page cannot detect that.
+      The VNC password is sent only inside the encrypted channel and is never stored.</p>
+    <form id="connect-form">
+      <fieldset id="quality" class="choices">
+        <legend class="label">Picture quality</legend>
+        <div class="row grid">
+          <label class="choice" title="For slow links"><input type="radio" name="quality" value="2"><span>Low</span></label>
+          <label class="choice"><input type="radio" name="quality" value="4"><span>Medium</span></label>
+          <label class="choice"><input type="radio" name="quality" value="6" checked><span>Good</span></label>
+          <label class="choice"><input type="radio" name="quality" value="8"><span>High</span></label>
+          <label class="choice"><input type="radio" name="quality" value="9"><span>Best</span></label>
+        </div>
+      </fieldset>
+      <p class="transport">WebSocket via Cloudflare / encrypted to your host</p>
+      <button id="connect" class="primary" type="submit" disabled>Connect</button>
+      <button id="forget" type="button" disabled>Forget pairing</button>
+    </form>
+    <form id="password-form" hidden>
+      <label class="label" for="password">VNC password</label>
+      <div class="controls">
+        <input id="password" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" required>
+        <button class="primary" type="submit">Sign in</button>
+      </div>
+    </form>
+    <p id="status" role="status">Sign in through Cloudflare Access, then connect.</p>
+    <details><summary>Connection log</summary><pre id="log"></pre></details>
+  </main>
+
+  <section id="viewer" hidden aria-label="Remote desktop">
+    <div id="screen">
+      <canvas id="canvas" width="1" height="1"></canvas>
+      <div id="cursor" hidden></div>
+      <p id="stats" hidden></p>
+    </div>
+    <div id="function-keys" class="keys scroller" hidden>
+      <button type="button" data-keysym="65470">F1</button><button type="button" data-keysym="65471">F2</button><button type="button" data-keysym="65472">F3</button><button type="button" data-keysym="65473">F4</button><button type="button" data-keysym="65474">F5</button><button type="button" data-keysym="65475">F6</button><button type="button" data-keysym="65476">F7</button><button type="button" data-keysym="65477">F8</button><button type="button" data-keysym="65478">F9</button><button type="button" data-keysym="65479">F10</button><button type="button" data-keysym="65480">F11</button><button type="button" data-keysym="65481">F12</button>
+      <button type="button" data-keysym="65535">Del</button><button type="button" data-keysym="65360">Home</button><button type="button" data-keysym="65367">End</button><button type="button" data-keysym="65365">PgUp</button><button type="button" data-keysym="65366">PgDn</button>
+    </div>
+    <nav id="toolbar" aria-label="Keys and viewer controls">
+      <div class="keys scroller">
+      <button type="button" data-keysym="65307">Esc</button>
+      <button type="button" data-keysym="65289">Tab</button>
+      <button type="button" data-keysym="65293">Enter</button>
+      <button type="button" data-modifier="ctrl">Ctrl</button>
+      <button type="button" data-modifier="alt">Alt</button>
+      <button type="button" data-modifier="shift">Shift</button>
+      <button type="button" data-modifier="super">Win</button>
+      <button type="button" data-keysym="65361" aria-label="Left arrow">←</button>
+      <button type="button" data-keysym="65362" aria-label="Up arrow">↑</button>
+      <button type="button" data-keysym="65364" aria-label="Down arrow">↓</button>
+      <button type="button" data-keysym="65363" aria-label="Right arrow">→</button>
+      <button type="button" id="show-function-keys" aria-expanded="false">Fn</button>
+      <button type="button" id="toggle-mode">Trackpad</button>
+      <button type="button" id="fit">Fit</button>
+      </div>
+      <!-- Always visible, whatever the scroll position of the keys. -->
+      <div class="keys pinned">
+        <button type="button" id="show-keyboard" aria-label="Show keyboard">⌨</button>
+        <button type="button" id="show-menu" aria-label="Session settings" aria-expanded="false">☰</button>
+      </div>
+    </nav>
+    <div id="menu" role="dialog" aria-labelledby="menu-title" hidden>
+      <div class="menu-head">
+        <h2 id="menu-title">Session settings</h2>
+        <button type="button" id="close-menu">Close</button>
+      </div>
+      <!-- The host display and served size are shared by every viewer. -->
+      <fieldset class="choices">
+        <legend class="label">Display</legend>
+        <div id="serve-display" class="row" hidden></div>
+        <p id="serve-display-missing" class="note">Not offered by this host</p>
+      </fieldset>
+      <div class="slider">
+        <label class="label" for="serve-scale">Served size</label>
+        <output id="serve-scale-value" for="serve-scale">Unavailable</output>
+        <input id="serve-scale" type="range" min="25" max="100" step="1" value="100" hidden>
+        <p id="serve-scale-ends" class="ends" hidden><span>25%</span><span>100%</span></p>
+        <p id="serve-scale-missing" class="note">Requires an updated TopVNC host</p>
+      </div>
+      <fieldset id="menu-quality" class="choices">
+        <legend class="label">Picture quality</legend>
+        <div class="row grid">
+          <label class="choice"><input type="radio" name="menu-quality" value="2"><span>Low</span></label>
+          <label class="choice"><input type="radio" name="menu-quality" value="4"><span>Med</span></label>
+          <label class="choice"><input type="radio" name="menu-quality" value="6" checked><span>Good</span></label>
+          <label class="choice"><input type="radio" name="menu-quality" value="8"><span>High</span></label>
+          <label class="choice"><input type="radio" name="menu-quality" value="9"><span>Best</span></label>
+        </div>
+      </fieldset>
+      <p class="transport">Encrypted to your host</p>
+      <div class="row">
+        <label class="choice toggle"><input id="stats-toggle" type="checkbox"><span>Stats</span></label>
+        <button type="button" id="disconnect">Disconnect</button>
+      </div>
+    </div>
+    <textarea id="keyboard" aria-label="Type on the remote desktop" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="send"></textarea>
+  </section>
+</body>
+</html>

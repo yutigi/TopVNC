@@ -25,12 +25,14 @@ mod windows_server;
 mod helpers;
 mod settings;
 mod ui;
+mod web_access;
 mod window;
 use desktop_host::{DisplayArea, HostPermissions, ServeOptions, ServerNotice};
 use ui::{
     Box2, Canvas, Compression, Config, Field, Quality, ServeRequest, ServerPhase, ServerView, Tab,
     UiState, WindowMode,
 };
+use web_access::runtime::{HostServer, ServerRequest, WebRuntime};
 use window::{Draw, Layer, Presenter, Ui, UiEvent};
 mod session_render;
 use session_render::{RenderOptions, RenderWorker};
@@ -46,7 +48,18 @@ fn encoding(config: &Config) -> Encoding {
     }
 }
 
-const USAGE: &str = "usage: topvnc [HOST:PORT] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--quality 0-9] [--progressive] [--ultra] [--smooth-motion | --immediate] [--input-debug]";
+fn connect_native(config: &Config) -> std::io::Result<Session> {
+    let address = config.address().map_err(std::io::Error::other)?;
+    Session::connect_with_transport(
+        &address,
+        config.tls.client(&config.host)?,
+        config.allow_insecure,
+        encoding(config),
+        || Ok(config.password.clone()),
+    )
+}
+
+const USAGE: &str = "usage: topvnc [HOST:PORT] [--tls-ca CA.pem] [--tls-server-name NAME] [--tls-cert CERT.pem --tls-key KEY.pem] [--unencrypted] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--quality 0-9] [--progressive] [--ultra] [--smooth-motion | --immediate] [--input-debug]";
 
 fn parse_quality(value: &str) -> Result<u8, Box<dyn Error>> {
     match value.parse::<u8>() {
@@ -488,21 +501,29 @@ impl Drop for TimerResolution {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments
-        .first()
-        .is_some_and(|argument| argument == "--serve")
-    {
-        return run_server(&arguments[1..]);
-    }
-    let mut config = Config::default();
-    settings::load(&mut config);
+/// Apply launch-only options to the form without persisting security choices.
+fn apply_viewer_arguments(
+    config: &mut Config,
+    arguments: impl IntoIterator<Item = String>,
+) -> Result<bool, Box<dyn Error>> {
     let mut input_debug = false;
     let mut address = None;
     let mut args = arguments.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--unencrypted" => config.tls.unencrypted = true,
+            "--tls-ca" => {
+                config.tls.ca = Some(args.next().ok_or("--tls-ca requires CA.pem")?.into())
+            }
+            "--tls-server-name" => {
+                config.tls.server_name = Some(args.next().ok_or("--tls-server-name requires NAME")?)
+            }
+            "--tls-cert" => {
+                config.tls.cert = Some(args.next().ok_or("--tls-cert requires CERT.pem")?.into())
+            }
+            "--tls-key" => {
+                config.tls.key = Some(args.next().ok_or("--tls-key requires KEY.pem")?.into())
+            }
             "--allow-insecure" => config.allow_insecure = true,
             "--fit" => config.window_mode = WindowMode::Fit,
             "--native-size" => config.window_mode = WindowMode::Native,
@@ -535,15 +556,40 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.port = port.to_string();
     }
 
+    config.serve.tls = config.tls.clone();
+    Ok(input_debug)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--serve")
+    {
+        return run_server(&arguments[1..]);
+    }
+    let mut config = Config::default();
+    settings::load(&mut config);
+    let input_debug = apply_viewer_arguments(&mut config, arguments)?;
+    config.tls.client(&config.host)?;
+
     #[cfg(windows)]
     let _timer = TimerResolution::new();
     let mut ui = Ui::new()?;
     let mut connection_error = None;
     // Lives across viewer sessions; dropping it stops the server.
     let mut server = HostedServer::default();
+    // Declared after the server so it is dropped first: the gateway and the
+    // tunnel stop before the server they relay to.
+    let mut web = WebRuntime::new(Box::new(web_access::process::ProcessSpawner));
     loop {
-        let Some((next_config, session)) =
-            show_landing(&mut ui, config, connection_error.take(), &mut server)?
+        let Some((next_config, session)) = show_landing(
+            &mut ui,
+            config,
+            connection_error.take(),
+            &mut server,
+            &mut web,
+        )?
         else {
             return Ok(());
         };
@@ -570,6 +616,21 @@ fn run_server(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 #[cfg(target_os = "macos")]
 fn run_server(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     macos_server::run(arguments)
+}
+
+#[cfg(windows)]
+fn copy_text(text: &str) -> Result<(), String> {
+    windows_server::copy_text(text)
+}
+
+#[cfg(target_os = "macos")]
+fn copy_text(text: &str) -> Result<(), String> {
+    macos_server::copy_text(text)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn copy_text(_text: &str) -> Result<(), String> {
+    Err("Copying to the clipboard is available on Windows and macOS only.".into())
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -648,16 +709,38 @@ struct HostedServer {
         thread::JoinHandle<()>,
     )>,
     authenticated: bool,
+    /// Plain RFB, which the browser gateway's loopback target needs.
+    plain: bool,
 }
 
 impl HostedServer {
+    /// The server as the WEB tab sees it.
+    fn web_view(&self) -> HostServer {
+        match &self.view.phase {
+            ServerPhase::Stopped => HostServer::Stopped,
+            ServerPhase::Starting => HostServer::Starting,
+            ServerPhase::Stopping => HostServer::Stopping,
+            ServerPhase::Serving {
+                address,
+                authenticated,
+                ..
+            } => HostServer::Serving {
+                address: address.clone(),
+                authenticated: *authenticated,
+                plain: self.plain,
+            },
+        }
+    }
+
     fn start(&mut self, request: ServeRequest) {
         if self.running.is_some() {
             return;
         }
+        self.plain = request.tls.unencrypted;
         let shutdown = Arc::new(AtomicBool::new(false));
         let (events, receiver) = mpsc::channel();
         let options = ServeOptions {
+            tls: request.tls,
             performance: request.performance,
             address: request.address,
             display: request.display,
@@ -798,6 +881,7 @@ fn show_landing(
     mut config: Config,
     error: Option<String>,
     server: &mut HostedServer,
+    web: &mut WebRuntime,
 ) -> Result<Option<(Config, Session)>, Box<dyn Error>> {
     const WIDTH: usize = 800;
     const HEIGHT: usize = 640;
@@ -838,8 +922,24 @@ fn show_landing(
             permissions_checked = Some(Instant::now());
         }
         if let Some(error) = server.poll() {
-            state.switch_tab(Tab::Server);
+            // A server the WEB tab started reports there.
+            if state.tab != Tab::Web {
+                state.switch_tab(Tab::Server);
+            }
             state.error = Some(error);
+        }
+        match web.poll(&server.web_view(), Instant::now()) {
+            Some(ServerRequest::Start(address)) => {
+                match web_serve_request(&config.serve, address) {
+                    Ok(request) => server.start(request),
+                    Err(error) => {
+                        state.error = Some(error);
+                        web.stop();
+                    }
+                }
+            }
+            Some(ServerRequest::Stop) => server.stop(),
+            None => {}
         }
         ui::landing(
             &mut Canvas::new(&mut pixels, WIDTH, HEIGHT),
@@ -848,6 +948,7 @@ fn show_landing(
             connecting,
             &server.view,
             &helpers,
+            web,
         );
         if redraw || pixels != shown {
             layer.upload(&pixels, WIDTH, 0, 0, WIDTH, HEIGHT);
@@ -877,6 +978,9 @@ fn show_landing(
         }
         let mut connect_clicked = false;
         let mut server_clicked = false;
+        let mut web_clicked = false;
+        let mut pair_clicked = false;
+        let mut copy_url_clicked = false;
         let mut helper_action = None;
         // Woken by input; the timeout picks up server status and the
         // connection result.
@@ -905,6 +1009,8 @@ fn show_landing(
                                 Tab::Server => {
                                     server_clicked = server.view.phase == ServerPhase::Stopped;
                                 }
+                                // Enter only starts browser access too.
+                                Tab::Web => web_clicked = web.is_idle(),
                                 Tab::Work => helper_action = Some(helpers::Action::CheckWork),
                                 Tab::Network => helper_action = Some(helpers::Action::Network),
                                 Tab::Firewall => helper_action = Some(helpers::Action::Firewall),
@@ -1042,6 +1148,9 @@ fn show_landing(
                         if editable && ui::INSECURE.contains(x, y) {
                             serve.allow_insecure = !serve.allow_insecure;
                         }
+                        if editable && ui::SERVE_UNENCRYPTED_TRANSPORT.contains(x, y) {
+                            serve.tls.unencrypted = !serve.tls.unencrypted;
+                        }
                         if editable && ui::LOCAL_ONLY.contains(x, y) {
                             serve.host = ui::LOCAL_ONLY_HOST.into();
                         }
@@ -1074,6 +1183,23 @@ fn show_landing(
                         if ui::CONNECT.contains(x, y) {
                             server_clicked = true;
                         }
+                    } else if state.tab == Tab::Web
+                        && !ui::TAB_MORE.contains(x, y)
+                        && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                        && !ui::MENU_TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                    {
+                        // The password describes the next start.
+                        state.focus = (web.is_idle() && ui::WEB_PASSWORD.contains(x, y))
+                            .then_some(Field::WebPassword);
+                        for (area, row) in ui::WEB_ROWS {
+                            if area.contains(x, y) {
+                                state.web_row = Some(row);
+                            }
+                        }
+                        web_clicked |= ui::WEB_START.contains(x, y);
+                        pair_clicked |= ui::WEB_PAIR.contains(x, y);
+                        copy_url_clicked |=
+                            ui::web_copy_url_shown(web) && ui::WEB_COPY_URL.contains(x, y);
                     } else if state.tab == Tab::Connect
                         && !ui::TAB_MORE.contains(x, y)
                         && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
@@ -1092,6 +1218,9 @@ fn show_landing(
                         }
                         if ui::INSECURE.contains(x, y) {
                             config.allow_insecure = !config.allow_insecure;
+                        }
+                        if ui::UNENCRYPTED_TRANSPORT.contains(x, y) {
+                            config.tls.unencrypted = !config.tls.unencrypted;
                         }
                         if ui::RAW.contains(x, y) {
                             config.compression = Compression::Raw;
@@ -1167,23 +1296,53 @@ fn show_landing(
                 ServerPhase::Starting | ServerPhase::Stopping => {}
             }
         }
+        if copy_url_clicked && let Some(origin) = web.app_origin() {
+            match copy_text(origin) {
+                Ok(()) => {
+                    state.error = None;
+                    state.notice = Some("APP URL COPIED TO THE CLIPBOARD.".into());
+                }
+                Err(error) => state.error = Some(format!("Could not copy the app URL: {error}")),
+            }
+        }
+        if web_clicked || pair_clicked {
+            state.notice = None;
+            let start = web.is_idle() && (web_clicked || (pair_clicked && !web.pairing_active()));
+            let started = if start {
+                state.web_row = None;
+                start_web(web, &config, server)
+            } else {
+                Ok(())
+            };
+            match started {
+                Err(error) => state.error = Some(error),
+                Ok(()) => {
+                    if start {
+                        state.error = None;
+                        state.focus = None;
+                    } else if web_clicked && !web.is_stopping() {
+                        web.stop();
+                    }
+                    if pair_clicked {
+                        if web.pairing_active() {
+                            web.cancel_pair();
+                        } else if let Err(error) = web.pair() {
+                            state.error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
         if connect_clicked && !connecting {
             match config.address() {
-                Ok(address) => {
+                Ok(_) => {
                     state.error = None;
                     connecting = true;
                     let sender = result_tx.clone();
-                    let password = config.password.clone();
-                    let allow_insecure = config.allow_insecure;
-                    let encoding = encoding(&config);
+                    let connection_config = config.clone();
                     thread::spawn(move || {
-                        let result = Session::connect_with_encoding(
-                            &address,
-                            allow_insecure,
-                            encoding,
-                            || Ok(password.clone()),
-                        )
-                        .map_err(|error| error.to_string());
+                        let result =
+                            connect_native(&connection_config).map_err(|error| error.to_string());
                         let _ = sender.send(result);
                     });
                 }
@@ -1191,6 +1350,41 @@ fn show_landing(
             }
         }
     }
+}
+
+/// Check the browser-access files and start the WEB tab's run.
+fn start_web(web: &mut WebRuntime, config: &Config, server: &HostedServer) -> Result<(), String> {
+    let launch = web_access::config::prepare().map_err(|problem| problem.to_string())?;
+    web.start(
+        launch,
+        &config.serve.password,
+        &server.web_view(),
+        Instant::now(),
+    )
+}
+
+/// The WEB tab's desktop server: the Server tab's display, size, mouse,
+/// priority, and performance choices, but always plain RFB on the gateway's
+/// loopback target with a password, never All networks or no password.
+fn web_serve_request(
+    form: &ui::ServeForm,
+    address: std::net::SocketAddr,
+) -> Result<ServeRequest, String> {
+    if !address.ip().is_loopback() {
+        return Err("Browser access serves on loopback only.".into());
+    }
+    let mut form = form.clone();
+    form.host = match address.ip() {
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        ip => ip.to_string(),
+    };
+    form.port = address.port().to_string();
+    form.allow_insecure = false;
+    form.tls = topvnc::transport::TlsOptions {
+        unencrypted: true,
+        ..Default::default()
+    };
+    form.request()
 }
 
 /// How often the title bar's statistics refresh.
@@ -1850,6 +2044,33 @@ fn run_session_inner(
 mod tests {
     use super::*;
 
+    #[test]
+    fn web_serve_request_is_plain_loopback_with_a_password() {
+        let mut form = ui::ServeForm {
+            host: ui::ALL_NETWORKS_HOST.into(),
+            port: "1".into(),
+            allow_insecure: true,
+            scale: 0.5,
+            ..ui::ServeForm::default()
+        };
+        form.tls.cert = Some("cert.pem".into());
+        form.tls.key = Some("key.pem".into());
+        // An empty password is refused even though the Server tab allows none.
+        assert!(web_serve_request(&form, "127.0.0.1:5900".parse().unwrap()).is_err());
+        form.password = "pw".into();
+        let request = web_serve_request(&form, "127.0.0.1:5900".parse().unwrap()).unwrap();
+        assert_eq!(request.address, "127.0.0.1:5900");
+        assert_eq!(request.password.as_deref(), Some("pw"));
+        assert!(!request.allow_insecure);
+        assert!(request.tls.unencrypted);
+        assert_eq!((request.tls.cert, request.tls.key), (None, None));
+        // The Server tab's other choices carry over.
+        assert_eq!(request.scale, 0.5);
+        let v6 = web_serve_request(&form, "[::1]:5900".parse().unwrap()).unwrap();
+        assert_eq!(v6.address, "[::1]:5900");
+        assert!(web_serve_request(&form, "192.168.1.2:5900".parse().unwrap()).is_err());
+    }
+
     /// Requires a real interactive Windows desktop and GPU. Opens a small
     /// two-second window, then tests worker shutdown with no UI pumping.
     #[cfg(windows)]
@@ -2280,9 +2501,10 @@ mod tests {
     fn hosted_server_reports_unsupported_platforms_and_stops() {
         let mut server = HostedServer::default();
         server.start(ServeRequest {
+            tls: Default::default(),
             performance: PerformanceMode::Standard,
             address: "127.0.0.1:0".into(),
-            display: None,
+            display: desktop_host::DisplaySelection::Primary,
             password: Some("secret".into()),
             allow_insecure: false,
             scale: 1.0,
@@ -2377,3 +2599,7 @@ mod stage_timing {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/native/app.rs"]
+mod native_connection_tests;

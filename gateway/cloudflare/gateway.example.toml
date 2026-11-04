@@ -1,0 +1,16 @@
+# Copy to gateway.local.toml (ignored) and fill in your non-secret values.
+# The configuration holds no VNC password, JWT, or tunnel token.
+listen = "127.0.0.1:6080"
+# `topvnc --serve` on this host. Loopback only; it must require a password.
+rfb_target = "127.0.0.1:5900"
+app_origin = "https://topvnc.YOUR_SUBDOMAIN.workers.dev"
+issuer = "https://YOUR_TEAM.cloudflareaccess.com"
+audience = "YOUR_ACCESS_APPLICATION_AUD"
+owner_email = "you@example.com"
+# Sessions end after this many seconds (1-7200) or at Access JWT expiry.
+max_session_seconds = 7200
+# E2E identity, relative to this file. Both are ignored by Git. To keep the
+# Phase 0 identity and paired browsers, use "spike/host.key" and
+# "spike/browsers.txt".
+host_key_file = "host.key"
+browser_keys_file = "browsers.txt"

@@ -1,0 +1,13 @@
+[package]
+name = "topvnc-rfb"
+version = "0.2.0"
+edition = "2024"
+description = "Sans-IO RFB client protocol, decoding, framebuffer, and input encoding shared by TopVNC's native and browser viewers"
+publish = false
+
+# No networking, threads, or platform UI: the native viewer and the browser
+# client drive the same state machines with their own transports.
+[dependencies]
+des = "0.8"
+flate2 = "1.1"
+zune-jpeg = "0.5.15"

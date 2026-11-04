@@ -1,0 +1,17 @@
+# Short commands for the Phase 0 Cloudflare gateway in gateway/cloudflare/spike
+# (a separate workspace) and its Tunnel connector; run them from this directory.
+# The gateway aliases keep --synthetic-echo explicit, so the gateway never
+# connects a desktop.
+[alias]
+# Gateway for an already enrolled browser.
+gateway = "run --manifest-path gateway/cloudflare/spike/Cargo.toml -p topvnc-spike-host -- --synthetic-echo gateway/cloudflare/spike/host.local.toml"
+# Gateway plus a one-time pairing QR code on this console.
+pair = "run --manifest-path gateway/cloudflare/spike/Cargo.toml -p topvnc-spike-host -- --synthetic-echo --pair gateway/cloudflare/spike/host.local.toml"
+# Private Tunnel connector (cloudflared) with the protected token file.
+tunnel = "run --manifest-path gateway/cloudflare/spike/Cargo.toml -p topvnc-spike-tunnel -- gateway/cloudflare/spike/tunnel-token.txt"
+# The production web gateway (crates/topvnc-web-gateway) for `topvnc --serve`,
+# with the ignored gateway/cloudflare/gateway.local.toml, and its Tunnel
+# connector with the ignored gateway/cloudflare/tunnel-token.txt.
+web-tunnel = "run --release -p topvnc-web-gateway --bin topvnc-tunnel -- gateway/cloudflare/tunnel-token.txt"
+web-gateway = "run --release -p topvnc-web-gateway --bin topvnc-web-gateway -- gateway/cloudflare/gateway.local.toml"
+web-pair = "run --release -p topvnc-web-gateway --bin topvnc-web-gateway -- --pair gateway/cloudflare/gateway.local.toml"

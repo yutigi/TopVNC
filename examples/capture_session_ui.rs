@@ -9,6 +9,9 @@ mod helpers;
 #[allow(dead_code)]
 #[path = "../src/ui.rs"]
 mod ui;
+#[allow(dead_code)]
+#[path = "../src/web_access/mod.rs"]
+mod web_access;
 
 use std::io::{self, Write};
 fn main() -> io::Result<()> {
