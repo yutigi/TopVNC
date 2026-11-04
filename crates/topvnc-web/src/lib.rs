@@ -231,6 +231,15 @@ impl Connection {
         self.inner.continuous_updates()
     }
 
+    /// The host's width and height while it serves more than this browser
+    /// shows, or empty.
+    pub fn oversize(&self) -> Vec<u16> {
+        self.inner
+            .oversize()
+            .map(|(width, height)| vec![width, height])
+            .unwrap_or_default()
+    }
+
     #[wasm_bindgen(js_name = serverName)]
     pub fn server_name(&self) -> String {
         self.inner.server_name().unwrap_or_default().to_owned()

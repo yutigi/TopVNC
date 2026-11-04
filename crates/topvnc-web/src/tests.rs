@@ -7,6 +7,7 @@ use topvnc_rfb::messages::{
 };
 use topvnc_rfb::protocol::{
     BUTTON_LEFT, CONTINUOUS_UPDATES_MESSAGE, DESKTOP_SIZE_ENCODING, FENCE_REQUEST,
+    SERVE_DISPLAY_ENCODING, SERVE_DISPLAY_FENCE, SERVE_SCALE_ENCODING, SERVE_SCALE_FENCE,
 };
 
 const CHALLENGE: [u8; 16] = [3; 16];
@@ -96,6 +97,11 @@ fn update(rects: &[Vec<u8>]) -> Vec<u8> {
 /// Run the password handshake with the server's bytes cut into `chunk`s and
 /// return the session with the browser's requests checked.
 fn signed_in(chunk: usize) -> (ClientSession, Host) {
+    signed_in_at(chunk, (4, 2), (4, 2))
+}
+
+/// Sign in to a host serving `size`; the first update asks for `requested`.
+fn signed_in_at(chunk: usize, size: (u16, u16), requested: (u16, u16)) -> (ClientSession, Host) {
     let (mut session, mut host) = connect(6);
     let mut server = b"RFB 003.008\n".to_vec();
     server.extend_from_slice(&[1, 2]);
@@ -112,7 +118,7 @@ fn signed_in(chunk: usize) -> (ClientSession, Host) {
     session.password("secret", 0.0).unwrap();
     host.expect(&mut session, &vnc_auth_response(&CHALLENGE, "secret"));
     let mut server = 0u32.to_be_bytes().to_vec();
-    server.extend_from_slice(&server_init(4, 2));
+    server.extend_from_slice(&server_init(size.0, size.1));
     let events = host.send(&mut session, &server, chunk, 0.0);
     assert_eq!(events & EVENT_CONNECTED, EVENT_CONNECTED);
     let mut expected = vec![1];
@@ -120,7 +126,7 @@ fn signed_in(chunk: usize) -> (ClientSession, Host) {
     expected.extend_from_slice(&set_encodings_message(
         &Encoding::Tight { quality: 6 }.advertised(),
     ));
-    expected.extend_from_slice(&update_request(false, 4, 2));
+    expected.extend_from_slice(&update_request(false, requested.0, requested.1));
     host.expect(&mut session, &expected);
     assert_eq!(session.server_name(), Some("desk"));
     (session, host)
@@ -253,6 +259,110 @@ fn input_is_encoded_bounded_to_the_framebuffer_and_released() {
     host.expect(
         &mut session,
         &set_encodings_message(&Encoding::Tight { quality: 2 }.advertised()),
+    );
+}
+
+fn fence_request(prefix: &[u8], value: u8) -> Vec<u8> {
+    let mut payload = prefix.to_vec();
+    payload.push(value);
+    fence_message(FENCE_REQUEST, &payload).to_vec()
+}
+
+/// All displays of a 3440×1440 ultrawide beside a portrait 4K, at 100%.
+const ALL_DISPLAYS: (u16, u16) = (5600, 3840);
+
+#[test]
+fn fitting_scales_stay_within_the_browser_limit() {
+    assert_eq!(fitting_scale(100, ALL_DISPLAYS.0, ALL_DISPLAYS.1), Some(88));
+    // Already scaled: the percentage is relative to the native size.
+    assert_eq!(fitting_scale(50, 8192, 4096), Some(35));
+    // Below the host's minimum there is nothing to ask for.
+    assert_eq!(fitting_scale(26, 8192, 8192), None);
+    for (current, size) in [(100, ALL_DISPLAYS), (100, (8192, 4096)), (90, (7000, 3000))] {
+        let percent = fitting_scale(current, size.0, size.1).unwrap();
+        let scaled = |value: u16| u32::from(value) * u32::from(percent) / u32::from(current);
+        assert!((scaled(size.0) * scaled(size.1)) as usize <= MAX_WEB_FRAMEBUFFER_PIXELS);
+        assert!(percent < current);
+    }
+}
+
+#[test]
+fn an_oversized_host_is_asked_for_a_smaller_size_and_then_shown() {
+    // Reconnecting after another viewer chose all displays: the host's
+    // size is more than the browser shows. The session stays up, asks for
+    // one pixel, and draws nothing.
+    let (mut session, mut host) = signed_in_at(4096, ALL_DISPLAYS, (1, 1));
+    assert_eq!(session.oversize(), Some(ALL_DISPLAYS));
+    assert_eq!(session.frame().unwrap().width(), 1);
+    // Pointer input has nothing to aim at and is dropped.
+    session.pointer(BUTTON_LEFT, 10, 10).unwrap();
+    host.expect(&mut session, &[]);
+    // The first update brings the host's controls; a smaller served size,
+    // which keeps all displays, is asked for once.
+    let mut pixels = rect(0, 0, 1, 1, 0);
+    pixels.extend_from_slice(&[1, 2, 3, 0]);
+    let first = update(&[
+        rect(0, 0, 100, 0, SERVE_SCALE_ENCODING),
+        rect(0, 2, 0, 0, SERVE_DISPLAY_ENCODING),
+        pixels.clone(),
+    ]);
+    let events = host.send(&mut session, &first, 4096, 0.0);
+    assert_eq!(events & EVENT_FRAME, 0, "nothing is drawn");
+    let mut expected = fence_request(SERVE_SCALE_FENCE, 88);
+    expected.extend_from_slice(&update_request(true, 1, 1));
+    host.expect(&mut session, &expected);
+    host.send(&mut session, &update(&[pixels]), 4096, 0.0);
+    host.expect(&mut session, &update_request(true, 1, 1));
+    // The host serves a size that fits: it is shown in full.
+    let events = host.send(
+        &mut session,
+        &update(&[
+            rect(0, 0, 4928, 3379, DESKTOP_SIZE_ENCODING),
+            rect(0, 0, 88, 0, SERVE_SCALE_ENCODING),
+        ]),
+        4096,
+        0.0,
+    );
+    assert_eq!(events & EVENT_RESIZED, EVENT_RESIZED);
+    assert_eq!(events & EVENT_OVERSIZE, 0);
+    assert_eq!(session.oversize(), None);
+    assert_eq!(session.frame().unwrap().width(), 4928);
+    host.expect(&mut session, &update_request(false, 4928, 3379));
+    // Choosing all displays again from here asks again.
+    let events = host.send(
+        &mut session,
+        &update(&[rect(0, 0, 5600, 3840, DESKTOP_SIZE_ENCODING)]),
+        4096,
+        0.0,
+    );
+    assert_eq!(events & EVENT_OVERSIZE, EVENT_OVERSIZE);
+    let mut expected = fence_request(SERVE_SCALE_FENCE, 77);
+    expected.extend_from_slice(&update_request(false, 1, 1));
+    host.expect(&mut session, &expected);
+}
+
+#[test]
+fn an_oversized_host_without_size_control_is_asked_for_one_display() {
+    let (mut session, mut host) = signed_in_at(4096, ALL_DISPLAYS, (1, 1));
+    host.send(
+        &mut session,
+        &update(&[rect(0, 2, 0, 0, SERVE_DISPLAY_ENCODING)]),
+        4096,
+        0.0,
+    );
+    let mut expected = fence_request(SERVE_DISPLAY_FENCE, 1);
+    expected.extend_from_slice(&update_request(true, 1, 1));
+    host.expect(&mut session, &expected);
+
+    // A host with neither control cannot be shown; the session says so.
+    let (mut session, host) = signed_in_at(4096, ALL_DISPLAYS, (1, 1));
+    let error = session
+        .receive(&{ host }.channel.seal(&update(&[])).unwrap(), 0.0)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("larger than this browser can show")
     );
 }
 

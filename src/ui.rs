@@ -385,6 +385,9 @@ pub struct UiState {
     pub menu_open: bool,
     pub focus: Option<Field>,
     pub error: Option<String>,
+    /// A WEB tab confirmation, such as a copied app URL, shown until the
+    /// next WEB action.
+    pub notice: Option<String>,
     /// The WEB tab row whose output is shown; `None` picks one.
     pub web_row: Option<Row>,
 }
@@ -1775,6 +1778,20 @@ const WEB_PANEL: Box2 = Box2 {
     w: 278,
     h: 420,
 };
+/// Below the help text in the panel, while the app URL is known and no
+/// pairing code is shown.
+pub const WEB_COPY_URL: Box2 = Box2 {
+    x: 480,
+    y: 476,
+    w: 278,
+    h: 36,
+};
+
+/// Whether the WEB tab offers [`WEB_COPY_URL`]: the app URL to copy is known
+/// and the panel is not showing pairing.
+pub fn web_copy_url_shown(web: &WebRuntime) -> bool {
+    web.app_origin().is_some() && !web.pairing_active()
+}
 const WEB_OUTPUT_Y: usize = 352;
 const WEB_OUTPUT_ROWS: usize = 14;
 /// Characters per small output line in the 420-pixel column.
@@ -1875,6 +1892,8 @@ fn web_tab(
     web_panel(canvas, web);
     if let Some(error) = &state.error {
         status_message(canvas, error, ERROR);
+    } else if let Some(notice) = &state.notice {
+        status_message(canvas, notice, TEXT);
     } else if let Some(message) = web.message() {
         status_message(canvas, message, TEXT);
     }
@@ -1994,6 +2013,9 @@ fn web_panel(canvas: &mut Canvas<'_>, web: &WebRuntime) {
     if !cfg!(windows) {
         y += 10;
         small(canvas, &mut y, "NOT YET TESTED ON THIS PLATFORM.", ERROR);
+    }
+    if web_copy_url_shown(web) {
+        canvas.button(WEB_COPY_URL, "COPY APP URL", false);
     }
 }
 
@@ -2594,6 +2616,8 @@ mod tests {
         const { assert!(WEB_PANEL.x > WEB_PASSWORD.x + WEB_PASSWORD.w) };
         const { assert!(WEB_PANEL.y + WEB_PANEL.h < 525) };
         const { assert!(WEB_START.x + WEB_START.w < WEB_PAIR.x) };
+        const { assert!(WEB_COPY_URL.y >= WEB_PANEL.y) };
+        const { assert!(WEB_COPY_URL.y + WEB_COPY_URL.h <= WEB_PANEL.y + WEB_PANEL.h) };
 
         // The WEB tab edits the Server tab's password; neither is saved.
         let mut state = UiState::default();

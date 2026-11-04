@@ -58,6 +58,8 @@ try {
 let pending; // A scanned invite and a new browser key, kept in memory until verified.
 let state = "idle"; // idle | connecting | password | connected
 let frame = { width: 0, height: 0 };
+// The host serves more than this browser shows; a size that fits was asked for.
+let oversized = false;
 let relativePointer = false;
 let mode = preference("mode", "trackpad");
 let buttons = 0;
@@ -215,6 +217,16 @@ async function onSessionMessage(message) {
       frame = { width: message.width, height: message.height };
       pointerPosition = { x: Math.floor(frame.width / 2), y: Math.floor(frame.height / 2) };
       layout();
+      if (oversized && message.width > 1) {
+        oversized = false;
+        report(`The host now shares ${message.width}×${message.height}, which fits this browser.`);
+      }
+      break;
+    case "oversize":
+      // The session asks the host for a size that fits; a 1×1 placeholder
+      // is shown until it arrives.
+      oversized = true;
+      report(`The host shares ${message.width}×${message.height}, more than this browser can show. Asking it to share a smaller size, or one display instead of all…`);
       break;
     case "pointerMode":
       relativePointer = message.relative;
@@ -231,6 +243,7 @@ async function onSessionMessage(message) {
     }
     case "closed": {
       const wasConnected = message.connected;
+      oversized = false;
       resetInput();
       state = "idle";
       passwordForm.hidden = true;

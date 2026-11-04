@@ -618,6 +618,21 @@ fn run_server(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     macos_server::run(arguments)
 }
 
+#[cfg(windows)]
+fn copy_text(text: &str) -> Result<(), String> {
+    windows_server::copy_text(text)
+}
+
+#[cfg(target_os = "macos")]
+fn copy_text(text: &str) -> Result<(), String> {
+    macos_server::copy_text(text)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn copy_text(_text: &str) -> Result<(), String> {
+    Err("Copying to the clipboard is available on Windows and macOS only.".into())
+}
+
 #[cfg(not(any(windows, target_os = "macos")))]
 fn run_server(_arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Err(SERVER_UNAVAILABLE.into())
@@ -965,6 +980,7 @@ fn show_landing(
         let mut server_clicked = false;
         let mut web_clicked = false;
         let mut pair_clicked = false;
+        let mut copy_url_clicked = false;
         let mut helper_action = None;
         // Woken by input; the timeout picks up server status and the
         // connection result.
@@ -1182,6 +1198,8 @@ fn show_landing(
                         }
                         web_clicked |= ui::WEB_START.contains(x, y);
                         pair_clicked |= ui::WEB_PAIR.contains(x, y);
+                        copy_url_clicked |=
+                            ui::web_copy_url_shown(web) && ui::WEB_COPY_URL.contains(x, y);
                     } else if state.tab == Tab::Connect
                         && !ui::TAB_MORE.contains(x, y)
                         && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
@@ -1278,7 +1296,17 @@ fn show_landing(
                 ServerPhase::Starting | ServerPhase::Stopping => {}
             }
         }
+        if copy_url_clicked && let Some(origin) = web.app_origin() {
+            match copy_text(origin) {
+                Ok(()) => {
+                    state.error = None;
+                    state.notice = Some("APP URL COPIED TO THE CLIPBOARD.".into());
+                }
+                Err(error) => state.error = Some(format!("Could not copy the app URL: {error}")),
+            }
+        }
         if web_clicked || pair_clicked {
+            state.notice = None;
             let start = web.is_idle() && (web_clicked || (pair_clicked && !web.pairing_active()));
             let started = if start {
                 state.web_row = None;
