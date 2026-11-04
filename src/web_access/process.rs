@@ -325,6 +325,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     const JOB_HELPER: &str = "TOPVNC_TEST_JOB_HELPER";
 
     /// Run only as the helper process of
