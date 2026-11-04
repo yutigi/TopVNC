@@ -16,7 +16,7 @@ release cannot fail the run without a code change. Moving to 1.99 required the
 
 - **Format** (Ubuntu): `cargo fmt --all --check` for the workspace. (It also
   checked the separate Rust Worker workspace until spec 015 T027 removed it.)
-- **Rust** (Windows, macOS, Ubuntu): `cargo clippy --locked --workspace
+- **Rust** (Windows, Ubuntu; macOS until 2026-11-04, see below): `cargo clippy --locked --workspace
   --all-targets -- -D warnings` and `cargo test --locked --workspace`. Ubuntu
   installs only the libxcb development packages that `display-info` links;
   winit loads Wayland, X11 and xkbcommon at run time.
@@ -40,7 +40,7 @@ code compiles and its automated tests pass there, nothing more.
   with read-only repository permissions and superseded runs cancelled.
 - Every Cargo command uses `--locked`, so a stale lock file fails the run.
 - The Rust version comes from `rust-toolchain.toml`, not from the latest stable.
-- Clippy warnings fail the run on all three operating systems.
+- Clippy warnings fail the run on every operating system in the matrix.
 - A matrix failure on one OS does not cancel the others (`fail-fast: false`), so
   each platform's status is visible.
 - The browser job fails if the wasm-bindgen CLI and the root `Cargo.lock`
@@ -137,3 +137,17 @@ shows that the workspace compiles and its automated tests pass on hosted macOS
 and Ubuntu runners. It does not show that live desktop capture, input
 injection or GPU presentation work there, and the README's platform claims are
 unchanged.
+
+## macOS removed from CI (2026-11-04)
+
+During a GitHub Actions incident on 2026-11-04, run 41864638387 on PR #7 held
+`Rust (macos-latest)` in the queue for more than 30 minutes, across two attempts,
+after every other job had passed. GitHub annotated the job: "Due to capacity
+constraints, jobs targeting macOS arm64 runners may experience longer queue
+times." A gate that cannot start blocks the pull request without testing
+anything, so the owner removed macOS from the Rust matrix.
+
+macOS is now checked locally only: before merging a change that can affect
+macOS, run `cargo clippy --locked --workspace --all-targets -- -D warnings` and
+`cargo test --locked --workspace` on a Mac. The macOS results in the runs above
+remain the last CI record for macOS; later macOS results come from local runs.

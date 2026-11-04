@@ -1,6 +1,8 @@
 # Repository gates from AGENTS.md on every pull request and on main:
-# formatting, Clippy and workspace tests on Windows, macOS and Linux, plus the
+# formatting, Clippy and workspace tests on Windows and Linux, plus the
 # WebAssembly browser client, its Node tests, and the Cloudflare Worker.
+# macOS is not run here: hosted macOS runners queue too long to gate pull
+# requests, so macOS Clippy and tests are run locally on a Mac before merging.
 name: CI
 
 on:
@@ -40,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
