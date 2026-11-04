@@ -1058,6 +1058,18 @@ impl Drop for ReconfigurationCallback {
     }
 }
 
+/// Put Unicode text from the TopVNC window, such as the WEB tab's app URL,
+/// on the general pasteboard.
+pub fn copy_text(text: &str) -> Result<(), String> {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    if pasteboard.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString }) {
+        Ok(())
+    } else {
+        Err("the pasteboard rejected the text".into())
+    }
+}
+
 /// The general pasteboard, tracking which changes this host made itself.
 struct Pasteboard {
     pasteboard: Retained<NSPasteboard>,

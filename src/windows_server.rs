@@ -985,7 +985,20 @@ fn read_system_clipboard_latin1() -> Result<Vec<u8>, Box<dyn Error>> {
 }
 
 fn set_system_clipboard(text: &[u8]) -> Result<u32, Box<dyn Error>> {
-    let utf16 = latin1_to_utf16(text);
+    set_clipboard_utf16(&latin1_to_utf16(text))
+}
+
+/// Put Unicode text from the TopVNC window, such as the WEB tab's app URL,
+/// on the system clipboard.
+pub fn copy_text(text: &str) -> Result<(), String> {
+    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    set_clipboard_utf16(&utf16)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// `utf16` ends with its NUL, as CF_UNICODETEXT requires.
+fn set_clipboard_utf16(utf16: &[u16]) -> Result<u32, Box<dyn Error>> {
     let byte_len = utf16
         .len()
         .checked_mul(size_of::<u16>())

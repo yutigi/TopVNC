@@ -18,6 +18,7 @@ export const EVENT = {
   POINTER_MODE: 1 << 6,
   CAPABILITIES: 1 << 7,
   RTT: 1 << 8,
+  OVERSIZE: 1 << 9,
 };
 
 // A link this far behind is not usable for interactive control.
@@ -143,6 +144,10 @@ export function createSession(post) {
       }
       current.image = undefined;
       post({ type: "resized", width, height });
+    }
+    if (events & EVENT.OVERSIZE) {
+      const [width, height] = current.connection.oversize();
+      if (width) post({ type: "oversize", width, height });
     }
     if (events & EVENT.POINTER_MODE) post({ type: "pointerMode", relative: current.connection.relativePointer() });
     if (events & EVENT.CAPABILITIES) {

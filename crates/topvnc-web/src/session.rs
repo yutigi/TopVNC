@@ -32,9 +32,14 @@ pub const EVENT_POINTER_MODE: u32 = 1 << 6;
 pub const EVENT_CAPABILITIES: u32 = 1 << 7;
 /// A round-trip time was measured.
 pub const EVENT_RTT: u32 = 1 << 8;
+/// The host serves more than [`MAX_WEB_FRAMEBUFFER_PIXELS`]; nothing is
+/// drawn and a size that fits was asked for. See
+/// [`ClientSession::oversize`].
+pub const EVENT_OVERSIZE: u32 = 1 << 9;
 
-/// The largest framebuffer the browser accepts: two 4K displays side by side,
-/// 64 MiB as RGBA.
+/// The largest framebuffer the browser shows: two 4K displays side by side,
+/// 64 MiB as RGBA, and the canvas area iOS Safari allows. A host serving more
+/// is asked for a smaller served size, or for one display instead of all.
 pub const MAX_WEB_FRAMEBUFFER_PIXELS: usize = 16_777_216;
 /// Fence payload prefix for round-trip measurements.
 const PING_FENCE: &[u8] = b"TopVNC.Ping/1:";
@@ -62,6 +67,78 @@ struct Running {
     /// The size at the start of the current update.
     update_size: (u16, u16),
     scratch: Vec<u8>,
+    /// The host serves more than this browser shows (`info` has its size):
+    /// `frame` is a 1×1 placeholder, rectangles are decoded, to keep the
+    /// zlib streams in step, but not applied, and updates ask for one pixel.
+    oversize: bool,
+    /// A smaller size was asked for since the size last changed.
+    fit_requested: bool,
+}
+
+/// Whether the browser shows a framebuffer of this size.
+fn fits(width: u16, height: u16) -> bool {
+    usize::from(width) * usize::from(height) <= MAX_WEB_FRAMEBUFFER_PIXELS
+}
+
+/// The framebuffer for a host size: a placeholder while it does not fit.
+fn frame_for(width: u16, height: u16) -> io::Result<RgbaFrame> {
+    if fits(width, height) {
+        RgbaFrame::new(width, height, MAX_WEB_FRAMEBUFFER_PIXELS)
+    } else {
+        topvnc_rfb::validate_framebuffer_size(width, height)?;
+        RgbaFrame::new(1, 1, MAX_WEB_FRAMEBUFFER_PIXELS)
+    }
+}
+
+/// The served percentage below `current` at which `width` × `height`, served
+/// at `current`, fits; `None` below the host's 25% minimum.
+pub(crate) fn fitting_scale(current: u8, width: u16, height: u16) -> Option<u8> {
+    let pixels = f64::from(width) * f64::from(height);
+    let ratio = (MAX_WEB_FRAMEBUFFER_PIXELS as f64 / pixels).sqrt();
+    let percent = (f64::from(current) * ratio)
+        .floor()
+        .min(f64::from(current) - 1.0);
+    (percent >= 25.0).then_some(percent as u8)
+}
+
+impl Running {
+    /// The region updates ask for: one pixel while nothing is drawn.
+    fn request_size(&self) -> (u16, u16) {
+        if self.oversize {
+            (1, 1)
+        } else {
+            (self.info.width, self.info.height)
+        }
+    }
+
+    /// Ask the host for a size that fits, at most once per size: a smaller
+    /// served size keeps the chosen displays, else one display instead of
+    /// all. Both are host-wide choices.
+    fn ask_to_fit(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
+        if !self.oversize || self.fit_requested {
+            return Ok(());
+        }
+        let (width, height) = (self.info.width, self.info.height);
+        if let Some(percent) = self
+            .input
+            .serve_scale()
+            .and_then(|current| fitting_scale(current, width, height))
+        {
+            self.input.request_serve_scale(percent, out)?;
+        } else if self
+            .input
+            .serve_display()
+            .is_some_and(|displays| displays.served == 0 && displays.count > 0)
+        {
+            self.input.request_serve_display(1, out)?;
+        } else {
+            return Err(invalid(
+                "the host's screen is larger than this browser can show, and the host cannot share it smaller",
+            ));
+        }
+        self.fit_requested = true;
+        Ok(())
+    }
 }
 
 pub struct ClientSession {
@@ -185,13 +262,26 @@ impl ClientSession {
         let Phase::Rfb(handshake) = std::mem::replace(&mut self.phase, Phase::Failed) else {
             unreachable!()
         };
-        let frame = RgbaFrame::new(info.width, info.height, MAX_WEB_FRAMEBUFFER_PIXELS)?;
+        // A host still serving a size this browser cannot show, such as all
+        // displays chosen from another viewer, is asked for a smaller one
+        // once its controls arrive with the first update.
+        let frame = frame_for(info.width, info.height)?;
+        let oversize = !fits(info.width, info.height);
+        // The reader keeps the protocol's own limit, so an oversized host
+        // can be read until it serves a size that fits.
         let mut reader = MessageReader::new(info.width, info.height, self.encoding);
-        reader.set_max_framebuffer_pixels(MAX_WEB_FRAMEBUFFER_PIXELS);
         reader.push(&handshake.into_leftover())?;
+        let (width, height) = if oversize {
+            (1, 1)
+        } else {
+            (info.width, info.height)
+        };
         self.plaintext
-            .extend_from_slice(&update_request(false, info.width, info.height));
+            .extend_from_slice(&update_request(false, width, height));
+        let events = if oversize { EVENT_OVERSIZE } else { 0 };
         self.phase = Phase::Running(Box::new(Running {
+            oversize,
+            fit_requested: false,
             update_size: (info.width, info.height),
             input: InputState::new(self.encoding.advertised()),
             reader,
@@ -202,7 +292,7 @@ impl ClientSession {
             scratch: Vec::new(),
             info,
         }));
-        Ok(EVENT_CONNECTED | EVENT_RESIZED | EVENT_FRAME)
+        Ok(EVENT_CONNECTED | EVENT_RESIZED | EVENT_FRAME | events)
     }
 
     /// Apply every complete server message.
@@ -210,54 +300,72 @@ impl ClientSession {
         let Phase::Running(running) = &mut self.phase else {
             return Ok(0);
         };
-        let Running {
-            info,
-            reader,
-            decoder,
-            input,
-            frame,
-            continuous,
-            update_size,
-            scratch,
-            ..
-        } = running.as_mut();
+        let running = running.as_mut();
         let out = &mut self.plaintext;
         let mut events = 0;
-        while let Some(message) = reader.next_message()? {
+        while let Some(message) = running.reader.next_message()? {
             match message {
-                ServerMessage::UpdateStart => *update_size = (info.width, info.height),
+                ServerMessage::UpdateStart => {
+                    running.update_size = (running.info.width, running.info.height)
+                }
                 ServerMessage::DesktopSize { width, height } => {
-                    frame.resize(width, height, MAX_WEB_FRAMEBUFFER_PIXELS)?;
-                    (info.width, info.height) = (width, height);
+                    if fits(width, height) {
+                        if running.oversize {
+                            running.frame =
+                                RgbaFrame::new(width, height, MAX_WEB_FRAMEBUFFER_PIXELS)?;
+                        } else {
+                            running
+                                .frame
+                                .resize(width, height, MAX_WEB_FRAMEBUFFER_PIXELS)?;
+                        }
+                        running.oversize = false;
+                    } else {
+                        // Free the old framebuffer rather than keep its size.
+                        running.frame = frame_for(width, height)?;
+                        running.oversize = true;
+                        events |= EVENT_OVERSIZE;
+                    }
+                    running.fit_requested = false;
+                    (running.info.width, running.info.height) = (width, height);
                     events |= EVENT_RESIZED | EVENT_FRAME;
                 }
                 ServerMessage::ServeScale(percent) => {
-                    input.set_serve_scale(percent);
+                    running.input.set_serve_scale(percent);
                     events |= EVENT_CAPABILITIES;
                 }
                 ServerMessage::ServeDisplay(displays) => {
-                    input.set_serve_display(displays);
+                    running.input.set_serve_display(displays);
                     events |= EVENT_CAPABILITIES;
                 }
                 ServerMessage::PointerMode { relative } => {
-                    input.server_pointer_mode(relative);
+                    running.input.server_pointer_mode(relative);
                     events |= EVENT_POINTER_MODE;
                 }
-                ServerMessage::ExtendedMouseButtons => input.server_extended_buttons(),
+                ServerMessage::ExtendedMouseButtons => running.input.server_extended_buttons(),
                 ServerMessage::Rect(rect) => {
-                    let pixels = decoder.decode_all(&rect, scratch)?;
-                    frame.apply_bgrx(rect.x, rect.y, rect.width, rect.height, pixels)?;
-                    events |= EVENT_FRAME;
+                    let pixels = running.decoder.decode_all(&rect, &mut running.scratch)?;
+                    if !running.oversize {
+                        running.frame.apply_bgrx(
+                            rect.x,
+                            rect.y,
+                            rect.width,
+                            rect.height,
+                            pixels,
+                        )?;
+                        events |= EVENT_FRAME;
+                    }
                 }
                 ServerMessage::UpdateEnd => {
                     self.frames += 1;
-                    let (width, height) = (info.width, info.height);
-                    if (width, height) != *update_size {
-                        if *continuous {
+                    // The update's capabilities are known by now.
+                    running.ask_to_fit(out)?;
+                    let (width, height) = running.request_size();
+                    if (running.info.width, running.info.height) != running.update_size {
+                        if running.continuous {
                             out.extend_from_slice(&continuous_updates_message(true, width, height));
                         }
                         out.extend_from_slice(&update_request(false, width, height));
-                    } else if !*continuous {
+                    } else if !running.continuous {
                         out.extend_from_slice(&update_request(true, width, height));
                     }
                 }
@@ -265,17 +373,14 @@ impl ClientSession {
                 // Clipboard sharing is not implemented in the browser yet.
                 ServerMessage::CutText(_) => {}
                 ServerMessage::EndOfContinuousUpdates => {
-                    if *continuous {
+                    let (width, height) = running.request_size();
+                    if running.continuous {
                         // The server stopped pushing; go back to requests.
-                        *continuous = false;
-                        out.extend_from_slice(&update_request(true, info.width, info.height));
+                        running.continuous = false;
+                        out.extend_from_slice(&update_request(true, width, height));
                     } else {
-                        *continuous = true;
-                        out.extend_from_slice(&continuous_updates_message(
-                            true,
-                            info.width,
-                            info.height,
-                        ));
+                        running.continuous = true;
+                        out.extend_from_slice(&continuous_updates_message(true, width, height));
                     }
                 }
                 // Messages are handled in order, which satisfies every
@@ -339,8 +444,13 @@ impl ClientSession {
         self.flush()
     }
 
+    /// Pointer input is dropped while nothing is drawn: the page has no
+    /// picture to aim at.
     pub fn pointer(&mut self, buttons: u16, x: u16, y: u16) -> io::Result<()> {
         self.input(|running, out| {
+            if running.oversize {
+                return Ok(());
+            }
             let x = x.min(running.info.width.saturating_sub(1));
             let y = y.min(running.info.height.saturating_sub(1));
             running.input.pointer(buttons, x, y, out);
@@ -350,6 +460,9 @@ impl ClientSession {
 
     pub fn pointer_motion(&mut self, buttons: u16, dx: i32, dy: i32) -> io::Result<()> {
         self.input(|running, out| {
+            if running.oversize {
+                return Ok(());
+            }
             running.input.pointer_motion(buttons, dx, dy, out);
             Ok(())
         })
@@ -477,6 +590,16 @@ impl ClientSession {
 
     pub fn continuous_updates(&self) -> bool {
         matches!(&self.phase, Phase::Running(running) if running.continuous)
+    }
+
+    /// The host's size while it serves more than this browser shows.
+    pub fn oversize(&self) -> Option<(u16, u16)> {
+        match &self.phase {
+            Phase::Running(running) if running.oversize => {
+                Some((running.info.width, running.info.height))
+            }
+            _ => None,
+        }
     }
 
     pub fn received_bytes(&self) -> u64 {
