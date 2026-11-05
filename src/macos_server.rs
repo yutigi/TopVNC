@@ -2,13 +2,13 @@
 //! capture, Quartz event injection, and pasteboard sync.
 
 use crate::desktop_host::{
-    CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureSurface, ClickTracker, DisplayBounds,
-    DisplaySelection, FrameDamage, FrameSlot, HostPermissions, KeyIdentity, MAC_FLAG_ALPHA_SHIFT,
-    MAX_CLIPBOARD_CHARS, MacKeyCode, MouseMode, PointerTransition, Rect, RemoteInputState,
-    Rotation, ServeOptions, ServerNotice, capture_rate, display_point, frame_damage,
-    latin1_from_unicode, latin1_to_string, macos_event_flags, macos_key_flags, macos_key_identity,
-    macos_modifier_flags, parse_serve_arguments, relative_point, served_size, unicode_key_units,
-    validate_capture_dimensions,
+    CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureOutage, CaptureSurface, ClickTracker,
+    DisplayBounds, DisplaySelection, FrameDamage, FrameSlot, HostPermissions, KeyIdentity,
+    MAC_FLAG_ALPHA_SHIFT, MAX_CLIPBOARD_CHARS, MacKeyCode, MouseMode, PointerTransition, Rect,
+    RemoteInputState, Rotation, ServeOptions, ServerNotice, capture_rate, display_point,
+    frame_damage, latin1_from_unicode, latin1_to_string, macos_event_flags, macos_key_flags,
+    macos_key_identity, macos_modifier_flags, parse_serve_arguments, relative_point, served_size,
+    unicode_key_units, validate_capture_dimensions,
 };
 use block2::RcBlock;
 use dispatch2::{DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained};
@@ -47,8 +47,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use topvnc::{
-    BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, ClientEvent, DamageRect,
-    Framebuffer, ServerConfig, VncServer,
+    BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, CaptureStatus,
+    ClientEvent, DamageRect, Framebuffer, ServerConfig, VncServer,
 };
 
 static SERVER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -405,7 +405,14 @@ fn serve_desktop(
     let mut last_display_check = Instant::now();
     let mut connections = 0;
     let mut regions = Vec::new();
+    let mut outage = CaptureOutage::default();
     while !shutdown.load(Ordering::Acquire) {
+        if capture.is_none() {
+            outage.stopped(Instant::now());
+        }
+        // Viewers keep the last picture while capture is stopped, such as
+        // while the Mac is locked; tell them once it lasts.
+        server.set_capture_status(outage.status(Instant::now()));
         let requested_scale = f32::from(server.requested_serve_scale()) / 100.0;
         if requested_scale != scale {
             scale = requested_scale;
@@ -489,6 +496,8 @@ fn serve_desktop(
                     };
                     report(ServerNotice::Message("Desktop capture resumed.".into()));
                     capture = Some(recreated);
+                    outage.resumed();
+                    server.set_capture_status(CaptureStatus::Live);
                     retry_delay = CAPTURE_RETRY_MIN;
                     last_capture_error.clear();
                     last_display_check = Instant::now();

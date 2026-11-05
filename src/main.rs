@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
-    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, Encoding, Framebuffer, InputWriter,
-    PerformanceMode, Session, StatsSnapshot, encoding_name,
+    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, CaptureStatus, Encoding, Framebuffer,
+    InputWriter, PerformanceMode, Session, StatsSnapshot, encoding_name,
 };
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -21,6 +21,8 @@ mod desktop_host;
 mod macos_server;
 #[cfg(windows)]
 mod windows_server;
+#[cfg(windows)]
+mod windows_service;
 
 mod helpers;
 mod settings;
@@ -562,11 +564,18 @@ fn apply_viewer_arguments(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments
-        .first()
-        .is_some_and(|argument| argument == "--serve")
-    {
-        return run_server(&arguments[1..]);
+    match arguments.first().map(String::as_str) {
+        Some("--serve") => return run_server(&arguments[1..]),
+        // The host service, which serves the lock and sign-in screens.
+        #[cfg(windows)]
+        Some("--install-service") => return windows_service::install(&arguments[1..]),
+        #[cfg(windows)]
+        Some("--uninstall-service") if arguments.len() == 1 => return windows_service::uninstall(),
+        #[cfg(windows)]
+        Some("--host-service") => return windows_service::run_service(),
+        #[cfg(windows)]
+        Some("--host-agent") => return windows_service::run_agent(&arguments[1..]),
+        _ => {}
     }
     let mut config = Config::default();
     settings::load(&mut config);
@@ -1649,9 +1658,14 @@ fn run_session_inner(
     let mut debug_status = title.clone();
     let mut known_serve_scale = None;
     let mut known_serve_display = None;
+    let mut capture_status = CaptureStatus::Live;
     loop {
         let mut title_changed = false;
         remote = frames.dimensions();
+        if writer.capture_status() != capture_status {
+            capture_status = writer.capture_status();
+            title_changed = true;
+        }
         let serve_scale = writer.serve_scale();
         let serve_display = writer.serve_display();
         if (known_serve_scale, known_serve_display) != (serve_scale, serve_display) {
@@ -2017,16 +2031,22 @@ fn run_session_inner(
             last_stats = now;
         }
         if title_changed {
-            let status = if config.debug {
-                &debug_status
+            let mut status = if config.debug {
+                debug_status.clone()
             } else {
-                &compact_status
+                compact_status.clone()
             };
-            if locked {
-                window.set_title(&format!("{status} · locked (F8)"));
-            } else {
-                window.set_title(status);
+            // The picture stays; say why it is not changing.
+            match capture_status {
+                CaptureStatus::Live => {}
+                CaptureStatus::NoDisplay => status += " · host has no display",
+                CaptureStatus::SecureDesktop => status += " · host screen locked",
+                CaptureStatus::Unavailable => status += " · host capture paused",
             }
+            if locked {
+                status += " · locked (F8)";
+            }
+            window.set_title(&status);
         }
         let mut options = RenderOptions::new(config, &window);
         options.open = settings_open;

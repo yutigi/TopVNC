@@ -16,8 +16,8 @@ use topvnc_rfb::messages::{
 use topvnc_rfb::protocol::*;
 pub use topvnc_rfb::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
-    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, DamageRect, Encoding, Framebuffer,
-    MAX_FRAMEBUFFER_DIMENSION, MAX_FRAMEBUFFER_PIXELS, MAX_SERVED_DISPLAYS, Security,
+    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, CaptureStatus, DamageRect, Encoding,
+    Framebuffer, MAX_FRAMEBUFFER_DIMENSION, MAX_FRAMEBUFFER_PIXELS, MAX_SERVED_DISPLAYS, Security,
     ServedDisplays, ServerInfo, encoding_name, negotiate, negotiate_with_encoding,
 };
 use topvnc_rfb::{Decoded, InputState, MessageReader, RectDecoder, ServerMessage};
@@ -599,6 +599,8 @@ pub struct VncServer {
     requested_serve_scale: Arc<std::sync::atomic::AtomicU8>,
     serve_display: Arc<std::sync::atomic::AtomicU16>,
     requested_display: Arc<std::sync::atomic::AtomicU16>,
+    /// The [`CaptureStatus`] code viewers are told.
+    capture_status: Arc<std::sync::atomic::AtomicU16>,
     events: std::sync::mpsc::SyncSender<ClientEvent>,
     event_receiver: Mutex<std::sync::mpsc::Receiver<ClientEvent>>,
     config: ServerConfig,
@@ -868,6 +870,9 @@ impl VncServer {
             requested_serve_scale: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             serve_display: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             requested_display: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            capture_status: Arc::new(std::sync::atomic::AtomicU16::new(
+                CaptureStatus::Live.code(),
+            )),
             events,
             event_receiver: Mutex::new(event_receiver),
             config,
@@ -929,6 +934,15 @@ impl VncServer {
         assert!(displays.is_valid());
         let packed = u16::from(displays.served) << 8 | u16::from(displays.count);
         if self.serve_display.swap(packed, Ordering::AcqRel) != packed {
+            self.wake_sessions();
+        }
+    }
+
+    /// Tell viewers whether the desktop can be captured. While it cannot,
+    /// they keep the last picture and say why. Viewers that advertised the
+    /// capability are told promptly; the others see a still picture.
+    pub fn set_capture_status(&self, status: CaptureStatus) {
+        if self.capture_status.swap(status.code(), Ordering::AcqRel) != status.code() {
             self.wake_sessions();
         }
     }
@@ -1073,6 +1087,7 @@ impl VncServer {
                 requested_serve_scale: Arc::clone(&self.requested_serve_scale),
                 serve_display: Arc::clone(&self.serve_display),
                 requested_display: Arc::clone(&self.requested_display),
+                capture_status: Arc::clone(&self.capture_status),
                 clipboard: Arc::clone(&self.clipboard),
                 thread_setup: self.config.thread_setup,
                 priority: self.config.priority,
@@ -1235,6 +1250,8 @@ struct SessionShared {
     /// [`DISPLAY_REQUEST_PENDING`] with the requested display in the low
     /// byte, or zero when no request is waiting.
     requested_display: Arc<std::sync::atomic::AtomicU16>,
+    /// The [`CaptureStatus`] code viewers are told.
+    capture_status: Arc<std::sync::atomic::AtomicU16>,
     clipboard: Arc<Mutex<ServerClipboard>>,
     /// See [`ServerConfig::thread_setup`].
     thread_setup: Option<fn()>,
@@ -1610,6 +1627,7 @@ struct ClientEncodings {
     desktop_size: bool,
     serve_scale: bool,
     serve_display: bool,
+    capture_status: bool,
     fence: bool,
     continuous_updates: bool,
     /// QEMU Pointer Motion Change: the client sends relative motion on request.
@@ -1634,6 +1652,7 @@ impl ClientEncodings {
                 DESKTOP_SIZE_ENCODING => result.desktop_size = true,
                 SERVE_SCALE_ENCODING => result.serve_scale = true,
                 SERVE_DISPLAY_ENCODING => result.serve_display = true,
+                CAPTURE_STATUS_ENCODING => result.capture_status = true,
                 FENCE_ENCODING => result.fence = true,
                 CONTINUOUS_UPDATES_ENCODING => result.continuous_updates = true,
                 POINTER_MOTION_CHANGE_ENCODING => result.pointer_motion_change = true,
@@ -1871,6 +1890,8 @@ fn write_client_updates(
     let mut pointer_mode: Option<bool> = None;
     let mut announced_scale = 0;
     let mut announced_displays = 0;
+    // Viewers assume a live picture until told otherwise.
+    let mut announced_status = CaptureStatus::Live.code();
     let mut encoder = SessionEncoder {
         priority: session.priority,
         performance: session.performance,
@@ -1913,6 +1934,18 @@ fn write_client_updates(
                 height: 0,
             });
             announced_displays = displays;
+        }
+        let status = session.capture_status.load(Ordering::Acquire);
+        if encodings.capture_status && status != announced_status {
+            pseudo.retain(|rect| rect.encoding != CAPTURE_STATUS_ENCODING);
+            pseudo.push(PseudoRect {
+                encoding: CAPTURE_STATUS_ENCODING,
+                x: status,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+            announced_status = status;
         }
         if encodings.pointer_motion_change {
             let relative = session.relative_pointer.load(Ordering::Acquire);
@@ -3017,6 +3050,7 @@ pub fn read_update_with_encoding(
 enum ServerControl<'a> {
     ServeScale(u8),
     ServeDisplay(ServedDisplays),
+    CaptureStatus(CaptureStatus),
     /// The server supports continuous updates, or stopped sending them.
     EndOfContinuousUpdates,
     Fence {
@@ -3084,6 +3118,7 @@ fn read_update_inner(
             ServerMessage::ServeDisplay(displays) => {
                 control(ServerControl::ServeDisplay(displays))?
             }
+            ServerMessage::CaptureStatus(status) => control(ServerControl::CaptureStatus(status))?,
             ServerMessage::PointerMode { relative } => {
                 control(ServerControl::PointerMode { relative })?
             }
@@ -3210,6 +3245,13 @@ impl InputWriter {
         self.state()
             .ok()
             .and_then(|state| state.input.serve_display())
+    }
+
+    /// Whether the host can capture its desktop; live unless it said not.
+    pub fn capture_status(&self) -> CaptureStatus {
+        self.state()
+            .map(|state| state.input.capture_status())
+            .unwrap_or_default()
     }
 
     /// Ask the host to serve `display`, numbered from 1, or 0 for all
@@ -3517,6 +3559,10 @@ impl Session {
                     writer.state()?.input.set_serve_display(displays);
                     Ok(())
                 }
+                ServerControl::CaptureStatus(status) => {
+                    writer.state()?.input.set_capture_status(status);
+                    Ok(())
+                }
                 ServerControl::EndOfContinuousUpdates => {
                     if continuous.get() {
                         // The server stopped pushing; go back to requests.
@@ -3658,6 +3704,7 @@ mod tests {
             requested_serve_scale: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             serve_display: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             requested_display: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            capture_status: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             clipboard: Arc::new(Mutex::new(ServerClipboard::default())),
             thread_setup: None,
             priority: UpdatePriority::Whole,
@@ -4509,6 +4556,45 @@ mod tests {
                 .unwrap();
             assert!(!matches!(client.read(&mut [0]), Ok(1)));
             assert_eq!(server.requested_serve_scale(), 100);
+            server.stop();
+        }
+    }
+
+    #[test]
+    fn viewers_are_told_when_the_desktop_cannot_be_captured_and_when_it_returns() {
+        fn read(session: &mut Session) {
+            session
+                .read_update_pipelined(&mut Vec::new(), |_, _, _, _, _| Ok(()))
+                .unwrap()
+        }
+        for push in [false, true] {
+            let (server, address) = start_insecure_server(Framebuffer::new(4, 2).unwrap());
+            let mut session = Session::connect_with_encoding(
+                &address.to_string(),
+                true,
+                Encoding::Raw,
+                || unreachable!(),
+            )
+            .unwrap();
+            session.set_continuous_updates(push);
+            let writer = session.writer();
+            writer.request_update(false, 4, 2).unwrap();
+            read(&mut session);
+            assert_eq!(writer.capture_status(), CaptureStatus::Live);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            for status in [
+                CaptureStatus::NoDisplay,
+                CaptureStatus::SecureDesktop,
+                CaptureStatus::Live,
+            ] {
+                // Nothing else changes: the announcement alone must arrive.
+                server.set_capture_status(status);
+                while writer.capture_status() != status {
+                    assert!(Instant::now() < deadline, "{status:?} was not announced");
+                    read(&mut session);
+                }
+            }
+            writer.shutdown().unwrap();
             server.stop();
         }
     }
@@ -6166,6 +6252,7 @@ mod tests {
                 DESKTOP_SIZE_ENCODING,
                 SERVE_SCALE_ENCODING,
                 SERVE_DISPLAY_ENCODING,
+                CAPTURE_STATUS_ENCODING,
                 POINTER_MOTION_CHANGE_ENCODING,
                 EXTENDED_MOUSE_BUTTONS_ENCODING,
             ],
