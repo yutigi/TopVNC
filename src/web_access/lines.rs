@@ -22,6 +22,9 @@ pub enum Event {
     Registered(u32),
     /// cloudflared lost connection `connIndex`, or every connection.
     Lost(Option<u32>),
+    /// cloudflared created a Quick Tunnel at this exact
+    /// `https://<label>.trycloudflare.com` origin.
+    QuickTunnelUrl(String),
 }
 
 /// Which pipe a line came from.
@@ -75,8 +78,24 @@ fn conn_index(line: &str) -> Option<u32> {
         .and_then(|value| value.parse().ok())
 }
 
+/// The Quick Tunnel URL inside cloudflared's banner box. Other links in its
+/// output (terms of use, documentation) are not a single-label
+/// `trycloudflare.com` origin and fail the gateway's own origin rule.
+fn quick_tunnel_url(line: &str) -> Option<String> {
+    if !line.contains(topvnc_access::QUICK_TUNNEL_SUFFIX) {
+        return None;
+    }
+    line.split(|c: char| c.is_whitespace() || c == '|')
+        .find(|word| topvnc_access::validate_quick_tunnel_origin(word).is_ok())
+        .map(str::to_owned)
+}
+
 fn tunnel_line(line: &str) -> Option<Event> {
-    if line.contains("Unregistered tunnel connection") || line.contains("Connection terminated") {
+    if let Some(url) = quick_tunnel_url(line) {
+        Some(Event::QuickTunnelUrl(url))
+    } else if line.contains("Unregistered tunnel connection")
+        || line.contains("Connection terminated")
+    {
         Some(Event::Lost(conn_index(line)))
     } else if line.contains("Registered tunnel connection") {
         conn_index(line).map(Event::Registered)
@@ -198,6 +217,57 @@ mod tests {
         );
         // Without an index, a registration cannot be tracked.
         assert_eq!(t("INF Registered tunnel connection"), None);
+    }
+
+    /// A Quick Tunnel start, with the messages and banner box cloudflared's
+    /// `quick_tunnel.go` prints (reconstructed from its source; the live
+    /// check in specs/019-quick-tunnel-mode confirms the real output).
+    const QUICK_TUNNEL_OUTPUT: &str = "\
+2026-11-05T14:00:00Z INF Thank you for trying Cloudflare Tunnel. Doing so, without a Cloudflare account, is a quick way to experiment and try it out. However, be aware that these account-less Tunnels have no uptime guarantee, are subject to the Cloudflare Online Services Terms of Use (https://www.cloudflare.com/website-terms/), and Cloudflare reserves the right to investigate your use of Tunnels for violations of such terms. If you intend to use Tunnels in production you should use a pre-created named tunnel by following: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps
+2026-11-05T14:00:00Z INF Requesting new quick Tunnel on trycloudflare.com...
+2026-11-05T14:00:01Z INF +--------------------------------------------------------------------------------------------+
+2026-11-05T14:00:01Z INF |  Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):  |
+2026-11-05T14:00:01Z INF |  https://seasonal-deck-organisms-sf.trycloudflare.com                                      |
+2026-11-05T14:00:01Z INF +--------------------------------------------------------------------------------------------+
+2026-11-05T14:00:01Z INF Cannot determine default configuration path. No file [config.yml config.yaml] in [~/.cloudflared ~/.cloudflare-warp ~/cloudflare-warp /etc/cloudflared /usr/local/etc/cloudflared]
+2026-11-05T14:00:01Z INF Version 2026.10.3
+2026-11-05T14:00:02Z INF Registered tunnel connection connIndex=0 connection=0c1d event=0 ip=198.41.192.67 location=sin11 protocol=quic";
+
+    #[test]
+    fn quick_tunnel_output_yields_its_url_once_and_its_connections() {
+        let events: Vec<Event> = QUICK_TUNNEL_OUTPUT
+            .lines()
+            .filter_map(|line| classify(Program::Tunnel, Stream::Stderr, line))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                Event::QuickTunnelUrl(
+                    "https://seasonal-deck-organisms-sf.trycloudflare.com".into()
+                ),
+                Event::Registered(0),
+            ]
+        );
+        let t = |line| classify(Program::Tunnel, Stream::Stderr, line);
+        for ignored in [
+            "INF |  https://a.b.trycloudflare.com  |",
+            "INF |  https://Upper.trycloudflare.com  |",
+            "INF |  http://plain.trycloudflare.com  |",
+            "INF |  https://evil.trycloudflare.com.attacker.example  |",
+            "INF |  https://x.trycloudflare.com/path  |",
+            "INF see https://topvnc.owner.workers.dev",
+        ] {
+            assert_eq!(t(ignored), None, "{ignored}");
+        }
+        // The gateway's pipes never yield one.
+        assert_eq!(
+            classify(
+                Program::Gateway,
+                Stream::Stdout,
+                "https://seasonal-deck-organisms-sf.trycloudflare.com"
+            ),
+            None
+        );
     }
 
     #[test]

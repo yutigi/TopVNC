@@ -1196,10 +1196,18 @@ fn show_landing(
                                 state.web_row = Some(row);
                             }
                         }
+                        // The route describes the next start, like the password.
+                        for (area, route, _) in ui::WEB_ROUTES {
+                            if web.is_idle() && area.contains(x, y) && state.web_route != route {
+                                state.web_route = route;
+                                state.error = None;
+                                state.notice = None;
+                            }
+                        }
                         web_clicked |= ui::WEB_START.contains(x, y);
                         pair_clicked |= ui::WEB_PAIR.contains(x, y);
                         copy_url_clicked |=
-                            ui::web_copy_url_shown(web) && ui::WEB_COPY_URL.contains(x, y);
+                            ui::web_copy_url_shown(&state, web) && ui::WEB_COPY_URL.contains(x, y);
                     } else if state.tab == Tab::Connect
                         && !ui::TAB_MORE.contains(x, y)
                         && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
@@ -1310,7 +1318,7 @@ fn show_landing(
             let start = web.is_idle() && (web_clicked || (pair_clicked && !web.pairing_active()));
             let started = if start {
                 state.web_row = None;
-                start_web(web, &config, server)
+                start_web(web, state.web_route, &config, server)
             } else {
                 Ok(())
             };
@@ -1352,9 +1360,14 @@ fn show_landing(
     }
 }
 
-/// Check the browser-access files and start the WEB tab's run.
-fn start_web(web: &mut WebRuntime, config: &Config, server: &HostedServer) -> Result<(), String> {
-    let launch = web_access::config::prepare().map_err(|problem| problem.to_string())?;
+/// Check the chosen route's files and start the WEB tab's run.
+fn start_web(
+    web: &mut WebRuntime,
+    route: web_access::config::RouteKind,
+    config: &Config,
+    server: &HostedServer,
+) -> Result<(), String> {
+    let launch = web_access::config::prepare(route).map_err(|problem| problem.to_string())?;
     web.start(
         launch,
         &config.serve.password,

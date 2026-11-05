@@ -35,13 +35,13 @@ const BUTTON = { left: 1, middle: 2, right: 4, wheelUp: 8, wheelDown: 16, wheelL
 const DOM_BUTTONS = [BUTTON.left, BUTTON.right, BUTTON.middle, BUTTON.back, BUTTON.forward];
 const MODIFIERS = { ctrl: 0xffe3, alt: 0xffe9, shift: 0xffe1, super: 0xffeb };
 const CLOSE_HINTS = {
-  "browser key is not enrolled": "This browser is not enrolled on the host. Run the gateway with --pair and scan its code again.",
-  "no pairing invite is active": "The pairing invite expired or was already used. Run the gateway with --pair again.",
-  "pairing invite expired or already used": "The pairing invite expired or was already used. Run the gateway with --pair again.",
+  "browser key is not enrolled": "This browser is not enrolled on the host. Pair it again: Pair a browser in TopVNC's WEB tab (or the gateway's --pair), then scan the code.",
+  "no pairing invite is active": "The pairing invite expired or was already used. Open a new one with Pair a browser in TopVNC's WEB tab (or the gateway's --pair).",
+  "pairing invite expired or already used": "The pairing invite expired or was already used. Open a new one with Pair a browser in TopVNC's WEB tab (or the gateway's --pair).",
   "E2E handshake failed": "The host rejected the encrypted handshake: the pinned host key or the pairing secret does not match.",
   "another browser session is active": "Another browser is connected. Disconnect it there, or wait about a minute for it to time out.",
   "RFB host offline": "The gateway is running, but TopVNC is not serving on the host. Start topvnc --serve.",
-  "Session expired": "The session reached its time limit or the Access sign-in expired. Reload to sign in again.",
+  "Session expired": "The session reached its time limit, or the Cloudflare Access sign-in expired. Reload and connect again.",
   "Replaced by a newer connection from this browser": "This session was replaced by a newer connection from this browser.",
   "Peer idle": "Disconnected after a minute without traffic, as when the phone sleeps.",
   "Slow WebSocket peer": "The connection was too slow, so the host closed it.",
@@ -119,7 +119,7 @@ function describeIdentity() {
   connectButton.disabled = busy || !current;
   forgetButton.disabled = busy || !current || Boolean(pending);
   if (!current) {
-    identity.textContent = "Not paired. On the host, start the gateway with --pair, sign in here, then scan its QR code with the camera.";
+    identity.textContent = "Not paired. On the host, choose Pair a browser in TopVNC's WEB tab (or run the gateway with --pair), then scan its QR code with the camera. On the Access route, sign in here first.";
     return;
   }
   try {
@@ -178,6 +178,9 @@ async function closeReason(message) {
     }
   } catch {
     return "The network is unavailable.";
+  }
+  if (location.hostname.endsWith(".trycloudflare.com")) {
+    return "The host is unavailable. A temporary Quick Tunnel address stops working when browser access stops; scan the host's new code.";
   }
   return "The private gateway is unavailable: the host, its tunnel connector, or the gateway is not running.";
 }
@@ -651,7 +654,7 @@ connectForm.addEventListener("submit", (event) => {
   // Plain HTTP only for the loopback test harness (local_web example).
   const loopback = location.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
   if (location.protocol !== "https:" && !loopback) {
-    report("Use the protected HTTPS workers.dev address.");
+    report("Use the HTTPS address the host shows.");
     return;
   }
   state = "connecting";

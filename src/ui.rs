@@ -3,6 +3,7 @@ use crate::desktop_host::{
     choose_displays, normalize_serve_scale,
 };
 use crate::helpers::{Helper, HelperForm, HelperRuntime};
+use crate::web_access::config::RouteKind;
 use crate::web_access::runtime::{Row, RowState, WebRuntime};
 use topvnc::presentation::MotionPresentation;
 use topvnc::{PerformanceMode, ServedDisplays, UpdatePriority};
@@ -390,6 +391,9 @@ pub struct UiState {
     pub notice: Option<String>,
     /// The WEB tab row whose output is shown; `None` picks one.
     pub web_row: Option<Row>,
+    /// The WEB tab's route for the next start. Not saved: the Quick Tunnel
+    /// is chosen each time, never by default.
+    pub web_route: RouteKind,
 }
 
 impl UiState {
@@ -1723,6 +1727,29 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     }
 }
 
+/// The route choice, changeable while browser access is stopped.
+pub const WEB_ROUTES: [(Box2, RouteKind, &str); 2] = [
+    (
+        Box2 {
+            x: 40,
+            y: 76,
+            w: 205,
+            h: 28,
+        },
+        RouteKind::Access,
+        "ACCESS",
+    ),
+    (
+        Box2 {
+            x: 255,
+            y: 76,
+            w: 205,
+            h: 28,
+        },
+        RouteKind::QuickTunnel,
+        "QUICK TUNNEL",
+    ),
+];
 pub const WEB_PASSWORD: Box2 = Box2 {
     x: 40,
     y: 130,
@@ -1787,10 +1814,16 @@ pub const WEB_COPY_URL: Box2 = Box2 {
     h: 36,
 };
 
-/// Whether the WEB tab offers [`WEB_COPY_URL`]: the app URL to copy is known
-/// and the panel is not showing pairing.
-pub fn web_copy_url_shown(web: &WebRuntime) -> bool {
-    web.app_origin().is_some() && !web.pairing_active()
+/// Whether the WEB tab offers [`WEB_COPY_URL`]: the app URL of the chosen
+/// route is known and the panel is not showing pairing.
+pub fn web_copy_url_shown(state: &UiState, web: &WebRuntime) -> bool {
+    web_app_origin(state, web).is_some() && !web.pairing_active()
+}
+
+/// The app URL for the chosen route, if the last run knows one.
+fn web_app_origin<'a>(state: &UiState, web: &'a WebRuntime) -> Option<&'a str> {
+    web.app_origin()
+        .filter(|_| web.route() == Some(state.web_route))
 }
 const WEB_OUTPUT_Y: usize = 352;
 const WEB_OUTPUT_ROWS: usize = 14;
@@ -1820,7 +1853,9 @@ fn web_tab(
     server: &ServerView,
     web: &WebRuntime,
 ) {
-    canvas.text(42, 76, "BROWSER ACCESS THROUGH CLOUDFLARE", MUTED, 2);
+    for (area, route, label) in WEB_ROUTES {
+        canvas.button(area, label, state.web_route == route);
+    }
     canvas.label(40, 108, "VNC PASSWORD");
     canvas.field(
         WEB_PASSWORD,
@@ -1889,7 +1924,7 @@ fn web_tab(
     for (index, line) in lines[first..].iter().enumerate() {
         canvas.text(40, WEB_OUTPUT_Y + 24 + index * 10, line, TEXT, 1);
     }
-    web_panel(canvas, web);
+    web_panel(canvas, state, web);
     if let Some(error) = &state.error {
         status_message(canvas, error, ERROR);
     } else if let Some(notice) = &state.notice {
@@ -1916,8 +1951,9 @@ fn web_tab(
     );
 }
 
-fn web_panel(canvas: &mut Canvas<'_>, web: &WebRuntime) {
+fn web_panel(canvas: &mut Canvas<'_>, state: &UiState, web: &WebRuntime) {
     let panel = WEB_PANEL;
+    let quick = state.web_route == RouteKind::QuickTunnel;
     let small = |canvas: &mut Canvas<'_>, y: &mut usize, text: &str, color| {
         for line in wrap(text, panel.w / 6) {
             canvas.text(panel.x, *y, &line, color, 1);
@@ -1972,7 +2008,11 @@ fn web_panel(canvas: &mut Canvas<'_>, web: &WebRuntime) {
         small(
             canvas,
             &mut y,
-            "SIGN IN TO THE APP URL ON THE PHONE FIRST, THEN SCAN THIS CODE AND CHECK THAT THE PHONE SHOWS THE SAME KEY. SHOW IT ONLY ON THIS SCREEN.",
+            if quick {
+                "SCAN THIS CODE WITH THE PHONE CAMERA: IT OPENS THE TEMPORARY URL WITH THE INVITE. CHECK THAT THE PHONE SHOWS THE SAME KEY, THEN CONNECT. SHOW IT ONLY ON THIS SCREEN."
+            } else {
+                "SIGN IN TO THE APP URL ON THE PHONE FIRST, THEN SCAN THIS CODE AND CHECK THAT THE PHONE SHOWS THE SAME KEY. SHOW IT ONLY ON THIS SCREEN."
+            },
             MUTED,
         );
         return;
@@ -1989,32 +2029,70 @@ fn web_panel(canvas: &mut Canvas<'_>, web: &WebRuntime) {
         );
         return;
     }
-    canvas.text(panel.x, y, "HOW IT WORKS", TEXT, 2);
-    y += 24;
-    small(
-        canvas,
-        &mut y,
-        "START RUNS THIS DESKTOP SERVER ON LOOPBACK WITH YOUR PASSWORD, THEN THE CLOUDFLARE TUNNEL, THEN THE WEB GATEWAY. STOP, OR CLOSING TOPVNC, ENDS ALL THREE.",
-        MUTED,
-    );
+    if quick {
+        // The opt-in warning AGENTS.md requires: no silent downgrade.
+        canvas.text(panel.x, y, "QUICK TUNNEL", WARN, 2);
+        y += 24;
+        small(
+            canvas,
+            &mut y,
+            "TEMPORARY URL, NO CLOUDFLARE SIGN-IN: PROTECTED ONLY BY PAIRING AND THE VNC PASSWORD. ANYONE WITH THE URL CAN OPEN THE PAGE. EVERY START GIVES A NEW URL AND HOST KEY, SO PAIR AGAIN EACH TIME. CLOUDFLARE OFFERS QUICK TUNNELS FOR TESTING, WITH NO UPTIME GUARANTEE.",
+            WARN,
+        );
+        y += 10;
+        small(
+            canvas,
+            &mut y,
+            "START RUNS THIS DESKTOP SERVER ON LOOPBACK WITH YOUR PASSWORD, THEN A QUICK TUNNEL, THEN THE GATEWAY, WHICH ALSO SERVES THE WEB APP. NO CLOUDFLARE ACCOUNT OR SETUP FILES.",
+            MUTED,
+        );
+    } else {
+        canvas.text(panel.x, y, "HOW IT WORKS", TEXT, 2);
+        y += 24;
+        small(
+            canvas,
+            &mut y,
+            "START RUNS THIS DESKTOP SERVER ON LOOPBACK WITH YOUR PASSWORD, THEN THE CLOUDFLARE TUNNEL, THEN THE WEB GATEWAY. STOP, OR CLOSING TOPVNC, ENDS ALL THREE.",
+            MUTED,
+        );
+    }
     y += 10;
-    if let Some(origin) = web.app_origin() {
-        canvas.text(panel.x, y, "APP URL", TEXT, 2);
+    if let Some(origin) = web_app_origin(state, web) {
+        canvas.text(
+            panel.x,
+            y,
+            if quick {
+                "TEMPORARY APP URL"
+            } else {
+                "APP URL"
+            },
+            TEXT,
+            2,
+        );
         y += 22;
         small(canvas, &mut y, origin, ACCENT);
         y += 10;
     }
-    small(
-        canvas,
-        &mut y,
-        "SETTINGS: GATEWAY/CLOUDFLARE/GATEWAY.LOCAL.TOML. FIRST-TIME SETUP: DOCS/CLOUDFLARE-GATEWAY.MD.",
-        MUTED,
-    );
+    if quick {
+        small(
+            canvas,
+            &mut y,
+            "NOT YET VALIDATED OVER A REAL QUICK TUNNEL. DETAILS: DOCS/CLOUDFLARE-GATEWAY.MD.",
+            ERROR,
+        );
+    } else {
+        small(
+            canvas,
+            &mut y,
+            "SETTINGS: GATEWAY/CLOUDFLARE/GATEWAY.LOCAL.TOML. FIRST-TIME SETUP: DOCS/CLOUDFLARE-GATEWAY.MD.",
+            MUTED,
+        );
+    }
     if !cfg!(windows) {
         y += 10;
         small(canvas, &mut y, "NOT YET TESTED ON THIS PLATFORM.", ERROR);
     }
-    if web_copy_url_shown(web) {
+    if web_copy_url_shown(state, web) {
         canvas.button(WEB_COPY_URL, "COPY APP URL", false);
     }
 }
@@ -2618,6 +2696,16 @@ mod tests {
         const { assert!(WEB_START.x + WEB_START.w < WEB_PAIR.x) };
         const { assert!(WEB_COPY_URL.y >= WEB_PANEL.y) };
         const { assert!(WEB_COPY_URL.y + WEB_COPY_URL.h <= WEB_PANEL.y + WEB_PANEL.h) };
+        // The route choice sits between the tab bar and the password label.
+        const { assert!(WEB_ROUTES[0].0.y > TAB_WEB.y + TAB_WEB.h) };
+        const { assert!(WEB_ROUTES[0].0.y + WEB_ROUTES[0].0.h < 108) };
+        const { assert!(WEB_ROUTES[0].0.x + WEB_ROUTES[0].0.w < WEB_ROUTES[1].0.x) };
+        const { assert!(WEB_ROUTES[1].0.x + WEB_ROUTES[1].0.w <= WEB_PASSWORD.x + WEB_PASSWORD.w) };
+        for (area, _, label) in WEB_ROUTES {
+            assert!(24 + label.len() * 12 <= area.w, "{label}");
+        }
+        // Access stays the default; the Quick Tunnel is always a choice.
+        assert_eq!(UiState::default().web_route, RouteKind::Access);
 
         // The WEB tab edits the Server tab's password; neither is saved.
         let mut state = UiState::default();

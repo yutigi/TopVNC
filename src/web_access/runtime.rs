@@ -3,8 +3,13 @@
 //! is the landing window's in-process host; this module only asks for it to
 //! start or stop and watches its state. The connector and the gateway are
 //! supervised children.
+//!
+//! On the Quick Tunnel route the connector also decides the page origin: the
+//! tunnel is Ready only once cloudflared has printed its
+//! `https://<label>.trycloudflare.com` URL and registered a connection, and
+//! the gateway then starts with that exact origin.
 
-use super::config::Launch;
+use super::config::{Launch, Route, RouteKind};
 use super::lines::{Event, Program};
 use super::pairing::PairingCode;
 use super::process::{Spawner, Supervised};
@@ -97,6 +102,8 @@ pub struct WebRuntime {
     kept: [Vec<String>; 2],
     connections: BTreeSet<u32>,
     tunnel_was_ready: bool,
+    /// The Quick Tunnel's origin, from cloudflared's first valid URL line.
+    quick_origin: Option<String>,
     gateway_stop_deadline: Option<Instant>,
     /// Pair as soon as the gateway is ready.
     pair_wanted: bool,
@@ -123,6 +130,7 @@ impl WebRuntime {
             kept: [Vec::new(), Vec::new()],
             connections: BTreeSet::new(),
             tunnel_was_ready: false,
+            quick_origin: None,
             gateway_stop_deadline: None,
             pair_wanted: false,
             pair_pending: false,
@@ -146,9 +154,9 @@ impl WebRuntime {
 
     /// The row's address or connection count, when it has one.
     pub fn detail(&self, row: Row) -> Option<String> {
-        let settings = &self.launch.as_ref()?.settings;
+        let launch = self.launch.as_ref()?;
         match (row, self.row(row)) {
-            (Row::Server, RowState::Ready) => Some(settings.rfb_target.to_string()),
+            (Row::Server, RowState::Ready) => Some(launch.rfb_target.to_string()),
             (Row::Tunnel, RowState::Ready) => Some(match self.connections.len() {
                 1 => "1 CONNECTION".into(),
                 count => format!("{count} CONNECTIONS"),
@@ -156,7 +164,7 @@ impl WebRuntime {
             (Row::Tunnel, RowState::Starting) if self.tunnel_was_ready => {
                 Some("RECONNECTING".into())
             }
-            (Row::Gateway, RowState::Ready) => Some(settings.listen.to_string()),
+            (Row::Gateway, RowState::Ready) => Some(launch.listen.to_string()),
             _ => None,
         }
     }
@@ -173,8 +181,19 @@ impl WebRuntime {
             .map_or_else(|| kept.clone(), |child| child.output())
     }
 
+    /// The page address to open on the phone. A Quick Tunnel's is known
+    /// only once cloudflared prints it, and ends with the run.
     pub fn app_origin(&self) -> Option<&str> {
-        Some(&self.launch.as_ref()?.settings.app_origin)
+        match &self.launch.as_ref()?.route {
+            Route::Access { app_origin, .. } => Some(app_origin),
+            Route::QuickTunnel { .. } if self.phase == Phase::Idle => None,
+            Route::QuickTunnel { .. } => self.quick_origin.as_deref(),
+        }
+    }
+
+    /// The route of the current, or last, run.
+    pub fn route(&self) -> Option<RouteKind> {
+        Some(self.launch.as_ref()?.route.kind())
     }
 
     pub fn fingerprint(&self) -> Option<&str> {
@@ -207,7 +226,7 @@ impl WebRuntime {
         if self.phase != Phase::Idle {
             return Err("Browser access is already running.".into());
         }
-        let target = launch.settings.rfb_target;
+        let target = launch.rfb_target;
         let owns_server = match server {
             HostServer::Serving {
                 address,
@@ -341,7 +360,7 @@ impl WebRuntime {
         match (self.row(Row::Server).clone(), server) {
             (RowState::Starting, HostServer::Stopped) if !self.server_requested => {
                 self.server_requested = true;
-                request = Some(ServerRequest::Start(launch.settings.rfb_target));
+                request = Some(ServerRequest::Start(launch.rfb_target));
             }
             (RowState::Starting, HostServer::Serving { .. }) => {
                 self.set(Row::Server, RowState::Ready, now);
@@ -366,11 +385,7 @@ impl WebRuntime {
         // Tunnel connector.
         if *self.row(Row::Server) == RowState::Ready && *self.row(Row::Tunnel) == RowState::Waiting
         {
-            let args: Vec<OsString> = ["tunnel", "--no-autoupdate", "run", "--token-file"]
-                .map(OsString::from)
-                .into_iter()
-                .chain([launch.token_file.clone().into_os_string()])
-                .collect();
+            let args = tunnel_args(&launch);
             match self
                 .spawner
                 .spawn(Program::Tunnel, &launch.cloudflared, &args)
@@ -386,14 +401,11 @@ impl WebRuntime {
         // Gateway.
         if *self.row(Row::Tunnel) == RowState::Ready && *self.row(Row::Gateway) == RowState::Waiting
         {
-            let args = [
-                OsString::from("--supervised"),
-                launch.gateway_config.clone().into_os_string(),
-            ];
-            match self
-                .spawner
-                .spawn(Program::Gateway, &launch.gateway_program, &args)
-            {
+            let spawned = gateway_args(&launch, self.quick_origin.as_deref()).and_then(|args| {
+                self.spawner
+                    .spawn(Program::Gateway, &launch.gateway_program, &args)
+            });
+            match spawned {
                 Ok(child) => {
                     self.gateway = Some(child);
                     self.set(Row::Gateway, RowState::Starting, now);
@@ -407,6 +419,10 @@ impl WebRuntime {
 
     fn poll_tunnel(&mut self, now: Instant) {
         let late = self.timed_out(Row::Tunnel, TUNNEL_START, now);
+        let quick = self
+            .launch
+            .as_ref()
+            .is_some_and(|launch| launch.route.kind() == RouteKind::QuickTunnel);
         let Some(tunnel) = &mut self.tunnel else {
             return;
         };
@@ -422,9 +438,15 @@ impl WebRuntime {
                     self.connections.remove(&index);
                 }
                 Event::Lost(None) => self.connections.clear(),
+                // Set once: a later line never moves the page elsewhere.
+                Event::QuickTunnelUrl(url) if quick && self.quick_origin.is_none() => {
+                    self.quick_origin = Some(url);
+                }
                 _ => {}
             }
         }
+        // A Quick Tunnel is reachable only at the URL cloudflared printed.
+        let routable = !quick || self.quick_origin.is_some();
         if let Some(exit) = tunnel.exit() {
             self.connections.clear();
             self.set(
@@ -432,7 +454,7 @@ impl WebRuntime {
                 RowState::Failed(format!("cloudflared {exit}")),
                 now,
             );
-        } else if !self.connections.is_empty() {
+        } else if !self.connections.is_empty() && routable {
             self.tunnel_was_ready = true;
             self.set(Row::Tunnel, RowState::Ready, now);
         } else if self.tunnel_was_ready {
@@ -440,11 +462,12 @@ impl WebRuntime {
             self.rows[Row::Tunnel.index()] = RowState::Starting;
         } else if late {
             tunnel.kill();
-            self.set(
-                Row::Tunnel,
-                RowState::Failed("no tunnel connection registered in time".into()),
-                now,
-            );
+            let reason = if routable {
+                "no tunnel connection registered in time"
+            } else {
+                "cloudflared printed no Quick Tunnel URL in time"
+            };
+            self.set(Row::Tunnel, RowState::Failed(reason.into()), now);
         }
     }
 
@@ -484,7 +507,7 @@ impl WebRuntime {
                     self.pair_pending = false;
                     self.message = Some(format!("Browser enrolled: key {fingerprint}."));
                 }
-                Event::Registered(_) | Event::Lost(_) => {}
+                Event::Registered(_) | Event::Lost(_) | Event::QuickTunnelUrl(_) => {}
             }
         }
         if ready && self.rows[Row::Gateway.index()] == RowState::Starting {
@@ -577,6 +600,42 @@ impl Drop for WebRuntime {
             tunnel.kill();
         }
     }
+}
+
+/// cloudflared's arguments. The Access route's token stays in its file;
+/// only the path is passed. A Quick Tunnel needs no token at all.
+fn tunnel_args(launch: &Launch) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["tunnel".into(), "--no-autoupdate".into()];
+    match &launch.route {
+        Route::Access { token_file, .. } => {
+            args.extend(["run".into(), "--token-file".into()]);
+            args.push(token_file.clone().into_os_string());
+        }
+        Route::QuickTunnel { .. } => {
+            args.push("--url".into());
+            args.push(format!("http://{}", launch.listen).into());
+        }
+    }
+    args
+}
+
+/// The gateway's arguments; a Quick Tunnel gateway needs the learned origin.
+fn gateway_args(launch: &Launch, quick_origin: Option<&str>) -> Result<Vec<OsString>, String> {
+    Ok(match &launch.route {
+        Route::Access { gateway_config, .. } => vec![
+            "--supervised".into(),
+            gateway_config.clone().into_os_string(),
+        ],
+        Route::QuickTunnel { web_root } => vec![
+            "--supervised-quick-tunnel".into(),
+            launch.listen.to_string().into(),
+            launch.rfb_target.to_string().into(),
+            quick_origin
+                .ok_or("the Quick Tunnel URL is not known")?
+                .into(),
+            web_root.clone().into_os_string(),
+        ],
+    })
 }
 
 /// A placeholder while the runtime is rebuilt in `start`.

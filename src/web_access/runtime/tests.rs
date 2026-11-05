@@ -1,6 +1,8 @@
 use super::*;
-use crate::web_access::config::{GatewaySettings, Launch};
+use crate::web_access::config::{Launch, QUICK_LISTEN, QUICK_RFB_TARGET};
 use std::path::PathBuf;
+
+mod quick;
 use std::sync::{Arc, Mutex};
 
 const ROWS: [Row; 3] = [Row::Server, Row::Tunnel, Row::Gateway];
@@ -104,15 +106,26 @@ impl FakeSpawner {
 
 fn launch() -> Launch {
     Launch {
-        settings: GatewaySettings {
-            listen: "127.0.0.1:6080".parse().unwrap(),
-            rfb_target: "127.0.0.1:5900".parse().unwrap(),
+        listen: "127.0.0.1:6080".parse().unwrap(),
+        rfb_target: "127.0.0.1:5900".parse().unwrap(),
+        route: Route::Access {
             app_origin: "https://topvnc.owner.workers.dev".into(),
-            host_key_file: "host.key".into(),
+            gateway_config: "gateway.local.toml".into(),
+            token_file: "tunnel-token.txt".into(),
         },
-        gateway_config: "gateway.local.toml".into(),
         gateway_program: "topvnc-web-gateway".into(),
-        token_file: "tunnel-token.txt".into(),
+        cloudflared: "cloudflared".into(),
+    }
+}
+
+fn quick_launch() -> Launch {
+    Launch {
+        listen: QUICK_LISTEN,
+        rfb_target: QUICK_RFB_TARGET,
+        route: Route::QuickTunnel {
+            web_root: "web/dist".into(),
+        },
+        gateway_program: "topvnc-web-gateway".into(),
         cloudflared: "cloudflared".into(),
     }
 }
