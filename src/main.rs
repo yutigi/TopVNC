@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
     BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, Encoding, Framebuffer, InputWriter,
-    PerformanceMode, Session, StatsSnapshot, encoding_name,
+    ListenerId, ListenerSecurity, PerformanceMode, ServerListeners, Session, StatsSnapshot,
+    encoding_name,
 };
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -698,45 +699,181 @@ enum HostEvent {
     Stopped(Result<(), String>),
 }
 
-/// The desktop server started from the Server tab. It runs on a background
-/// thread so the UI and viewer sessions stay responsive.
+/// A tab that serves this desktop: the Server tab for native viewers, and
+/// the WEB tab for the browser gateway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owner {
+    ServerTab,
+    Web,
+}
+
+impl Owner {
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Self::ServerTab => Self::Web,
+            Self::Web => Self::ServerTab,
+        }
+    }
+}
+
+/// The listener a tab asked for on the desktop server.
+#[derive(Debug)]
+struct Claim {
+    address: String,
+    tls: topvnc::transport::TlsOptions,
+    password: Option<String>,
+    allow_insecure: bool,
+    /// Open on the server; `None` while it waits for the server to start.
+    listener: Option<(ListenerId, String)>,
+}
+
+impl Claim {
+    fn new(request: &ServeRequest) -> Self {
+        Self {
+            address: request.address.clone(),
+            tls: request.tls.clone(),
+            password: request.password.clone(),
+            allow_insecure: request.allow_insecure,
+            listener: None,
+        }
+    }
+
+    /// Both listen on one address, which only one socket can hold.
+    fn same_address(&self, other: &Self) -> bool {
+        match (
+            self.address.parse::<std::net::SocketAddr>(),
+            other.address.parse::<std::net::SocketAddr>(),
+        ) {
+            (Ok(mine), Ok(theirs)) => mine == theirs,
+            _ => self.address == other.address,
+        }
+    }
+
+    /// Viewers of either could use the other's listener as it is.
+    fn same_security(&self, other: &Self) -> bool {
+        self.tls == other.tls
+            && self.password == other.password
+            && self.allow_insecure == other.allow_insecure
+    }
+}
+
+/// The desktop server the Server tab and the WEB tab share. One capture
+/// serves every viewer; each tab adds its own listener, with its own
+/// address, transport security, and password, and the server runs while
+/// either tab has one. It runs on a background thread so the UI and viewer
+/// sessions stay responsive.
 #[derive(Default)]
 struct HostedServer {
+    /// What the Server tab shows: its own listener on the shared server.
     view: ServerView,
+    /// The server as a whole; its address is the first listener's.
+    phase: ServerPhase,
     running: Option<(
         Arc<AtomicBool>,
         mpsc::Receiver<HostEvent>,
         thread::JoinHandle<()>,
     )>,
-    authenticated: bool,
-    /// Plain RFB, which the browser gateway's loopback target needs.
-    plain: bool,
+    /// Reported by the server thread once it binds its first listener.
+    listeners: Option<ServerListeners>,
+    claims: [Option<Claim>; 2],
+    /// The tab whose request the server was started with; that listener is
+    /// the one the server binds first.
+    first: Option<Owner>,
+    /// Listener failures that did not stop the server, for the next poll.
+    failure: Option<String>,
 }
 
 impl HostedServer {
-    /// The server as the WEB tab sees it.
-    fn web_view(&self) -> HostServer {
-        match &self.view.phase {
-            ServerPhase::Stopped => HostServer::Stopped,
-            ServerPhase::Starting => HostServer::Starting,
-            ServerPhase::Stopping => HostServer::Stopping,
-            ServerPhase::Serving {
-                address,
-                authenticated,
-                ..
-            } => HostServer::Serving {
+    fn claim(&self, owner: Owner) -> Option<&Claim> {
+        self.claims[owner.index()].as_ref()
+    }
+
+    /// The server as one tab sees it: serving only on its own listener.
+    fn phase_for(&self, owner: Owner) -> ServerPhase {
+        let claim = self.claim(owner);
+        match (&self.phase, claim) {
+            (ServerPhase::Stopped, _) => ServerPhase::Stopped,
+            (ServerPhase::Stopping, _) => ServerPhase::Stopping,
+            (_, None) => ServerPhase::Stopped,
+            (ServerPhase::Starting, Some(_)) => ServerPhase::Starting,
+            (ServerPhase::Serving { .. }, Some(Claim { listener: None, .. })) => {
+                ServerPhase::Starting
+            }
+            (
+                ServerPhase::Serving {
+                    width,
+                    height,
+                    connections,
+                    view_only,
+                    ..
+                },
+                Some(Claim {
+                    listener: Some((_, address)),
+                    password,
+                    ..
+                }),
+            ) => ServerPhase::Serving {
                 address: address.clone(),
-                authenticated: *authenticated,
-                plain: self.plain,
+                width: *width,
+                height: *height,
+                connections: *connections,
+                authenticated: password.is_some(),
+                view_only: *view_only,
             },
         }
     }
 
-    fn start(&mut self, request: ServeRequest) {
-        if self.running.is_some() {
-            return;
+    /// The WEB tab's listener, as it needs to see it.
+    fn web_view(&self) -> HostServer {
+        match self.phase_for(Owner::Web) {
+            ServerPhase::Stopped => HostServer::Stopped,
+            ServerPhase::Starting => HostServer::Starting,
+            ServerPhase::Serving { .. } => HostServer::Serving,
+            ServerPhase::Stopping => HostServer::Stopping,
         }
-        self.plain = request.tls.unencrypted;
+    }
+
+    fn refresh(&mut self) {
+        self.view.phase = self.phase_for(Owner::ServerTab);
+    }
+
+    /// Serve `owner`'s listener: start the server with it, or add it to the
+    /// server the other tab runs.
+    fn start(&mut self, owner: Owner, request: ServeRequest) -> Result<(), String> {
+        if self.claim(owner).is_some() {
+            return Ok(());
+        }
+        let result = match self.phase {
+            _ if self.running.is_none() => self.spawn(owner, request),
+            ServerPhase::Stopping => Err("Wait for the desktop server to finish stopping.".into()),
+            _ => {
+                self.claims[owner.index()] = Some(Claim::new(&request));
+                // Before the server reports its listeners, the claim waits.
+                let joined = if self.listeners.is_some() {
+                    self.attach(owner)
+                } else {
+                    Ok(())
+                };
+                if joined.is_ok() && owner == Owner::ServerTab {
+                    self.view.message = Some(
+                        "Joined the desktop server browser access runs; its display and \
+                         size stay as they started."
+                            .into(),
+                    );
+                }
+                joined
+            }
+        };
+        self.refresh();
+        result
+    }
+
+    fn spawn(&mut self, owner: Owner, request: ServeRequest) -> Result<(), String> {
+        let claim = Claim::new(&request);
         let shutdown = Arc::new(AtomicBool::new(false));
         let (events, receiver) = mpsc::channel();
         let options = ServeOptions {
@@ -749,10 +886,9 @@ impl HostedServer {
             mouse: request.mouse,
             priority: request.priority,
         };
-        self.authenticated = request.password.is_some();
         let password = request.password;
         let thread_shutdown = Arc::clone(&shutdown);
-        let spawned = thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("topvnc-server".into())
             .spawn(move || {
                 // `mpsc::Sender` is not `Sync`; the capture and input threads
@@ -765,38 +901,150 @@ impl HostedServer {
                 };
                 let result = serve_desktop(options, password, &thread_shutdown, &report);
                 let _ = events.send(HostEvent::Stopped(result));
-            });
-        match spawned {
-            Ok(thread) => {
-                self.view = ServerView {
-                    phase: ServerPhase::Starting,
-                    message: None,
-                    permissions: self.view.permissions,
-                    displays: self.view.displays.take(),
-                };
-                self.running = Some((shutdown, receiver, thread));
+            })
+            .map_err(|error| format!("Could not start the server: {error}"))?;
+        self.phase = ServerPhase::Starting;
+        self.view.message = None;
+        self.claims[owner.index()] = Some(claim);
+        self.first = Some(owner);
+        self.running = Some((shutdown, receiver, thread));
+        Ok(())
+    }
+
+    /// Open `owner`'s waiting listener on the running server. A listener the
+    /// other tab already has on the same address is shared when its viewers
+    /// would connect the same way; otherwise the address conflicts.
+    fn attach(&mut self, owner: Owner) -> Result<(), String> {
+        let (Some(listeners), Some(claim)) = (&self.listeners, self.claim(owner)) else {
+            return Ok(());
+        };
+        if claim.listener.is_some() {
+            return Ok(());
+        }
+        let result = match self.claim(owner.other()) {
+            Some(other) if other.listener.is_some() && claim.same_address(other) => {
+                if claim.same_security(other) {
+                    Ok(other.listener.clone().expect("checked above"))
+                } else {
+                    Err(match owner {
+                        Owner::Web => format!(
+                            "The Server tab already listens on {}, the address browser access \
+                             needs for its gateway. Give the Server tab another port.",
+                            claim.address
+                        ),
+                        Owner::ServerTab => format!(
+                            "Browser access already listens on {} for its gateway. Choose \
+                             another port.",
+                            claim.address
+                        ),
+                    })
+                }
+            }
+            _ => claim
+                .tls
+                .server()
+                .map_err(|error| error.to_string())
+                .and_then(|tls| {
+                    let security = ListenerSecurity {
+                        tls,
+                        password: claim.password.clone(),
+                        allow_insecure: claim.allow_insecure,
+                    };
+                    let id = listeners
+                        .add(claim.address.as_str(), security)
+                        .map_err(|error| {
+                            format!("Could not listen on {}: {error}", claim.address)
+                        })?;
+                    let bound = listeners
+                        .local_addr(id)
+                        .map_or_else(|| claim.address.clone(), |address| address.to_string());
+                    Ok((id, bound))
+                }),
+        };
+        match result {
+            Ok(listener) => {
+                if let Some(claim) = &mut self.claims[owner.index()] {
+                    claim.listener = Some(listener);
+                }
+                Ok(())
             }
             Err(error) => {
-                self.view.message = Some(format!("Could not start the server: {error}"));
+                self.claims[owner.index()] = None;
+                Err(error)
             }
         }
     }
 
-    fn stop(&mut self) {
-        if let Some((shutdown, ..)) = &self.running {
-            shutdown.store(true, Ordering::Release);
-            self.view.phase = ServerPhase::Stopping;
+    /// Close `owner`'s listener, and the server when no tab has one left.
+    fn stop(&mut self, owner: Owner) {
+        let Some(claim) = self.claims[owner.index()].take() else {
+            return;
+        };
+        if self.first == Some(owner) {
+            self.first = None;
+        }
+        if self.claim(owner.other()).is_none() {
+            if let Some((shutdown, ..)) = &self.running {
+                shutdown.store(true, Ordering::Release);
+                self.phase = ServerPhase::Stopping;
+            }
+        } else if let (Some(listeners), Some((id, _))) = (&self.listeners, claim.listener) {
+            let shared = self
+                .claim(owner.other())
+                .and_then(|other| other.listener.as_ref())
+                .is_some_and(|(other, _)| *other == id);
+            if !shared {
+                listeners.remove(id);
+            }
+        }
+        self.refresh();
+    }
+
+    /// The server reported its listeners: give the first one to the tab it
+    /// was started for, and open the listeners other tabs wait for.
+    fn adopt(&mut self, listeners: ServerListeners) {
+        let primary = listeners.primary();
+        self.listeners = Some(listeners);
+        if let Some(primary) = primary {
+            let address = self
+                .listeners
+                .as_ref()
+                .and_then(|listeners| listeners.local_addr(primary))
+                .map(|address| address.to_string());
+            match self
+                .first
+                .and_then(|first| self.claims[first.index()].as_mut())
+            {
+                Some(claim) if claim.listener.is_none() => {
+                    claim.listener = Some((primary, address.unwrap_or_default()));
+                }
+                // The tab stopped while the server started.
+                _ => {
+                    if let Some(listeners) = &self.listeners {
+                        listeners.remove(primary);
+                    }
+                }
+            }
+        }
+        for owner in [Owner::ServerTab, Owner::Web] {
+            if let Err(error) = self.attach(owner) {
+                self.failure = Some(error);
+            }
         }
     }
 
-    /// Apply status from the server thread. Returns the error that ended it.
+    /// Apply status from the server thread. Returns the error that ended
+    /// it, or a tab's listener that could not open.
     fn poll(&mut self) -> Option<String> {
-        let (_, receiver, _) = self.running.as_ref()?;
+        let Some((_, receiver, _)) = self.running.as_ref() else {
+            return self.failure.take();
+        };
         let events = receiver.try_iter().collect::<Vec<_>>();
         let mut failure = None;
         let mut stopped = false;
         for event in events {
             match event {
+                HostEvent::Notice(ServerNotice::Listeners(listeners)) => self.adopt(listeners),
                 HostEvent::Notice(notice) => {
                     eprintln!("Server: {notice}");
                     self.apply(notice);
@@ -814,18 +1062,18 @@ impl HostedServer {
             if let Some((_, _, thread)) = self.running.take() {
                 let _ = thread.join();
             }
-            self.view = ServerView {
-                phase: ServerPhase::Stopped,
-                message: failure.is_none().then(|| "Server stopped.".into()),
-                permissions: self.view.permissions,
-                displays: self.view.displays.take(),
-            };
+            self.phase = ServerPhase::Stopped;
+            self.view.message = failure.is_none().then(|| "Server stopped.".into());
+            self.listeners = None;
+            self.claims = [None, None];
+            self.first = None;
         }
-        failure
+        self.refresh();
+        failure.or_else(|| self.failure.take())
     }
 
     fn apply(&mut self, notice: ServerNotice) {
-        match (notice, &mut self.view.phase) {
+        match (notice, &mut self.phase) {
             (
                 ServerNotice::Serving {
                     address,
@@ -835,12 +1083,12 @@ impl HostedServer {
                 },
                 ServerPhase::Starting,
             ) => {
-                self.view.phase = ServerPhase::Serving {
+                self.phase = ServerPhase::Serving {
                     address: address.to_string(),
                     width,
                     height,
                     connections: 0,
-                    authenticated: self.authenticated,
+                    authenticated: false,
                     view_only: false,
                 };
             }
@@ -863,6 +1111,7 @@ impl HostedServer {
             (ServerNotice::Message(message), _) => self.view.message = Some(message),
             _ => {}
         }
+        self.refresh();
     }
 }
 
@@ -930,15 +1179,15 @@ fn show_landing(
         }
         match web.poll(&server.web_view(), Instant::now()) {
             Some(ServerRequest::Start(address)) => {
-                match web_serve_request(&config.serve, address) {
-                    Ok(request) => server.start(request),
-                    Err(error) => {
-                        state.error = Some(error);
-                        web.stop();
-                    }
+                let started = web_serve_request(&config.serve, address)
+                    .and_then(|request| server.start(Owner::Web, request));
+                if let Err(error) = started {
+                    state.error = Some(error);
+                    web.stop();
                 }
             }
-            Some(ServerRequest::Stop) => server.stop(),
+            // The Server tab keeps its own listener on the server.
+            Some(ServerRequest::Stop) => server.stop(Owner::Web),
             None => {}
         }
         ui::landing(
@@ -1288,11 +1537,14 @@ fn show_landing(
                     Ok(request) => {
                         state.error = None;
                         state.focus = None;
-                        server.start(request);
+                        if let Err(error) = server.start(Owner::ServerTab, request) {
+                            state.error = Some(error);
+                        }
                     }
                     Err(error) => state.error = Some(error),
                 },
-                ServerPhase::Serving { .. } => server.stop(),
+                // Browser access keeps its own listener on the server.
+                ServerPhase::Serving { .. } => server.stop(Owner::ServerTab),
                 ServerPhase::Starting | ServerPhase::Stopping => {}
             }
         }
@@ -2448,22 +2700,112 @@ mod tests {
         assert!(clip(area, (8, 600)).is_none());
     }
 
+    /// A plain, password-protected listener request on `address`.
+    fn plain_request(address: &str, password: &str) -> ServeRequest {
+        ServeRequest {
+            tls: topvnc::transport::TlsOptions {
+                unencrypted: true,
+                ..Default::default()
+            },
+            performance: PerformanceMode::Standard,
+            address: address.into(),
+            display: desktop_host::DisplaySelection::Primary,
+            password: Some(password.into()),
+            allow_insecure: false,
+            scale: 1.0,
+            mouse: desktop_host::MouseMode::Auto,
+            priority: topvnc::UpdatePriority::Whole,
+        }
+    }
+
+    /// Plays the server thread's part: a real RFB server with real
+    /// listeners, whose notices reach the hosted server through `events`.
+    struct FakeHost {
+        server: topvnc::VncServer,
+        events: mpsc::Sender<HostEvent>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    impl FakeHost {
+        /// Report the listeners and start serving, as the thread does.
+        /// `hosted` handles each notice as soon as it is sent, the earliest
+        /// the window could, so a listener it removes on `Listeners` is
+        /// already closed when the thread reports `Serving`.
+        fn serve(&self, hosted: &mut HostedServer) -> Option<String> {
+            let hosted = std::cell::RefCell::new(hosted);
+            let failure = std::cell::RefCell::new(None);
+            desktop_host::report_serving(
+                &self.server,
+                &|notice| {
+                    self.events.send(HostEvent::Notice(notice)).unwrap();
+                    if let Some(error) = hosted.borrow_mut().poll() {
+                        failure.borrow_mut().get_or_insert(error);
+                    }
+                },
+                "DISPLAY1".into(),
+                1920,
+                1080,
+            )
+            .unwrap();
+            failure.into_inner()
+        }
+
+        fn listeners(&self) -> ServerListeners {
+            self.server.listeners()
+        }
+    }
+
+    /// Start `hosted` for `owner` as [`HostedServer::spawn`] does, with a
+    /// [`FakeHost`] in place of desktop capture. The claim names the
+    /// address the server actually bound.
+    fn fake_start(hosted: &mut HostedServer, owner: Owner, mut request: ServeRequest) -> FakeHost {
+        let server = topvnc::VncServer::bind(
+            request.address.as_str(),
+            Framebuffer::new(4, 4).unwrap(),
+            topvnc::ServerConfig {
+                password: request.password.clone(),
+                allow_insecure: request.allow_insecure,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        request.address = server.local_addr().unwrap().to_string();
+        let (events, receiver) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        hosted.claims[owner.index()] = Some(Claim::new(&request));
+        hosted.first = Some(owner);
+        hosted.phase = ServerPhase::Starting;
+        hosted.running = Some((Arc::clone(&shutdown), receiver, thread::spawn(|| {})));
+        hosted.refresh();
+        FakeHost {
+            server,
+            events,
+            shutdown,
+        }
+    }
+
+    fn listener(hosted: &HostedServer, owner: Owner) -> ListenerId {
+        hosted.claim(owner).unwrap().listener.as_ref().unwrap().0
+    }
+
     #[test]
     fn hosted_server_status_follows_notices_in_order() {
         let mut server = HostedServer::default();
-        let address = "0.0.0.0:5900".parse().unwrap();
-        let serving = |width, height| ServerNotice::Serving {
-            address,
-            display: "DISPLAY1".into(),
-            width,
-            height,
-        };
         // Notices for a server that is not starting are ignored.
-        server.apply(serving(1920, 1080));
+        server.apply(ServerNotice::Serving {
+            address: "0.0.0.0:5900".parse().unwrap(),
+            display: "DISPLAY1".into(),
+            width: 1920,
+            height: 1080,
+        });
         assert_eq!(server.view.phase, ServerPhase::Stopped);
-        server.view.phase = ServerPhase::Starting;
-        server.authenticated = true;
-        server.apply(serving(1920, 1080));
+        let host = fake_start(
+            &mut server,
+            Owner::ServerTab,
+            plain_request("127.0.0.1:0", "pw"),
+        );
+        assert_eq!(server.view.phase, ServerPhase::Starting);
+        assert_eq!(host.serve(&mut server), None);
         server.apply(ServerNotice::Connections(2));
         server.apply(ServerNotice::Resized {
             width: 1280,
@@ -2474,7 +2816,7 @@ mod tests {
         assert_eq!(
             server.view.phase,
             ServerPhase::Serving {
-                address: "0.0.0.0:5900".into(),
+                address: host.server.local_addr().unwrap().to_string(),
                 width: 1280,
                 height: 720,
                 connections: 2,
@@ -2496,21 +2838,189 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn browser_access_joins_the_server_tab_server_and_leaves_it_running() {
+        let mut server = HostedServer::default();
+        let host = fake_start(
+            &mut server,
+            Owner::ServerTab,
+            plain_request("127.0.0.1:0", "native"),
+        );
+        host.serve(&mut server);
+        assert_eq!(server.web_view(), HostServer::Stopped);
+        let native = server.view.phase.clone();
+
+        server
+            .start(Owner::Web, plain_request("127.0.0.1:0", "browser"))
+            .unwrap();
+        assert_eq!(server.web_view(), HostServer::Serving);
+        let web = listener(&server, Owner::Web);
+        assert_ne!(web, listener(&server, Owner::ServerTab));
+        assert!(host.listeners().local_addr(web).is_some());
+        assert_eq!(server.view.phase, native, "the Server tab is unchanged");
+
+        server.stop(Owner::Web);
+        assert_eq!(server.web_view(), HostServer::Stopped);
+        assert_eq!(host.listeners().local_addr(web), None);
+        assert!(!host.shutdown.load(Ordering::Acquire));
+        assert_eq!(server.view.phase, native);
+
+        server.stop(Owner::ServerTab);
+        assert!(host.shutdown.load(Ordering::Acquire));
+        assert_eq!(server.view.phase, ServerPhase::Stopping);
+        // Browser access waits for the server to stop before it restarts.
+        assert!(
+            server
+                .start(Owner::Web, plain_request("127.0.0.1:0", "browser"))
+                .is_err()
+        );
+        host.events.send(HostEvent::Stopped(Ok(()))).unwrap();
+        assert_eq!(server.poll(), None);
+        assert_eq!(server.view.phase, ServerPhase::Stopped);
+        assert_eq!(server.web_view(), HostServer::Stopped);
+    }
+
+    #[test]
+    fn the_server_tab_joins_and_leaves_without_stopping_browser_access() {
+        let mut server = HostedServer::default();
+        let host = fake_start(
+            &mut server,
+            Owner::Web,
+            plain_request("127.0.0.1:0", "browser"),
+        );
+        host.serve(&mut server);
+        assert_eq!(server.web_view(), HostServer::Serving);
+        // The Server tab does not show the WEB tab's listener as its own.
+        assert_eq!(server.view.phase, ServerPhase::Stopped);
+
+        server
+            .start(Owner::ServerTab, plain_request("127.0.0.1:0", "native"))
+            .unwrap();
+        let native = listener(&server, Owner::ServerTab);
+        assert!(matches!(
+            &server.view.phase,
+            ServerPhase::Serving { address, .. }
+                if *address == host.listeners().local_addr(native).unwrap().to_string()
+        ));
+        assert!(server.view.message.is_some(), "joining is explained");
+
+        server.stop(Owner::ServerTab);
+        assert_eq!(server.view.phase, ServerPhase::Stopped);
+        assert_eq!(host.listeners().local_addr(native), None);
+        assert_eq!(server.web_view(), HostServer::Serving);
+        assert!(!host.shutdown.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn one_address_is_shared_only_by_viewers_that_connect_the_same_way() {
+        let mut server = HostedServer::default();
+        let host = fake_start(
+            &mut server,
+            Owner::ServerTab,
+            plain_request("127.0.0.1:0", "pw"),
+        );
+        host.serve(&mut server);
+        let address = host.server.local_addr().unwrap().to_string();
+
+        let error = server
+            .start(Owner::Web, plain_request(&address, "other"))
+            .unwrap_err();
+        assert!(error.contains("another port"), "{error}");
+        assert_eq!(server.web_view(), HostServer::Stopped);
+        assert!(server.claim(Owner::Web).is_none());
+
+        server
+            .start(Owner::Web, plain_request(&address, "pw"))
+            .unwrap();
+        let shared = listener(&server, Owner::ServerTab);
+        assert_eq!(listener(&server, Owner::Web), shared);
+        server.stop(Owner::Web);
+        assert!(host.listeners().local_addr(shared).is_some());
+        assert!(matches!(server.view.phase, ServerPhase::Serving { .. }));
+    }
+
+    #[test]
+    fn a_tab_that_joins_while_the_server_starts_waits_for_its_listener() {
+        let mut server = HostedServer::default();
+        let host = fake_start(
+            &mut server,
+            Owner::Web,
+            plain_request("127.0.0.1:0", "browser"),
+        );
+        server
+            .start(Owner::ServerTab, plain_request("127.0.0.1:0", "native"))
+            .unwrap();
+        assert_eq!(server.view.phase, ServerPhase::Starting);
+        assert_eq!(server.web_view(), HostServer::Starting);
+        assert_eq!(host.serve(&mut server), None);
+        assert!(matches!(server.view.phase, ServerPhase::Serving { .. }));
+        assert_eq!(server.web_view(), HostServer::Serving);
+        assert_ne!(
+            listener(&server, Owner::ServerTab),
+            listener(&server, Owner::Web)
+        );
+    }
+
+    #[test]
+    fn the_first_listener_closes_when_its_tab_stops_during_start() {
+        let mut server = HostedServer::default();
+        let host = fake_start(
+            &mut server,
+            Owner::ServerTab,
+            plain_request("127.0.0.1:0", "native"),
+        );
+        server
+            .start(Owner::Web, plain_request("127.0.0.1:0", "browser"))
+            .unwrap();
+        server.stop(Owner::ServerTab);
+        assert!(!host.shutdown.load(Ordering::Acquire), "the WEB tab waits");
+        assert_eq!(host.serve(&mut server), None);
+        assert_eq!(host.listeners().primary(), None);
+        assert_eq!(server.view.phase, ServerPhase::Stopped);
+        assert_eq!(server.web_view(), HostServer::Serving);
+    }
+
+    #[test]
+    fn a_listener_that_cannot_open_is_reported_and_the_server_keeps_running() {
+        let mut server = HostedServer::default();
+        let host = fake_start(
+            &mut server,
+            Owner::ServerTab,
+            plain_request("127.0.0.1:0", "native"),
+        );
+        // Another program holds the port the WEB tab asks for.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = taken.local_addr().unwrap().to_string();
+        server
+            .start(Owner::Web, plain_request(&address, "browser"))
+            .unwrap();
+        let error = host.serve(&mut server).unwrap();
+        assert!(error.contains(&address), "{error}");
+        assert_eq!(server.web_view(), HostServer::Stopped);
+        assert!(matches!(server.view.phase, ServerPhase::Serving { .. }));
+        assert!(!host.shutdown.load(Ordering::Acquire));
+    }
+
     #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn hosted_server_reports_unsupported_platforms_and_stops() {
         let mut server = HostedServer::default();
-        server.start(ServeRequest {
-            tls: Default::default(),
-            performance: PerformanceMode::Standard,
-            address: "127.0.0.1:0".into(),
-            display: desktop_host::DisplaySelection::Primary,
-            password: Some("secret".into()),
-            allow_insecure: false,
-            scale: 1.0,
-            mouse: desktop_host::MouseMode::Auto,
-            priority: topvnc::UpdatePriority::Whole,
-        });
+        server
+            .start(
+                Owner::ServerTab,
+                ServeRequest {
+                    tls: Default::default(),
+                    performance: PerformanceMode::Standard,
+                    address: "127.0.0.1:0".into(),
+                    display: desktop_host::DisplaySelection::Primary,
+                    password: Some("secret".into()),
+                    allow_insecure: false,
+                    scale: 1.0,
+                    mouse: desktop_host::MouseMode::Auto,
+                    priority: topvnc::UpdatePriority::Whole,
+                },
+            )
+            .unwrap();
         assert_eq!(server.view.phase, ServerPhase::Starting);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let error = loop {

@@ -359,9 +359,17 @@ row to see its recent output. **Stop browser access**, or closing TopVNC, ends
 all three. On Windows the children are tied to TopVNC, so they also end if
 TopVNC crashes or is killed.
 
-If the Server tab is already serving, the WEB tab uses that server only when it
-listens on `rfb_target` with a password and plain RFB; otherwise it asks you
-to stop it first. Before starting anything, the tab checks
+The Server tab and the WEB tab can serve at the same time. They share one
+desktop capture, and each tab has its own listener: the Server tab's (for
+example TLS on All networks) for native viewers, and the WEB tab's plain,
+password-protected loopback listener for the gateway. Whichever tab starts
+first starts the server; the other adds its listener, and stopping one tab
+leaves the other serving. The display, size, mouse, and priority stay as the
+first tab started them. If the Server tab listens on `rfb_target` itself, the
+WEB tab shares that listener only when it is plain RFB with the same password;
+otherwise it asks you to give the Server tab another port. See
+[`specs/019-server-and-web-together/spec.md`](../specs/019-server-and-web-together/spec.md).
+Before starting anything, the tab checks
 `gateway.local.toml` with the gateway's own rules, the token file, the host
 key, the gateway program, and cloudflared, and names the setup step that
 fixes the first problem it finds.

@@ -7,8 +7,8 @@ use crate::desktop_host::{
     MAX_CLIPBOARD_CHARS, MacKeyCode, MouseMode, PointerTransition, Rect, RemoteInputState,
     Rotation, ServeOptions, ServerNotice, capture_rate, display_point, frame_damage,
     latin1_from_unicode, latin1_to_string, macos_event_flags, macos_key_flags, macos_key_identity,
-    macos_modifier_flags, parse_serve_arguments, relative_point, served_size, unicode_key_units,
-    validate_capture_dimensions,
+    macos_modifier_flags, parse_serve_arguments, relative_point, report_serving, served_size,
+    unicode_key_units, validate_capture_dimensions,
 };
 use block2::RcBlock;
 use dispatch2::{DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained};
@@ -273,12 +273,13 @@ pub fn serve(
     // explicit choice asks viewers for relative motion.
     server.set_relative_pointer(mouse == MouseMode::Relative);
     server.set_serve_scale((scale * 100.0).round() as u8);
-    report(ServerNotice::Serving {
-        address: server.local_addr()?,
-        display: capture.name.clone(),
-        width: capture.width,
-        height: capture.height,
-    });
+    report_serving(
+        &server,
+        report,
+        capture.name.clone(),
+        capture.width,
+        capture.height,
+    )?;
     if !input_allowed {
         report(ServerNotice::ViewOnly(true));
         report(ServerNotice::Message(format!(

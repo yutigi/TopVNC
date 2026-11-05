@@ -71,7 +71,8 @@ failure path automatically.
 4. **Given** the Server tab is already serving, **When** Start is pressed,
    **Then** TopVNC reuses that server only if it is on the gateway's loopback
    `rfb_target`, password-protected, and plain RFB. Otherwise it refuses with an
-   explanation and changes nothing.
+   explanation and changes nothing. *Superseded by feature 019: the WEB tab now
+   adds its own listener to the running server, so both tabs serve at once.*
 5. **Given** a child exits or never reaches Ready within its time limit,
    **Then** its row shows Failed with the last lines of its output, and the
    other rows stay as they are. No automatic restart loop.
