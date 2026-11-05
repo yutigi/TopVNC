@@ -19,32 +19,46 @@ use crate::windows_server;
 use std::error::Error;
 use std::ffi::c_void;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::ToSocketAddrs;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT,
-    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE, ERROR_SUCCESS, HANDLE,
-    HANDLE_FLAG_INHERIT, NO_ERROR, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_CALL_NOT_IMPLEMENTED,
+    ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED,
+    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE, ERROR_SUCCESS, GENERIC_READ,
+    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, NO_ERROR, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authentication::Identity::{
     LSA_HANDLE, LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaClose, LsaFreeMemory,
     LsaNtStatusToWinError, LsaOpenPolicy, LsaRetrievePrivateData, LsaStorePrivateData,
     POLICY_CREATE_SECRET, POLICY_GET_PRIVATE_INFORMATION,
 };
-use windows_sys::Win32::Security::{
-    DuplicateTokenEx, SECURITY_ATTRIBUTES, SecurityIdentification, SetTokenInformation,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-    TOKEN_QUERY, TokenPrimary, TokenSessionId,
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
+use windows_sys::Win32::Security::{
+    DuplicateTokenEx, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SecurityIdentification,
+    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary, TokenSessionId,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES,
+    OPEN_EXISTING, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND, ReadFile, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT,
+};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+};
 use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
 use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows_sys::Win32::System::Services::{
@@ -61,8 +75,9 @@ use windows_sys::Win32::System::Services::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateEventW, CreateProcessAsUserW, GetCurrentProcess,
-    INFINITE, OpenProcessToken, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
+    GetCurrentProcessId, GetProcessId, INFINITE, OpenProcessToken, PROCESS_INFORMATION,
+    ResumeThread, STARTUPINFOW, SetEvent, TerminateProcess, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 /// The service's name in the service manager; also `sc query TopVNCHost`.
@@ -84,6 +99,14 @@ const AGENT_RESTART_MAX: Duration = Duration::from_secs(30);
 /// An agent that ran this long resets the restart backoff.
 const AGENT_STABLE: Duration = Duration::from_secs(60);
 const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// From starting an agent to it opening both of its pipes.
+const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Put first after `--host-agent` by the service, followed by the pipes'
+/// name.
+const AGENT_PIPE_FLAG: &str = "--agent-pipe";
+const AGENT_PIPE_PREFIX: &str = "topvnc-host-agent-";
+/// Only SYSTEM, which the service and its agents run as, may open the pipes.
+const AGENT_PIPE_SECURITY: &str = "D:P(A;;GA;;;SY)";
 const CONSOLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 /// The service log is rotated past this size.
@@ -718,9 +741,6 @@ fn supervise(
     log: &Arc<ServiceLog>,
 ) -> Result<(), Box<dyn Error>> {
     let executable = std::env::current_exe()?;
-    let mut agent_arguments = vec!["--host-agent".to_owned()];
-    agent_arguments.extend_from_slice(arguments);
-    let command = command_line(&executable, &agent_arguments);
     if !software_sas_allowed() {
         log.write(
             "Ctrl+Alt+Delete from viewers is off: the software Secure Attention Sequence \
@@ -746,7 +766,7 @@ fn supervise(
         }
         no_session_logged = false;
         let started = Instant::now();
-        match Agent::start(&command, session, log) {
+        match Agent::start(&executable, arguments, session, log) {
             Err(error) => log.write(&format!("Could not start the host agent: {error}")),
             Ok(agent) => {
                 log.write(&format!("Host agent started in console session {session}."));
@@ -785,37 +805,262 @@ enum AgentEnd {
 struct Agent {
     process: OwnedHandle,
     /// Closing it tells the agent to stop.
-    input: Option<File>,
+    input: Option<ServicePipe>,
     output: Option<std::thread::JoinHandle<()>>,
+    /// Ends the agent if the service ends without stopping it. Each agent
+    /// has its own: a job stays in the session of its first process, so an
+    /// agent in the next console session cannot join this one's.
+    _job: job::Job,
 }
 
-/// A pipe whose `child` end the agent inherits.
-fn inheritable_pipe(child_reads: bool) -> std::io::Result<(OwnedHandle, OwnedHandle)> {
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 1,
-    };
-    let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
-    if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
-        return Err(last_error());
+// ---- The pipes between the service and an agent ------------------------
+//
+// The agent runs in the console session and the service in session 0, and
+// handles cannot be inherited across sessions. So the service creates two
+// named pipes, one each way, that only SYSTEM can open, starts the agent
+// with their name, and accepts only that agent process on them. The agent
+// accepts only pipes made by the service whose process ID is in the name.
+
+/// A new name for an agent's pipes: the service's process ID and 128
+/// random bits, so no other process can take the name first.
+fn new_agent_pipe_name() -> std::io::Result<String> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let service = unsafe { GetCurrentProcessId() };
+    Ok(random.iter().fold(
+        format!("{AGENT_PIPE_PREFIX}{service}-"),
+        |mut name, byte| {
+            name.push_str(&format!("{byte:02x}"));
+            name
+        },
+    ))
+}
+
+/// The service process ID in an agent pipe name, if `name` is one the
+/// service makes. The agent opens nothing else, so never a file, a device,
+/// or a remote share.
+fn agent_pipe_service(name: &str) -> Option<u32> {
+    let (service, id) = name.strip_prefix(AGENT_PIPE_PREFIX)?.split_once('-')?;
+    let digits = !service.is_empty() && service.bytes().all(|byte| byte.is_ascii_digit());
+    let random = id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    if digits && random {
+        service.parse().ok()
+    } else {
+        None
     }
-    // SAFETY: CreatePipe returned two new handles owned from here on.
-    let (read, write) = unsafe {
-        (
-            OwnedHandle::from_raw_handle(read),
-            OwnedHandle::from_raw_handle(write),
+}
+
+fn agent_pipe_path(name: &str, to_agent: bool) -> Vec<u16> {
+    let direction = if to_agent { "to-agent" } else { "from-agent" };
+    wide(&format!(r"\\.\pipe\{name}.{direction}"))
+}
+
+/// The service's end of one pipe to an agent. It is overlapped so that
+/// waiting for the agent can time out or notice the agent exiting.
+struct ServicePipe {
+    pipe: OwnedHandle,
+    /// Signalled when an overlapped operation on `pipe` completes.
+    event: OwnedHandle,
+}
+
+impl ServicePipe {
+    fn create(name: &str, to_agent: bool, security: &str) -> std::io::Result<Self> {
+        let sddl = wide(security);
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let direction = if to_agent {
+            PIPE_ACCESS_OUTBOUND
+        } else {
+            PIPE_ACCESS_INBOUND
+        };
+        let path = agent_pipe_path(name, to_agent);
+        // The first instance: if the name already exists, this fails rather
+        // than joining someone else's pipe.
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                path.as_ptr(),
+                direction | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                0,
+                &attributes,
+            )
+        };
+        let created = last_error();
+        unsafe { LocalFree(descriptor) };
+        if pipe == INVALID_HANDLE_VALUE {
+            return Err(created);
+        }
+        // SAFETY: a new handle owned from here on.
+        let pipe = unsafe { OwnedHandle::from_raw_handle(pipe) };
+        // Manual reset, as overlapped operations require.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(last_error());
+        }
+        // SAFETY: a new handle owned from here on.
+        let event = unsafe { OwnedHandle::from_raw_handle(event) };
+        Ok(Self { pipe, event })
+    }
+
+    fn overlapped(&self) -> OVERLAPPED {
+        OVERLAPPED {
+            hEvent: raw(&self.event),
+            ..Default::default()
+        }
+    }
+
+    /// Wait for the process `agent` to open the pipe. Fails if it exits
+    /// first, if any other process opens it, or after `timeout`.
+    fn accept(&self, agent: HANDLE, timeout: Duration) -> std::io::Result<()> {
+        let pipe = raw(&self.pipe);
+        let mut overlapped = self.overlapped();
+        if unsafe { ConnectNamedPipe(pipe, &mut overlapped) } == 0 {
+            match unsafe { GetLastError() } {
+                ERROR_PIPE_CONNECTED => {}
+                ERROR_IO_PENDING => {
+                    let handles = [raw(&self.event), agent];
+                    let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+                    let waited =
+                        unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) };
+                    let wait_error = last_error();
+                    let mut transferred = 0;
+                    if waited != WAIT_OBJECT_0 {
+                        // The overlapped structure must outlive the operation.
+                        unsafe {
+                            CancelIoEx(pipe, &overlapped);
+                            GetOverlappedResult(pipe, &overlapped, &mut transferred, 1);
+                        }
+                        return Err(match waited {
+                            _ if waited == WAIT_OBJECT_0 + 1 => {
+                                std::io::Error::other("the host agent exited before it connected")
+                            }
+                            WAIT_TIMEOUT => std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "the host agent did not connect in time",
+                            ),
+                            _ => wait_error,
+                        });
+                    }
+                    if unsafe { GetOverlappedResult(pipe, &overlapped, &mut transferred, 0) } == 0 {
+                        return Err(last_error());
+                    }
+                }
+                error => return Err(std::io::Error::from_raw_os_error(error as i32)),
+            }
+        }
+        let mut client = 0;
+        if unsafe { GetNamedPipeClientProcessId(pipe, &mut client) } == 0 {
+            return Err(last_error());
+        }
+        if client != unsafe { GetProcessId(agent) } {
+            return Err(std::io::Error::other(
+                "another process opened the host agent's pipe",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Reads what the agent writes; the agent closing its end reads as the end.
+impl Read for ServicePipe {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let pipe = raw(&self.pipe);
+        let mut overlapped = self.overlapped();
+        let length = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+        let started = unsafe {
+            ReadFile(
+                pipe,
+                buffer.as_mut_ptr(),
+                length,
+                std::ptr::null_mut(),
+                &mut overlapped,
+            )
+        };
+        if started == 0 {
+            match unsafe { GetLastError() } {
+                ERROR_IO_PENDING => {}
+                ERROR_BROKEN_PIPE => return Ok(0),
+                error => return Err(std::io::Error::from_raw_os_error(error as i32)),
+            }
+        }
+        let mut transferred = 0;
+        if unsafe { GetOverlappedResult(pipe, &overlapped, &mut transferred, 1) } == 0 {
+            let error = last_error();
+            return if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                Ok(0)
+            } else {
+                Err(error)
+            };
+        }
+        Ok(transferred as usize)
+    }
+}
+
+/// The agent's end of one pipe from the service named in `name`. Fails if
+/// another process made the pipe.
+fn open_service_pipe(name: &str, to_agent: bool) -> std::io::Result<File> {
+    let service = agent_pipe_service(name).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{name:?} is not a host agent pipe"),
+        )
+    })?;
+    let path = agent_pipe_path(name, to_agent);
+    // Reading the attributes is needed to check the pipe's server.
+    let access = FILE_READ_ATTRIBUTES
+        | if to_agent {
+            GENERIC_READ
+        } else {
+            GENERIC_WRITE
+        };
+    let pipe = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            access,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            // The service may identify the agent but not act as it.
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            std::ptr::null_mut(),
         )
     };
-    let (child, parent) = if child_reads {
-        (read, write)
-    } else {
-        (write, read)
-    };
-    if unsafe { SetHandleInformation(raw(&parent), HANDLE_FLAG_INHERIT, 0) } == 0 {
+    if pipe == INVALID_HANDLE_VALUE {
         return Err(last_error());
     }
-    Ok((child, parent))
+    // SAFETY: a new handle owned from here on.
+    let pipe = unsafe { OwnedHandle::from_raw_handle(pipe) };
+    let mut server = 0;
+    if unsafe { GetNamedPipeServerProcessId(raw(&pipe), &mut server) } == 0 {
+        return Err(last_error());
+    }
+    if server != service {
+        return Err(std::io::Error::other(
+            "the host agent's pipe was not made by the service",
+        ));
+    }
+    Ok(File::from(pipe))
 }
 
 fn raw(handle: &OwnedHandle) -> HANDLE {
@@ -873,21 +1118,25 @@ fn session_token(session: u32) -> std::io::Result<OwnedHandle> {
 }
 
 impl Agent {
-    fn start(command: &str, session: u32, log: &Arc<ServiceLog>) -> std::io::Result<Self> {
+    fn start(
+        executable: &Path,
+        arguments: &[String],
+        session: u32,
+        log: &Arc<ServiceLog>,
+    ) -> std::io::Result<Self> {
         let token = session_token(session)?;
-        let (child_input, parent_input) = inheritable_pipe(true)?;
-        let (child_output, parent_output) = inheritable_pipe(false)?;
+        let name = new_agent_pipe_name()?;
+        let input = ServicePipe::create(&name, true, AGENT_PIPE_SECURITY)?;
+        let output = ServicePipe::create(&name, false, AGENT_PIPE_SECURITY)?;
+        let mut agent_arguments = vec!["--host-agent".to_owned(), AGENT_PIPE_FLAG.to_owned(), name];
+        agent_arguments.extend_from_slice(arguments);
+        let mut command = wide(&command_line(executable, &agent_arguments));
         let mut desktop = wide(AGENT_DESKTOP);
         let startup = STARTUPINFOW {
             cb: size_of::<STARTUPINFOW>() as u32,
             lpDesktop: desktop.as_mut_ptr(),
-            dwFlags: STARTF_USESTDHANDLES,
-            hStdInput: raw(&child_input),
-            hStdOutput: raw(&child_output),
-            hStdError: raw(&child_output),
             ..Default::default()
         };
-        let mut command = wide(command);
         let mut process = PROCESS_INFORMATION::default();
         if unsafe {
             CreateProcessAsUserW(
@@ -896,7 +1145,8 @@ impl Agent {
                 command.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
-                1,
+                // Nothing is inherited: the agent runs in another session.
+                0,
                 CREATE_NO_WINDOW | CREATE_SUSPENDED,
                 std::ptr::null(),
                 std::ptr::null(),
@@ -915,13 +1165,25 @@ impl Agent {
             )
         };
         // The agent ends with the service, even if the service crashes.
-        if let Err(error) = job::adopt_handle(raw(&handle)) {
-            unsafe { TerminateProcess(raw(&handle), 1) };
-            return Err(std::io::Error::other(error));
-        }
+        let job = match job::Job::new().and_then(|job| job.assign(raw(&handle)).map(|()| job)) {
+            Ok(job) => job,
+            Err(error) => {
+                unsafe { TerminateProcess(raw(&handle), 1) };
+                return Err(std::io::Error::other(error));
+            }
+        };
         unsafe { ResumeThread(raw(&thread)) };
-        drop((child_input, child_output, thread));
-        let output = File::from(parent_output);
+        drop(thread);
+        let connected = input
+            .accept(raw(&handle), AGENT_CONNECT_TIMEOUT)
+            .and_then(|()| output.accept(raw(&handle), AGENT_CONNECT_TIMEOUT));
+        if let Err(error) = connected {
+            unsafe {
+                TerminateProcess(raw(&handle), 1);
+                WaitForSingleObject(raw(&handle), INFINITE);
+            }
+            return Err(error);
+        }
         let log = Arc::clone(log);
         let output = std::thread::Builder::new()
             .name("topvnc-agent-output".into())
@@ -940,8 +1202,9 @@ impl Agent {
             })?;
         Ok(Self {
             process: handle,
-            input: Some(File::from(parent_input)),
+            input: Some(input),
             output: Some(output),
+            _job: job,
         })
     }
 
@@ -1035,46 +1298,76 @@ fn send_secure_attention() -> Result<(), String> {
 // ---- The agent process -------------------------------------------------
 
 static AGENT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// The agent's pipe to the service, once open.
+static TO_SERVICE: OnceLock<Mutex<File>> = OnceLock::new();
 
 fn tell_service(line: &str) {
-    let mut output = std::io::stdout().lock();
-    let _ = writeln!(output, "{line}");
-    let _ = output.flush();
+    let Some(pipe) = TO_SERVICE.get() else {
+        return;
+    };
+    let mut pipe = pipe.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = pipe.write_all(format!("{line}\n").as_bytes());
 }
 
 fn request_secure_attention() {
     tell_service("SAS");
 }
 
-/// `topvnc --host-agent [--serve options]`: started by the service as
-/// SYSTEM in the console session.
+/// `topvnc --host-agent --agent-pipe NAME [--serve options]`: started by
+/// the service as SYSTEM in the console session.
 pub fn run_agent(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let not_from_service =
+        || format!("--host-agent is started by the {SERVICE_NAME} service as SYSTEM");
+    let [flag, name, arguments @ ..] = arguments else {
+        return Err(not_from_service().into());
+    };
+    if flag != AGENT_PIPE_FLAG {
+        return Err(not_from_service().into());
+    }
+    let unreachable =
+        |error: std::io::Error| format!("could not reach the {SERVICE_NAME} service: {error}");
+    let from_service = open_service_pipe(name, true).map_err(unreachable)?;
+    let to_service = open_service_pipe(name, false).map_err(unreachable)?;
+    let _ = TO_SERVICE.set(Mutex::new(to_service));
+    // The agent has no console, so failures are reported to the service log.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tell_service(&format!(
+            "LOG The host agent failed: {}",
+            info.to_string().replace(['\r', '\n'], " ")
+        ));
+        default_hook(info);
+    }));
+    let result = serve_agent(arguments, from_service);
+    if let Err(error) = &result {
+        tell_service(&format!("LOG The host agent stopped: {error}"));
+    }
+    result
+}
+
+fn serve_agent(arguments: &[String], mut from_service: File) -> Result<(), Box<dyn Error>> {
     let arguments = service_arguments(arguments)?;
     let options = parse_serve_arguments(&arguments)?;
     let password = read_password().map_err(|error| {
         format!("{error}. --host-agent is started by the {SERVICE_NAME} service as SYSTEM")
     })?;
-    // The service closes standard input to stop the agent.
+    // The service closes its end of this pipe to stop the agent.
     std::thread::Builder::new()
         .name("topvnc-agent-stop".into())
-        .spawn(|| {
+        .spawn(move || {
             let mut sink = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+            let _ = from_service.read_to_end(&mut sink);
             AGENT_SHUTDOWN.store(true, Ordering::Release);
         })?;
     windows_server::follow_input_desktops(request_secure_attention);
-    let result = windows_server::serve(options, Some(password), &AGENT_SHUTDOWN, &|notice| {
+    windows_server::serve(options, Some(password), &AGENT_SHUTDOWN, &|notice| {
         if !matches!(notice, ServerNotice::Connections(_)) {
             tell_service(&format!(
                 "LOG {}",
                 notice.to_string().replace(['\r', '\n'], " ")
             ));
         }
-    });
-    if let Err(error) = &result {
-        tell_service(&format!("LOG The host agent stopped: {error}"));
-    }
-    result
+    })
 }
 
 #[cfg(test)]
@@ -1155,5 +1448,132 @@ mod tests {
             AgentMessage::parse("thread 'main' panicked"),
             AgentMessage::Log("thread 'main' panicked".into())
         );
+    }
+
+    /// Tests are not SYSTEM, so they open the pipes under a looser rule;
+    /// everything else is the service's code.
+    const TEST_PIPE_SECURITY: &str = "D:P(A;;GA;;;WD)";
+
+    fn this_process() -> HANDLE {
+        unsafe { GetCurrentProcess() }
+    }
+
+    #[test]
+    fn agent_pipe_names_carry_the_service_and_nothing_else_is_opened() {
+        let name = new_agent_pipe_name().unwrap();
+        assert_eq!(
+            agent_pipe_service(&name),
+            Some(unsafe { GetCurrentProcessId() })
+        );
+        assert_ne!(name, new_agent_pipe_name().unwrap());
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            agent_pipe_service(&format!("{AGENT_PIPE_PREFIX}42-{id}")),
+            Some(42)
+        );
+        for bad in [
+            format!("{AGENT_PIPE_PREFIX}-{id}"),
+            format!("{AGENT_PIPE_PREFIX}4x-{id}"),
+            format!("{AGENT_PIPE_PREFIX}42-{}", &id[1..]),
+            format!("{AGENT_PIPE_PREFIX}42-{}", id.to_uppercase()),
+            format!("{AGENT_PIPE_PREFIX}42-{id}\\..\\other"),
+            format!("{AGENT_PIPE_PREFIX}99999999999-{id}"),
+            format!("other-42-{id}"),
+            r"\\server\share\file".to_owned(),
+        ] {
+            assert_eq!(agent_pipe_service(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn agent_pipes_carry_lines_out_and_closing_stops_the_agent() {
+        let name = new_agent_pipe_name().unwrap();
+        let input = ServicePipe::create(&name, true, TEST_PIPE_SECURITY).unwrap();
+        let output = ServicePipe::create(&name, false, TEST_PIPE_SECURITY).unwrap();
+        // A second service pipe of the same name is refused.
+        assert!(ServicePipe::create(&name, true, TEST_PIPE_SECURITY).is_err());
+        let mut from_service = open_service_pipe(&name, true).unwrap();
+        let mut to_service = open_service_pipe(&name, false).unwrap();
+        input
+            .accept(this_process(), Duration::from_secs(5))
+            .unwrap();
+        output
+            .accept(this_process(), Duration::from_secs(5))
+            .unwrap();
+
+        to_service.write_all(b"SAS\nLOG ready\n").unwrap();
+        drop(to_service);
+        let lines: Vec<String> = BufReader::new(output)
+            .lines()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(lines, ["SAS", "LOG ready"]);
+
+        drop(input);
+        let mut sink = Vec::new();
+        assert_eq!(from_service.read_to_end(&mut sink).unwrap(), 0);
+    }
+
+    #[test]
+    fn agent_pipes_accept_only_the_agent_in_time() {
+        let name = new_agent_pipe_name().unwrap();
+        let pipe = ServicePipe::create(&name, false, TEST_PIPE_SECURITY).unwrap();
+        // A running process that never connects: waiting times out.
+        let mut slow = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 5 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        let waited = {
+            use std::os::windows::io::AsRawHandle;
+            pipe.accept(slow.as_raw_handle(), Duration::from_millis(50))
+        };
+        let _ = slow.kill();
+        let _ = slow.wait();
+        assert_eq!(waited.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+
+        // This process opens the pipe, but the service expects another.
+        let _client = open_service_pipe(&name, false).unwrap();
+        let mut other = std::process::Command::new("cmd")
+            .args(["/c", "exit"])
+            .spawn()
+            .unwrap();
+        use std::os::windows::io::AsRawHandle;
+        let refused = pipe.accept(other.as_raw_handle(), Duration::from_secs(5));
+        let _ = other.wait();
+        assert!(refused.unwrap_err().to_string().contains("another process"));
+    }
+
+    #[test]
+    fn agents_open_only_pipes_made_by_the_named_service() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut random = [0u8; 4];
+        getrandom::fill(&mut random).unwrap();
+        let elsewhere = unsafe { GetCurrentProcessId() }.wrapping_add(1);
+        // Unique per run, but naming a service that is not this process.
+        let name = format!(
+            "{AGENT_PIPE_PREFIX}{elsewhere}-{}{}",
+            &id[8..],
+            random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let _pipe = ServicePipe::create(&name, true, TEST_PIPE_SECURITY).unwrap();
+        let opened = open_service_pipe(&name, true);
+        assert!(opened.unwrap_err().to_string().contains("not made by"));
+    }
+
+    #[test]
+    fn host_agents_need_the_service_pipe() {
+        let error = run_agent(&arguments(&["127.0.0.1:5900"])).unwrap_err();
+        assert!(error.to_string().contains("started by the"), "{error}");
+        let error = run_agent(&arguments(&[AGENT_PIPE_FLAG, r"..\secret"])).unwrap_err();
+        assert!(
+            error.to_string().contains("not a host agent pipe"),
+            "{error}"
+        );
+        let missing = format!("{AGENT_PIPE_PREFIX}1-0123456789abcdef0123456789abcdef");
+        let error = run_agent(&arguments(&[AGENT_PIPE_FLAG, &missing])).unwrap_err();
+        assert!(error.to_string().contains("could not reach"), "{error}");
     }
 }
