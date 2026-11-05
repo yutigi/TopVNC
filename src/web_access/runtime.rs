@@ -1,8 +1,9 @@
 //! The WEB tab's run state: the desktop server, the tunnel connector, and the
 //! gateway, started in that order and stopped in reverse. The desktop server
-//! is the landing window's in-process host; this module only asks for it to
-//! start or stop and watches its state. The connector and the gateway are
-//! supervised children.
+//! is the landing window's in-process host; this module only asks for its
+//! loopback listener and watches it. The landing window adds that listener to
+//! a server the Server tab already runs, so both can serve at once. The
+//! connector and the gateway are supervised children.
 //!
 //! On the Quick Tunnel route the connector also decides the page origin: the
 //! tunnel is Ready only once cloudflared has printed its
@@ -56,25 +57,22 @@ pub enum RowState {
     Failed(String),
 }
 
-/// The landing window's desktop server, as this module needs to see it.
+/// The WEB tab's listener on the landing window's desktop server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostServer {
     Stopped,
     Starting,
-    Serving {
-        address: String,
-        authenticated: bool,
-        /// Plain RFB (no TLS), as the gateway's loopback target speaks.
-        plain: bool,
-    },
+    Serving,
     Stopping,
 }
 
-/// What the landing window should do with its desktop server.
+/// What the landing window should do with the WEB tab's listener.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerRequest {
-    /// Serve plain RFB on this loopback address with the typed password.
+    /// Serve plain RFB on this loopback address with the typed password,
+    /// starting the desktop server if it is not running.
     Start(SocketAddr),
+    /// Close the listener, and the server if no other tab uses it.
     Stop,
 }
 
@@ -92,8 +90,6 @@ pub struct WebRuntime {
     rows: [RowState; 3],
     /// When each row entered Starting.
     since: [Option<Instant>; 3],
-    /// The WEB tab started the desktop server, so it also stops it.
-    owns_server: bool,
     server_requested: bool,
     stop_requested: bool,
     tunnel: Option<Box<dyn Supervised>>,
@@ -122,7 +118,6 @@ impl WebRuntime {
             phase: Phase::Idle,
             rows: [RowState::Stopped, RowState::Stopped, RowState::Stopped],
             since: [None; 3],
-            owns_server: false,
             server_requested: false,
             stop_requested: false,
             tunnel: None,
@@ -214,8 +209,7 @@ impl WebRuntime {
     }
 
     /// Start browser access. `password` is the VNC password the WEB tab will
-    /// serve with; a server the Server tab already runs is reused only when
-    /// the gateway can use it as it is.
+    /// serve with; `server` is the tab's listener, which must be closed.
     pub fn start(
         &mut self,
         launch: Launch,
@@ -226,45 +220,18 @@ impl WebRuntime {
         if self.phase != Phase::Idle {
             return Err("Browser access is already running.".into());
         }
-        let target = launch.rfb_target;
-        let owns_server = match server {
-            HostServer::Serving {
-                address,
-                authenticated,
-                plain,
-            } => {
-                if address.parse::<SocketAddr>().ok() != Some(target) || !authenticated || !plain {
-                    return Err(format!(
-                        "The Server tab is already serving on {address}. Browser access needs a password-protected plain RFB server on {target}. Stop that server first."
-                    ));
-                }
-                false
-            }
-            HostServer::Starting | HostServer::Stopping => {
-                return Err(
-                    "Wait for the Server tab's server to finish starting or stopping.".into(),
-                );
-            }
-            HostServer::Stopped if password.is_empty() => {
-                return Err("Enter a VNC password.".into());
-            }
-            HostServer::Stopped => true,
-        };
+        if *server != HostServer::Stopped {
+            return Err("Wait for the desktop server to finish stopping.".into());
+        }
+        if password.is_empty() {
+            return Err("Enter a VNC password.".into());
+        }
         // A fresh state; only the spawner carries over.
         let spawner = std::mem::replace(&mut self.spawner, Box::new(NoSpawner));
         *self = Self::new(spawner);
         self.launch = Some(launch);
         self.phase = Phase::Running;
-        self.owns_server = owns_server;
-        self.rows = [
-            if owns_server {
-                RowState::Starting
-            } else {
-                RowState::Ready
-            },
-            RowState::Waiting,
-            RowState::Waiting,
-        ];
+        self.rows = [RowState::Starting, RowState::Waiting, RowState::Waiting];
         self.since[Row::Server.index()] = Some(now);
         Ok(())
     }
@@ -362,7 +329,7 @@ impl WebRuntime {
                 self.server_requested = true;
                 request = Some(ServerRequest::Start(launch.rfb_target));
             }
-            (RowState::Starting, HostServer::Serving { .. }) => {
+            (RowState::Starting, HostServer::Serving) => {
                 self.set(Row::Server, RowState::Ready, now);
             }
             (RowState::Starting | RowState::Ready, HostServer::Stopped) => {
@@ -558,18 +525,16 @@ impl WebRuntime {
         }
         self.finish(Row::Gateway);
         self.finish(Row::Tunnel);
-        if self.owns_server {
-            match server {
-                HostServer::Starting | HostServer::Serving { .. } if !self.stop_requested => {
-                    self.stop_requested = true;
-                    if !matches!(self.rows[Row::Server.index()], RowState::Failed(_)) {
-                        self.rows[Row::Server.index()] = RowState::Stopping;
-                    }
-                    return Some(ServerRequest::Stop);
+        match server {
+            HostServer::Starting | HostServer::Serving if !self.stop_requested => {
+                self.stop_requested = true;
+                if !matches!(self.rows[Row::Server.index()], RowState::Failed(_)) {
+                    self.rows[Row::Server.index()] = RowState::Stopping;
                 }
-                HostServer::Stopped => {}
-                _ => return None,
+                return Some(ServerRequest::Stop);
             }
+            HostServer::Stopped => {}
+            _ => return None,
         }
         self.finish(Row::Server);
         self.phase = Phase::Idle;
