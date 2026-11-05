@@ -1,8 +1,10 @@
 use qrcode::{QrCode, render::unicode::Dense1x2};
 use std::path::Path;
+use std::sync::Arc;
 use topvnc_e2e as e2e;
 use topvnc_web_gateway::{
-    Config, Gateway, PAIRING_SECONDS, create_host_key, routes, spawn_synthetic_echo,
+    Config, Gateway, PAIRING_SECONDS, QUICK_TUNNEL_SESSION_SECONDS, QuickTunnelConfig,
+    create_host_key, routes, spawn_synthetic_echo,
 };
 
 const USAGE: &str = "Usage:
@@ -10,13 +12,19 @@ const USAGE: &str = "Usage:
   topvnc-web-gateway [--pair] <gateway.toml>
   topvnc-web-gateway --synthetic-echo [--pair] <gateway.toml>
   topvnc-web-gateway --supervised <gateway.toml>
+  topvnc-web-gateway --supervised-quick-tunnel <listen> <rfb-target> <app-origin> <web-dist>
 Relays Cloudflare Access-authenticated, end-to-end encrypted browser sessions
 to the configured loopback rfb_target, normally `topvnc --serve` with a VNC
 password. --pair shows a one-time enrollment QR code on this console.
 --synthetic-echo replaces the target with a loopback echo, for route tests.
 --supervised is for the TopVNC window: it reads `pair` and `cancel-pair`
 commands on stdin, stops when stdin closes, and reports `fingerprint`,
-`ready`, `pair`, and `pair-error` lines on stdout instead of a QR code.";
+`ready`, `pair`, and `pair-error` lines on stdout instead of a QR code.
+--supervised-quick-tunnel is the same for a temporary Quick Tunnel: no Access
+sign-in, only pairing and the VNC password. It serves the built web app from
+<web-dist>, accepts upgrades only from <app-origin> (an exact
+https://<label>.trycloudflare.com origin), and keeps a new host key and its
+enrollments in memory for this run only.";
 
 /// Key paths are resolved relative to the configuration file.
 fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
@@ -52,7 +60,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ["--pair", path] => (false, true, *path),
         ["--synthetic-echo", path] => (true, false, *path),
         ["--synthetic-echo", "--pair", path] => (true, true, *path),
-        ["--supervised", path] => return supervised(path).await,
+        ["--supervised", path] => {
+            let config = load_config(path)?;
+            let listen = config.listen;
+            let target = config.rfb_target;
+            return supervised(
+                Gateway::new(config)?,
+                listen,
+                &format!(
+                    "for the RFB server at {target} (Access JWT, an enrolled browser, and the VNC password required)"
+                ),
+            )
+            .await;
+        }
+        [
+            "--supervised-quick-tunnel",
+            listen,
+            target,
+            origin,
+            web_root,
+        ] => {
+            let config = QuickTunnelConfig {
+                listen: listen.parse()?,
+                rfb_target: target.parse()?,
+                app_origin: (*origin).to_owned(),
+                max_session_seconds: QUICK_TUNNEL_SESSION_SECONDS,
+                web_root: web_root.into(),
+            };
+            let (listen, target) = (config.listen, config.rfb_target);
+            return supervised(
+                Gateway::quick_tunnel(config)?,
+                listen,
+                &format!(
+                    "for the RFB server at {target}, serving the web app for {origin} (Quick Tunnel: no Access sign-in; an enrolled browser and the VNC password required)"
+                ),
+            )
+            .await;
+        }
         ["--help"] => {
             eprintln!("{USAGE}");
             return Ok(());
@@ -137,23 +181,26 @@ fn parse_command(line: &str) -> Command {
 /// specs/018-cloudflare-setup-ui/plan.md and is the only place the pairing
 /// link is written; stderr stays the human log. Closing stdin, which also
 /// happens when the supervisor dies, shuts the gateway down.
-async fn supervised(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_config(config_path)?;
-    let listen = config.listen;
-    let target = config.rfb_target;
-    let origin = config.app_origin.clone();
-    let gateway = Gateway::new(config)?;
+async fn supervised(
+    gateway: Arc<Gateway>,
+    listen: std::net::SocketAddr,
+    serving: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let origin = gateway.app_origin().to_owned();
     let fingerprint = e2e::fingerprint(&gateway.host_public());
     eprintln!(
-        "Host key fingerprint: {fingerprint} ({} enrolled browser key(s))",
-        gateway.enrolled_browsers()
+        "Host key fingerprint: {fingerprint} ({} enrolled browser key(s){})",
+        gateway.enrolled_browsers(),
+        if gateway.is_pairing_only() {
+            "; a new key for this run only"
+        } else {
+            ""
+        }
     );
     println!("fingerprint {fingerprint}");
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let address = listener.local_addr()?;
-    eprintln!(
-        "Gateway listening on {address} for the RFB server at {target} (Access JWT, an enrolled browser, and the VNC password required)"
-    );
+    eprintln!("Gateway listening on {address} {serving}");
     println!("ready {address}");
 
     // A plain thread: a blocked tokio stdin read would hold up runtime
@@ -172,7 +219,7 @@ async fn supervised(config_path: &str) -> Result<(), Box<dyn std::error::Error>>
             let _ = commands.send(None);
         })?;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let control = std::sync::Arc::clone(&gateway);
+    let control = Arc::clone(&gateway);
     let control_task = tokio::spawn(async move {
         while let Some(Some(command)) = received.recv().await {
             match command {
