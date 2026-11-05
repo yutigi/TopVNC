@@ -225,6 +225,9 @@ pub struct ServerView {
 }
 
 /// The TopVNC Host service's state, as the SERVICE tab shows it.
+// Only Windows constructs the installed-service states; other platforms keep
+// the shared SERVICE tab in NotInstalled.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ServiceState {
     #[default]
