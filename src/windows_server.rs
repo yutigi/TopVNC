@@ -12,6 +12,7 @@ use crate::desktop_host::{
 };
 use crate::desktop_host::{
     MAX_CLIPBOARD_CHARS, ServeOptions, ServerNotice, VirtualKey, parse_serve_arguments,
+    report_serving,
 };
 use std::collections::HashSet;
 use std::error::Error;
@@ -312,12 +313,13 @@ pub fn serve(
     let server = VncServer::bind(&address, served.image(&framebuffer).clone(), config)?;
     server.set_serve_scale((scale * 100.0).round() as u8);
     server.set_serve_display(plan.announcement());
-    report(ServerNotice::Serving {
-        address: server.local_addr()?,
-        display: plan.description(),
-        width: served_width,
-        height: served_height,
-    });
+    report_serving(
+        &server,
+        report,
+        plan.description(),
+        served_width,
+        served_height,
+    )?;
     if let Some(notice) = plan.fallback_notice() {
         report(ServerNotice::Message(notice));
     }
