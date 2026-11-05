@@ -141,7 +141,9 @@ The server shares the primary display unless `--display NUMBER` selects another 
 
 Windows shows its lock and sign-in screens on a secure desktop that only SYSTEM can capture or type into, so the Server tab and `--serve` cannot unlock the computer. The optional **TopVNC Host** service can. It runs as LocalSystem and starts a host agent as SYSTEM in the session at the physical console. Capture and input in that agent follow whichever desktop receives input, including the lock screen, the sign-in screen after a restart, and UAC prompts. Viewers still sign in with the VNC password, then unlock Windows with that account's normal Windows password or PIN. Nothing bypasses Windows sign-in or turns off screen locking.
 
-From an administrator terminal, with the same options as `--serve`:
+From the TopVNC window, open **... → SERVICE**. The tab shows whether the service is installed, stopped, or running and on which address, and whether Ctrl+Alt+Delete is allowed. It also shows where the log is. **INSTALL SERVICE** uses the Server tab's settings and password, and **REMOVE SERVICE** removes the service. Both ask for Windows administrator approval; no terminal is needed. The window checks the settings before asking: a password is required, and plain TCP is allowed only on a loopback address. It passes the password to the approved installer over a private pipe that only SYSTEM, Administrators, and your account can open, and only after confirming the installer is the process it started. The installer's summary or error appears in the tab. While the service is running, the Server tab will not start on the service's port.
+
+Or from an administrator terminal, with the same options as `--serve`:
 
 ```sh
 topvnc --install-service 127.0.0.1:5900 --unencrypted        # for the browser gateway on this computer
@@ -401,12 +403,14 @@ cargo run
 | [`src/window.rs`](src/window.rs) | winit event loop, wgpu textures and surfaces, and synchronized or immediate presentation. |
 | [`src/presentation.rs`](src/presentation.rs) | Platform-neutral incremental frame mailbox and bounded frame-pacing statistics. |
 | [`src/session_render.rs`](src/session_render.rs) | Dedicated session render worker, separate from input and protocol decoding. |
-| [`src/ui.rs`](src/ui.rs) | Connect, Server, Work, Network, and Firewall tabs and in-session settings UI. |
+| [`src/ui.rs`](src/ui.rs) | Connect, Server, Web, Work, Network, Firewall, and Service tabs and in-session settings UI. |
 | [`src/helpers.rs`](src/helpers.rs) | Windows helper forms, script resolution, bounded background execution, and reports. |
 | [`src/settings.rs`](src/settings.rs) | Saved connection details and platform-specific password storage. |
 | [`src/desktop_host.rs`](src/desktop_host.rs) | Platform-neutral server host logic: input ownership, Windows and macOS key mapping, capture and pointer geometry, frame hand-off, and cursor compositing. |
 | [`src/windows_server.rs`](src/windows_server.rs) | Windows Desktop Duplication capture and remote keyboard/mouse injection for the Server tab and `--serve`. |
 | [`src/windows_service.rs`](src/windows_service.rs) | The optional TopVNC Host service and its SYSTEM agent, which serve the Windows lock and sign-in screens. |
+| [`src/host_service.rs`](src/host_service.rs) | The Service tab's status polling, install options taken from the Server tab, and port-conflict checks. |
+| [`src/service_pipe.rs`](src/service_pipe.rs) | Administrator approval for the service installer and the private pipe that passes it the password. |
 | [`src/macos_server.rs`](src/macos_server.rs) | macOS ScreenCaptureKit capture, Quartz keyboard/mouse injection, and pasteboard sync for the Server tab and `--serve`. |
 | [`build.rs`](build.rs) | Weak-links ScreenCaptureKit so the app still starts on macOS releases older than 12.3. |
 | [`examples/latency_bench.rs`](examples/latency_bench.rs) | End-to-end frame rate and latency benchmark over an emulated network link. |

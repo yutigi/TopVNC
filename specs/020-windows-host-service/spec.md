@@ -39,6 +39,43 @@ Windows shows the lock screen, the sign-in screen, and UAC prompts on the Winlog
 7. Switching users moves the agent to the new console session.
 8. Stopping or uninstalling the service ends the agent, leaves no key held, and removes the password and the copied executable.
 
+## Installing from the TopVNC window
+
+Scope: install, see the status of, and remove the service from the TopVNC window, without opening an administrator terminal. The command line stays as it is, and both paths share one installer.
+
+- **Where:** MORE ▸ SERVICE. The tab shows the service state: not installed, stopped, starting, running on its address, or stopping. It reads the state without administrator rights (`SC_MANAGER_CONNECT`, `SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG`) about once a second while the tab is shown. It also shows whether the Ctrl+Alt+Delete policy allows services, and where the service log is.
+- **Options:** the service uses the Server tab's settings and password, in the same way as the WEB tab. The window checks them with the installer's rules before asking for approval: a password is required ("allow none" is refused), and plain TCP is allowed only on a loopback address.
+- **Install:** clicking INSTALL starts `topvnc --install-service --ui-pipe NAME [--serve options]` hidden, through `ShellExecuteEx` with the `runas` verb, so Windows asks for administrator approval. The elevated installer reads the password from the pipe instead of the console, and writes its summary or error back to the pipe. The tab shows that text.
+- **Remove:** REMOVE does the same with `topvnc --uninstall-service --ui-pipe NAME`. Nothing is sent to it.
+- **Port conflict:** while the service is running, START SERVER in the Server tab refuses the service's port and says why.
+
+Security of the password hand-off. The installer's guarantees above still hold:
+
+- The window creates the pipe before it starts the installer. The pipe has these properties:
+  - a random 128-bit name, `\\.\pipe\topvnc-service-<32 hex digits>`;
+  - `FILE_FLAG_FIRST_PIPE_INSTANCE`, so no other process can already own the name;
+  - one instance;
+  - remote clients rejected;
+  - a DACL that grants only SYSTEM, Administrators, and the signed-in user.
+- The window sends the password only after it checks that the connected client is the process it started (`GetNamedPipeClientProcessId`). The password is length-prefixed and at most 1024 bytes.
+- The elevated side accepts only a pipe name of exactly that form, so it never opens a path or a remote share. It opens the pipe at identification level (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`), so the pipe's owner cannot impersonate the administrator.
+- The password is never on a command line, in a file, or in a log. No console window is shown.
+
+Acceptance criteria for the window:
+
+9. Showing the SERVICE tab never asks for administrator approval. On a computer without the service, the tab shows NOT INSTALLED.
+10. INSTALL is refused in the window, before any approval prompt, in these cases: an empty password, "allow none", or plain TCP on an address that is not loopback.
+11. Cancelling the approval prompt installs nothing, and the tab says that approval was cancelled.
+12. Approving installs and starts the service. The tab then shows the following, and no console window appears:
+    - RUNNING ON the address;
+    - the installer's summary;
+    - the Ctrl+Alt+Delete policy state;
+    - the log path.
+
+    The password does not appear in `sc qc TopVNCHost` or in any file.
+13. REMOVE, once approved, stops and removes the service, and the tab shows NOT INSTALLED.
+14. With the service running on port P, START SERVER on port P is refused with an explanation, and another port still starts.
+
 ## Validation (Windows 11, 2026-11-05)
 
 - Unit tests:
@@ -54,3 +91,23 @@ Windows shows the lock screen, the sign-in screen, and UAC prompts on the Winlog
   - `--host-agent` cannot read the password outside SYSTEM.
   - Nothing was installed (`sc query TopVNCHost` fails with 1060).
 - Not yet validated: criteria 2 to 8 need an administrator to install the service and a person at the computer to lock and unlock it. They have not been run.
+
+Installing from the window (Windows 11, 2026-11-05). No test asks for administrator approval:
+
+- Unit tests:
+  - The service's options come from the Server tab's form and parse back the same. The password is never an argument. "Allow none", an empty password, and an invalid port are refused.
+  - Before approval, plain TCP on a non-loopback address and missing TLS files are refused. Relative TLS paths reach the installer as absolute paths.
+  - Command lines split back into the arguments they were built from. The installed command line gives the service's address.
+  - Service manager states map to the tab's states. Reading the status succeeds without administrator rights.
+  - Pipe names: only `topvnc-service-` plus 32 lowercase hex digits; never a path or a share.
+  - Password frames round-trip. Empty, oversized, truncated, and non-UTF-8 frames are refused.
+  - A window pipe with an installer standing in on a thread of the same process. The pipe name cannot be created twice. The password reaches the installer, and the installer's report and error come back.
+  - A client that is not the started process is refused before anything is sent. An installer that ends without connecting is reported.
+  - Port conflicts: any host on the service's port, only while it is starting or running.
+  - The tab's layout, status lines, report wrapping, and its password shared with the Server tab.
+- Smoke tests from a non-administrator terminal:
+  - `--ui-pipe` with a name of the wrong form, or a path, is refused.
+  - A well-formed name with no window is reported as unreachable.
+  - `--uninstall-service extra` prints the usage.
+  - Nothing was installed (`sc query TopVNCHost` fails with 1060).
+- Not yet validated: criteria 9 to 14 in the running window. They need a person to look at the tab and to approve or cancel the prompt.
