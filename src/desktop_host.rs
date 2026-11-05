@@ -662,6 +662,9 @@ pub enum ServerNotice {
     ViewOnly(bool),
     /// A recoverable condition, such as a capture pause or clipboard failure.
     Message(String),
+    /// The server's listeners, sent just before [`Self::Serving`], so the
+    /// host window can add or remove listeners while the server runs.
+    Listeners(topvnc::ServerListeners),
 }
 
 /// Host permissions the Server tab shows while the server is stopped.
@@ -696,8 +699,33 @@ impl std::fmt::Display for ServerNotice {
                 formatter.write_str("Accessibility access granted; remote input is enabled.")
             }
             Self::Message(message) => formatter.write_str(message),
+            Self::Listeners(_) => formatter.write_str("Listening for viewers."),
         }
     }
+}
+
+/// Report the server's listeners, then that it serves `display`.
+///
+/// The bound address is read first: once the host window holds the
+/// listeners it may remove the first one at any time, for example when the
+/// tab that started the server stops while another tab joins it.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+pub fn report_serving(
+    server: &topvnc::VncServer,
+    report: &dyn Fn(ServerNotice),
+    display: String,
+    width: u16,
+    height: u16,
+) -> std::io::Result<()> {
+    let address = server.local_addr()?;
+    report(ServerNotice::Listeners(server.listeners()));
+    report(ServerNotice::Serving {
+        address,
+        display,
+        width,
+        height,
+    });
+    Ok(())
 }
 
 pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'static str> {
