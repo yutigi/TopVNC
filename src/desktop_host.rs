@@ -23,6 +23,9 @@ pub const WHEEL_DELTA: i32 = 120;
 /// Capture is recreated after a failure with exponential backoff between these.
 pub const CAPTURE_RETRY_MIN: Duration = Duration::from_millis(250);
 pub const CAPTURE_RETRY_MAX: Duration = Duration::from_secs(2);
+/// How long capture may stay stopped before viewers are told, so a planned
+/// restart on another display does not flash a notice.
+pub const CAPTURE_STATUS_GRACE: Duration = Duration::from_secs(1);
 
 pub const SERVE_USAGE: &str = "usage: topvnc --serve [HOST:PORT] [--display primary|NUMBER|all] [--scale 0.25-1] [--mouse auto|relative|absolute] [--priority whole|center|mouse|changes] [--ultra] [--tls-cert CERT.pem --tls-key KEY.pem | --unencrypted] [--allow-insecure]";
 
@@ -198,6 +201,11 @@ impl<L: PartialEq> LayoutWatch<L> {
         }
     }
 
+    /// Whether `layout` is the current layout, with no change settling.
+    pub fn is_current(&self, layout: &L) -> bool {
+        self.settling.is_none() && *layout == self.current
+    }
+
     /// Compare a newly read `layout`. Returns whether it is a settled
     /// change, which then becomes the current layout.
     pub fn changed(&mut self, layout: L) -> bool {
@@ -246,6 +254,13 @@ impl DisplayPlan {
         self.chosen.announcement(self.attached)
     }
 
+    /// Whether every planned display has its area in `layout`.
+    pub fn shown_in(&self, layout: &[DisplayArea]) -> bool {
+        self.outputs
+            .iter()
+            .all(|(_, rect)| layout.iter().any(|display| display.rect == *rect))
+    }
+
     pub fn description(&self) -> String {
         match self.chosen.number {
             Some(number) => format!(
@@ -287,6 +302,10 @@ pub struct DisplayFollower {
     /// What the running capture serves, and the layout it was checked
     /// against; `None` while capture is stopped.
     serving: Option<(DisplayPlan, LayoutWatch<Vec<DisplayArea>>)>,
+    /// A layout that capture was restarted for because it lacked planned
+    /// displays; it is not restarted for again, so two sources that
+    /// disagree for good cannot restart capture over and over.
+    stale_restart: Option<Vec<DisplayArea>>,
 }
 
 impl DisplayFollower {
@@ -294,6 +313,7 @@ impl DisplayFollower {
         Self {
             selection,
             serving: None,
+            stale_restart: None,
         }
     }
 
@@ -334,16 +354,29 @@ impl DisplayFollower {
 
     /// The monitor layout was read again. A change counts once it reads the
     /// same twice in a row; see [`LayoutWatch`].
+    ///
+    /// Capture can also start from a display listing taken while Windows
+    /// was still reconfiguring: the layout read just before already showed
+    /// the change, so it never changes again, while capture waits on a
+    /// display that no longer shows anything. When the steady layout lacks
+    /// a planned display, capture restarts once for that layout.
     pub fn layout_read(
         &mut self,
         layout: Vec<DisplayArea>,
         attached: impl FnOnce() -> Result<Vec<DisplayArea>, String>,
     ) -> DisplayChange {
-        let settled = self
-            .serving
-            .as_mut()
-            .is_some_and(|(_, watch)| watch.changed(layout));
-        if settled {
+        let Some((plan, watch)) = self.serving.as_mut() else {
+            return DisplayChange::None;
+        };
+        if watch.is_current(&layout)
+            && !plan.shown_in(&layout)
+            && self.stale_restart.as_ref() != Some(&layout)
+        {
+            self.stale_restart = Some(layout);
+            return DisplayChange::Restart;
+        }
+        if watch.changed(layout) {
+            self.stale_restart = None;
             self.follow(attached)
         } else {
             DisplayChange::None
@@ -371,6 +404,62 @@ impl DisplayFollower {
             DisplayChange::Renumbered
         } else {
             DisplayChange::None
+        }
+    }
+}
+
+/// Keeps only the displays whose names are in `connected`, the displays a
+/// monitor is still connected to. With `None`, when the system cannot say,
+/// every display is kept.
+pub fn connected_displays(
+    displays: Vec<DisplayArea>,
+    connected: Option<&HashSet<String>>,
+) -> Vec<DisplayArea> {
+    displays
+        .into_iter()
+        .filter(|display| display_connected(&display.name, connected))
+        .collect()
+}
+
+/// Whether the display named `name` is in `connected`, compared without
+/// case; every display is when the system cannot say (`None`).
+pub fn display_connected(name: &str, connected: Option<&HashSet<String>>) -> bool {
+    connected.is_none_or(|connected| connected.contains(&name.to_ascii_uppercase()))
+}
+
+/// Decides what viewers are told while capture is stopped: nothing during
+/// the first [`CAPTURE_STATUS_GRACE`], then why capture last failed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureOutage {
+    since: Option<Instant>,
+    reason: Option<topvnc::CaptureStatus>,
+}
+
+impl CaptureOutage {
+    /// Capture stopped at `now`, or is still stopped.
+    pub fn stopped(&mut self, now: Instant) {
+        self.since.get_or_insert(now);
+    }
+
+    /// Starting capture failed at `now` for `reason`.
+    pub fn failed(&mut self, reason: topvnc::CaptureStatus, now: Instant) {
+        self.stopped(now);
+        self.reason = Some(reason);
+    }
+
+    /// Capture is running again.
+    pub fn resumed(&mut self) {
+        *self = Self::default();
+    }
+
+    /// What viewers should be told at `now`.
+    pub fn status(&self, now: Instant) -> topvnc::CaptureStatus {
+        match self.since {
+            Some(since) if now.saturating_duration_since(since) >= CAPTURE_STATUS_GRACE => self
+                .reason
+                .filter(|reason| *reason != topvnc::CaptureStatus::Live)
+                .unwrap_or(topvnc::CaptureStatus::Unavailable),
+            _ => topvnc::CaptureStatus::Live,
         }
     }
 }
@@ -703,6 +792,24 @@ pub fn windows_key_identity(keysym: u32) -> KeyIdentity {
     keysym_to_virtual_key(keysym)
         .map(KeyIdentity::Virtual)
         .unwrap_or(KeyIdentity::Unicode(keysym))
+}
+
+/// Whether pressing `key` while the `held` keys are down is Ctrl+Alt+Delete,
+/// the secure attention sequence. Windows ignores it when injected as keys;
+/// only `SendSAS` from a service, or a real keyboard, starts it.
+pub fn is_secure_attention(key: KeyIdentity, held: impl IntoIterator<Item = KeyIdentity>) -> bool {
+    // Delete and keypad Delete share the virtual key.
+    if !matches!(key, KeyIdentity::Virtual(VirtualKey { code: 0x2e, .. })) {
+        return false;
+    }
+    let (mut control, mut alt) = (false, false);
+    for key in held {
+        if let KeyIdentity::Virtual(VirtualKey { code, .. }) = key {
+            control |= matches!(code, 0x11 | 0xa2 | 0xa3);
+            alt |= matches!(code, 0x12 | 0xa4 | 0xa5);
+        }
+    }
+    control && alt
 }
 
 /// Keys whose scan codes carry the 0xE0 prefix on a standard keyboard.
@@ -2244,6 +2351,26 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_alt_delete_is_recognized_from_either_side_and_the_keypad() {
+        let held = |keysyms: &[u32]| {
+            keysyms
+                .iter()
+                .map(|&keysym| key(keysym))
+                .collect::<Vec<_>>()
+        };
+        // Control_L, Control_R, Alt_L, Alt_R; Delete and KP_Delete.
+        for (control, alt) in [(0xffe3, 0xffe9), (0xffe4, 0xffea)] {
+            for delete in [0xffff, 0xff9f] {
+                assert!(is_secure_attention(key(delete), held(&[control, alt])));
+            }
+        }
+        assert!(!is_secure_attention(key(0xffff), held(&[0xffe3])));
+        assert!(!is_secure_attention(key(0xffff), held(&[0xffe9])));
+        assert!(!is_secure_attention(key(0xffff), held(&[0xffe1, 0xffe9])));
+        assert!(!is_secure_attention(key(0xff08), held(&[0xffe3, 0xffe9])));
+    }
+
+    #[test]
     fn keysyms_map_to_windows_virtual_keys_and_extended_flags() {
         assert_eq!(keysym_to_virtual_key('a' as u32), vk(0x41));
         assert_eq!(keysym_to_virtual_key('A' as u32), vk(0x41));
@@ -2691,6 +2818,108 @@ mod tests {
         );
         let plan = restart(&mut follower, &desktops::one_primary());
         assert_eq!(served(&plan).0, "\\\\.\\DISPLAY1");
+    }
+
+    /// Capture started from a DXGI listing that still had display 1, after
+    /// the layout read just before already showed it unplugged. The layout
+    /// never changes again, so only the planned display's absence from it
+    /// shows that capture waits on a display that shows nothing.
+    #[test]
+    fn capture_started_from_a_stale_listing_restarts_once() {
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        let stale = desktops::one_primary();
+        let layout = desktops::only_two();
+        let plan = DisplayPlan::new(follower.selection(), &stale).unwrap();
+        follower.started(plan, layout.clone());
+        let attached = || Ok(desktops::only_two());
+        assert_eq!(
+            follower.layout_read(layout.clone(), attached),
+            DisplayChange::Restart
+        );
+        let plan = restart(&mut follower, &desktops::only_two());
+        assert_eq!(served(&plan).0, "\\\\.\\DISPLAY2");
+        assert_eq!(
+            follower.layout_read(layout.clone(), attached),
+            DisplayChange::None
+        );
+        // Sources that disagree for good restart capture only once.
+        follower.stopped();
+        let plan = DisplayPlan::new(follower.selection(), &stale).unwrap();
+        follower.started(plan, layout.clone());
+        for _ in 0..3 {
+            assert_eq!(
+                follower.layout_read(layout.clone(), attached),
+                DisplayChange::None
+            );
+        }
+        // A later settled change is followed as usual.
+        assert_eq!(
+            settle(&mut follower, &desktops::one_primary()),
+            DisplayChange::None
+        );
+    }
+
+    /// Windows can keep an unplugged monitor's display on the desktop for a
+    /// while, or for good, while nothing is shown on it; it is then left out
+    /// of the layout and the attached displays alike.
+    #[test]
+    fn displays_without_a_connected_monitor_are_left_out() {
+        let connected = HashSet::from(["\\\\.\\DISPLAY2".to_string()]);
+        let remaining = connected_displays(desktops::one_primary(), Some(&connected));
+        assert_eq!(remaining, vec![desktops::one_primary()[1].clone()]);
+        // Windows has not yet made the remaining display primary; it is
+        // served anyway.
+        let plan = DisplayPlan::new(DisplaySelection::Primary, &remaining).unwrap();
+        assert_eq!(served(&plan).0, "\\\\.\\DISPLAY2");
+        assert_eq!(
+            connected_displays(desktops::one_primary(), None),
+            desktops::one_primary()
+        );
+        // The only monitor unplugged: nothing can be captured.
+        let none = connected_displays(desktops::only_one(), Some(&connected));
+        assert!(none.is_empty());
+        assert!(DisplayPlan::new(DisplaySelection::Primary, &none).is_err());
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        start(&mut follower, &desktops::one_primary());
+        assert_eq!(settle(&mut follower, &remaining), DisplayChange::Restart);
+    }
+
+    #[test]
+    fn viewers_learn_of_a_capture_outage_only_after_the_grace_period() {
+        use topvnc::CaptureStatus;
+        let start = Instant::now();
+        let mut outage = CaptureOutage::default();
+        assert_eq!(outage.status(start), CaptureStatus::Live);
+        // A planned restart on another display stays quiet.
+        outage.stopped(start);
+        assert_eq!(outage.status(start), CaptureStatus::Live);
+        outage.resumed();
+        assert_eq!(
+            outage.status(start + CAPTURE_STATUS_GRACE * 2),
+            CaptureStatus::Live
+        );
+        // An outage is reported with the last reason once the grace passed,
+        // counted from when capture first stopped.
+        outage.stopped(start);
+        outage.failed(CaptureStatus::Unavailable, start + CAPTURE_STATUS_GRACE / 2);
+        outage.failed(CaptureStatus::NoDisplay, start + CAPTURE_STATUS_GRACE / 2);
+        assert_eq!(outage.status(start), CaptureStatus::Live);
+        assert_eq!(
+            outage.status(start + CAPTURE_STATUS_GRACE),
+            CaptureStatus::NoDisplay
+        );
+        // Stopped without a known reason.
+        let mut unknown = CaptureOutage::default();
+        unknown.stopped(start);
+        assert_eq!(
+            unknown.status(start + CAPTURE_STATUS_GRACE),
+            CaptureStatus::Unavailable
+        );
+        outage.resumed();
+        assert_eq!(
+            outage.status(start + CAPTURE_STATUS_GRACE * 4),
+            CaptureStatus::Live
+        );
     }
 
     /// The reported bug: the served monitor is unplugged.

@@ -3,13 +3,13 @@
 //! Every method appends the messages to send to `out`; the caller writes
 //! them to its transport in order.
 
-use crate::ServedDisplays;
 use crate::invalid;
 use crate::messages::{fence_message, key_event, pointer_event, set_encodings_message};
 use crate::protocol::{
     FENCE_REQUEST, MAX_RELATIVE_DELTA, MAX_SERVED_DISPLAYS, POINTER_MOTION_CHANGE_ENCODING,
     RELATIVE_POINTER_ORIGIN, SERVE_DISPLAY_FENCE, SERVE_SCALE_FENCE,
 };
+use crate::{CaptureStatus, ServedDisplays};
 use std::io;
 
 /// Keys tracked for [`InputState::release_all`]; more held at once are sent
@@ -27,6 +27,7 @@ pub struct InputState {
     extended_buttons: bool,
     serve_scale: Option<u8>,
     serve_display: Option<ServedDisplays>,
+    capture_status: CaptureStatus,
     /// The last absolute position sent.
     position: (u16, u16),
     /// The buttons last sent.
@@ -43,6 +44,7 @@ impl InputState {
             extended_buttons: false,
             serve_scale: None,
             serve_display: None,
+            capture_status: CaptureStatus::Live,
             position: (0, 0),
             buttons: 0,
             held_keys: Vec::new(),
@@ -213,6 +215,15 @@ impl InputState {
 
     pub fn set_serve_display(&mut self, displays: ServedDisplays) {
         self.serve_display = Some(displays);
+    }
+
+    /// Whether the host can capture its desktop; live until it says not.
+    pub fn capture_status(&self) -> CaptureStatus {
+        self.capture_status
+    }
+
+    pub fn set_capture_status(&mut self, status: CaptureStatus) {
+        self.capture_status = status;
     }
 
     /// Ask the host to serve `display`, numbered from 1, or 0 for all

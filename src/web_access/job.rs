@@ -53,10 +53,15 @@ fn create() -> Result<Job, String> {
 /// Put `child` in TopVNC's job. A child that cannot be adopted is not
 /// started, so it can never outlive TopVNC.
 pub fn adopt(child: &std::process::Child) -> Result<(), String> {
+    adopt_handle(child.as_raw_handle())
+}
+
+/// Like [`adopt`], for a process started without `std::process`.
+pub fn adopt_handle(process: HANDLE) -> Result<(), String> {
     static JOB: OnceLock<Result<Job, String>> = OnceLock::new();
     let job = JOB.get_or_init(create).as_ref().map_err(Clone::clone)?;
     // SAFETY: both handles are valid for the duration of the call.
-    let assigned = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) };
+    let assigned = unsafe { AssignProcessToJobObject(job.0, process) };
     if assigned == 0 {
         return Err(format!(
             "could not tie the child process to TopVNC: {}",
