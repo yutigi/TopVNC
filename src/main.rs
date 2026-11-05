@@ -2728,20 +2728,26 @@ mod tests {
 
     impl FakeHost {
         /// Report the listeners and start serving, as the thread does.
+        /// `hosted` handles each notice as soon as it is sent, the earliest
+        /// the window could, so a listener it removes on `Listeners` is
+        /// already closed when the thread reports `Serving`.
         fn serve(&self, hosted: &mut HostedServer) -> Option<String> {
-            let notices = [
-                ServerNotice::Listeners(self.server.listeners()),
-                ServerNotice::Serving {
-                    address: self.server.local_addr().unwrap(),
-                    display: "DISPLAY1".into(),
-                    width: 1920,
-                    height: 1080,
+            let hosted = std::cell::RefCell::new(hosted);
+            let failure = std::cell::RefCell::new(None);
+            desktop_host::report_serving(
+                &self.server,
+                &|notice| {
+                    self.events.send(HostEvent::Notice(notice)).unwrap();
+                    if let Some(error) = hosted.borrow_mut().poll() {
+                        failure.borrow_mut().get_or_insert(error);
+                    }
                 },
-            ];
-            for notice in notices {
-                self.events.send(HostEvent::Notice(notice)).unwrap();
-            }
-            hosted.poll()
+                "DISPLAY1".into(),
+                1920,
+                1080,
+            )
+            .unwrap();
+            failure.into_inner()
         }
 
         fn listeners(&self) -> ServerListeners {

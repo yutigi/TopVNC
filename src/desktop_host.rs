@@ -615,6 +615,30 @@ impl std::fmt::Display for ServerNotice {
     }
 }
 
+/// Report the server's listeners, then that it serves `display`.
+///
+/// The bound address is read first: once the host window holds the
+/// listeners it may remove the first one at any time, for example when the
+/// tab that started the server stops while another tab joins it.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+pub fn report_serving(
+    server: &topvnc::VncServer,
+    report: &dyn Fn(ServerNotice),
+    display: String,
+    width: u16,
+    height: u16,
+) -> std::io::Result<()> {
+    let address = server.local_addr()?;
+    report(ServerNotice::Listeners(server.listeners()));
+    report(ServerNotice::Serving {
+        address,
+        display,
+        width,
+        height,
+    });
+    Ok(())
+}
+
 pub fn parse_serve_arguments(arguments: &[String]) -> Result<ServeOptions, &'static str> {
     let mut options = ServeOptions {
         tls: Default::default(),
