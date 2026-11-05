@@ -117,16 +117,9 @@ fn launch() -> Launch {
     }
 }
 
-fn serving(address: &str, authenticated: bool, plain: bool) -> HostServer {
-    HostServer::Serving {
-        address: address.into(),
-        authenticated,
-        plain,
-    }
-}
-
+/// The WEB tab's listener is open.
 fn ours() -> HostServer {
-    serving("127.0.0.1:5900", true, true)
+    HostServer::Serving
 }
 
 fn runtime() -> (WebRuntime, FakeSpawner) {
@@ -254,23 +247,12 @@ fn a_gateway_that_ignores_stdin_is_killed_after_the_grace_period() {
 }
 
 #[test]
-fn reuses_only_a_matching_server_and_leaves_it_running() {
+fn starts_only_with_a_password_and_its_listener_closed() {
     let now = Instant::now();
-    let (mut web, spawner) = runtime();
-    // No password is needed for a server that already has one.
-    web.start(launch(), "", &ours(), now).unwrap();
-    assert_eq!(*web.row(Row::Server), RowState::Ready);
-    assert_eq!(web.poll(&ours(), now), None);
-    assert_eq!(spawner.count(), 1);
-    web.stop();
-    assert_eq!(web.poll(&ours(), now), None);
-    assert!(web.is_idle(), "a reused server is not stopped");
-
+    // A listener left from an earlier run must close first; a server the
+    // Server tab runs does not show here, so it never blocks the start.
     for (server, why) in [
-        (serving("0.0.0.0:5900", true, true), "all networks"),
-        (serving("127.0.0.1:5901", true, true), "another port"),
-        (serving("127.0.0.1:5900", false, true), "no password"),
-        (serving("127.0.0.1:5900", true, false), "TLS"),
+        (ours(), "serving"),
         (HostServer::Starting, "starting"),
         (HostServer::Stopping, "stopping"),
     ] {

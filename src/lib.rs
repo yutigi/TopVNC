@@ -22,6 +22,8 @@ pub use topvnc_rfb::{
 };
 use topvnc_rfb::{Decoded, InputState, MessageReader, RectDecoder, ServerMessage};
 
+mod listeners;
+pub use listeners::{ListenerId, ListenerSecurity, ServerListeners};
 pub mod presentation;
 pub mod transport;
 use transport::NativeStream;
@@ -589,7 +591,7 @@ impl Default for ServerConfig {
 /// and announces size changes with the DesktopSize pseudo-encoding.
 /// The caller owns display capture and OS input injection.
 pub struct VncServer {
-    listener: std::net::TcpListener,
+    listeners: ServerListeners,
     framebuffer: Arc<Mutex<ServerFramebuffer>>,
     /// The framebuffer's generation and size, readable without its lock.
     geometry: Arc<Geometry>,
@@ -666,6 +668,8 @@ fn shut_down_client(stream: &TcpStream) {
 struct ServerSessions {
     /// The socket handle each session reads from, shared with its stream.
     streams: std::collections::HashMap<u64, Arc<TcpStream>>,
+    /// The listener each session arrived on.
+    arrivals: std::collections::HashMap<u64, ListenerId>,
     wakers: std::collections::HashMap<u64, SessionWaker>,
     exclusive_client: Option<u64>,
 }
@@ -681,7 +685,12 @@ impl ServerSessions {
         }
     }
 
-    fn register(&mut self, client_id: u64, stream: impl Into<Arc<TcpStream>>) -> io::Result<()> {
+    fn register(
+        &mut self,
+        client_id: u64,
+        listener: ListenerId,
+        stream: impl Into<Arc<TcpStream>>,
+    ) -> io::Result<()> {
         if self.exclusive_client.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -689,6 +698,7 @@ impl ServerSessions {
             ));
         }
         self.streams.insert(client_id, stream.into());
+        self.arrivals.insert(client_id, listener);
         Ok(())
     }
 
@@ -727,6 +737,7 @@ impl ServerSessions {
 
     fn remove(&mut self, client_id: u64) {
         self.streams.remove(&client_id);
+        self.arrivals.remove(&client_id);
         self.wakers.remove(&client_id);
         if self.exclusive_client == Some(client_id) {
             self.exclusive_client = None;
@@ -736,6 +747,17 @@ impl ServerSessions {
     fn shutdown_all(&self) {
         for stream in self.streams.values() {
             shut_down_client(stream);
+        }
+    }
+
+    /// End the sessions that arrived on `listener`.
+    fn shutdown_listener(&self, listener: ListenerId) {
+        for (client_id, arrival) in &self.arrivals {
+            if *arrival == listener
+                && let Some(stream) = self.streams.get(client_id)
+            {
+                shut_down_client(stream);
+            }
         }
     }
 }
@@ -838,29 +860,27 @@ impl VncServer {
         framebuffer: Framebuffer,
         config: ServerConfig,
     ) -> io::Result<Self> {
-        if config
-            .password
-            .as_ref()
-            .is_some_and(|password| password.is_empty())
-        {
-            return Err(invalid("server password must not be empty"));
-        }
-        if config.password.is_none() && !config.allow_insecure {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "server requires a password unless allow_insecure is explicitly enabled",
-            ));
-        }
         if config.name.len() > MAX_NAME_BYTES {
             return Err(invalid("server name is too long"));
         }
-        let listener = std::net::TcpListener::bind(address)?;
+        let sessions = Arc::new(Mutex::new(ServerSessions::default()));
+        let listeners = ServerListeners::new(Arc::clone(&sessions));
+        // The configured security is the primary listener's; listeners
+        // added later bring their own.
+        listeners.add_primary(
+            address,
+            ListenerSecurity {
+                tls: config.tls.clone(),
+                password: config.password.clone(),
+                allow_insecure: config.allow_insecure,
+            },
+        )?;
         let (events, event_receiver) = std::sync::mpsc::sync_channel(SERVER_EVENT_QUEUE_CAPACITY);
         let geometry = Geometry::default();
         let (width, height) = framebuffer.dimensions();
         geometry.store(0, width, height);
         Ok(Self {
-            listener,
+            listeners,
             framebuffer: Arc::new(Mutex::new(ServerFramebuffer::new(framebuffer))),
             geometry: Arc::new(geometry),
             relative_pointer: Arc::new(AtomicBool::new(false)),
@@ -874,13 +894,27 @@ impl VncServer {
             active_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             stopped: std::sync::atomic::AtomicBool::new(false),
             next_client_id: std::sync::atomic::AtomicU64::new(1),
-            sessions: Arc::new(Mutex::new(ServerSessions::default())),
+            sessions,
             clipboard: Arc::new(Mutex::new(ServerClipboard::default())),
         })
     }
 
+    /// The address of the listener the server was bound with.
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
-        self.listener.local_addr()
+        self.listeners
+            .primary()
+            .and_then(|primary| self.listeners.local_addr(primary))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "the server's first listener is closed",
+                )
+            })
+    }
+
+    /// The server's listeners, to add or remove ones while it runs.
+    pub fn listeners(&self) -> ServerListeners {
+        self.listeners.clone()
     }
 
     /// Open client connections, including ones still authenticating.
@@ -1004,134 +1038,137 @@ impl VncServer {
     pub fn stop(&self) {
         self.stopped
             .store(true, std::sync::atomic::Ordering::Release);
+        self.listeners.close();
         if let Ok(sessions) = self.sessions.lock() {
             sessions.shutdown_all();
         }
     }
 
-    /// Accept clients until [`VncServer::stop`] is called or an I/O error occurs.
+    /// Accept clients on every listener until [`VncServer::stop`] is called
+    /// or an I/O error occurs.
     pub fn run(&self) -> io::Result<()> {
-        self.listener.set_nonblocking(true)?;
         while !self.stopped.load(std::sync::atomic::Ordering::Acquire) {
-            let stream = match self.listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                // A client that resets before it is accepted affects only
-                // that connection; keep listening for others.
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::ConnectionAborted
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if stream.set_nonblocking(false).is_err() {
-                continue;
-            }
-            if self
-                .active_clients
-                .try_update(
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                    |count| (count < 8).then_some(count + 1),
-                )
-                .is_err()
-            {
-                drop(stream);
-                continue;
-            }
-            let client_id = self
-                .next_client_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let sessions = Arc::clone(&self.sessions);
-            // The registry and the session share one socket handle, so a
-            // server-side close can cancel the session's blocked read.
-            let stream = Arc::new(stream);
-            let registration = sessions
-                .lock()
-                .map_err(|_| invalid("session registry lock is poisoned"))
-                .and_then(|mut sessions| sessions.register(client_id, Arc::clone(&stream)));
-            if registration.is_err() {
-                self.active_clients
-                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                drop(stream);
-                continue;
-            }
-            let shared = SessionShared {
-                framebuffer: Arc::clone(&self.framebuffer),
-                geometry: Arc::clone(&self.geometry),
-                relative_pointer: Arc::clone(&self.relative_pointer),
-                serve_scale: Arc::clone(&self.serve_scale),
-                requested_serve_scale: Arc::clone(&self.requested_serve_scale),
-                serve_display: Arc::clone(&self.serve_display),
-                requested_display: Arc::clone(&self.requested_display),
-                clipboard: Arc::clone(&self.clipboard),
-                thread_setup: self.config.thread_setup,
-                priority: self.config.priority,
-                performance: self.config.performance,
-                focus: Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
-            };
-            let events = self.events.clone();
-            let config = self.config.clone();
-            let active_clients = Arc::clone(&self.active_clients);
-            let client_sessions = Arc::clone(&self.sessions);
-            let result = std::thread::Builder::new()
-                .name("topvnc-rfb-client".into())
-                .spawn(move || {
-                    struct ClientSlot {
-                        active: Arc<std::sync::atomic::AtomicUsize>,
-                        sessions: Arc<Mutex<ServerSessions>>,
-                        client_id: u64,
-                    }
-                    impl Drop for ClientSlot {
-                        fn drop(&mut self) {
-                            self.active
-                                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                            if let Ok(mut sessions) = self.sessions.lock() {
-                                sessions.remove(self.client_id);
-                            }
-                        }
-                    }
-                    let _slot = ClientSlot {
-                        active: active_clients,
-                        sessions: client_sessions.clone(),
-                        client_id,
-                    };
-                    if let Some(setup) = shared.thread_setup {
-                        setup();
-                    }
-                    let deadline = Instant::now() + SERVER_HANDSHAKE_TIMEOUT;
-                    let Ok(mut stream) = NativeStream::server(stream, config.tls.clone(), deadline)
-                    else {
-                        return;
-                    };
-                    let _ = stream.set_nodelay(true);
-                    let _ = serve_client(
-                        &mut stream,
-                        &shared,
-                        &events,
-                        &config,
-                        &client_sessions,
-                        client_id,
-                        deadline,
-                    );
-                    let _ = events.send(ClientEvent::ClientDisconnected { client_id });
-                });
-            if let Err(error) = result {
-                self.active_clients
-                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                return Err(error);
+            let accepted = self
+                .listeners
+                .accept_each(|stream, listener| self.start_client(stream, listener))?;
+            if !accepted {
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         Ok(())
+    }
+
+    /// Start a session for a viewer that arrived on `listener`, with that
+    /// listener's transport security and password.
+    fn start_client(&self, stream: TcpStream, listener: &listeners::Listener) -> io::Result<()> {
+        if self
+            .active_clients
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |count| (count < 8).then_some(count + 1),
+            )
+            .is_err()
+        {
+            drop(stream);
+            return Ok(());
+        }
+        let client_id = self
+            .next_client_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sessions = Arc::clone(&self.sessions);
+        // The registry and the session share one socket handle, so a
+        // server-side close can cancel the session's blocked read.
+        let stream = Arc::new(stream);
+        let registration = sessions
+            .lock()
+            .map_err(|_| invalid("session registry lock is poisoned"))
+            .and_then(|mut sessions| {
+                sessions.register(client_id, listener.id, Arc::clone(&stream))
+            });
+        if registration.is_err() {
+            self.active_clients
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            drop(stream);
+            return Ok(());
+        }
+        let shared = SessionShared {
+            framebuffer: Arc::clone(&self.framebuffer),
+            geometry: Arc::clone(&self.geometry),
+            relative_pointer: Arc::clone(&self.relative_pointer),
+            serve_scale: Arc::clone(&self.serve_scale),
+            requested_serve_scale: Arc::clone(&self.requested_serve_scale),
+            serve_display: Arc::clone(&self.serve_display),
+            requested_display: Arc::clone(&self.requested_display),
+            clipboard: Arc::clone(&self.clipboard),
+            thread_setup: self.config.thread_setup,
+            priority: self.config.priority,
+            performance: self.config.performance,
+            focus: Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
+        };
+        let events = self.events.clone();
+        let config = ServerConfig {
+            tls: listener.tls.clone(),
+            password: listener.password.clone(),
+            ..self.config.clone()
+        };
+        let active_clients = Arc::clone(&self.active_clients);
+        let client_sessions = Arc::clone(&self.sessions);
+        let result = std::thread::Builder::new()
+            .name("topvnc-rfb-client".into())
+            .spawn(move || {
+                struct ClientSlot {
+                    active: Arc<std::sync::atomic::AtomicUsize>,
+                    sessions: Arc<Mutex<ServerSessions>>,
+                    client_id: u64,
+                }
+                impl Drop for ClientSlot {
+                    fn drop(&mut self) {
+                        self.active
+                            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        if let Ok(mut sessions) = self.sessions.lock() {
+                            sessions.remove(self.client_id);
+                        }
+                    }
+                }
+                let _slot = ClientSlot {
+                    active: active_clients,
+                    sessions: client_sessions.clone(),
+                    client_id,
+                };
+                if let Some(setup) = shared.thread_setup {
+                    setup();
+                }
+                let deadline = Instant::now() + SERVER_HANDSHAKE_TIMEOUT;
+                let Ok(mut stream) = NativeStream::server(stream, config.tls.clone(), deadline)
+                else {
+                    return;
+                };
+                let _ = stream.set_nodelay(true);
+                let _ = serve_client(
+                    &mut stream,
+                    &shared,
+                    &events,
+                    &config,
+                    &client_sessions,
+                    client_id,
+                    deadline,
+                );
+                let _ = events.send(ClientEvent::ClientDisconnected { client_id });
+            });
+        if let Err(error) = result {
+            self.active_clients
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VncServer {
+    /// Free the ports even while another handle to the listeners lives.
+    fn drop(&mut self) {
+        self.listeners.close();
     }
 }
 
@@ -4090,18 +4127,22 @@ mod tests {
         let (server_two, _peer_two) = tcp_pair();
         let (server_three, _peer_three) = tcp_pair();
         let mut sessions = ServerSessions::default();
-        sessions.register(1, server_one).unwrap();
-        sessions.register(2, server_two).unwrap();
+        sessions.register(1, ListenerId::TEST, server_one).unwrap();
+        sessions.register(2, ListenerId::TEST, server_two).unwrap();
         sessions.admit(1, true).unwrap();
         sessions.admit(2, false).unwrap();
 
         let mut byte = [0];
         assert_eq!(peer_one.read(&mut byte).unwrap(), 0);
-        assert!(sessions.register(3, server_three).is_err());
+        assert!(
+            sessions
+                .register(3, ListenerId::TEST, server_three)
+                .is_err()
+        );
         sessions.remove(2);
 
         let (server_four, _) = tcp_pair();
-        sessions.register(4, server_four).unwrap();
+        sessions.register(4, ListenerId::TEST, server_four).unwrap();
         sessions.admit(4, true).unwrap();
     }
 
@@ -4997,7 +5038,7 @@ mod tests {
             server_sessions
                 .lock()
                 .unwrap()
-                .register(44, stream.try_clone().unwrap())
+                .register(44, ListenerId::TEST, stream.try_clone().unwrap())
                 .unwrap();
             let mut stream = NativeStream::from(stream);
             let result = serve_client(

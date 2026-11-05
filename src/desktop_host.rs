@@ -573,6 +573,9 @@ pub enum ServerNotice {
     ViewOnly(bool),
     /// A recoverable condition, such as a capture pause or clipboard failure.
     Message(String),
+    /// The server's listeners, sent just before [`Self::Serving`], so the
+    /// host window can add or remove listeners while the server runs.
+    Listeners(topvnc::ServerListeners),
 }
 
 /// Host permissions the Server tab shows while the server is stopped.
@@ -607,6 +610,7 @@ impl std::fmt::Display for ServerNotice {
                 formatter.write_str("Accessibility access granted; remote input is enabled.")
             }
             Self::Message(message) => formatter.write_str(message),
+            Self::Listeners(_) => formatter.write_str("Listening for viewers."),
         }
     }
 }
