@@ -14,6 +14,8 @@
 //! Windows password as usual.
 
 use crate::desktop_host::{ServerNotice, parse_serve_arguments};
+use crate::service_pipe::{self, UI_PIPE_FLAG};
+use crate::ui::{ServiceState, ServiceStatus};
 use crate::web_access::job;
 use crate::windows_server;
 use std::error::Error;
@@ -63,15 +65,16 @@ use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD,
 use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, CloseServiceHandle, ControlService, CreateServiceW, DeleteService,
-    OpenSCManagerW, OpenServiceW, QueryServiceStatus, RegisterServiceCtrlHandlerExW, SC_ACTION,
-    SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE,
-    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
-    SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONTROL_INTERROGATE,
-    SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL,
-    SERVICE_FAILURE_ACTIONSW, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_PENDING,
-    SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE, SERVICE_STOP,
-    SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
-    SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
+    OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, QueryServiceStatus,
+    RegisterServiceCtrlHandlerExW, SC_ACTION, SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_CONNECT,
+    SC_MANAGER_CREATE_SERVICE, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
+    SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS,
+    SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN,
+    SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW,
+    SERVICE_PAUSE_PENDING, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE,
+    SERVICE_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
+    SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateEventW, CreateProcessAsUserW, GetCurrentProcess,
@@ -79,6 +82,7 @@ use windows_sys::Win32::System::Threading::{
     ResumeThread, STARTUPINFOW, SetEvent, TerminateProcess, WaitForMultipleObjects,
     WaitForSingleObject,
 };
+use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 /// The service's name in the service manager; also `sc query TopVNCHost`.
 pub const SERVICE_NAME: &str = "TopVNCHost";
@@ -198,11 +202,56 @@ fn quote_argument(argument: &str, line: &mut String) {
 pub fn command_line(program: &Path, arguments: &[String]) -> String {
     let mut line = String::new();
     quote_argument(&program.to_string_lossy(), &mut line);
-    for argument in arguments {
+    if !arguments.is_empty() {
         line.push(' ');
+        line.push_str(&argument_line(arguments));
+    }
+    line
+}
+
+/// `arguments` quoted for a Windows command line, without the program.
+pub fn argument_line(arguments: &[String]) -> String {
+    let mut line = String::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if index > 0 {
+            line.push(' ');
+        }
         quote_argument(argument, &mut line);
     }
     line
+}
+
+/// Split a command line as Windows does for a program's arguments.
+fn split_command_line(line: &str) -> Vec<String> {
+    let line = wide(line);
+    let mut count = 0;
+    let list = unsafe { CommandLineToArgvW(line.as_ptr(), &mut count) };
+    if list.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: Windows returned `count` null-terminated strings, freed below.
+    let arguments = unsafe {
+        std::slice::from_raw_parts(list, usize::try_from(count).unwrap_or(0))
+            .iter()
+            .map(|&argument| from_wide(argument))
+            .collect()
+    };
+    unsafe { LocalFree(list.cast()) };
+    arguments
+}
+
+/// The text of a null-terminated UTF-16 string.
+///
+/// # Safety
+/// `text` must be null or point to a null-terminated UTF-16 string.
+unsafe fn from_wide(text: *const u16) -> String {
+    if text.is_null() {
+        return String::new();
+    }
+    unsafe {
+        let length = (0..).take_while(|&at| *text.add(at) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, length))
+    }
 }
 
 /// What the agent tells the service on its standard output, one per line.
@@ -255,6 +304,30 @@ impl ScHandle {
             return Err(last_error());
         }
         Ok(status.dwCurrentState)
+    }
+
+    /// The service's command line; needs `SERVICE_QUERY_CONFIG`.
+    fn binary_path(&self) -> std::io::Result<String> {
+        // The service manager caps the configuration at 8 KiB.
+        const MAX_CONFIG_BYTES: u32 = 8 * 1024;
+        let mut needed = 0;
+        unsafe { QueryServiceConfigW(self.0, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 || needed > MAX_CONFIG_BYTES {
+            return Err(last_error());
+        }
+        // `u64` keeps the structure's pointers aligned.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
+        if unsafe { QueryServiceConfigW(self.0, buffer.as_mut_ptr().cast(), needed, &mut needed) }
+            == 0
+        {
+            return Err(last_error());
+        }
+        // SAFETY: the service manager filled the buffer with the structure
+        // and the strings it points to.
+        Ok(unsafe {
+            let config = &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>();
+            from_wide(config.lpBinaryPathName)
+        })
     }
 }
 
@@ -376,7 +449,7 @@ fn install_folder() -> Result<PathBuf, String> {
 
 /// `SendSAS` from a service works only when this policy allows services
 /// (1) or both services and ease-of-access tools (3).
-fn software_sas_allowed() -> bool {
+pub fn software_sas_allowed() -> bool {
     let key = wide(SAS_POLICY_KEY);
     let value = wide(SAS_POLICY_VALUE);
     let mut data = 0u32;
@@ -395,9 +468,98 @@ fn software_sas_allowed() -> bool {
     read == ERROR_SUCCESS && data & 1 != 0
 }
 
+// ---- Status, for the TopVNC window -------------------------------------
+
+/// The service's state and address. Needs no administrator rights.
+pub fn query_status() -> Result<ServiceStatus, String> {
+    let manager = ScHandle::manager(SC_MANAGER_CONNECT)
+        .map_err(|error| format!("could not open the Windows service manager: {error}"))?;
+    let service = match manager.service(SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG) {
+        Ok(service) => service,
+        Err(error) if is_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => {
+            return Ok(ServiceStatus::default());
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not read the {SERVICE_NAME} service: {error}"
+            ));
+        }
+    };
+    let state = service
+        .state()
+        .map_err(|error| format!("could not read the {SERVICE_NAME} service: {error}"))?;
+    Ok(ServiceStatus {
+        state: service_state(state),
+        address: service
+            .binary_path()
+            .ok()
+            .and_then(|command| service_address(&command)),
+    })
+}
+
+fn service_state(state: SERVICE_STATUS_CURRENT_STATE) -> ServiceState {
+    match state {
+        SERVICE_RUNNING => ServiceState::Running,
+        SERVICE_START_PENDING | SERVICE_CONTINUE_PENDING => ServiceState::Starting,
+        SERVICE_STOP_PENDING | SERVICE_PAUSE_PENDING => ServiceState::Stopping,
+        // Stopped, and paused, which this service does not accept.
+        _ => ServiceState::Stopped,
+    }
+}
+
+/// The address an installed service's command line listens on.
+fn service_address(command: &str) -> Option<String> {
+    if command.trim().is_empty() {
+        return None;
+    }
+    match split_command_line(command).as_slice() {
+        [_, mode, options @ ..] if mode == "--host-service" => parse_serve_arguments(options)
+            .ok()
+            .map(|options| options.address),
+        _ => None,
+    }
+}
+
+/// Where the installer gets the VNC password.
+enum PasswordSource {
+    /// Asked twice on the console.
+    Prompt,
+    /// From the TopVNC window, which asked for it.
+    Given(String),
+}
+
 /// `topvnc --install-service [--serve options]`, from an administrator
-/// terminal.
+/// terminal. The TopVNC window starts it elevated with `--ui-pipe NAME`
+/// first, and passes the password and gets the result through that pipe.
 pub fn install(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if let [flag, name, options @ ..] = arguments
+        && flag == UI_PIPE_FLAG
+    {
+        return service_pipe::report_to_window(name, |pipe| {
+            let password = pipe.read_password()?;
+            install_with(options, PasswordSource::Given(password), pipe)
+        });
+    }
+    install_with(arguments, PasswordSource::Prompt, &mut std::io::stdout())
+}
+
+/// `topvnc --uninstall-service`, from an administrator terminal, or with
+/// `--ui-pipe NAME` from the TopVNC window.
+pub fn uninstall(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [] => uninstall_with(&mut std::io::stdout()),
+        [flag, name] if flag == UI_PIPE_FLAG => {
+            service_pipe::report_to_window(name, |pipe| uninstall_with(pipe))
+        }
+        _ => Err("usage: topvnc --uninstall-service".into()),
+    }
+}
+
+fn install_with(
+    arguments: &[String],
+    password: PasswordSource,
+    out: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
     let arguments = service_arguments(arguments)?;
     // Load the TLS files now, so a mistake is reported here and not by a
     // service that keeps restarting.
@@ -415,12 +577,20 @@ pub fn install(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Err(error) if is_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => {}
         Err(error) => return Err(error.into()),
     }
-    let password = rpassword::prompt_password("VNC password for the host service: ")?;
+    let password = match password {
+        PasswordSource::Given(password) => password,
+        PasswordSource::Prompt => {
+            let password = rpassword::prompt_password("VNC password for the host service: ")?;
+            if !password.is_empty()
+                && rpassword::prompt_password("Repeat the VNC password: ")? != password
+            {
+                return Err("the passwords do not match".into());
+            }
+            password
+        }
+    };
     if password.is_empty() {
         return Err("the VNC password must not be empty".into());
-    }
-    if rpassword::prompt_password("Repeat the VNC password: ")? != password {
-        return Err("the passwords do not match".into());
     }
 
     let folder = install_folder()?;
@@ -496,28 +666,29 @@ pub fn install(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    println!(
-        "Installed and started the {SERVICE_NAME} service, serving on {}.",
-        options.address
-    );
-    println!("It runs {} as SYSTEM.", executable.display());
-    println!(
-        "Viewers that sign in with the VNC password can now see and use the Windows lock and \
-         sign-in screens. Stop the Server tab's own server first: both cannot use one port."
+    // The service is installed now, so a report that cannot be written is
+    // not an installation failure.
+    let mut summary = format!(
+        "Installed and started the {SERVICE_NAME} service, serving on {}.\n\
+         It runs {} as SYSTEM.\n\
+         Viewers that sign in with the VNC password can now see and use the Windows lock and \
+         sign-in screens. Stop the Server tab's own server first: both cannot use one port.\n",
+        options.address,
+        executable.display()
     );
     if !software_sas_allowed() {
-        println!(
+        summary.push_str(
             "Ctrl+Alt+Delete from viewers is off: Windows allows it only when the policy \
              \"Disable or enable software Secure Attention Sequence\" is set to Services. \
-             The lock screen normally does not need it."
+             The lock screen normally does not need it.\n",
         );
     }
-    println!("Log: {}", log_path()?.display());
+    summary.push_str(&format!("Log: {}\n", log_path()?.display()));
+    let _ = out.write_all(summary.as_bytes());
     Ok(())
 }
 
-/// `topvnc --uninstall-service`, from an administrator terminal.
-pub fn uninstall() -> Result<(), Box<dyn Error>> {
+fn uninstall_with(out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     let manager = ScHandle::manager(SC_MANAGER_CONNECT).map_err(administrator_needed)?;
     let service = match manager.service(SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE_ACCESS) {
         Ok(service) => service,
@@ -561,7 +732,10 @@ pub fn uninstall() -> Result<(), Box<dyn Error>> {
         }
     }
     let _ = std::fs::remove_dir(install_folder()?);
-    println!("Removed the {SERVICE_NAME} service and its stored password.");
+    let _ = writeln!(
+        out,
+        "Removed the {SERVICE_NAME} service and its stored password."
+    );
     Ok(())
 }
 
@@ -674,7 +848,7 @@ pub fn run_service() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn log_path() -> Result<PathBuf, String> {
+pub fn log_path() -> Result<PathBuf, String> {
     let data = std::env::var_os("ProgramData").ok_or("the ProgramData folder is not set")?;
     Ok(PathBuf::from(data).join("TopVNC").join("host-service.log"))
 }
@@ -1431,6 +1605,65 @@ mod tests {
         let mut quoted = String::new();
         quote_argument(r"with space\", &mut quoted);
         assert_eq!(quoted, r#""with space\\""#);
+    }
+
+    #[test]
+    fn command_lines_split_back_into_the_same_arguments() {
+        let values = arguments(&[
+            "--host-service",
+            "127.0.0.1:5900",
+            "--tls-cert",
+            r"C:\My Certs\cert.pem",
+            "",
+            r#"say "hi""#,
+            r"ends\",
+            r"a\\b",
+        ]);
+        let program = r"C:\Program Files\TopVNC\topvnc.exe";
+        let split = split_command_line(&command_line(Path::new(program), &values));
+        assert_eq!(split[0], program);
+        assert_eq!(&split[1..], values);
+        assert_eq!(
+            split_command_line(&argument_line(&values))[1..],
+            values[1..]
+        );
+        assert_eq!(argument_line(&[]), "");
+    }
+
+    #[test]
+    fn installed_command_lines_give_the_service_address() {
+        let program = Path::new(r"C:\Program Files\TopVNC\topvnc.exe");
+        let line = command_line(
+            program,
+            &arguments(&["--host-service", "127.0.0.1:5901", "--unencrypted"]),
+        );
+        assert_eq!(service_address(&line).as_deref(), Some("127.0.0.1:5901"));
+        // The default address, when none was given.
+        let line = command_line(program, &arguments(&["--host-service", "--unencrypted"]));
+        assert_eq!(service_address(&line).as_deref(), Some("127.0.0.1:5900"));
+        // Anything that is not this service's command line has no address.
+        for line in [
+            String::new(),
+            command_line(program, &arguments(&["--host-agent", "127.0.0.1:5901"])),
+            command_line(program, &arguments(&["--host-service", "--bogus"])),
+        ] {
+            assert_eq!(service_address(&line), None);
+        }
+    }
+
+    #[test]
+    fn service_manager_states_map_to_what_the_window_shows() {
+        assert_eq!(service_state(SERVICE_RUNNING), ServiceState::Running);
+        for state in [SERVICE_START_PENDING, SERVICE_CONTINUE_PENDING] {
+            assert_eq!(service_state(state), ServiceState::Starting);
+        }
+        for state in [SERVICE_STOP_PENDING, SERVICE_PAUSE_PENDING] {
+            assert_eq!(service_state(state), ServiceState::Stopping);
+        }
+        assert_eq!(service_state(SERVICE_STOPPED), ServiceState::Stopped);
+        // Reading the status needs no administrator rights, whether or not
+        // the service is installed.
+        assert!(query_status().is_ok());
     }
 
     #[test]

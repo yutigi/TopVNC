@@ -20,11 +20,14 @@ mod desktop_host;
 #[cfg(target_os = "macos")]
 mod macos_server;
 #[cfg(windows)]
+mod service_pipe;
+#[cfg(windows)]
 mod windows_server;
 #[cfg(windows)]
 mod windows_service;
 
 mod helpers;
+mod host_service;
 mod settings;
 mod ui;
 mod web_access;
@@ -570,7 +573,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         #[cfg(windows)]
         Some("--install-service") => return windows_service::install(&arguments[1..]),
         #[cfg(windows)]
-        Some("--uninstall-service") if arguments.len() == 1 => return windows_service::uninstall(),
+        Some("--uninstall-service") => return windows_service::uninstall(&arguments[1..]),
         #[cfg(windows)]
         Some("--host-service") => return windows_service::run_service(),
         #[cfg(windows)]
@@ -591,6 +594,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Declared after the server so it is dropped first: the gateway and the
     // tunnel stop before the server they relay to.
     let mut web = WebRuntime::new(Box::new(web_access::process::ProcessSpawner));
+    // Keeps an installer's report while a viewer session runs.
+    let mut service = host_service::ServiceRuntime::default();
     loop {
         let Some((next_config, session)) = show_landing(
             &mut ui,
@@ -598,6 +603,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             connection_error.take(),
             &mut server,
             &mut web,
+            &mut service,
         )?
         else {
             return Ok(());
@@ -891,6 +897,7 @@ fn show_landing(
     error: Option<String>,
     server: &mut HostedServer,
     web: &mut WebRuntime,
+    service: &mut host_service::ServiceRuntime,
 ) -> Result<Option<(Config, Session)>, Box<dyn Error>> {
     const WIDTH: usize = 800;
     const HEIGHT: usize = 640;
@@ -919,6 +926,7 @@ fn show_landing(
     let mut cursor: Option<(usize, usize)> = None;
     loop {
         helpers.poll();
+        service.poll(state.tab == Tab::Service);
         // Permissions can change in System Settings while the window is open.
         // So can the attached displays, which the Server tab lists.
         if server.view.phase == ServerPhase::Stopped
@@ -958,6 +966,7 @@ fn show_landing(
             &server.view,
             &helpers,
             web,
+            &service.view,
         );
         if redraw || pixels != shown {
             layer.upload(&pixels, WIDTH, 0, 0, WIDTH, HEIGHT);
@@ -991,6 +1000,7 @@ fn show_landing(
         let mut pair_clicked = false;
         let mut copy_url_clicked = false;
         let mut helper_action = None;
+        let mut service_action = None;
         // Woken by input; the timeout picks up server status and the
         // connection result.
         for event in ui.pump(Duration::from_millis(50)) {
@@ -1023,6 +1033,9 @@ fn show_landing(
                                 Tab::Work => helper_action = Some(helpers::Action::CheckWork),
                                 Tab::Network => helper_action = Some(helpers::Action::Network),
                                 Tab::Firewall => helper_action = Some(helpers::Action::Firewall),
+                                // Installing asks for administrator approval,
+                                // so it takes a click.
+                                Tab::Service => {}
                             }
                         }
                         PhysicalKey::Code(code) if state.key(&mut config, code) => {}
@@ -1209,6 +1222,20 @@ fn show_landing(
                         pair_clicked |= ui::WEB_PAIR.contains(x, y);
                         copy_url_clicked |=
                             ui::web_copy_url_shown(web) && ui::WEB_COPY_URL.contains(x, y);
+                    } else if state.tab == Tab::Service
+                        && !ui::TAB_MORE.contains(x, y)
+                        && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                        && !ui::MENU_TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                    {
+                        state.focus = ui::SERVICE_PASSWORD
+                            .contains(x, y)
+                            .then_some(Field::ServicePassword);
+                        if ui::SERVICE_INSTALL.contains(x, y) {
+                            service_action = Some(host_service::ServiceAction::Install);
+                        }
+                        if ui::SERVICE_REMOVE.contains(x, y) {
+                            service_action = Some(host_service::ServiceAction::Remove);
+                        }
                     } else if state.tab == Tab::Connect
                         && !ui::TAB_MORE.contains(x, y)
                         && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
@@ -1291,13 +1318,46 @@ fn show_landing(
                 ..helpers::Report::default()
             };
         }
+        if let Some(action) = service_action {
+            let serving = match &server.view.phase {
+                ServerPhase::Serving { address, .. } => Some(address.as_str()),
+                _ => None,
+            };
+            let started = match (action, serving) {
+                // The service could not listen while the Server tab does.
+                (host_service::ServiceAction::Install, Some(address))
+                    if host_service::same_port(
+                        address,
+                        &format!("{}:{}", config.serve.host.trim(), config.serve.port.trim()),
+                    ) =>
+                {
+                    Err(format!(
+                        "Stop the Server tab's server on {address} first: the service needs \
+                         the same port."
+                    ))
+                }
+                _ => service.start(action, &config.serve),
+            };
+            match started {
+                Ok(()) => {
+                    state.error = None;
+                    state.focus = None;
+                }
+                Err(error) => state.error = Some(error),
+            }
+        }
         if server_clicked {
             match server.view.phase {
                 ServerPhase::Stopped => match config.serve.request() {
                     Ok(request) => {
-                        state.error = None;
-                        state.focus = None;
-                        server.start(request);
+                        service.refresh();
+                        if let Some(conflict) = service.port_conflict(&request.address) {
+                            state.error = Some(conflict);
+                        } else {
+                            state.error = None;
+                            state.focus = None;
+                            server.start(request);
+                        }
                     }
                     Err(error) => state.error = Some(error),
                 },
