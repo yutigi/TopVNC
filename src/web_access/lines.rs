@@ -219,35 +219,29 @@ mod tests {
         assert_eq!(t("INF Registered tunnel connection"), None);
     }
 
-    /// A Quick Tunnel start, with the messages and banner box cloudflared's
-    /// `quick_tunnel.go` prints (reconstructed from its source; the live
-    /// check in specs/019-quick-tunnel-mode confirms the real output).
-    const QUICK_TUNNEL_OUTPUT: &str = "\
-2026-11-05T14:00:00Z INF Thank you for trying Cloudflare Tunnel. Doing so, without a Cloudflare account, is a quick way to experiment and try it out. However, be aware that these account-less Tunnels have no uptime guarantee, are subject to the Cloudflare Online Services Terms of Use (https://www.cloudflare.com/website-terms/), and Cloudflare reserves the right to investigate your use of Tunnels for violations of such terms. If you intend to use Tunnels in production you should use a pre-created named tunnel by following: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps
-2026-11-05T14:00:00Z INF Requesting new quick Tunnel on trycloudflare.com...
-2026-11-05T14:00:01Z INF +--------------------------------------------------------------------------------------------+
-2026-11-05T14:00:01Z INF |  Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):  |
-2026-11-05T14:00:01Z INF |  https://seasonal-deck-organisms-sf.trycloudflare.com                                      |
-2026-11-05T14:00:01Z INF +--------------------------------------------------------------------------------------------+
-2026-11-05T14:00:01Z INF Cannot determine default configuration path. No file [config.yml config.yaml] in [~/.cloudflared ~/.cloudflare-warp ~/cloudflare-warp /etc/cloudflared /usr/local/etc/cloudflared]
-2026-11-05T14:00:01Z INF Version 2026.10.3
-2026-11-05T14:00:02Z INF Registered tunnel connection connIndex=0 connection=0c1d event=0 ip=198.41.192.67 location=sin11 protocol=quic";
+    /// Captured from cloudflared 2026.10.3 on Windows during the live run on
+    /// 2026-11-05. Machine-specific addresses and identifiers are redacted;
+    /// the banner, readiness messages, and their order are preserved.
+    const QUICK_TUNNEL_OUTPUT: &str = include_str!("fixtures/cloudflared-quick-tunnel.txt");
 
     #[test]
     fn quick_tunnel_output_yields_its_url_once_and_its_connections() {
-        let events: Vec<Event> = QUICK_TUNNEL_OUTPUT
-            .lines()
-            .filter_map(|line| classify(Program::Tunnel, Stream::Stderr, line))
-            .collect();
-        assert_eq!(
-            events,
-            [
-                Event::QuickTunnelUrl(
-                    "https://seasonal-deck-organisms-sf.trycloudflare.com".into()
-                ),
-                Event::Registered(0),
-            ]
-        );
+        // cloudflared logs to stderr; the supervisor also accepts stdout.
+        for stream in [Stream::Stdout, Stream::Stderr] {
+            let events: Vec<Event> = QUICK_TUNNEL_OUTPUT
+                .lines()
+                .filter_map(|line| classify(Program::Tunnel, stream, line))
+                .collect();
+            assert_eq!(
+                events,
+                [
+                    Event::QuickTunnelUrl(
+                        "https://brian-crm-produce-intelligence.trycloudflare.com".into()
+                    ),
+                    Event::Registered(0),
+                ]
+            );
+        }
         let t = |line| classify(Program::Tunnel, Stream::Stderr, line);
         for ignored in [
             "INF |  https://a.b.trycloudflare.com  |",
@@ -264,7 +258,7 @@ mod tests {
             classify(
                 Program::Gateway,
                 Stream::Stdout,
-                "https://seasonal-deck-organisms-sf.trycloudflare.com"
+                "https://brian-crm-produce-intelligence.trycloudflare.com"
             ),
             None
         );

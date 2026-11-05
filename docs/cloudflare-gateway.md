@@ -28,7 +28,7 @@ lists what still needs a live run by the owner.
 - [Each session](#each-session)
 - [Quick Tunnel (temporary, no account)](#quick-tunnel-temporary-no-account):
   a temporary URL with no setup, protected only by pairing and the VNC
-  password; not yet validated live
+  password; phone and long-session checks pending
 - [Troubleshooting](#troubleshooting)
 - [Runbook verification](#runbook-verification)
 
@@ -415,10 +415,12 @@ Ctrl+C in all three windows.
 
 ## Quick Tunnel (temporary, no account)
 
-**Not yet validated over a real Quick Tunnel.** Tested locally on 2026-11-05
-with simulated programs and the real gateway binary. No phone has yet
-connected through a live `trycloudflare.com` URL. The checks still to run
-are under "Validation" in `specs/019-quick-tunnel-mode/spec.md`.
+**Partially validated live (2026-11-06).** Windows Chromium paired, signed in
+with a VNC password, and displayed a moving synthetic test pattern through a
+real `trycloudflare.com` URL for ten minutes. Reconnect, restart with a new
+URL/key, rejection of the old pairing, and fresh pairing also passed.
+This does not validate iPhone Safari, macOS, or the real desktop flow from
+the WEB tab. See the recorded checks and remaining limits in [Quick Tunnel validation](../specs/019-quick-tunnel-mode/validation.md).
 
 For a temporary session, the **WEB** tab can use a Cloudflare
 [Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
@@ -715,7 +717,7 @@ must stay on loopback.
 | Live route, desktop control of a Windows host | iPhone Safari | Owner-reported (2026-10-31): display, pointer, tap clicks, two-finger scroll, pinch zoom, on-screen typing, toolbar keys, disconnect and reconnect. Background return not confirmed; iOS version not recorded. Host ran plain `--serve`, before native TLS became the default; the page deployed then predates the 2026-10-31 restyle |
 | Worker CPU within the Free plan's 10 ms | Workers analytics | **Not passed; open risk.** Warm upgrades about 1.6-4 ms; 7 of 88 upgrades, the cold ones, used 13.0-18.7 ms. None was terminated. See [Free-plan Worker CPU](#free-plan-worker-cpu) |
 | WEB tab start, stop, and pairing | Windows 11 | Locally tested with simulated programs and the real gateway binary (2026-11-04); live route not run |
-| Quick Tunnel route from the WEB tab | Windows 11 | Locally tested with simulated programs and the real gateway binary in Quick Tunnel mode (2026-11-05). **Not validated over a real Quick Tunnel**; cloudflared's URL output is matched to its source, not yet to a live run |
+| Quick Tunnel route | Windows 11 | Local WEB-tab simulations and real gateway tests; Windows Chromium paired and displayed a synthetic VNC test pattern over a real Quick Tunnel (2026-11-06). Captured cloudflared output is a regression fixture. Phone, real-desktop WEB-tab, macOS, and long-session checks remain pending; see [validation](../specs/019-quick-tunnel-mode/validation.md) |
 | This runbook, end to end on a fresh account | Any | Not run. Steps checked locally and by dry run on 2026-11-01; see [Runbook verification](#runbook-verification) |
 | Two-hour soak, mobile link latency | iPhone Safari | Not tested |
 | macOS or Linux host | Any | Not tested |

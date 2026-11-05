@@ -2077,7 +2077,7 @@ fn web_panel(canvas: &mut Canvas<'_>, state: &UiState, web: &WebRuntime) {
         small(
             canvas,
             &mut y,
-            "NOT YET VALIDATED OVER A REAL QUICK TUNNEL. DETAILS: DOCS/CLOUDFLARE-GATEWAY.MD.",
+            "PHONE AND LONG-SESSION CHECKS STILL PENDING. DETAILS: DOCS/CLOUDFLARE-GATEWAY.MD.",
             ERROR,
         );
     } else {

@@ -5,8 +5,10 @@
 **Created**: 2026-11-05
 
 **Status**: Plan approved by the owner on 2026-11-05. Implemented and tested
-with simulated programs and local gateway tests. **Not yet validated over a
-real Quick Tunnel**; the live check is listed under "Validation".
+with simulated programs and local gateway tests. A Windows Chromium session
+through a real Quick Tunnel displayed a synthetic VNC test pattern on
+2026-11-06. Phone, real-desktop WEB-tab, macOS, and long-session checks remain
+pending; see [validation.md](validation.md).
 
 **Input**: Owner: "I have an idea": let any TopVNC user reach their host from a
 phone browser through a free `https://<random>.trycloudflare.com` URL, with no
@@ -99,8 +101,8 @@ Quick Tunnel mode and fetch the page and complete a paired session.
 1. **Given** the WEB tab is idle, **When** the user selects Quick Tunnel,
    **Then** the panel states, before Start: temporary URL, no Cloudflare
    sign-in, protected by pairing and the VNC password, anyone with the URL can
-   open the page, each start gives a new URL and needs a new pairing, and the
-   route is not yet validated live.
+   open the page, each start gives a new URL and needs a new pairing, and
+   phone and long-session checks remain pending.
 2. **Given** Quick Tunnel is selected, **When** Start is pressed, **Then**
    TopVNC needs no `gateway.local.toml`, token file, or host key file. It checks
    only for `cloudflared`, the gateway program, and the built `web/dist`, and
@@ -165,7 +167,7 @@ Quick Tunnel mode and fetch the page and complete a paired session.
 - **FR-005**: The pairing link MUST stay secret as before: shown only as a QR
   code, never as text, in output, or in logs.
 - **FR-006**: The docs MUST describe the route, its limitations, and that it
-  is not yet validated live.
+  still needs phone and long-session validation.
 
 ## Success Criteria
 
@@ -178,7 +180,9 @@ Quick Tunnel mode and fetch the page and complete a paired session.
 
 ## Validation
 
-Pending, by the owner after merge (record results in a `validation.md` here):
+Results are recorded in [validation.md](validation.md). The live Chromium
+check uses a synthetic password-protected VNC server; the owner still needs
+to check the real desktop and phone flow:
 
 1. Start Quick Tunnel from the WEB tab on Windows; scan from iPhone Safari;
    pair, enter the VNC password, and use the desktop.
