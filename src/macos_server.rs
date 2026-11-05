@@ -273,6 +273,7 @@ pub fn serve(
     // explicit choice asks viewers for relative motion.
     server.set_relative_pointer(mouse == MouseMode::Relative);
     server.set_serve_scale((scale * 100.0).round() as u8);
+    report(ServerNotice::Listeners(server.listeners()));
     report(ServerNotice::Serving {
         address: server.local_addr()?,
         display: capture.name.clone(),

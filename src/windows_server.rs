@@ -287,6 +287,7 @@ pub fn serve(
     let server = VncServer::bind(&address, served.image(&framebuffer).clone(), config)?;
     server.set_serve_scale((scale * 100.0).round() as u8);
     server.set_serve_display(plan.announcement());
+    report(ServerNotice::Listeners(server.listeners()));
     report(ServerNotice::Serving {
         address: server.local_addr()?,
         display: plan.description(),
