@@ -48,6 +48,15 @@ function edit(field, inputType, { data = null, cancelable = true, isComposing = 
   if (field.value !== previous) fire(field, "input", { inputType, data, isComposing });
 }
 
+// Native insertions replace the current selection, rather than always append.
+function insertAtSelection(field, inputType, data, { cancelable = true, isComposing = false, beforeinput = true, eventData = data } = {}) {
+  if (beforeinput && fire(field, "beforeinput", { inputType, data: eventData, isComposing }, cancelable).defaultPrevented) return;
+  const start = field.selectionStart;
+  field.value = field.value.slice(0, start) + data + field.value.slice(field.selectionEnd);
+  field.setSelectionRange(start + data.length, start + data.length);
+  fire(field, "input", { inputType, data: eventData, isComposing });
+}
+
 test("inserted text is sent once whether or not the insertion can be cancelled", () => {
   for (const inputType of ["insertText", "insertReplacementText"]) {
     for (const cancelable of [true, false]) {
@@ -57,6 +66,57 @@ test("inserted text is sent once whether or not the insertion can be cancelled",
       assert.equal(field.value, placeholder);
     }
   }
+});
+
+test("native insertions before the placeholder do not send it to the host", () => {
+  for (const [inputType, data] of [["insertFromPaste", "hello"], ["insertText", "hello"], ["insertLineBreak", "\n"]]) {
+    for (const beforeinput of [true, false]) {
+      const { field, sent, placeholder } = fixture();
+      field.setSelectionRange(0, 0);
+      insertAtSelection(field, inputType, data, { cancelable: false, beforeinput, eventData: inputType === "insertLineBreak" ? null : data });
+      assert.deepEqual(sent, [["text", data]]);
+      assert.equal(field.value, placeholder);
+      assert.equal(field.selectionStart, placeholder.length);
+      assert.equal(field.selectionEnd, placeholder.length);
+    }
+  }
+});
+
+test("pasted zero-width characters are preserved on either side of the placeholder", () => {
+  for (const position of [0, 1]) {
+    for (const beforeinput of [true, false]) {
+      for (const data of ["a\u200bb", "\u200bhello", "hello\u200b", "\u200b"]) {
+        const { field, sent } = fixture();
+        field.setSelectionRange(position, position);
+        insertAtSelection(field, "insertFromPaste", data, { beforeinput });
+        assert.deepEqual(sent, [["text", data]]);
+      }
+    }
+  }
+});
+
+test("replacing the selected placeholder preserves zero-width characters in user text", () => {
+  for (const data of ["a\u200bb", "\u200b"]) {
+    for (const beforeinput of [true, false]) {
+      const { field, sent } = fixture();
+      field.setSelectionRange(0, field.value.length);
+      insertAtSelection(field, "insertFromPaste", data, { beforeinput });
+      assert.deepEqual(sent, [["text", data]]);
+    }
+  }
+});
+
+test("composition before the placeholder sends only the committed text", () => {
+  const { field, sent, placeholder } = fixture();
+  field.setSelectionRange(0, 0);
+  fire(field, "compositionstart");
+  insertAtSelection(field, "insertCompositionText", "に", { cancelable: false, isComposing: true });
+  field.setSelectionRange(0, 1);
+  insertAtSelection(field, "insertCompositionText", "日本", { cancelable: false, isComposing: true });
+  assert.deepEqual(sent, []);
+  fire(field, "compositionend", { data: "日本" });
+  assert.deepEqual(sent, [["text", "日本"]]);
+  assert.equal(field.value, placeholder);
 });
 
 test("a line break is one Return whether or not it can be cancelled", () => {
