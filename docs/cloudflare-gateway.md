@@ -534,20 +534,66 @@ background. Afterwards, read the `/ws` CPU times in Workers analytics.
   to hold the left button, and long-press to right-click.
 - **Zoom**: pinch with two fingers in either mode. **Fit** resets the view.
   Zoom changes only this device's view, not what the host sends.
-- **Keyboard**: ⌨ opens the on-screen keyboard. Typed text arrives as text,
-  with Shift added for capitals and shifted symbols on the host's US layout.
-  Ctrl, Alt, Shift, and Win latch until the next key. **Fn** shows F1-F12 and
-  navigation keys. A hardware keyboard sends physical keys, like the native
-  viewer.
+- **Thumb dock**: Keys / Type / Pointer / Enter stays in the same order across
+  portrait and landscape, unless you save a different order in Customize.
+  **Keys** has Escape, Tab, one-shot modifiers, arrows and Copy/Paste shortcuts;
+  **Fn** opens function and navigation keys without a horizontal toolbar scroll.
+- **Type** opens TopVNC's custom keyboard by default. Characters form a local
+  draft (up to 2000 UTF-16 units); **Insert** sends it, split into bounded Unicode
+  chunks. Enter inserts a nonempty draft, otherwise sends Return. Hold Backspace
+  to erase repeatedly. Ctrl/Alt/Shift apply to the next key/chord; Shift labels
+  match the next character. Ctrl/Alt shortcuts send keys without inserting the
+  draft. Hardware keys still use physical positions, including one-shot modifiers.
+- **Languages**: tap the keyboard globe to cycle profiles; hold for 350 ms, slide
+  to an entry and lift to choose. Lifting over the globe keeps the menu open;
+  lifting outside cancels. Arrow keys and assistive activation open the same menu.
+  **Manage languages** (or Edit) adds/removes profiles, favorites up to four, and
+  edits three rows of 3–14 character keys (up to eight UTF-16 units per key).
+  English, Thai, Chinese and Japanese are editable examples. Chinese/Japanese
+  layouts type direct characters; there is no custom conversion dictionary.
+- **Native input** focuses a real editable field. Committed Unicode/IME text is
+  sent directly, once, after composition. The OS controls keyboard visibility
+  and language switching. Custom modifier buttons are disabled in native Type.
+- **Pointer** adds a separate drag pad and independently held left/right buttons;
+  the screen keeps the trackpad/direct gestures above. **Fullscreen** is available
+  in Settings, and in the wider header where the browser offers it.
+- **Customize** saves up to eight custom chords or text snippets (200 UTF-16 units
+  each), button order/size, optional custom-key visibility and separate portrait
+  and landscape deck arrangements. Save a layout explicitly. Settings, Customize
+  and the dock remain reachable. Preferences stay in this browser; if storage is
+  blocked, edits last for the current page session. Legacy wireframe preferences
+  migrate when present, without allowing old language visibility to hide modifiers.
+- **FPS preset** in Customize changes Pointer to Play. Separate fingers can hold
+  movement, sprint/crouch, fire/aim and actions while dragging the look zone.
+  Remap keys, mirror the aiming hand and adjust sensitivity in Presets. Relative
+  aiming follows host pointer-mode negotiation; game behavior needs device/host
+  testing. Standard layouts, custom keys and language profiles are kept.
 - **Mouse** (desktop browsers): absolute pointer, buttons, and wheel. Pointer
   Lock is used when the host asks for relative motion.
 - **Menu**: picture quality, the host's served size and display (when
   offered), a statistics line (updates and frames drawn per second, Mbit/s,
   round trip through the host), and Disconnect.
 
-Held keys and buttons are released when the page loses focus, is hidden, or
-disconnects, and when a gesture is cancelled. Input typed while disconnected
-is dropped, never replayed.
+Held keys and buttons are released on mode/source/orientation changes, focus
+loss, hidden pages, disconnect and cancellation. Lost pointer capture releases
+its held control. Leaving a native composition through a lifecycle interruption
+cancels it; late IME events cannot replay text after reconnect. The custom draft
+survives mode/source changes and is cleared on disconnect. Input while
+disconnected is dropped, never replayed.
+
+The mobile controls have Node interaction/model tests and an offline headless
+Chromium check at 320×568, 390×844 and 844×390. The browser check runs the real app
+with a fixture Worker, including emulated simultaneous touches; it does not test
+an encrypted connection to a live host. Physical-device reach, Safari/other
+browser rendering, OS keyboard visibility, device IMEs, game behavior and input
+latency still need manual verification. No performance improvement is claimed.
+
+To reproduce automated checks in `web/`, run `npm test`, `npm run build` and
+`npm run test:wasm` (the build needs the pinned WASM tool described above).
+`CARGO_TARGET_DIR` may point at a shared build cache. For the optional offline
+browser check, set `TOPVNC_BROWSER` to a Chromium/Chrome executable and run
+`npm run test:browser`. It starts no HTTP server and writes screenshots and its
+temporary fixture/profile to ignored `web/build/mobile-qa/`.
 
 ## Interruptions
 
