@@ -224,6 +224,52 @@ pub struct ServerView {
     pub displays: Option<Vec<DisplayArea>>,
 }
 
+/// The TopVNC Host service's state, as the SERVICE tab shows it.
+// Only Windows constructs the installed-service states; other platforms keep
+// the shared SERVICE tab in NotInstalled.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServiceState {
+    #[default]
+    NotInstalled,
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+}
+
+/// The installed service as the window sees it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceStatus {
+    pub state: ServiceState,
+    /// Where the installed service listens, from its command line.
+    pub address: Option<String>,
+    /// The gateway speaks plain RFB to its loopback target.
+    pub unencrypted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceAction {
+    Install,
+    Remove,
+}
+
+/// What the SERVICE tab shows.
+#[derive(Clone, Debug, Default)]
+pub struct ServiceView {
+    pub status: ServiceStatus,
+    /// Why the status could not be read.
+    pub status_error: Option<String>,
+    /// Whether Windows lets the service send Ctrl+Alt+Delete.
+    pub sas_allowed: bool,
+    pub log_path: String,
+    /// The installer run waiting for approval or still running.
+    pub busy: Option<ServiceAction>,
+    /// The last installer's summary or error.
+    pub report: String,
+    pub failed: bool,
+}
+
 /// Displays the Server tab cycles through where the host cannot list them.
 const UNLISTED_DISPLAYS: usize = 4;
 
@@ -329,6 +375,8 @@ pub enum Field {
     ServePassword,
     /// The WEB tab's VNC password; the same value as the Server tab's.
     WebPassword,
+    /// The SERVICE tab's VNC password; the same value as the Server tab's.
+    ServicePassword,
     WorkHost,
     WorkPort,
     NetworkPort,
@@ -348,6 +396,8 @@ pub enum Tab {
     Work,
     Network,
     Firewall,
+    /// The TopVNC Host service, which serves the Windows lock screen.
+    Service,
 }
 
 impl Tab {
@@ -357,6 +407,7 @@ impl Tab {
             Self::Connect => &[Field::Host, Field::Port, Field::Password, Field::WindowSize],
             Self::Server => &[Field::ServeHost, Field::ServePort, Field::ServePassword],
             Self::Web => &[Field::WebPassword],
+            Self::Service => &[Field::ServicePassword],
             Self::Work => &[Field::WorkHost, Field::WorkPort],
             Self::Network => &[Field::NetworkPort],
             Self::Firewall => &[
@@ -448,7 +499,9 @@ impl UiState {
             Field::WindowSize => Some(&mut config.window_size),
             Field::ServeHost => Some(&mut config.serve.host),
             Field::ServePort => Some(&mut config.serve.port),
-            Field::ServePassword | Field::WebPassword => Some(&mut config.serve.password),
+            Field::ServePassword | Field::WebPassword | Field::ServicePassword => {
+                Some(&mut config.serve.password)
+            }
             Field::WorkHost => Some(&mut config.helpers.work_host),
             Field::WorkPort => Some(&mut config.helpers.work_port),
             Field::NetworkPort => Some(&mut config.helpers.network_port),
@@ -801,11 +854,47 @@ pub const MENU_FIREWALL: Box2 = Box2 {
     w: 150,
     h: 36,
 };
-pub const MENU_TABS: [(Box2, Tab, &str); 3] = [
+pub const MENU_SERVICE: Box2 = Box2 {
+    x: 482,
+    y: 198,
+    w: 150,
+    h: 36,
+};
+pub const MENU_TABS: [(Box2, Tab, &str); 4] = [
     (MENU_WORK, Tab::Work, "WORK"),
     (MENU_NETWORK, Tab::Network, "NETWORK"),
     (MENU_FIREWALL, Tab::Firewall, "FIREWALL"),
+    (MENU_SERVICE, Tab::Service, "SERVICE"),
 ];
+/// The SERVICE tab's password; where the Server tab has its own.
+pub const SERVICE_PASSWORD: Box2 = SERVE_PASSWORD;
+const SERVICE_STATUS: Box2 = Box2 {
+    x: 40,
+    y: 130,
+    w: 718,
+    h: 44,
+};
+const SERVICE_REPORT: Box2 = Box2 {
+    x: 40,
+    y: 392,
+    w: 718,
+    h: 128,
+};
+/// Characters per small report line in [`SERVICE_REPORT`].
+const SERVICE_REPORT_CHARS: usize = 114;
+const SERVICE_REPORT_ROWS: usize = 11;
+pub const SERVICE_INSTALL: Box2 = Box2 {
+    x: 40,
+    y: 574,
+    w: 349,
+    h: 40,
+};
+pub const SERVICE_REMOVE: Box2 = Box2 {
+    x: 409,
+    y: 574,
+    w: 349,
+    h: 40,
+};
 pub const TABS: [(Box2, Tab, &str); 3] = [
     (TAB_CONNECT, Tab::Connect, "CONNECT"),
     (TAB_SERVER, Tab::Server, "SERVER"),
@@ -1087,6 +1176,7 @@ const SERVER_STATUS: Box2 = Box2 {
     h: 44,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn landing(
     canvas: &mut Canvas<'_>,
     config: &Config,
@@ -1095,6 +1185,7 @@ pub fn landing(
     server: &ServerView,
     helpers: &HelperRuntime,
     web: &WebRuntime,
+    service: &ServiceView,
 ) {
     canvas.fill(
         Box2 {
@@ -1121,7 +1212,7 @@ pub fn landing(
     canvas.button(
         TAB_MORE,
         "...",
-        state.menu_open || state.tab.helper().is_some(),
+        state.menu_open || MENU_TABS.iter().any(|(_, tab, _)| *tab == state.tab),
     );
     match state.tab {
         Tab::Connect => connect_tab(canvas, config, state, connecting),
@@ -1130,6 +1221,7 @@ pub fn landing(
         Tab::Work | Tab::Network | Tab::Firewall => {
             helper_tab(canvas, &config.helpers, state, helpers)
         }
+        Tab::Service => service_tab(canvas, &config.serve, state, service),
     }
     if state.menu_open {
         for (area, tab, label) in MENU_TABS {
@@ -1721,6 +1813,172 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
         ServerPhase::Serving { .. } => canvas.button(CONNECT, "STOP SERVER", false),
         ServerPhase::Stopping => canvas.button(CONNECT, "STOPPING...", false),
     }
+}
+
+/// The SERVICE tab's status line and indicator color.
+fn service_status_line(service: &ServiceView) -> (String, u32) {
+    if let Some(error) = &service.status_error {
+        return (
+            error.to_uppercase(),
+            if cfg!(windows) { ERROR } else { MUTED },
+        );
+    }
+    let address = service
+        .status
+        .address
+        .as_deref()
+        .unwrap_or("UNKNOWN ADDRESS");
+    match service.status.state {
+        ServiceState::NotInstalled => ("NOT INSTALLED".into(), MUTED),
+        ServiceState::Stopped => (format!("STOPPED / SET TO SERVE {address}"), WARN),
+        ServiceState::Starting => ("STARTING...".into(), WARN),
+        ServiceState::Running => (format!("RUNNING ON {address}"), ACCENT),
+        ServiceState::Stopping => ("STOPPING...".into(), WARN),
+    }
+}
+
+/// The Server tab settings the service would be installed with.
+fn service_settings_line(form: &ServeForm) -> String {
+    format!(
+        "{}:{} / {} / {}",
+        form.host.trim(),
+        form.port.trim(),
+        if form.tls.unencrypted {
+            "UNENCRYPTED"
+        } else {
+            "TLS"
+        },
+        display_choice_label(form.display, None)
+    )
+}
+
+/// The installer's report, wrapped to the report box.
+fn service_report_lines(report: &str) -> Vec<String> {
+    report
+        .lines()
+        .flat_map(|line| wrap(line, SERVICE_REPORT_CHARS))
+        .take(SERVICE_REPORT_ROWS)
+        .collect()
+}
+
+fn service_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, service: &ServiceView) {
+    canvas.text(
+        42,
+        76,
+        "SERVE THE LOCK SCREEN AS A WINDOWS SERVICE",
+        MUTED,
+        2,
+    );
+    canvas.label(40, 108, "SERVICE STATUS");
+    canvas.fill(SERVICE_STATUS, PANEL);
+    canvas.frame(SERVICE_STATUS, BORDER);
+    let (status, color) = service_status_line(service);
+    canvas.fill(
+        Box2 {
+            x: SERVICE_STATUS.x + 14,
+            y: SERVICE_STATUS.y + 17,
+            w: 10,
+            h: 10,
+        },
+        color,
+    );
+    let room = (SERVICE_STATUS.w - 46) / 12;
+    let status: String = status.chars().take(room).collect();
+    canvas.text(
+        SERVICE_STATUS.x + 34,
+        SERVICE_STATUS.y + 15,
+        &status,
+        TEXT,
+        2,
+    );
+
+    canvas.label(40, 192, "SERVER PASSWORD");
+    canvas.field(
+        SERVICE_PASSWORD,
+        &form.password,
+        "REQUIRED",
+        state.focus == Some(Field::ServicePassword),
+        true,
+    );
+    canvas.label(548, 192, "CTRL+ALT+DEL");
+    let (sas, sas_color) = if !cfg!(windows) {
+        ("-", MUTED)
+    } else if service.sas_allowed {
+        ("ALLOWED", ACCENT)
+    } else {
+        ("OFF BY POLICY", WARN)
+    };
+    canvas.text(548, 228, sas, sas_color, 2);
+
+    canvas.label(40, 276, "FROM THE SERVER TAB");
+    canvas.text(40, 300, &service_settings_line(form), TEXT, 2);
+    let mut notes = vec![
+        ("INSTALL AND REMOVE ASK FOR WINDOWS ADMINISTRATOR APPROVAL. ONLY SYSTEM CAN READ THE STORED PASSWORD.".to_string(), MUTED),
+        ("VIEWERS ENTER THIS VNC PASSWORD, THEN UNLOCK WINDOWS WITH ITS OWN PASSWORD OR PIN.".to_string(), MUTED),
+    ];
+    if cfg!(windows) && !service.sas_allowed {
+        notes.push((
+            "CTRL+ALT+DEL NEEDS THE POLICY \"SOFTWARE SECURE ATTENTION SEQUENCE\" SET TO SERVICES."
+                .into(),
+            WARN,
+        ));
+    }
+    if !service.log_path.is_empty() {
+        notes.push((format!("LOG: {}", service.log_path), MUTED));
+    }
+    for (index, (note, color)) in notes.iter().enumerate() {
+        canvas.text(40, 330 + index * 14, note, *color, 1);
+    }
+
+    canvas.fill(SERVICE_REPORT, FIELD);
+    canvas.frame(SERVICE_REPORT, BORDER);
+    let (report, report_color) = if service.report.is_empty() {
+        (
+            "INSTALL COPIES TOPVNC TO PROGRAM FILES AND RUNS IT AS SYSTEM, STARTING WITH WINDOWS."
+                .to_string(),
+            MUTED,
+        )
+    } else {
+        (
+            service.report.clone(),
+            if service.failed { ERROR } else { TEXT },
+        )
+    };
+    for (index, line) in service_report_lines(&report).iter().enumerate() {
+        canvas.text(
+            SERVICE_REPORT.x + 12,
+            SERVICE_REPORT.y + 10 + index * 10,
+            line,
+            report_color,
+            1,
+        );
+    }
+
+    if let Some(error) = &state.error {
+        status_message(canvas, error, ERROR);
+    }
+    let busy = service.busy;
+    canvas.button(
+        SERVICE_INSTALL,
+        if busy == Some(ServiceAction::Install) {
+            "WAITING..."
+        } else {
+            "INSTALL SERVICE"
+        },
+        cfg!(windows)
+            && busy.is_none()
+            && service.status_error.is_none()
+            && service.status.state == ServiceState::NotInstalled,
+    );
+    canvas.button(
+        SERVICE_REMOVE,
+        if busy == Some(ServiceAction::Remove) {
+            "WAITING..."
+        } else {
+            "REMOVE SERVICE"
+        },
+        false,
+    );
 }
 
 pub const WEB_PASSWORD: Box2 = Box2 {
@@ -2627,6 +2885,63 @@ mod tests {
         assert_eq!(state.focus, Some(Field::WebPassword));
         state.character(&mut config, 'p');
         assert_eq!(config.serve.password, "p");
+    }
+
+    #[test]
+    fn service_tab_layout_status_and_shared_password() {
+        for pair in MENU_TABS.windows(2) {
+            assert!(pair[0].0.y + pair[0].0.h <= pair[1].0.y);
+        }
+        const { assert!(SERVICE_STATUS.y + SERVICE_STATUS.h < SERVICE_PASSWORD.y) };
+        const { assert!(SERVICE_PASSWORD.x + SERVICE_PASSWORD.w < 548) };
+        // Four notes fit between the settings line and the report.
+        const { assert!(330 + 4 * 14 <= SERVICE_REPORT.y) };
+        const {
+            assert!(
+                SERVICE_REPORT.y + 10 + SERVICE_REPORT_ROWS * 10
+                    <= SERVICE_REPORT.y + SERVICE_REPORT.h
+            )
+        };
+        const { assert!(SERVICE_REPORT.y + SERVICE_REPORT.h < 525) };
+        const { assert!(12 + SERVICE_REPORT_CHARS * 6 <= SERVICE_REPORT.w) };
+        const { assert!(SERVICE_INSTALL.x + SERVICE_INSTALL.w < SERVICE_REMOVE.x) };
+        const { assert!(SERVICE_REMOVE.x + SERVICE_REMOVE.w <= 758) };
+
+        // The SERVICE tab edits the Server tab's password; neither is saved.
+        let mut state = UiState::default();
+        let mut config = Config::default();
+        state.switch_tab(Tab::Service);
+        state.key(&mut config, KeyCode::Tab);
+        assert_eq!(state.focus, Some(Field::ServicePassword));
+        state.character(&mut config, 'p');
+        assert_eq!(config.serve.password, "p");
+
+        let mut service = ServiceView::default();
+        assert_eq!(service_status_line(&service).0, "NOT INSTALLED");
+        service.status = ServiceStatus {
+            state: ServiceState::Running,
+            address: Some("127.0.0.1:5900".into()),
+            unencrypted: true,
+        };
+        assert_eq!(
+            service_status_line(&service),
+            ("RUNNING ON 127.0.0.1:5900".into(), ACCENT)
+        );
+        service.status_error = Some("could not read".into());
+        assert_eq!(service_status_line(&service).0, "COULD NOT READ");
+        assert_eq!(
+            service_settings_line(&ServeForm::default()),
+            "127.0.0.1:5900 / TLS / MAIN"
+        );
+        let report = format!("Installed.\n{}", "word ".repeat(400));
+        let lines = service_report_lines(&report);
+        assert_eq!(lines[0], "Installed.");
+        assert_eq!(lines.len(), SERVICE_REPORT_ROWS);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().count() <= SERVICE_REPORT_CHARS)
+        );
     }
 
     #[test]

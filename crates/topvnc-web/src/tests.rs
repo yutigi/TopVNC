@@ -1,14 +1,15 @@
 use crate::session::*;
 use topvnc_e2e::{Channel, Keypair, Responder};
-use topvnc_rfb::Encoding;
 use topvnc_rfb::messages::{
     PIXEL_FORMAT_MESSAGE, continuous_updates_message, fence_message, key_event, pointer_event,
     set_encodings_message, update_request, vnc_auth_response,
 };
 use topvnc_rfb::protocol::{
-    BUTTON_LEFT, CONTINUOUS_UPDATES_MESSAGE, DESKTOP_SIZE_ENCODING, FENCE_REQUEST,
-    SERVE_DISPLAY_ENCODING, SERVE_DISPLAY_FENCE, SERVE_SCALE_ENCODING, SERVE_SCALE_FENCE,
+    BUTTON_LEFT, CAPTURE_STATUS_ENCODING, CONTINUOUS_UPDATES_MESSAGE, DESKTOP_SIZE_ENCODING,
+    FENCE_REQUEST, SERVE_DISPLAY_ENCODING, SERVE_DISPLAY_FENCE, SERVE_SCALE_ENCODING,
+    SERVE_SCALE_FENCE,
 };
+use topvnc_rfb::{CaptureStatus, Encoding};
 
 const CHALLENGE: [u8; 16] = [3; 16];
 
@@ -202,6 +203,31 @@ fn continuous_updates_fences_and_resizes_follow_the_server() {
     expected.extend_from_slice(&update_request(false, 8, 6));
     host.expect(&mut session, &expected);
     assert_eq!(session.frame().unwrap().width(), 8);
+}
+
+#[test]
+fn the_page_learns_when_the_host_cannot_capture_its_desktop() {
+    let (mut session, mut host) = signed_in(4096);
+    assert_eq!(session.capture_status(), CaptureStatus::Live);
+    let status = |code| update(&[rect(code, 0, 0, 0, CAPTURE_STATUS_ENCODING)]);
+    let events = host.send(&mut session, &status(1), 5, 0.0);
+    assert_eq!(events & EVENT_CAPTURE_STATUS, EVENT_CAPTURE_STATUS);
+    assert_eq!(session.capture_status(), CaptureStatus::NoDisplay);
+    // Repeating the same status is not news.
+    let events = host.send(&mut session, &status(1), 64, 0.0);
+    assert_eq!(events & EVENT_CAPTURE_STATUS, 0);
+    // Codes from newer hosts still mean the picture is not live.
+    host.send(&mut session, &status(9), 64, 0.0);
+    assert_eq!(session.capture_status(), CaptureStatus::Unavailable);
+    let events = host.send(&mut session, &status(0), 64, 0.0);
+    assert_eq!(events & EVENT_CAPTURE_STATUS, EVENT_CAPTURE_STATUS);
+    assert_eq!(session.capture_status(), CaptureStatus::Live);
+    // A malformed announcement fails the session.
+    let malformed = host
+        .channel
+        .seal(&update(&[rect(1, 1, 0, 0, CAPTURE_STATUS_ENCODING)]))
+        .unwrap();
+    assert!(session.receive(&malformed, 0.0).is_err());
 }
 
 #[test]

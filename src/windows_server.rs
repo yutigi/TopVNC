@@ -2,27 +2,29 @@
 //! Duplication capture, `SendInput` injection, and clipboard sync.
 
 use crate::desktop_host::{
-    CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureSurface, CursorKind, CursorShape, DesktopImage,
-    DisplayArea, DisplayChange, DisplayFollower, DisplayPlan, Downscaler, KeyIdentity,
-    MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner, PointerTransition, Rect,
-    RemoteInputState, Rotation, WHEEL_DELTA, absolute_mouse_coordinate, latin1_from_unicode,
-    latin1_to_utf16, native_coordinate, served_size, unicode_key_units,
-    validate_capture_dimensions, windows_key_identity,
+    CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureOutage, CaptureSurface, CursorKind, CursorShape,
+    DesktopImage, DisplayArea, DisplayChange, DisplayFollower, DisplayPlan, Downscaler,
+    KeyIdentity, MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner, PointerTransition, Rect,
+    RemoteInputState, Rotation, WHEEL_DELTA, absolute_mouse_coordinate, connected_displays,
+    display_connected, is_secure_attention, latin1_from_unicode, latin1_to_utf16,
+    native_coordinate, served_size, unicode_key_units, validate_capture_dimensions,
+    windows_key_identity,
 };
 use crate::desktop_host::{
     MAX_CLIPBOARD_CHARS, ServeOptions, ServerNotice, VirtualKey, parse_serve_arguments,
     report_serving,
 };
+use std::collections::HashSet;
 use std::error::Error;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use topvnc::{
-    BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, ClientEvent, DamageRect,
-    Framebuffer, ServerConfig, VncServer,
+    BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, CaptureStatus,
+    ClientEvent, DamageRect, Framebuffer, ServerConfig, VncServer,
 };
 use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::{
@@ -49,7 +51,14 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
 use windows::core::{BOOL, Interface};
-use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, SetLastError};
+use windows_sys::Win32::Devices::Display::{
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
+    QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+};
+use windows_sys::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL, GetLastError, GlobalFree, SetLastError,
+};
 use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
@@ -63,8 +72,12 @@ use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::StationsAndDesktops::{
+    CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, HDESK, OpenInputDesktop,
+    SetThreadDesktop, UOI_NAME,
+};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetPriorityClass, HIGH_PRIORITY_CLASS,
+    GetCurrentProcess, GetCurrentThreadId, GetPriorityClass, HIGH_PRIORITY_CLASS,
     PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
     PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
     ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
@@ -87,6 +100,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 static SERVER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Set in the host agent, which the host service runs as SYSTEM: capture
+/// and input then follow the desktop that receives input, including the
+/// lock screen and UAC prompts on the secure desktop.
+static FOLLOW_INPUT_DESKTOP: AtomicBool = AtomicBool::new(false);
+/// Asks the host service to start Ctrl+Alt+Delete; set with
+/// [`FOLLOW_INPUT_DESKTOP`].
+static SECURE_ATTENTION: OnceLock<fn()> = OnceLock::new();
+/// How often the input thread checks which desktop receives input.
+const INPUT_DESKTOP_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 /// How long one capture poll waits for a new desktop frame.
 const FRAME_TIMEOUT_MS: u32 = 50;
 const FRAME_TIMEOUT: Duration = Duration::from_millis(FRAME_TIMEOUT_MS as u64);
@@ -249,6 +271,9 @@ pub fn serve(
     enable_thread_dpi_awareness();
     // The game runs in the foreground; keep capture and encoding on pace.
     let _scheduling = HostScheduling::raise(report);
+    if let Err(error) = follow_input_desktop() {
+        report(ServerNotice::Message(error));
+    }
     let mut follower = DisplayFollower::new(display);
     let (capture, plan) = start_capture(&mut follower).map_err(|error| {
         format!(
@@ -392,7 +417,14 @@ fn serve_desktop(
     let mut last_layout_check = Instant::now();
     let mut connections = 0;
     let mut pointer_mode = PointerModeHint::default();
+    let mut outage = CaptureOutage::default();
     while !shutdown.load(Ordering::Acquire) {
+        if capture.is_none() {
+            outage.stopped(Instant::now());
+        }
+        // Viewers keep the last picture while capture is stopped; tell them
+        // why once it lasts, and that it is live again once it resumes.
+        server.set_capture_status(outage.status(Instant::now()));
         server.set_relative_pointer(match mouse {
             // Games that turn the camera with the mouse hide the cursor;
             // ask viewers for relative motion while it stays hidden.
@@ -480,6 +512,14 @@ fn serve_desktop(
                 thread::sleep(Duration::from_millis(50));
                 continue;
             }
+            // Capture stops when the desktop switches, as to the lock
+            // screen; the agent duplicates the one that receives input now.
+            if let Err(error) = follow_input_desktop()
+                && error != last_capture_error
+            {
+                report(ServerNotice::Message(error.clone()));
+                last_capture_error = error;
+            }
             match start_capture(&mut follower) {
                 Ok((recreated, plan)) => {
                     let size = (recreated.placement.width, recreated.placement.height);
@@ -503,11 +543,14 @@ fn serve_desktop(
                             .unwrap_or_else(|| format!("Serving {}.", plan.description())),
                     ));
                     capture = Some(recreated);
+                    outage.resumed();
+                    server.set_capture_status(CaptureStatus::Live);
                     retry_delay = CAPTURE_RETRY_MIN;
                     last_capture_error.clear();
                     last_layout_check = Instant::now();
                 }
                 Err(error) => {
+                    outage.failed(capture_failure_status(error.as_ref()), Instant::now());
                     let message = error.to_string();
                     if message != last_capture_error {
                         report(ServerNotice::Message(format!(
@@ -577,6 +620,80 @@ fn damage_rect(rect: &Rect) -> DamageRect {
     }
 }
 
+/// Run capture and input on the desktop that receives input, for the host
+/// agent running as SYSTEM. `secure_attention` is called when a viewer
+/// presses Ctrl+Alt+Delete.
+pub fn follow_input_desktops(secure_attention: fn()) {
+    let _ = SECURE_ATTENTION.set(secure_attention);
+    FOLLOW_INPUT_DESKTOP.store(true, Ordering::Release);
+}
+
+/// In the host agent, move the calling thread to the desktop that receives
+/// input, such as Winlogon for the lock screen. Only SYSTEM can open the
+/// secure desktops. Returns whether the thread moved; does nothing outside
+/// the agent.
+fn follow_input_desktop() -> Result<bool, String> {
+    /// One handle per desktop name, opened once and kept: a thread's
+    /// desktop handle cannot be closed while the thread uses it.
+    static DESKTOPS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+    if !FOLLOW_INPUT_DESKTOP.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    let input = unsafe { OpenInputDesktop(0, 0, GENERIC_ALL) };
+    if input.is_null() {
+        return Err(format!(
+            "could not open the desktop that receives input: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let name = desktop_name(input);
+    let current = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
+    if name.is_some() && name == desktop_name(current) {
+        unsafe { CloseDesktop(input) };
+        return Ok(false);
+    }
+    let desktop = match (name, DESKTOPS.lock()) {
+        (Some(name), Ok(mut desktops)) => match desktops.iter().find(|(known, _)| *known == name) {
+            Some(&(_, handle)) => {
+                unsafe { CloseDesktop(input) };
+                handle as HDESK
+            }
+            None => {
+                desktops.push((name, input as usize));
+                input
+            }
+        },
+        // Unnamed desktops are not cached; this handle stays open.
+        _ => input,
+    };
+    if unsafe { SetThreadDesktop(desktop) } == 0 {
+        return Err(format!(
+            "could not switch to the desktop that receives input: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(true)
+}
+
+/// A desktop's name, such as `Default` or `Winlogon`.
+fn desktop_name(desktop: HDESK) -> Option<String> {
+    if desktop.is_null() {
+        return None;
+    }
+    let mut name = [0u16; 256];
+    let mut needed = 0;
+    let read = unsafe {
+        GetUserObjectInformationW(
+            desktop,
+            UOI_NAME,
+            name.as_mut_ptr().cast(),
+            size_of_val(&name) as u32,
+            &mut needed,
+        )
+    };
+    (read != 0).then(|| device_name(&name))
+}
+
 /// Make this thread see physical pixels without changing the DPI awareness of
 /// windows created on other threads.
 fn enable_thread_dpi_awareness() {
@@ -603,12 +720,21 @@ fn run_input(
 ) {
     let mut input = InputReleaseGuard(RemoteInputState::default());
     let mut injection_failed = false;
+    let mut desktop_checked: Option<Instant> = None;
     while !shutdown.load(Ordering::Acquire) {
         let event = match server.recv_event_timeout(INPUT_POLL_INTERVAL) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        // Input goes to this thread's desktop; follow the lock screen. A
+        // failure is retried at the next check and shows as rejected input.
+        if injection_failed
+            || desktop_checked.is_none_or(|at| at.elapsed() >= INPUT_DESKTOP_CHECK_INTERVAL)
+        {
+            desktop_checked = Some(Instant::now());
+            let _ = follow_input_desktop();
+        }
         let mut injection = Ok(false);
         match event {
             ClientEvent::Key {
@@ -617,7 +743,14 @@ fn run_input(
                 down,
             } => {
                 let key = windows_key_identity(keysym);
-                if input.0.key_event(client_id, key, down) {
+                let secure_attention = SECURE_ATTENTION
+                    .get()
+                    .filter(|_| down && is_secure_attention(key, input.0.held_keys()));
+                if let Some(request) = secure_attention {
+                    // Injected Ctrl+Alt+Delete does nothing; the service
+                    // starts it. Delete is not pressed, so not released.
+                    request();
+                } else if input.0.key_event(client_id, key, down) {
                     injection = inject_key(key, down);
                 }
             }
@@ -1103,6 +1236,28 @@ struct CaptureState {
     error: Option<String>,
 }
 
+/// Capture cannot start for a reason viewers are told.
+#[derive(Debug)]
+struct CaptureUnavailable {
+    status: CaptureStatus,
+    message: String,
+}
+
+impl std::fmt::Display for CaptureUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for CaptureUnavailable {}
+
+/// What viewers are told about a capture that failed to start.
+fn capture_failure_status(error: &(dyn Error + 'static)) -> CaptureStatus {
+    error
+        .downcast_ref::<CaptureUnavailable>()
+        .map_or(CaptureStatus::Unavailable, |unavailable| unavailable.status)
+}
+
 /// Start capturing what `follower` selects, among the displays attached
 /// now, and tell it what is served.
 fn start_capture(
@@ -1111,6 +1266,12 @@ fn start_capture(
     // Read the layout first: a change while starting is then noticed.
     let layout = monitor_layout();
     let attached = attached_outputs()?;
+    if attached.is_empty() {
+        return Err(Box::new(CaptureUnavailable {
+            status: CaptureStatus::NoDisplay,
+            message: "no display with a connected monitor was found".into(),
+        }));
+    }
     let areas = attached
         .iter()
         .map(|output| output.area.clone())
@@ -1227,6 +1388,8 @@ impl Drop for DesktopCapture {
 /// Capture one display until stopped or until its capture fails.
 fn capture_output(mut output: OutputCapture, shared: &CaptureShared, stop: &AtomicBool) {
     enable_thread_dpi_awareness();
+    // A failure shows up as a lost duplication, which restarts capture.
+    let _ = follow_input_desktop();
     while !stop.load(Ordering::Acquire) {
         if let Err(error) = output.next_frame(shared) {
             if let Ok(mut state) = shared.state.lock() {
@@ -1310,13 +1473,19 @@ impl OutputCapture {
             .cast::<IDXGIDevice>()
             .is_ok_and(|device| unsafe { device.SetGPUThreadPriority(7) }.is_ok());
         let output: IDXGIOutput1 = attached.output.cast()?;
-        let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(|error| {
-            if error.code() == E_ACCESSDENIED {
-                format!("Windows denied access to the desktop (secure desktop or locked session): {error}")
-            } else {
-                format!("could not start Desktop Duplication: {error}")
-            }
-        })?;
+        let duplication =
+            unsafe { output.DuplicateOutput(&device) }.map_err(|error| -> Box<dyn Error> {
+                if error.code() == E_ACCESSDENIED {
+                    Box::new(CaptureUnavailable {
+                        status: CaptureStatus::SecureDesktop,
+                        message: format!(
+                            "Windows denied access to the desktop (secure desktop or locked session): {error}"
+                        ),
+                    })
+                } else {
+                    format!("could not start Desktop Duplication: {error}").into()
+                }
+            })?;
         Ok(Self {
             owner,
             origin,
@@ -1680,6 +1849,7 @@ pub fn displays() -> Vec<DisplayArea> {
 /// Display outputs attached to the desktop, in DXGI enumeration order. The
 /// primary display is the one at the desktop origin.
 fn attached_outputs() -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
+    let connected = connected_sources();
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
     let mut outputs = Vec::new();
     for adapter_index in 0..16 {
@@ -1695,7 +1865,8 @@ fn attached_outputs() -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
                 Err(error) => return Err(error.into()),
             };
             let desc: DXGI_OUTPUT_DESC = unsafe { output.GetDesc()? };
-            if !desc.AttachedToDesktop.as_bool() {
+            let name = device_name(&desc.DeviceName);
+            if !desc.AttachedToDesktop.as_bool() || !display_connected(&name, connected.as_ref()) {
                 continue;
             }
             let area = desc.DesktopCoordinates;
@@ -1703,7 +1874,7 @@ fn attached_outputs() -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
                 adapter: adapter.clone(),
                 output,
                 area: DisplayArea {
-                    name: device_name(&desc.DeviceName),
+                    name,
                     rect: Rect::new(area.left, area.top, area.right, area.bottom),
                     primary: area.left == 0 && area.top == 0,
                 },
@@ -1717,8 +1888,66 @@ fn attached_outputs() -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
     Ok(outputs)
 }
 
-/// The monitors on the desktop as GDI reports them. Cheap enough to compare
-/// twice a second, unlike enumerating DXGI outputs.
+/// GDI device names, in upper case, of the desktop displays at least one
+/// connected monitor shows, or `None` when Windows cannot say. Windows can
+/// keep an unplugged monitor's display on the desktop, marked unavailable,
+/// for a while or for good; Desktop Duplication of it then waits for frames
+/// that never come, without an error.
+fn connected_sources() -> Option<HashSet<String>> {
+    // The topology can change between sizing and reading; try again, and
+    // give up (keeping every display) if it keeps changing.
+    let mut active = None;
+    for _ in 0..4 {
+        let (mut path_count, mut mode_count) = (0u32, 0u32);
+        if unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+        } != ERROR_SUCCESS
+        {
+            return None;
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        match unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        } {
+            ERROR_SUCCESS => {
+                paths.truncate(path_count as usize);
+                active = Some(paths);
+                break;
+            }
+            ERROR_INSUFFICIENT_BUFFER => {}
+            _ => return None,
+        }
+    }
+    let paths = active?;
+    let mut connected = HashSet::new();
+    for path in paths
+        .iter()
+        .filter(|path| path.targetInfo.targetAvailable != 0)
+    {
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+        source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+        source.header.adapterId = path.sourceInfo.adapterId;
+        source.header.id = path.sourceInfo.id;
+        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != ERROR_SUCCESS as i32 {
+            return None;
+        }
+        connected.insert(device_name(&source.viewGdiDeviceName).to_ascii_uppercase());
+    }
+    Some(connected)
+}
+
+/// The monitors on the desktop as GDI reports them, without displays no
+/// connected monitor shows. Cheap enough to compare twice a second, unlike
+/// enumerating DXGI outputs.
 fn monitor_layout() -> Vec<DisplayArea> {
     unsafe extern "system" fn collect(
         monitor: HMONITOR,
@@ -1757,7 +1986,7 @@ fn monitor_layout() -> Vec<DisplayArea> {
             LPARAM(&mut monitors as *mut Vec<DisplayArea> as isize),
         );
     }
-    monitors
+    connected_displays(monitors, connected_sources().as_ref())
 }
 
 fn rotation(rotation: DXGI_MODE_ROTATION) -> Result<Rotation, &'static str> {
@@ -1912,6 +2141,36 @@ mod tests {
         assert!(!displays.is_empty());
         assert_eq!(displays.iter().filter(|display| display.primary).count(), 1);
         assert_eq!(sorted(monitor_layout()), sorted(displays));
+    }
+
+    /// Every display a monitor shows is reported connected, so filtering by
+    /// connection leaves a normally attached desktop unchanged.
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn every_attached_display_has_a_connected_monitor() {
+        enable_thread_dpi_awareness();
+        let connected = connected_sources().expect("Windows reports display paths");
+        assert!(!connected.is_empty());
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.unwrap();
+        let mut attached = Vec::new();
+        for adapter_index in 0.. {
+            let Ok(adapter) = (unsafe { factory.EnumAdapters1(adapter_index) }) else {
+                break;
+            };
+            for output_index in 0.. {
+                let Ok(output) = (unsafe { adapter.EnumOutputs(output_index) }) else {
+                    break;
+                };
+                let desc = unsafe { output.GetDesc() }.unwrap();
+                if desc.AttachedToDesktop.as_bool() {
+                    attached.push(device_name(&desc.DeviceName).to_ascii_uppercase());
+                }
+            }
+        }
+        assert!(!attached.is_empty());
+        for name in &attached {
+            assert!(connected.contains(name), "{name} is not in {connected:?}");
+        }
     }
 
     /// Captures every display alone and all together, and checks that each
