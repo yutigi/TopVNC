@@ -10,7 +10,7 @@
 
 pub mod config;
 #[cfg(windows)]
-mod job;
+pub mod job;
 pub mod lines;
 pub mod pairing;
 pub mod process;

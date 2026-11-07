@@ -30,9 +30,10 @@ pub use protocol::{
 pub use reader::{MessageReader, Rect, ServerMessage};
 
 use protocol::{
-    CLIENT_TIGHT_COMPRESS_LEVEL, CONTINUOUS_UPDATES_ENCODING, DESKTOP_SIZE_ENCODING,
-    EXTENDED_MOUSE_BUTTONS_ENCODING, FENCE_ENCODING, POINTER_MOTION_CHANGE_ENCODING, RAW_ENCODING,
-    SERVE_DISPLAY_ENCODING, SERVE_SCALE_ENCODING, ZLIB_ENCODING,
+    CAPTURE_STATUS_ENCODING, CLIENT_TIGHT_COMPRESS_LEVEL, CONTINUOUS_UPDATES_ENCODING,
+    DESKTOP_SIZE_ENCODING, EXTENDED_MOUSE_BUTTONS_ENCODING, FENCE_ENCODING,
+    POINTER_MOTION_CHANGE_ENCODING, RAW_ENCODING, SERVE_DISPLAY_ENCODING, SERVE_SCALE_ENCODING,
+    ZLIB_ENCODING,
 };
 use std::io;
 
@@ -70,6 +71,47 @@ impl ServedDisplays {
     }
 }
 
+/// Whether a TopVNC host can capture its desktop, as it announces to
+/// viewers. While it cannot, viewers keep the last picture and should say
+/// why; input is still sent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureStatus {
+    /// The picture is live.
+    #[default]
+    Live,
+    /// No display is attached or connected, such as after the only monitor
+    /// was unplugged.
+    NoDisplay,
+    /// The desktop is on a screen the host cannot capture, such as the lock
+    /// screen or a UAC prompt.
+    SecureDesktop,
+    /// Capture stopped for another reason, including codes this viewer does
+    /// not know.
+    Unavailable,
+}
+
+impl CaptureStatus {
+    /// The code sent in the rectangle's `x` field.
+    pub fn code(self) -> u16 {
+        match self {
+            Self::Live => 0,
+            Self::NoDisplay => 1,
+            Self::SecureDesktop => 2,
+            Self::Unavailable => 3,
+        }
+    }
+
+    /// Unknown codes from newer hosts still mean the picture is not live.
+    pub fn from_code(code: u16) -> Self {
+        match code {
+            0 => Self::Live,
+            1 => Self::NoDisplay,
+            2 => Self::SecureDesktop,
+            _ => Self::Unavailable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
     Raw,
@@ -103,6 +145,7 @@ impl Encoding {
             DESKTOP_SIZE_ENCODING,
             SERVE_SCALE_ENCODING,
             SERVE_DISPLAY_ENCODING,
+            CAPTURE_STATUS_ENCODING,
         ]);
         // Relative motion for games that capture the mouse, and the back
         // and forward buttons.

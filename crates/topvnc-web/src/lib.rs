@@ -202,6 +202,14 @@ impl Connection {
         self.inner.request_serve_display(display).map_err(error)
     }
 
+    /// Whether the host can capture its desktop: 0 live, 1 no display
+    /// attached, 2 a secure screen such as the lock screen, 3 another
+    /// reason. See [`topvnc_rfb::CaptureStatus`].
+    #[wasm_bindgen(js_name = captureStatus)]
+    pub fn capture_status(&self) -> u16 {
+        self.inner.capture_status().code()
+    }
+
     #[wasm_bindgen(js_name = relativePointer)]
     pub fn relative_pointer(&self) -> bool {
         self.inner.relative_pointer()

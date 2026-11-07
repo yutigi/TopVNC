@@ -19,6 +19,7 @@ export const EVENT = {
   CAPABILITIES: 1 << 7,
   RTT: 1 << 8,
   OVERSIZE: 1 << 9,
+  CAPTURE_STATUS: 1 << 10,
 };
 
 // A link this far behind is not usable for interactive control.
@@ -153,6 +154,7 @@ export function createSession(post) {
     if (events & EVENT.CAPABILITIES) {
       post({ type: "capabilities", serveScale: current.connection.serveScale(), displays: [...current.connection.servedDisplays()] });
     }
+    if (events & EVENT.CAPTURE_STATUS) post({ type: "captureStatus", status: current.connection.captureStatus() });
     if (events & EVENT.BELL) post({ type: "bell" });
     if (events & EVENT.FRAME && !current.renderPending) {
       current.renderPending = true;
