@@ -11,17 +11,23 @@ viewport** on a phone to try the layout at its actual viewport size.
 ## Review flows
 
 - **Type:** the custom TopVNC keyboard is the default. Tap character keys, use
-  Shift, symbols, Space, or hold Backspace; Insert puts the phrase in the demo
-  remote editor. Four thumb-dock controls keep their order across orientations.
-- **Languages:** EN, Thai, Chinese, and Japanese are editable examples. The +
-  panel adds/removes language profiles and pins up to four. Edit each profile's
-  three character rows. Preferences are saved only in this browser.
+  symbols, Space, or hold Backspace; Insert puts the phrase in the demo remote
+  editor. The row above Type contains Ctrl, Alt and Shift. Shift updates the
+  character labels and inserts shifted text; Ctrl/Alt plus a key reports a demo
+  chord without changing the composed phrase. Modifiers clear after one use.
+  Four thumb-dock controls keep their order across orientations.
+- **Languages:** the ◎ icon inside the custom keyboard opens language selection
+  and configuration. English, Thai, Chinese, and Japanese are editable examples.
+  Add/remove profiles, favorite up to four, and edit each profile's three rows.
+  Saved pins become favorites at the top of the picker; profiles and layouts stay
+  saved in this browser. The icon identifies the current language for assistive tools.
 - **Chinese/Japanese:** type `nihao` or `zhongwen` in Chinese, or `nihon` or
   `arigatou` in Japanese, then select a candidate and Insert. Candidates are
   explicitly labeled demo fixtures; no complete conversion engine is included.
 - **Native input:** switches to a real editable field labeled with the detected
   OS. Your browser and OS control whether an on-screen keyboard opens. The
   website does not switch OS languages; use the native keyboard's globe key.
+  The Type modifier row is disabled here; native text and IME use OS controls.
 - **Keys:** tap modifiers for the next key, configure four pinned shortcuts, or
   open the Fn grid. Mode/rotation/focus changes release modifiers.
 - **Pointer:** drag in the demo trackpad to move the sample cursor.
@@ -33,13 +39,16 @@ viewport** on a phone to try the layout at its actual viewport size.
 - **FPS configuration:** remap each game button, mirror the aiming hand, and set
   simulated look sensitivity in Presets. Standard layouts and custom keys stay
   saved. Switch to Type for chat; the Play button returns to the FPS overlay.
-- **Language pins:** appear only in Type, never in Quick Keys or FPS Play.
+- **Type modifier row:** appears only in Type, never in Quick Keys or FPS Play.
+  The keyboard's own Shift and the row's Shift share a single visible state.
 - **Customize → Your keys:** create up to eight labeled single-key shortcuts,
   modifier chords, or text snippets. Edit, remove, move up/down, and choose a
   two-column button. Changes save in this browser and appear in the custom pad.
 - **Customize → UI layout:** independently configure portrait and landscape deck
-  placement, control-group order, mode-dock order, optional language/custom-key
-  visibility, and standard/large custom-key sizing. Save applies the arrangement;
+  placement, control-group order, mode-dock order, optional custom-key visibility,
+  and standard/large custom-key sizing. Old language-row ordering moves the Type
+  modifiers instead; old hide-language preferences cannot hide them.
+  Save applies the arrangement;
   Reset selects defaults for the chosen orientation. All modes and the header's
   Customize entry stay reachable. Longer custom decks scroll above a sticky dock.
 
@@ -49,8 +58,10 @@ primary dock controls remain at least 44 CSS pixels high.
 
 ## Verification limits
 
-JavaScript syntax, CSS parsing, HTML element references, and the customization
-model tests are checked. The initial version also passed local HTTP checks;
+JavaScript syntax, CSS parsing, HTML element references, customization/FPS model
+tests, and app-handler tests for modifiers and IME guards are checked. The handler
+tests use a DOM stand-in and do not verify visual rendering.
+The initial version also passed local HTTP checks;
 subsequent review uses Sites without starting a local server.
 Browser automation was unavailable: the browser host failed, and the Windows
 fallback stopped because it could not verify the active URL. Visual rendering,

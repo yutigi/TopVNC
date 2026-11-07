@@ -9,8 +9,7 @@
   white-space: nowrap;
   border: 0;
 }
-.typing .deck-top,
-.typing .language-hint {
+.typing .deck-top {
   display: none;
 }
 .typing .deck-grip {
@@ -19,16 +18,27 @@
 .typing .mode-panel {
   min-height: 0;
 }
-.typing .language-bar {
+.type-modifiers {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
   margin-bottom: 8px;
 }
-.language-chip {
-  flex: 1 1 0;
-  min-width: 44px;
-  max-width: 95px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  padding: 4px;
+.type-modifiers button {
+  min-height: 44px;
+  font-size: 12px;
+  background: #edf2e4;
+  border-color: #cbd4bf;
+  touch-action: manipulation;
+}
+.type-modifiers button[aria-pressed=true] {
+  background: #697a50;
+  color: #fff;
+  border-color: #697a50;
+}
+.type-modifiers button:disabled {
+  opacity: .5;
+  cursor: default;
 }
 .type-toolbar {
   display: flex;
@@ -253,20 +263,8 @@
   padding-right: 12px;
   padding-top: 5px;
 }
-.device.landscape.typing .language-bar {
-  position: absolute;
-  right: 12px;
-  top: 5px;
-  width: 46%;
-  margin: 0;
-}
-.device.landscape.typing .language-chip {
-  min-height: 34px;
-}
-.device.landscape.typing .language-add {
-  height: 34px;
-  width: 34px;
-  min-height: 34px;
+.device.landscape.typing .type-modifiers {
+  margin-bottom: 5px;
 }
 .device.landscape.typing .type-toolbar {
   height: 34px;

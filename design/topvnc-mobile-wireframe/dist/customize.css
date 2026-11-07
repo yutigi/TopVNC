@@ -67,8 +67,7 @@
   order: -20;
   flex-shrink: 0;
 }
-.device .control-deck > .language-bar,
-.device .control-deck > .language-hint,
+.device .control-deck > .type-modifiers,
 .device .control-deck > .mode-panel {
   flex-shrink: 0;
 }
@@ -89,13 +88,6 @@
 }
 .layout-hidden {
   display: none !important;
-}
-.device.landscape.typing .language-bar {
-  position: static;
-  right: auto;
-  top: auto;
-  width: 100%;
-  margin-bottom: 5px;
 }
 .device.landscape.typing .type-toolbar {
   width: 100%;

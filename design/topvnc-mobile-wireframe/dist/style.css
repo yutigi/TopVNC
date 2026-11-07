@@ -539,44 +539,6 @@ h1 {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.language-bar {
-  display: flex;
-  gap: 5px;
-  align-items: center;
-}
-.language-bar > div {
-  display: flex;
-  gap: 5px;
-  flex: 1;
-  overflow-x: auto;
-}
-.language-chip {
-  font-size: 11px;
-  min-width: 54px;
-  min-height: 44px;
-  flex: 1;
-  white-space: nowrap;
-  background: #fafbf7;
-  border-color: #e1e5d8;
-}
-.language-chip[aria-pressed=true] {
-  background: #e8eddc;
-  border-color: #a8b695;
-  color: #4d6034;
-  box-shadow: inset 0 0 0 1px #a8b695;
-}
-.language-add {
-  width: 44px;
-  height: 44px;
-  background: #fff;
-  flex-shrink: 0;
-  font-size: 16px;
-}
-.language-hint {
-  font-size: 8px;
-  color: #98a08c;
-  margin: 6px 0 13px;
-}
 .mode-panel {
   min-height: 175px;
 }
@@ -1131,13 +1093,6 @@ kbd {
 .landscape .deck-top {
   margin: 10px 0 7px;
 }
-.landscape .language-hint {
-  margin-bottom: 7px;
-}
-.landscape .language-chip {
-  min-width: 45px;
-  font-size: 10px;
-}
 .landscape .mode-panel {
   min-height: 0;
   flex: 1;
@@ -1502,12 +1457,6 @@ kbd {
   }
   .quick-controls {
     gap: 7px;
-  }
-  .language-chip {
-    min-width: 47px;
-  }
-  .language-hint {
-    font-size: 7px;
   }
   .device {
     height: 720px;
