@@ -6,6 +6,10 @@ pub const SERVE_SCALE_ENCODING: i32 = 0x5456_4e53;
 pub const SERVE_SCALE_FENCE: &[u8] = b"TopVNC.Scale/1:";
 pub const SERVE_DISPLAY_ENCODING: i32 = 0x5456_4e44;
 pub const SERVE_DISPLAY_FENCE: &[u8] = b"TopVNC.Display/1:";
+/// TopVNC private pseudo-encoding (TVNC): whether the host can capture its
+/// desktop. A payload-free rectangle with `x` = [`crate::CaptureStatus`]
+/// code and `y` = width = height = 0.
+pub const CAPTURE_STATUS_ENCODING: i32 = 0x5456_4e43;
 /// The most host displays the display capability describes.
 pub const MAX_SERVED_DISPLAYS: u8 = 16;
 pub const MAX_FRAMEBUFFER_DIMENSION: u16 = 8192;

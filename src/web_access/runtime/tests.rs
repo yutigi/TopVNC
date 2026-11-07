@@ -153,6 +153,54 @@ fn running(now: Instant) -> (WebRuntime, FakeSpawner) {
 }
 
 #[test]
+fn service_backed_browser_access_stops_only_its_own_children() {
+    let now = Instant::now();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = listener.local_addr().unwrap();
+    let mut launch = launch();
+    launch.settings.rfb_target = target;
+    let mut service = crate::host_service::ServiceRuntime::default();
+    service.view.status = crate::ui::ServiceStatus {
+        state: crate::ui::ServiceState::Running,
+        address: Some(target.to_string()),
+        unencrypted: true,
+    };
+    let mut host = crate::HostedServer::default();
+    let (mut web, spawner) = runtime();
+    web.start(launch, "pw", &host.web_view(), now).unwrap();
+    assert_eq!(
+        web.poll(&host.web_view(), now),
+        Some(ServerRequest::Start(target))
+    );
+    host.start_web(&crate::ui::ServeForm::default(), target, &service)
+        .unwrap();
+    assert_eq!(web.poll(&host.web_view(), now), None);
+    spawner.push(Program::Tunnel, Event::Registered(0));
+    web.poll(&host.web_view(), now);
+    spawner.push(
+        Program::Gateway,
+        Event::GatewayReady("127.0.0.1:6080".into()),
+    );
+    web.poll(&host.web_view(), now);
+    for row in ROWS {
+        assert_eq!(*web.row(row), RowState::Ready);
+    }
+    assert!(host.running.is_none(), "no desktop server was started");
+    web.stop();
+    assert_eq!(web.poll(&host.web_view(), now), None);
+    assert!(spawner.child(Program::Gateway).lock().unwrap().input_closed);
+    spawner.child(Program::Gateway).lock().unwrap().exit = Some("exited".into());
+    assert_eq!(web.poll(&host.web_view(), now), Some(ServerRequest::Stop));
+    host.stop(crate::Owner::Web);
+    assert_eq!(web.poll(&host.web_view(), now), None);
+    assert!(web.is_idle());
+    assert!(spawner.child(Program::Tunnel).lock().unwrap().killed);
+    assert!(host.web_service.is_none());
+    assert_eq!(service.view.status.state, crate::ui::ServiceState::Running);
+    std::net::TcpStream::connect(target).unwrap();
+}
+
+#[test]
 fn starts_server_then_tunnel_then_gateway() {
     let now = Instant::now();
     let (mut web, spawner) = runtime();
