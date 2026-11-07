@@ -305,6 +305,20 @@ failed job on the current main commit. An older run fails if main has moved.
 Main runs and production deployments are serialized, without cancelling a
 running upload.
 
+Public source does not make environment secrets public. This workflow exposes
+production secrets only to its main-only deployment job; fork and PR jobs do
+not receive them. Actions are pinned to upstream commit SHAs so moving a
+release tag cannot silently change their code. Keep these pins current through
+reviewed changes. Require PRs and passing CI on `main`, block force pushes and
+deletions, and review workflow, dependency and browser-code changes carefully.
+A repository writer who can change code on `main`, a compromised dependency or
+a compromised runner could steal the deployment token or publish malicious
+browser code. The token can modify Workers in its selected account; it is not
+limited to this Worker. Anyone who can replace the served client can capture
+future browser sessions despite transport encryption. Environment secrets and
+log masking reduce exposure; they do not remove that trust boundary. See
+[GitHub's secure-use guidance](https://docs.github.com/en/actions/reference/security/secure-use).
+
 ### One-time repository setup
 
 1. In GitHub **Settings → Environments**, create `cloudflare-production`.
