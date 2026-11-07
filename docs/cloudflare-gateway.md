@@ -24,6 +24,7 @@ lists what still needs a live run by the owner.
 - [How it works](#how-it-works)
 - [Before you start](#before-you-start)
 - [One-time setup](#one-time-setup) (about 30 minutes)
+- [Automatic deployment from GitHub](#automatic-deployment-from-github)
 - [Pair your phone](#pair-your-phone) (once per browser)
 - [Each session](#each-session)
 - [Troubleshooting](#troubleshooting)
@@ -292,6 +293,116 @@ With the JavaScript Worker, `deploy:check` also runs the Worker's tests
 (17 pass) and the upload is 14.01 KiB (4.71 KiB gzip); the Rust Worker's was
 649.51 KiB. `npm run deploy` itself last ran live on 2026-10-31 (versions
 `9e792e97` and `31ffb4b5`), with the Rust Worker and the Phase 0 Worker name.
+
+## Automatic deployment from GitHub
+
+The `Deploy Cloudflare` job in `.github/workflows/ci.yml` publishes the existing
+`topvnc-connection-spike` Worker and its static assets after **all** CI jobs
+succeed on a push to `main`. It downloads `web/dist` from that same run; it does
+not rebuild a different revision. Pull requests and manual runs on feature
+branches cannot deploy. To retry, run **CI → Run workflow → main**, or rerun the
+failed job on the current main commit. An older run fails if main has moved.
+Main runs and production deployments are serialized, without cancelling a
+running upload.
+
+### One-time repository setup
+
+1. In GitHub **Settings → Environments**, create `cloudflare-production`.
+   Under **Deployment branches and tags**, select **Selected branches and tags**
+   and add the **branch** `main` (not a tag). No reviewer or wait timer is needed.
+2. Create a dedicated [Cloudflare API token](https://dash.cloudflare.com/profile/api-tokens)
+   limited to the existing account, with **Workers Scripts: Edit** and
+   **Connectivity Directory: Read + Bind**. The latter permits binding the
+   existing private VPC service; it does not need Admin or permission to create
+   services/tunnels. No DNS, Access policy, billing, or zone-edit permission is
+   needed. Use an expiry appropriate for your maintenance schedule and rotate
+   before it expires. See [Cloudflare GitHub Actions](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/)
+   and [VPC permissions](https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/#required-roles).
+3. Add environment secret **`CLOUDFLARE_API_TOKEN`** with that token. An interactive
+   `wrangler login` OAuth session is for local use; do not copy its refresh token
+   into GitHub. With the GitHub CLI, this command prompts for the value without
+   putting it in command history:
+
+   ```powershell
+   gh secret set CLOUDFLARE_API_TOKEN --env cloudflare-production --repo yutigi/TopVNC
+   ```
+
+4. Add environment secret **`CLOUDFLARE_WRANGLER_CONFIG`** containing this JSON,
+   replacing the five uppercase placeholders with the matching values from the
+   existing ignored `wrangler.local.toml`. Keep the Worker name, origin, service
+   ID and Access values identical to the live deployment. These values are not
+   login credentials, but the environment secret keeps account/personal details
+   out of the public repository. Never include the tunnel token, host key,
+   browser keys or VNC password.
+
+   ```json
+   {
+     "name": "topvnc-connection-spike",
+     "account_id": "EXISTING_ACCOUNT_ID",
+     "main": "src/index.mjs",
+     "compatibility_date": "2026-10-29",
+     "workers_dev": true,
+     "preview_urls": false,
+     "assets": {
+       "directory": "../../../web/dist",
+       "run_worker_first": ["/ws"]
+     },
+     "vars": {
+       "APP_ORIGIN": "https://topvnc-connection-spike.js-sookudom-temp.workers.dev",
+       "ACCESS_ISSUER": "EXISTING_ACCESS_ISSUER",
+       "ACCESS_AUD": "EXISTING_ACCESS_AUD",
+       "OWNER_EMAIL": "EXISTING_OWNER_EMAIL",
+       "UPSTREAM_URL": "http://127.0.0.1:6080/ws"
+     },
+     "vpc_services": [{
+       "binding": "HOST_NET",
+       "service_id": "EXISTING_SERVICE_ID",
+       "remote": true
+     }]
+   }
+   ```
+
+   The preparation script validates the fixed deployment destination and Access
+   configuration, strips extra settings, masks individual values in Actions,
+   and writes an ignored `wrangler.ci.json` only for the job. Wrangler's
+   informational binding summary is suppressed because it truncates values,
+   which prevents full-value secret masking from matching them. Changing the
+   production hostname or compatibility date requires a reviewed script update.
+5. In the existing Worker's **Settings → Builds**, check whether it is connected
+   to Git. Disable any independent automatic production deploy before using
+   Actions, so it cannot bypass CI or race this job. This workflow does not
+   create a Builds integration, preview deployment or public tunnel hostname.
+
+### Verify and recover
+
+After merging, open **Actions → CI** for the main commit. All checks and
+`Deploy Cloudflare` must succeed; Wrangler records the Git SHA and Actions run
+ID in the deployment message. The final step requests `/` and `/ws` without
+cookies and requires a 302 to the configured team's Access login. This checks
+edge protection, not a paired device session. On the phone, sign in and check
+display, typing, simultaneous controls and reconnect with the host running.
+
+If the Access check fails, treat the deploy as failed even if the upload
+succeeded. The check cannot undo an upload. Inspect the exact-hostname Access
+application and restore the previous Worker version if needed; never bypass
+Access to make the check pass. Existing tunnel, VPC service, host identity and
+pairings stay in place.
+
+For an emergency rollback, cancel pending **CI** deployments first. In
+Cloudflare **Workers & Pages → topvnc-connection-spike → Deployments**, roll
+back to the last known good version (including its static assets). Or, from
+`gateway/cloudflare/worker` with the existing local config and authorized
+credentials:
+
+```powershell
+npx --no-install wrangler deployments list --config wrangler.local.toml
+npx --no-install wrangler rollback VERSION_ID --config wrangler.local.toml
+```
+
+Then revert the faulty commit through a PR to `main`; successful CI deploys the
+revert. Rerunning an old CI commit is intentionally refused. A later main
+deployment supersedes an emergency rollback, so fix or pause pending runs first.
+See [Cloudflare rollbacks](https://developers.cloudflare.com/workers/configuration/versions-and-deployments/rollbacks/).
 
 ## Pair your phone
 
