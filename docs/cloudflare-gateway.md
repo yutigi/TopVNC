@@ -447,8 +447,13 @@ It needs only:
 
 Use it:
 
-1. On the **WEB** tab, choose **QUICK TUNNEL** and read the warning.
-2. Type a VNC password and press **Start browser access**. TopVNC serves this
+1. On the **WEB** tab, choose **QUICK TUNNEL**. **Limitations** opens the
+   notice at any time, including during a run.
+2. Type a VNC password and press **Start browser access**. Read the popup and
+   choose **Continue** to start; **Cancel** or Escape closes only the popup.
+   Keyboard users can Tab to Continue and press Enter; Cancel is selected
+   initially. **Pair a browser** from idle shows the same popup before starting.
+   TopVNC serves this
    desktop on `127.0.0.1:5900` as on the Access route, then starts the gateway
    and waits until it owns `127.0.0.1:6080`. Only then does it run
    `cloudflared tunnel --no-autoupdate --config <per-run-config> --url http://127.0.0.1:6080`.
@@ -483,11 +488,21 @@ How it differs from the Access route:
 | Pairing | Once per browser | After every start: new URL, new host key |
 | Enrolled browsers | Saved in `browsers.txt` | Kept in the gateway's memory for this run only |
 | Page served by | The Worker | The gateway on the host, through the tunnel |
-| Session limit | `max_session_seconds` and the Access sign-in expiry | 7200 s |
+| Session limit | `max_session_seconds` and the Access sign-in expiry | Two hours per connection; reconnect within the same run |
 | Service | Cloudflare's free plans | Cloudflare's testing service, with no uptime guarantee |
 
 Limitations:
 
+- **Two hours per connection.** This is TopVNC's connection cap, not the
+  lifetime of the tunnel. Reconnect with the enrolled browser and VNC password
+  while the same run remains active. Only one browser session is active at a
+  time, with up to eight browsers paired per run.
+- **Phone background/resume is unverified.** Switching apps or locking the
+  phone may disconnect Safari. Return to the page and reconnect; the same run
+  does not need another invite. A new run needs the new URL and pairing again.
+- **Keep invites private.** They expire after ten minutes and can be used
+  once. A copied pairing URL remains on the clipboard until replaced; copying
+  does not extend its validity.
 - **A new URL every start.** The phone cannot find it again unless it can see
   the host's screen. Browser storage is per address, so every start also
   loses the phone's pairing.
@@ -503,11 +518,65 @@ Limitations:
 - **Often blocked.** The `trycloudflare.com` domain is widely abused, so some
   networks and security tools block it or flag cloudflared.
 - **`--allowed-mail` is not used.** Cloudflare's optional email one-time PIN
-  for Quick Tunnels is not known to cover WebSocket upgrades, so TopVNC does
-  not rely on it.
+  is not enabled in the WEB tab. The 2026-11-07 live harness did verify an
+  email-authenticated encrypted WebSocket session and reconnect. Fresh clients,
+  expired-cookie replays, and a browser with its login removed were denied.
+  However, the actual auth cookie had only about four seconds remaining after
+  sign-in in this test. An established session stayed connected after expiry;
+  new connections require sign-in again. An email field is deferred because
+  of that short observed login lifetime. See
+  [the exact results](../specs/019-quick-tunnel-mode/validation.md).
 - **Same trust limit.** TLS still ends at Cloudflare. The page now comes from
   the host through the tunnel, so no Worker can replace it, but Cloudflare's
   edge still could. See [Security model](#security-model).
+
+### Repeatable live validation
+
+`node scripts/check-quick-tunnel.mjs` runs real gateway/cloudflared/browser
+checks against a harmless synthetic desktop. Input never reaches the OS.
+It requires Node 22+, `cargo build --workspace --locked`, built `web/dist`,
+cloudflared, and an already-installed Chromium browser. Run from the repository
+root, setting `TOPVNC_TEST_CHROME` to that browser executable and `CLOUDFLARED`
+if it is not on PATH. No additional Node packages are needed.
+
+Without an email, the harness checks two starts, old pairing rejection,
+encrypted moving frames, safe input/release, enrolled reconnect, Chromium
+freezes of 2 and 65 seconds, and shutdown. These freezes do not establish
+iPhone Safari behavior. It opens only a disposable, private browser session.
+
+To exercise the experimental email gate, supply your own allowed address
+temporarily. For example, in PowerShell 7:
+
+```powershell
+$env:TOPVNC_TEST_CHROME = 'C:\path\to\chrome.exe'
+$env:CLOUDFLARED = 'C:\path\to\cloudflared.exe'
+try {
+    $env:TOPVNC_TEST_EMAIL = Read-Host 'Email to allow (sent to Cloudflare)' -MaskInput
+    $env:TOPVNC_TEST_EXPIRY_WAIT_SECONDS = '600'
+    node scripts/check-quick-tunnel.mjs
+} finally {
+    Remove-Item Env:TOPVNC_TEST_EMAIL -ErrorAction SilentlyContinue
+    Remove-Item Env:TOPVNC_TEST_EXPIRY_WAIT_SECONDS -ErrorAction SilentlyContinue
+}
+```
+
+Enter the email and PIN yourself in the new private Chromium window. The
+harness waits up to 15 minutes for login, then checks the real encrypted
+session. It tests fresh-client denial, reconnect, cookie removal, and replay
+after the observed auth-session expiry when that fits the configured wait
+budget (0-10800 seconds, default 0). An existing socket surviving expiry is
+recorded separately from whether a new upgrade is rejected. Cookie removal
+is not a natural-expiry test. An unsupported flag or failed gate never causes
+an ungated retry.
+
+The address is passed to cloudflared as an argument during the test and is
+not saved in project configuration or reports. Reports under
+`target/quick-tunnel-checks/<run>/report.json` contain selected outcomes and
+timings only. Private browser profiles and owned child processes are cleaned
+up on completion or handled interruption. PINs, cookie values, pairing keys,
+passwords, and raw child/browser output are never written to these reports.
+Run the harness regressions with
+`node --test scripts/tests/QuickTunnel.Tests.mjs`.
 
 ## Troubleshooting
 

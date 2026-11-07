@@ -65,8 +65,41 @@ Design choices made while implementing (within the approved plan):
   Access route is never accepted without Access.
 
 Out of scope: a stable URL or any rendezvous for the phone to find a new URL;
-`--allowed-mail`; a named tunnel without Access; changing the Access route;
+a named tunnel without Access; changing the Access route;
 packaging without a repository checkout.
+
+### Email-gate validation extension (owner requested 2026-11-07)
+
+The owner confirmed the limitations popup and requested implementation of
+email-gated WebSocket checks and the remaining validation. Add a repeatable,
+opt-in live harness before enabling an email field in the product. The
+original no-account route remains available with mandatory pairing/password.
+
+Acceptance criteria for the live harness:
+
+- Bind the real gateway before publishing; isolate cloudflared configuration
+  and inherited `TUNNEL_*` settings exactly as the WEB tab does. When an email
+  is supplied, pass `--allowed-mail` on every launch and never retry without it.
+- Before login, both the page/assets and `/ws` must be gated. A fresh client
+  must never get a WebSocket 101 or TopVNC app contents. Repeat after login
+  and after clearing the disposable browser's login to check rejection.
+- The owner supplies the allowed email and enters the PIN interactively.
+  After login, verify the host fingerprint, mandatory pairing and VNC password,
+  actual encrypted WebSocket session and changing frames, input, reconnect
+  without a new invite, and shutdown. Use a harmless synthetic RFB fixture
+  for automated input, never an arbitrary desktop application.
+- Test loss of browser focus with held input and confirm release at the
+  synthetic server. Distinguish this from physical iPhone background/resume.
+- Record natural login expiry separately from clearing cookies. A cookie
+  removal check must never be reported as token-expiry or active-session
+  revocation evidence. Product email support remains unverified until the
+  relevant live gates pass; no fallback may weaken the selected restriction.
+- Reports contain only allowlisted outcomes and timings. Never save emails,
+  PINs, cookies/tokens, pairing links, passwords, or browser storage. Browser
+  authentication uses a disposable private session and is closed on cleanup.
+- Plain-route runs also check restart with a fresh URL/key, old pairing
+  rejection, fresh pairing, reconnect, and connector-first shutdown. These
+  harness runs must be distinguished from actual WEB-tab desktop tests.
 
 ## Limitations
 
@@ -132,6 +165,21 @@ Quick Tunnel mode and fetch the page and complete a paired session.
    forwarding immediately; graceful shutdown stops the connector before
    closing the gateway. Returning from a native viewer restores the active
    route, its URL, and its route-specific security explanation.
+8. Before each Quick Tunnel start (including **Pair a browser** from idle or
+   Enter), a modal explains the limitations and offers **Cancel** and
+   **Continue**. No component starts before Continue. Cancel or Escape closes
+   only the modal. A **Limitations** button reopens the notice while idle or
+   running without starting or stopping anything. While open, underlying
+   fields, tabs, and actions cannot be used; keyboard navigation and an
+   explicit confirmation work without letting a held Enter start the run.
+9. The readable notice distinguishes TopVNC's two-hour **per connection**
+   cap from tunnel lifetime: reconnect with the enrolled browser and VNC
+   password during the same run; restarting needs the new URL, host-key
+   verification, and pairing again. It explains possible phone background
+   disconnects, no uptime guarantee/testing-service limits, mandatory pairing
+   and password, public page access, Cloudflare page-code trust, and private
+   ten-minute/single-use invites whose clipboard copies remain until replaced.
+   Phone and long-session validation remain explicitly pending.
 
 ### User Story 2 - The route stays as safe as pairing allows (Priority: P1)
 
@@ -184,6 +232,9 @@ Quick Tunnel mode and fetch the page and complete a paired session.
   copy remains until the user replaces it and MUST be treated as private.
 - **FR-006**: The docs MUST describe the route, its limitations, and that it
   still needs phone and long-session validation.
+- **FR-007**: Quick Tunnel starts MUST require the limitations modal described
+  in User Story 1 scenarios 8-9. It MUST also be available on demand. This
+  notice MUST NOT change the default route, authentication, or session cap.
 
 ## Success Criteria
 
