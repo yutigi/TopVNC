@@ -34,6 +34,9 @@ export function attachTextInput(field, { active, text, tap }) {
   // The field and its selection before the current edit.
   let before;
   let composing = false;
+  // A lifecycle release invalidates late edits from an abandoned IME session.
+  // A fresh focus explicitly enables input again.
+  let accepting = true;
   // An uncancelled deletion that beforeinput already sent, so its input
   // event must not send it again.
   let deletionSent = false;
@@ -95,7 +98,7 @@ export function attachTextInput(field, { active, text, tap }) {
   }
 
   resetField();
-  field.addEventListener("focus", resetField);
+  field.addEventListener("focus", () => { accepting = true; resetField(); });
   // The caret moves without edit events: tapping or dragging in the field,
   // the iOS space-bar trackpad, Home. Browsers differ on where they report
   // that, so listen to both, and to keyup as a fallback.
@@ -106,7 +109,7 @@ export function attachTextInput(field, { active, text, tap }) {
   field.addEventListener("keyup", pinCaret);
 
   field.addEventListener("beforeinput", (event) => {
-    if (!active()) return;
+    if (!accepting || !active()) return;
     deletionSent = false;
     if (event.isComposing) return;
     snapshot();
@@ -132,7 +135,7 @@ export function attachTextInput(field, { active, text, tap }) {
 
   // Uncancelled insertions, and anything else that changed the field.
   field.addEventListener("input", (event) => {
-    if (!active()) return;
+    if (!accepting || !active()) return;
     const key = SPECIAL[event.inputType];
     const deletion = DELETION.test(event.inputType);
     if (event.isComposing) {
@@ -156,6 +159,7 @@ export function attachTextInput(field, { active, text, tap }) {
   });
 
   field.addEventListener("compositionstart", () => {
+    if (!accepting || !active()) return;
     composing = true;
     snapshot();
   });
@@ -164,7 +168,10 @@ export function attachTextInput(field, { active, text, tap }) {
   // whether it is still marked as composing; send the result here, once.
   field.addEventListener("compositionend", () => {
     composing = false;
-    if (!active()) return;
+    if (!accepting || !active()) return;
     sendField();
   });
+  return {
+    cancel() { accepting = false; composing = false; deletionSent = false; resetField(); },
+  };
 }
