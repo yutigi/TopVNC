@@ -8,6 +8,7 @@
   <meta name="description" content="A hands-on wireframe for configurable multilingual typing and familiar mobile remote controls.">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="keyboard.css">
+  <link rel="stylesheet" href="customize.css">
   <script type="module" src="app.mjs"></script>
 </head>
 <body>
@@ -35,7 +36,7 @@
         <div class="stage-ruler"><span id="dimension-label">390 × 740 / logical preview</span><span>CLICK TO EXPLORE ↓</span></div>
         <div id="device" class="device portrait">
           <div class="device-status"><span>9:41</span><span class="device-camera"></span><span>▥ ▰</span></div>
-          <header class="session-bar"><button id="host-button" class="host-button"><span class="host-icon">▣</span><span>Gaming PC<small>Simulated session</small></span><span>⌄</span></button><div class="session-actions"><span class="demo-pill">DEMO</span><button id="settings-button" class="icon-button" aria-label="Session settings">⚙</button></div></header>
+          <header class="session-bar"><button id="host-button" class="host-button"><span class="host-icon">▣</span><span>Gaming PC<small id="session-feedback" role="status">Simulated session</small></span><span>⌄</span></button><div class="session-actions"><button id="customize-button" class="customize-entry" aria-label="Customize keys and UI layout">✎ Customize</button><button id="settings-button" class="icon-button" aria-label="Session settings">⚙</button></div></header>
           <div class="session-body">
             <div id="remote" class="remote-screen">
               <div class="remote-top"><span>REMOTE DISPLAY</span><span>Fit to screen ↗</span></div>
@@ -48,6 +49,7 @@
               <div class="deck-top"><span id="deck-label">QUICK KEYS</span><span id="key-feedback" role="status" aria-live="polite">Try a key below</span></div>
               <div class="language-bar" aria-label="Pinned language profiles"><div id="language-pins"></div><button id="language-settings" class="language-add" aria-label="Configure your languages">＋</button></div>
               <div class="language-hint" id="language-hint">English · custom QWERTY layout</div>
+              <div id="custom-action-pad" class="custom-action-pad" aria-label="Your custom keys"></div>
               <div id="keys-panel" class="mode-panel">
                 <div id="pin-row" class="key-row pin-row"></div>
                 <div class="quick-controls"><div class="modifier-grid"><button data-key="Esc">Esc</button><button data-key="Tab">Tab ⇥</button><button data-mod="Ctrl" aria-pressed="false">Ctrl</button><button data-mod="Alt" aria-pressed="false">Alt</button><button data-mod="Shift" aria-pressed="false">Shift</button><button data-key="Backspace" aria-label="Backspace">⌫</button></div><div class="arrow-grid"><button data-key="ArrowUp" class="arrow-up" aria-label="Arrow up">↑</button><button data-key="ArrowLeft" class="arrow-left" aria-label="Arrow left">←</button><button data-key="ArrowDown" class="arrow-down" aria-label="Arrow down">↓</button><button data-key="ArrowRight" class="arrow-right" aria-label="Arrow right">→</button></div></div>
@@ -67,7 +69,7 @@
       <div class="scenario-bar"><span class="scenario-label">TRY THE FLOW</span><button id="try-shortcut"><span>1</span> Ctrl + C</button><span class="scenario-divider">/</span><button id="try-language"><span>2</span> Change language</button><span class="scenario-divider">/</span><button id="try-rotate"><span>3</span> Rotate view</button></div>
     </section>
 
-    <aside class="inspector"><div class="inspector-heading"><span class="section-label">THE THINKING</span><span class="annotation-icon">↙</span></div><article><span class="note-number">01</span><h3>Keep the screen in sight.</h3><p>Portrait stacks the view and controls. Landscape splits the keyboard below the view; quick keys and the trackpad use a side deck.</p></article><article><span class="note-number">02</span><h3>Your languages. One tap away.</h3><p>Pin English, ไทย, 中文, 日本語 — or build your own layout. Type on TopVNC keys, with native OS input available whenever you prefer.</p><button id="inspector-languages" class="text-link">Configure languages ↗</button></article><article><span class="note-number">03</span><h3>Build muscle memory.</h3><p>Keys, Type, Pointer, Enter always keep their order. Shortcuts stay in the slots you choose. Nothing moves based on usage.</p></article><div class="decision-card"><span>↳ A deliberate detail</span><p>A lit modifier means “next key.” It clears after use or when you leave the view.</p><div><kbd>Ctrl</kbd><span>+</span><kbd>C</kbd><span>→</span><span class="released">released</span></div></div><div class="validation-note"><span class="section-label">NEXT TO VALIDATE</span><p>Thumb reach on real phones.<br>Keyboard behavior after rotation.<br>Chinese & Japanese IME flows.</p></div></aside>
+    <aside class="inspector"><div class="inspector-heading"><span class="section-label">THE THINKING</span><span class="annotation-icon">↙</span></div><article><span class="note-number">01</span><h3>Keep the screen in sight.</h3><p>Portrait stacks the view and controls. Landscape splits the keyboard below the view; quick keys and the trackpad use a side deck.</p></article><article><span class="note-number">02</span><h3>Your languages. One tap away.</h3><p>Pin English, ไทย, 中文, 日本語 — or build your own layout. Type on TopVNC keys, with native OS input available whenever you prefer.</p><button id="inspector-languages" class="text-link">Configure languages ↗</button></article><article><span class="note-number">03</span><h3>Build muscle memory.</h3><p>Arrange keys, control groups, and the thumb dock yourself. Save different portrait and landscape layouts. Nothing moves based on usage.</p></article><div class="decision-card"><span>↳ A deliberate detail</span><p>A lit modifier means “next key.” It clears after use or when you leave the view.</p><div><kbd>Ctrl</kbd><span>+</span><kbd>C</kbd><span>→</span><span class="released">released</span></div></div><div class="validation-note"><span class="section-label">NEXT TO VALIDATE</span><p>Thumb reach on real phones.<br>Keyboard behavior after rotation.<br>Chinese & Japanese IME flows.</p></div></aside>
   </main>
   <footer class="workbench-footer"><span><span class="outline-dot"></span> Wireframe first. Details next.</span><span>PROTOTYPE ONLY · NO LIVE HOST</span></footer>
   <button id="exit-focus" hidden>↙ Back to wireframe</button>
