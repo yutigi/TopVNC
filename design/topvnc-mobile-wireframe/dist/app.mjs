@@ -1,5 +1,6 @@
 import { createCustomization } from './customize.mjs';
 import { createFpsController } from './fps.mjs';
+import { createLanguageSwitcher } from './language-switcher.mjs';
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const defaults = [
@@ -33,6 +34,7 @@ let lastFocus;
 let sheetKind;
 let customization;
 let fps;
+let languageSwitcher;
 const modifiers = new Set();
 function save() {
   try { localStorage.setItem('topvnc-wireframe-v1', JSON.stringify({ profiles, pins, selected })); } catch { /* Session-only preferences still work. */ }
@@ -45,6 +47,7 @@ function el(tag, text, className) {
 }
 function feedback(text) { $('#key-feedback').textContent = text; $('#session-feedback').textContent = text; }
 function release() {
+  languageSwitcher?.cancel();
   fps?.release();
   modifiers.clear();
   stopErase();
@@ -53,8 +56,8 @@ function release() {
 function currentProfile() { return profiles.find(p => p.id === selected) ?? profiles[0]; }
 function renderLanguages() {
   const profile = currentProfile();
-  $('#keyboard-languages').setAttribute('aria-label', `Switch or configure keyboard language · ${profile.name} selected`);
-  $('#keyboard-languages').title = `${profile.name} · switch language`;
+  $('#keyboard-languages').setAttribute('aria-label', `Keyboard language · ${profile.name} selected. Tap for next language; hold to choose.`);
+  $('#keyboard-languages').title = `${profile.name} · tap to switch, hold to choose`;
   $('#compose').lang = profile.tag;
   $('#ime-example').textContent = keyboardSource === 'native' ? 'Native input: use the OS globe key to switch languages. Keyboard visibility is controlled by your OS.' : profile.id === 'zh' ? 'Demo Pinyin: try nihao or zhongwen. A full custom IME is future implementation.' : profile.id === 'ja' ? 'Demo romaji: try nihon or arigatou. A full custom IME is future implementation.' : 'TopVNC keys · edit the layout to match your habits.';
   renderKeyboard();
@@ -370,7 +373,6 @@ document.addEventListener('click', event => {
   if (key && event.detail === 0) addCharacter(key.dataset.character);
 });
 $('#symbol-keyboard').addEventListener('click', () => { symbols = !symbols; renderKeyboard(); });
-$('#keyboard-languages').addEventListener('click', () => openSheet('languages'));
 $('#keyboard-layout').addEventListener('click', () => openSheet('layout'));
 $('#keyboard-return').addEventListener('click', insertText);
 function backspace() {
@@ -434,6 +436,11 @@ const osName = mobileApple ? 'iOS' : /Android/.test(navigator.userAgent) ? 'Andr
 $('#native-keyboard').textContent = `Native · ${osName}`;
 $('#native-keyboard').setAttribute('aria-label', `Switch to native ${osName} keyboard input`);
 fps = createFpsController({ $, el, feedback });
+languageSwitcher = createLanguageSwitcher({
+  key: $('#keyboard-languages'), host: $('#device'), el, profiles: () => profiles, current: () => selected,
+  choose: selectLanguage, configure: () => openSheet('languages', $('#keyboard-languages')),
+  canChange: () => !composing && mode === 'type' && keyboardSource === 'custom', beforeOpen: release, feedback,
+});
 customization = createCustomization({
   el, $, orientation: () => orientation, mode: () => mode, close: closeSheet, feedback,
   canChange: () => !composing,

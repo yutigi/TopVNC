@@ -16,11 +16,17 @@ viewport** on a phone to try the layout at its actual viewport size.
   character labels and inserts shifted text; Ctrl/Alt plus a key reports a demo
   chord without changing the composed phrase. Modifiers clear after one use.
   Four thumb-dock controls keep their order across orientations.
-- **Languages:** the ◎ icon inside the custom keyboard opens language selection
-  and configuration. English, Thai, Chinese, and Japanese are editable examples.
+- **Languages:** tap the globe to cycle profiles, or hold for 350 ms, slide to a
+  language and release to select it. The compact menu highlights the language
+  under your finger and marks the current one. Lift on the globe to leave it open
+  for tapping or scrolling; release outside to cancel. Arrow keys or assistive
+  activation open the same menu, with Escape to dismiss. Manage languages opens
+  the existing editor. English, Thai, Chinese, and Japanese are editable examples.
   Add/remove profiles, favorite up to four, and edit each profile's three rows.
   Saved pins become favorites at the top of the picker; profiles and layouts stay
   saved in this browser. The icon identifies the current language for assistive tools.
+  Rotation, mode changes, cancellation, focus loss and native composition dismiss
+  the menu without switching. This custom gesture does not control the OS keyboard.
 - **Chinese/Japanese:** type `nihao` or `zhongwen` in Chinese, or `nihon` or
   `arigatou` in Japanese, then select a candidate and Insert. Candidates are
   explicitly labeled demo fixtures; no complete conversion engine is included.
