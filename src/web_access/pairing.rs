@@ -1,11 +1,12 @@
 //! The pairing invite as the WEB tab shows it: a QR code drawn in TopVNC's
-//! own window. The link is consumed when the code is made and is not kept.
+//! own window. The link stays in memory for the explicit clipboard action.
 
 use std::time::Instant;
 
 /// A QR code for one pairing invite.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PairingCode {
+    link: String,
     /// Modules per side, without the quiet zone.
     pub width: usize,
     /// Row-major, `true` for dark modules.
@@ -14,12 +15,12 @@ pub struct PairingCode {
 }
 
 impl PairingCode {
-    /// Encode `link`, which is dropped here.
+    /// Encode `link` and retain it only for this invite's lifetime.
     pub fn new(link: String, expires: Instant) -> Result<Self, String> {
         let code = qrcode::QrCode::new(link.as_bytes())
             .map_err(|error| format!("could not make the pairing QR code: {error}"))?;
-        drop(link);
         Ok(Self {
+            link,
             width: code.width(),
             modules: code
                 .to_colors()
@@ -28,6 +29,11 @@ impl PairingCode {
                 .collect(),
             expires,
         })
+    }
+
+    /// An expired invite must not be copied, even before the next runtime poll.
+    pub fn copy_url(&self, now: Instant) -> Option<&str> {
+        (now < self.expires).then_some(self.link.as_str())
     }
 
     pub fn dark(&self, x: usize, y: usize) -> bool {
@@ -43,10 +49,32 @@ impl PairingCode {
     }
 }
 
+impl std::fmt::Debug for PairingCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Both the link and the QR modules encode the pairing secret.
+        f.debug_struct("PairingCode")
+            .field("width", &self.width)
+            .field("expires", &self.expires)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn copying_expires_and_debug_does_not_reveal_the_invite() {
+        let now = Instant::now();
+        let link = "https://test.trycloudflare.com/#pair=private-invite";
+        let code = PairingCode::new(link.into(), now + Duration::from_secs(600)).unwrap();
+        assert_eq!(code.copy_url(now), Some(link));
+        assert_eq!(code.copy_url(now + Duration::from_secs(600)), None);
+        let debug = format!("{code:?}");
+        assert!(!debug.contains("private-invite"));
+        assert!(!debug.contains("modules"));
+    }
 
     #[test]
     fn a_typical_invite_fits_a_small_code() {

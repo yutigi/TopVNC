@@ -123,7 +123,8 @@ Quick Tunnel mode and fetch the page and complete a paired session.
    that exact origin over stdin and serves the page and `/ws` on
    `127.0.0.1:6080`.
 5. **Given** the gateway is Ready, **When** the user pairs, **Then** the QR
-   code encodes the temporary URL with the invite in the fragment.
+   code encodes the temporary URL with the invite in the fragment. An explicit
+   **Copy pairing URL** action copies the same unexpired invite to the clipboard.
 6. **Given** a running Quick Tunnel, **When** the user stops and starts again,
    **Then** a new URL and a new host key fingerprint are shown, and the old
    pairing no longer works.
@@ -175,8 +176,12 @@ Quick Tunnel mode and fetch the page and complete a paired session.
 - **FR-004**: In Pairing-only mode the gateway MUST use an in-memory host key
   and in-memory enrollments, MUST serve the built page itself, and MUST cap
   sessions at `max_session_seconds`.
-- **FR-005**: The pairing link MUST stay secret as before: shown only as a QR
-  code, never as text, in output, or in logs.
+- **FR-005**: The pairing link MUST stay private: shown as a QR code, never as
+  text, in output, or in logs. At the owner's request on 2026-11-07, the WEB
+  tab MUST also offer an explicit **Copy pairing URL** action while the invite
+  is active. Retain the link only in memory until enrollment, cancellation,
+  expiry, or shutdown; copying MUST NOT extend its validity. The clipboard
+  copy remains until the user replaces it and MUST be treated as private.
 - **FR-006**: The docs MUST describe the route, its limitations, and that it
   still needs phone and long-session validation.
 

@@ -319,7 +319,10 @@ screen: never send the link through chat or email.
    With the WEB tab instead of consoles, press **Pair a browser**. TopVNC
    draws the QR code, the fingerprint, and the minutes left in its own window,
    and removes the code when a browser enrolls, after ten minutes, or on
-   **Cancel pairing**. The link is never shown as text. Pairing this way does
+   **Cancel pairing**. **Copy pairing URL** copies the active invite so you can
+   open it directly in your browser. Keep that clipboard content private;
+   it remains there until replaced, but expires with the invite. The link
+   is never shown as text or logged. Pairing this way does
    not restart the gateway, so a connected phone stays connected.
 3. On the phone, open the app URL and **finish the Access sign-in first**.
    The sign-in redirect loses the pairing part of the link, so scanning before
@@ -456,7 +459,8 @@ Use it:
    stdin. The same listener stays held throughout startup. The
    gateway serves the web app itself, with the same Content-Security-Policy
    as the Worker, next to `/ws`. The panel shows the temporary app URL.
-3. Press **Pair a browser** and scan the QR code with the phone camera. It
+3. Press **Pair a browser** and scan the QR code with the phone camera, or use
+   **Copy pairing URL** to open the invite directly in your browser. It
    opens the temporary URL with the invite. Check that the phone shows the
    same key as the TopVNC window, press **Connect**, and enter the VNC password.
 4. **Stop browser access**, or closing TopVNC, ends the server, the tunnel,

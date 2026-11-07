@@ -1819,8 +1819,7 @@ const WEB_PANEL: Box2 = Box2 {
     w: 278,
     h: 420,
 };
-/// Below the help text in the panel, while the app URL is known and no
-/// pairing code is shown.
+/// Below the help text or pairing code in the panel.
 pub const WEB_COPY_URL: Box2 = Box2 {
     x: 480,
     y: 476,
@@ -1828,10 +1827,21 @@ pub const WEB_COPY_URL: Box2 = Box2 {
     h: 36,
 };
 
-/// Whether the WEB tab offers [`WEB_COPY_URL`]: the app URL of the chosen
-/// route is known and the panel is not showing pairing.
+/// The URL offered by the explicit copy action for the selected route.
+pub fn web_copy_url<'a>(state: &UiState, web: &'a WebRuntime) -> Option<&'a str> {
+    web_app_origin(state, web)?;
+    if let Some(code) = web.pairing() {
+        code.copy_url(std::time::Instant::now())
+    } else if !web.pairing_active() {
+        web_app_origin(state, web)
+    } else {
+        None
+    }
+}
+
+/// Whether the WEB tab offers [`WEB_COPY_URL`].
 pub fn web_copy_url_shown(state: &UiState, web: &WebRuntime) -> bool {
-    web_app_origin(state, web).is_some() && !web.pairing_active()
+    web_copy_url(state, web).is_some()
 }
 
 /// The app URL for the chosen route, if the last run knows one.
@@ -2023,12 +2033,15 @@ fn web_panel(canvas: &mut Canvas<'_>, state: &UiState, web: &WebRuntime) {
             canvas,
             &mut y,
             if quick {
-                "SCAN THIS CODE WITH THE PHONE CAMERA: IT OPENS THE TEMPORARY URL WITH THE INVITE. CHECK THAT THE PHONE SHOWS THE SAME KEY, THEN CONNECT. SHOW IT ONLY ON THIS SCREEN."
+                "SCAN THIS CODE OR COPY THE PAIRING URL TO YOUR BROWSER. CHECK THE SAME KEY, THEN CONNECT. KEEP THE INVITE PRIVATE."
             } else {
-                "SIGN IN TO THE APP URL ON THE PHONE FIRST, THEN SCAN THIS CODE AND CHECK THAT THE PHONE SHOWS THE SAME KEY. SHOW IT ONLY ON THIS SCREEN."
+                "SIGN IN TO THE APP URL FIRST, THEN SCAN OR COPY THE PAIRING URL. CHECK THE SAME KEY. KEEP THE INVITE PRIVATE."
             },
             MUTED,
         );
+        if web_copy_url_shown(state, web) {
+            canvas.button(WEB_COPY_URL, "COPY PAIRING URL", false);
+        }
         return;
     }
     let mut y = panel.y;

@@ -424,13 +424,20 @@ fn pairing_waits_for_the_gateway_and_ends_on_enrollment() {
         ["pair"]
     );
     assert!(web.pairing().is_none());
+    let ui = crate::ui::UiState::for_landing(None, &web);
+    assert_eq!(crate::ui::web_copy_url(&ui, &web), None);
     pair_line(&spawner);
     web.poll(&ours(), now);
     assert_eq!(web.pairing().unwrap().minutes_left(now), 10);
+    assert_eq!(
+        crate::ui::web_copy_url(&ui, &web),
+        Some("https://topvnc.owner.workers.dev/#pair=SECRET")
+    );
     spawner.push(Program::Gateway, Event::Enrolled("0a0b".into()));
     web.poll(&ours(), now);
     assert!(web.pairing().is_none());
     assert!(!web.pairing_active());
+    assert_eq!(crate::ui::web_copy_url(&ui, &web), web.app_origin());
     assert_eq!(web.message(), Some("Browser enrolled: key 0a0b."));
 }
 
