@@ -665,15 +665,25 @@ mod tests {
             "jwks": fixtures::jwks(), "accepted": accepted, "rejected": rejected,
         });
         let text = serde_json::to_string_pretty(&vectors).unwrap() + "\n";
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../gateway/cloudflare/worker/test/access-vectors.json"
-        );
         if std::env::var_os("TOPVNC_WRITE_ACCESS_VECTORS").is_some() {
-            std::fs::write(path, &text).unwrap();
+            // Cargo supplies the current checkout at runtime, even when the
+            // test binary was restored from a cache built elsewhere.
+            let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+                .expect("run this test through cargo test to regenerate Access vectors");
+            let path = std::path::PathBuf::from(manifest_dir)
+                .join("../../gateway/cloudflare/worker/test/access-vectors.json");
+            std::fs::write(&path, &text)
+                .unwrap_or_else(|error| panic!("could not write {}: {error}", path.display()));
+        } else {
+            // Track the fixture as a compile-time dependency and keep cached
+            // test binaries independent of their original checkout's path.
+            let saved = include_str!("../../../gateway/cloudflare/worker/test/access-vectors.json")
+                .replace("\r\n", "\n");
+            assert_eq!(
+                saved, text,
+                "regenerate with TOPVNC_WRITE_ACCESS_VECTORS=1 cargo test -p topvnc-access"
+            );
         }
-        let saved = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
-        assert_eq!(saved, text, "regenerate {path}");
     }
 
     #[test]

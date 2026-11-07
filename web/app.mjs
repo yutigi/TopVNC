@@ -19,6 +19,7 @@ const forgetButton = $("#forget");
 const passwordForm = $("#password-form");
 const passwordInput = $("#password");
 const statusLine = $("#status");
+const hostStatus = $("#host-status");
 const log = $("#log");
 const viewer = $("#viewer");
 const screen = $("#screen");
@@ -100,6 +101,27 @@ function choose(name, value) {
 function setQuality(value) {
   choose("quality", value);
   choose("menu-quality", value);
+}
+
+// What the viewer says while the host cannot capture its desktop, by
+// CaptureStatus code (crates/topvnc-rfb/src/lib.rs); 0 is a live picture.
+function captureStatusText(status) {
+  switch (status) {
+    case 0:
+      return "";
+    case 1:
+      return "The host has no display to share: its monitor was disconnected or turned off. The last picture stays until a display is available again.";
+    case 2:
+      return "The host is showing its lock screen or a security prompt, which this host cannot share. The last picture stays until the desktop returns.";
+    default:
+      return "The host cannot capture its screen right now. The last picture stays until capture resumes.";
+  }
+}
+
+function showCaptureStatus(status) {
+  const text = captureStatusText(status);
+  hostStatus.textContent = text;
+  hostStatus.hidden = !text;
 }
 
 function report(message) {
@@ -239,6 +261,10 @@ async function onSessionMessage(message) {
     case "capabilities":
       showCapabilities(message);
       break;
+    case "captureStatus":
+      showCaptureStatus(message.status);
+      report(message.status === 0 ? "The host's screen is live again." : captureStatusText(message.status));
+      break;
     case "stats": {
       const rtt = message.rtt >= 0 ? ` · RTT ${message.rtt.toFixed(0)} ms` : "";
       statsLine.textContent = `${message.fps.toFixed(0)} updates/s · ${message.presentedFps.toFixed(0)} drawn/s · ${message.mbps.toFixed(1)} Mbit/s${rtt}${message.continuous ? " · push" : ""}`;
@@ -254,6 +280,7 @@ async function onSessionMessage(message) {
       showViewer(false);
       // The next host may not offer these controls.
       showCapabilities({ serveScale: 0, displays: [] });
+      showCaptureStatus(0);
       describeIdentity();
       report(`${wasConnected ? "Disconnected" : "Connection failed"} (${message.code}). ${await closeReason(message)}`);
       connectButton.textContent = wasConnected ? "Reconnect" : "Connect";
