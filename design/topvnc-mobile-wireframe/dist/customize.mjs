@@ -1,12 +1,14 @@
+import { defaultFpsSettings, normalizeFpsSettings, normalizeFpsKey, FPS_ACTIONS } from './fps.mjs';
 const STORAGE_KEY = 'topvnc-wireframe-customize-v1';
 const GROUPS = ['languages', 'actions', 'input'];
 const DOCK = ['keys', 'type', 'pointer', 'enter'];
-const GROUP_NAMES = { languages: 'Language switcher', actions: 'Your custom keys', input: 'Keyboard / active input' };
+const GROUP_NAMES = { languages: 'Typing language switcher', actions: 'Your custom keys', input: 'Keyboard / active input' };
 const DOCK_NAMES = { keys: 'Keys', type: 'Type', pointer: 'Pointer', enter: 'Enter' };
 export function defaultCustomization() {
   const layout = () => ({ position: 'auto', groups: [...GROUPS], dock: [...DOCK], showLanguages: true, showActions: true, size: 'standard' });
   return {
     actions: [],
+    preset: 'standard', fps: defaultFpsSettings(),
     layouts: { portrait: layout(), landscape: layout() },
   };
 }
@@ -30,6 +32,8 @@ function permutation(value, expected) {
 export function normalizeCustomization(value) {
   const result = defaultCustomization();
   if (!value || typeof value !== 'object') return result;
+  result.preset = value.preset === 'fps' ? 'fps' : 'standard';
+  result.fps = normalizeFpsSettings(value.fps);
   if (Array.isArray(value.actions) && value.actions.length <= 8 && value.actions.every(isAction) && new Set(value.actions.map(action => action.id)).size === value.actions.length) {
     result.actions = value.actions.map(({ id, label, type, value: actionValue, wide }) => ({ id, label, type, value: type === 'key' ? normalizeChord(actionValue) : actionValue, wide }));
   }
@@ -65,8 +69,9 @@ export function createCustomization(api) {
     device.dataset.keySize = layout.size;
     const groups = { languages: [$('.language-bar'), $('#language-hint')], actions: [$('#custom-action-pad')], input: [$('#keys-panel'), $('#type-panel'), $('#pointer-panel')] };
     layout.groups.forEach((group, index) => groups[group].forEach(node => { node.style.order = String(index * 10); }));
-    $('.language-bar').hidden = !layout.showLanguages;
-    $('#language-hint').classList.toggle('layout-hidden', !layout.showLanguages);
+    const typing = api.mode() === 'type';
+    $('.language-bar').hidden = !layout.showLanguages || !typing;
+    $('#language-hint').classList.toggle('layout-hidden', !layout.showLanguages || !typing);
     const pad = $('#custom-action-pad'); pad.replaceChildren(); pad.hidden = !layout.showActions || !state.actions.length;
     state.actions.forEach(action => {
       const button = el('button', action.label, action.wide ? 'custom-key wide-key' : 'custom-key');
@@ -77,6 +82,15 @@ export function createCustomization(api) {
     });
     const dockNodes = { keys: $('[data-mode="keys"]'), type: $('[data-mode="type"]'), pointer: $('[data-mode="pointer"]'), enter: $('.dock-enter') };
     layout.dock.forEach(name => $('.thumb-dock').append(dockNodes[name]));
+    const fpsActive = state.preset === 'fps' && api.mode() === 'pointer';
+    dockNodes.pointer.querySelector('small').textContent = state.preset === 'fps' ? 'Play' : 'Pointer';
+    dockNodes.pointer.querySelector('span').textContent = state.preset === 'fps' ? '⊕' : '↖';
+    api.fps(fpsActive, state.fps);
+    $('#fps-preset-button').classList.toggle('selected', fpsActive);
+  }
+  function usePreset(preset) {
+    if (!api.canChange()) { api.feedback('Finish composing before changing preset'); return; }
+    state.preset = preset === 'fps' ? 'fps' : 'standard'; persist(); api.close(); api.enterPreset(state.preset); apply();
   }
   function build(content) {
     let tab = 'keys'; let editingId;
@@ -86,15 +100,35 @@ export function createCustomization(api) {
     const tabs = el('div', undefined, 'customize-tabs'); tabs.setAttribute('aria-label', 'Customization sections');
     const body = el('div', undefined, 'customize-body');
     const status = el('p', '', 'customize-status'); status.setAttribute('role', 'status');
-    const keyTab = el('button', 'Your keys'); const layoutTab = el('button', 'UI layout');
-    tabs.append(keyTab, layoutTab); content.append(tabs, status, body);
+    const presetTab = el('button', 'Presets'); const keyTab = el('button', 'Your keys'); const layoutTab = el('button', 'UI layout');
+    tabs.append(presetTab, keyTab, layoutTab); content.append(tabs, status, body);
     function message(text) { status.textContent = text + (storageAvailable ? '' : ' Storage unavailable: changes last for this session.'); }
     function show(next) {
-      tab = next; keyTab.setAttribute('aria-pressed', String(tab === 'keys')); layoutTab.setAttribute('aria-pressed', String(tab === 'layout'));
+      tab = next; presetTab.setAttribute('aria-pressed', String(tab === 'presets')); keyTab.setAttribute('aria-pressed', String(tab === 'keys')); layoutTab.setAttribute('aria-pressed', String(tab === 'layout'));
       body.replaceChildren();
-      if (tab === 'keys') buildKeys(); else buildLayoutMenu();
+      if (tab === 'presets') buildPresets(); else if (tab === 'keys') buildKeys(); else buildLayoutMenu();
     }
-    keyTab.addEventListener('click', () => show('keys')); layoutTab.addEventListener('click', () => show('layout'));
+    presetTab.addEventListener('click', () => show('presets')); keyTab.addEventListener('click', () => show('keys')); layoutTab.addEventListener('click', () => show('layout'));
+    function buildPresets() {
+      const draft = structuredClone(state.fps);
+      const card = el('div', undefined, 'fps-preset-card');
+      card.append(el('span', '01 / GAME PRESET', 'section-label'), el('h4', 'FPS · two-thumb controls'), el('p', 'Hold WASD to move. Drag the look zone while another finger fires. Jump, reload, sprint and crouch stay within reach. No language pins in play.', 'sheet-description'));
+      const use = el('button', state.preset === 'fps' ? 'Open FPS preset →' : 'Use FPS preset →', 'wide-button');
+      const fields = new Map();
+      function readDraft() {
+        for (const [id, input] of fields) { const value = normalizeFpsKey(input.value); if (!value) { message(`Choose a valid key for ${id}. Examples: W, Shift, Space, Mouse1.`); input.focus(); return false; } draft.bindings[id] = value; }
+        state.fps = normalizeFpsSettings(draft); return true;
+      }
+      use.addEventListener('click', () => { if (readDraft()) usePreset('fps'); }); card.append(use); body.append(card);
+      const handLabel = el('label', 'Aiming hand', 'customize-field'); const hand = el('select');
+      [['right', 'Right thumb aims · WASD on left'], ['left', 'Left thumb aims · WASD on right']].forEach(([value, title]) => { const option = el('option', title); option.value = value; hand.append(option); }); hand.value = draft.handedness; hand.addEventListener('change', () => { draft.handedness = hand.value; }); handLabel.append(hand); body.append(handLabel);
+      const sensitivityLabel = el('label', 'Demo look sensitivity', 'customize-field'); const sensitivity = el('input'); sensitivity.type = 'range'; sensitivity.min = '0.5'; sensitivity.max = '2'; sensitivity.step = '0.1'; sensitivity.value = String(draft.sensitivity); const output = el('output', `${draft.sensitivity.toFixed(1)}×`); sensitivity.addEventListener('input', () => { draft.sensitivity = Number(sensitivity.value); output.textContent = `${draft.sensitivity.toFixed(1)}×`; }); sensitivityLabel.append(sensitivity, output); body.append(sensitivityLabel, el('h4', 'Remap game controls', 'customize-subheading'));
+      const mapping = el('div', undefined, 'fps-binding-editor');
+      FPS_ACTIONS.forEach(([id, title]) => { const label = el('label', title); const input = el('input'); input.value = draft.bindings[id]; input.maxLength = 16; input.setAttribute('aria-label', `${title} binding`); input.autocomplete = 'off'; label.append(input); fields.set(id, input); mapping.append(label); }); body.append(mapping);
+      const save = el('button', 'Save FPS controls', 'wide-button'); save.addEventListener('click', () => { if (readDraft()) { persist(); apply(); message('FPS controls saved on this device.'); } });
+      const standard = el('button', 'Use standard controls', 'cancel-customize'); standard.addEventListener('click', () => usePreset('standard'));
+      body.append(save, standard, el('p', 'This is an interactive control wireframe, not a live game. Simultaneous holds and aim are simulated. Your custom keys, typing languages and standard UI layouts are preserved.', 'sheet-notice'));
+    }
     function reorderList(items, names, onMove, onEdit, onRemove) {
       const list = el('div', undefined, 'reorder-list');
       items.forEach((id, index) => {
@@ -146,7 +180,7 @@ export function createCustomization(api) {
     }
     function buildLayoutMenu() {
       const layout = draftLayouts[editingOrientation];
-      body.append(el('p', 'Organize each orientation yourself. Your choices stay fixed until you change them. Press Save layout to apply.', 'sheet-description'));
+      body.append(el('p', 'Arrange standard controls per orientation. Language pins appear only in Type. FPS Play uses its own thumb overlay; customize that in Presets.', 'sheet-description'));
       const orientationButtons = el('div', undefined, 'customize-tabs');
       ['portrait', 'landscape'].forEach(value => { const button = el('button', value === 'portrait' ? '▯ Portrait' : '▭ Landscape'); button.setAttribute('aria-pressed', String(editingOrientation === value)); button.addEventListener('click', () => { editingOrientation = value; show('layout'); }); orientationButtons.append(button); }); body.append(orientationButtons);
       const field = el('label', 'Control deck position', 'customize-field'); const position = el('select');
@@ -158,13 +192,13 @@ export function createCustomization(api) {
       body.append(reorderList(layout.groups, GROUP_NAMES, (index, direction) => { layout.groups = moveItem(layout.groups, index, direction); show('layout'); }));
       body.append(el('h4', 'Thumb dock order', 'customize-subheading'));
       body.append(reorderList(layout.dock, DOCK_NAMES, (index, direction) => { layout.dock = moveItem(layout.dock, index, direction); show('layout'); }));
-      for (const [key, title] of [['showLanguages', 'Show language switcher'], ['showActions', 'Show custom key pad']]) { const label = el('label', undefined, 'customize-check'); const checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.checked = layout[key]; checkbox.addEventListener('change', () => { layout[key] = checkbox.checked; updateSketch(); }); label.append(checkbox, el('span', title)); body.append(label); }
+      for (const [key, title] of [['showLanguages', 'Show language switcher in Type only'], ['showActions', 'Show custom key pad']]) { const label = el('label', undefined, 'customize-check'); const checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.checked = layout[key]; checkbox.addEventListener('change', () => { layout[key] = checkbox.checked; updateSketch(); }); label.append(checkbox, el('span', title)); body.append(label); }
       const sizeLabel = el('label', 'Custom key size', 'customize-field'); const size = el('select'); [['standard', 'Standard · 44 px'], ['large', 'Large · 52 px']].forEach(([value, title]) => { const option = el('option', title); option.value = value; size.append(option); }); size.value = layout.size; size.addEventListener('change', () => { layout.size = size.value; }); sizeLabel.append(size); body.append(sizeLabel);
       const save = el('button', 'Save layout · view changes', 'wide-button'); save.addEventListener('click', () => { state.layouts = structuredClone(draftLayouts); persist(); api.close(); api.switchOrientation(editingOrientation); apply(); api.feedback('Your layout saved · stable until you change it'); });
       const reset = el('button', 'Reset this orientation to defaults', 'cancel-customize'); reset.addEventListener('click', () => { draftLayouts[editingOrientation] = defaultCustomization().layouts[editingOrientation]; show('layout'); message('Default layout selected. Press Save layout to apply.'); });
       body.append(save, reset, el('p', 'Keys and the layout for the other orientation are kept. Customize and all four mode buttons always remain available.', 'sheet-notice'));
     }
-    show('keys');
+    show('presets');
   }
-  return { apply, build };
+  return { apply, build, usePreset, isFps: () => state.preset === 'fps' };
 }

@@ -1,4 +1,5 @@
 import { createCustomization } from './customize.mjs';
+import { createFpsController } from './fps.mjs';
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const defaults = [
@@ -32,6 +33,7 @@ let focusMode = false;
 let lastFocus;
 let sheetKind;
 let customization;
+let fps;
 const modifiers = new Set();
 function save() {
   try { localStorage.setItem('topvnc-wireframe-v1', JSON.stringify({ profiles, pins, selected })); } catch { /* Session-only preferences still work. */ }
@@ -44,6 +46,7 @@ function el(tag, text, className) {
 }
 function feedback(text) { $('#key-feedback').textContent = text; $('#session-feedback').textContent = text; }
 function release() {
+  fps?.release();
   modifiers.clear();
   keyboardShift = false;
   stopErase();
@@ -430,10 +433,16 @@ const mobileApple = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Mac/.test(
 const osName = mobileApple ? 'iOS' : /Android/.test(navigator.userAgent) ? 'Android' : /Win/.test(platformText) ? 'Windows' : /Mac/.test(platformText) ? 'macOS' : /Linux/.test(platformText) ? 'Linux' : 'device';
 $('#native-keyboard').textContent = `Native · ${osName}`;
 $('#native-keyboard').setAttribute('aria-label', `Switch to native ${osName} keyboard input`);
+fps = createFpsController({ $, el, feedback });
 customization = createCustomization({
-  el, $, orientation: () => orientation, close: closeSheet, feedback,
+  el, $, orientation: () => orientation, mode: () => mode, close: closeSheet, feedback,
+  canChange: () => !composing,
+  fps: (active, settings) => { fps.apply(active, settings); $('#canvas-title').textContent = active ? `FPS / ${orientation} controls` : orientation === 'portrait' ? 'Portrait / two-thumb reach' : 'Landscape / room to play'; if (active) $('#preview-caption').textContent = 'Hold movement + fire together. Drag to aim. Demo only.'; },
+  enterPreset: preset => { if (preset === 'fps') { setKeyboardSource('custom'); setOrientation(focusMode ? (innerWidth > innerHeight ? 'landscape' : 'portrait') : 'landscape'); setMode('pointer'); feedback('FPS preset · hold to move, drag to aim'); } else { setMode('type'); feedback('Standard controls · typing languages restored'); } },
   switchOrientation: setOrientation,
   key: (value, button) => { if (composing) { feedback('Finish composing before using a custom key'); return; } pressKey(value, button); },
   text: value => { if (composing) { feedback('Finish composing before inserting custom text'); return; } $('#remote-output').textContent = value; release(); feedback('Custom text inserted in demo screen'); },
 });
 renderLanguages(); renderPins(); setMode('type'); setOrientation('portrait'); feedback('Try the TopVNC keyboard');
+$('#fps-preset-button').addEventListener('click', () => customization.usePreset('fps'));
+if (customization.isFps() || new URLSearchParams(location.search).get('preset') === 'fps') customization.usePreset('fps');
