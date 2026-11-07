@@ -1,0 +1,373 @@
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.typing .deck-top,
+.typing .language-hint {
+  display: none;
+}
+.typing .deck-grip {
+  margin: 6px auto 8px;
+}
+.typing .mode-panel {
+  min-height: 0;
+}
+.typing .language-bar {
+  margin-bottom: 8px;
+}
+.language-chip {
+  flex: 1 1 0;
+  min-width: 44px;
+  max-width: 95px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 4px;
+}
+.type-toolbar {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 7px;
+  padding: 3px;
+  background: #f0f3e9;
+  border: 1px solid #e3e8d9;
+  border-radius: 6px;
+  width: 100%;
+  height: 34px;
+}
+.keyboard-source {
+  font-size: 9px;
+  flex: 1;
+  background: none;
+  border-color: transparent;
+  padding: 3px;
+}
+.keyboard-source.active {
+  background: #fff;
+  border-color: #cdd7bf;
+  color: #536b37;
+  box-shadow: 0 1px 3px #46563412;
+}
+.typing .compose-wrap textarea {
+  min-height: 37px;
+  height: 37px;
+  max-height: 70px;
+  padding: 8px 10px;
+  font-size: 13px;
+  resize: none;
+  line-height: 1.4;
+}
+.typing .compose-wrap textarea[readonly] {
+  background: #f9fbf3;
+  cursor: default;
+}
+.typing .insert-button {
+  font-size: 9px;
+  min-width: 48px;
+}
+.custom-keyboard-panel {
+  margin-top: 7px;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+}
+#keyboard-rows {
+  display: grid;
+  gap: 4px;
+}
+.keyboard-row {
+  display: flex;
+  justify-content: center;
+  gap: 4px;
+}
+.keyboard-row button {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0;
+  border-color: #cbd4bf;
+  border-bottom-width: 2px;
+  background: #f8faf3;
+  font-size: 15px;
+  border-radius: 5px;
+  touch-action: manipulation;
+}
+.keyboard-row:nth-child(2) {
+  padding-left: 8px;
+  padding-right: 8px;
+}
+.keyboard-row:nth-child(3) {
+  padding-right: 7px;
+}
+.keyboard-row .keyboard-shift {
+  flex: 1.3;
+  background: #edf1e4;
+  font-size: 20px;
+}
+.keyboard-shift[aria-pressed=true] {
+  background: #6c7d54 !important;
+  color: #fff;
+}
+.keyboard-bottom {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+.keyboard-bottom button {
+  min-height: 44px;
+  min-width: 32px;
+  padding: 0 7px;
+  font-size: 12px;
+  background: #edf2e4;
+  border-color: #cbd4bf;
+  border-bottom-width: 2px;
+  touch-action: manipulation;
+}
+.keyboard-bottom #keyboard-space {
+  flex: 1;
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.keyboard-bottom #keyboard-return {
+  min-width: 46px;
+  background: #dce6cd;
+  border-color: #a8bb91;
+  font-size: 20px;
+}
+.typing .typing-help {
+  margin-top: 1px;
+  height: 22px;
+  font-size: 8px;
+  justify-content: space-between;
+}
+.typing .typing-help > span {
+  font-size: 8px;
+}
+.typing .typing-help button {
+  min-height: 22px;
+  font-size: 8px;
+}
+.typing .ime-example {
+  padding: 4px 5px;
+  line-height: 1.4;
+  font-size: 7px;
+  min-height: 19px;
+}
+.candidate-bar {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 39px;
+  margin-top: 4px;
+  overflow-x: auto;
+}
+.candidate-bar button {
+  min-width: 44px;
+  min-height: 36px;
+  background: #eef4e4;
+  border-color: #c4d3b3;
+  font-size: 15px;
+}
+.candidate-label {
+  font: 6px var(--mono);
+  color: #97a589;
+  letter-spacing: .5px;
+}
+.candidate-empty {
+  font-size: 8px;
+  line-height: 1.5;
+  color: #839473;
+}
+.layout-editor {
+  width: 100%;
+  border: 1px solid #bbcba9;
+  background: #fff;
+  border-radius: 5px;
+  font: 13px/2 var(--mono);
+  padding: 10px;
+  resize: vertical;
+}
+.device.landscape.typing .device-status,
+.device.landscape.typing .home-indicator {
+  display: none;
+}
+.device.landscape.typing .session-bar {
+  height: 42px;
+  min-height: 42px;
+  padding-top: 0;
+}
+.device.landscape.typing .session-body {
+  flex-direction: column;
+}
+.device.landscape.typing .remote-screen {
+  min-height: 54px;
+  padding-top: 7px;
+  padding-bottom: 8px;
+}
+.device.landscape.typing .remote-top,
+.device.landscape.typing .remote-hint,
+.device.landscape.typing .callout-screen {
+  display: none;
+}
+.device.landscape.typing .remote-window {
+  margin: 0 auto;
+  max-width: 520px;
+  min-height: 60px;
+}
+.device.landscape.typing .editor-content {
+  min-height: 25px;
+  padding: 3px 9px;
+  max-height: 45px;
+  font-size: 8px;
+  line-height: 1.3;
+}
+.device.landscape.typing .editor-content p {
+  margin: 0;
+}
+.device.landscape.typing .editor-menu,
+.device.landscape.typing .editor-comment,
+.device.landscape.typing .editor-status {
+  display: none;
+}
+.device.landscape.typing .line-numbers {
+  font-size: 6px;
+}
+.device.landscape.typing .window-title {
+  height: 14px;
+}
+.device.landscape.typing .control-deck {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  border-left: 0;
+  border-top: 1px solid #d7dccb;
+  padding-left: 12px;
+  padding-right: 12px;
+  padding-top: 5px;
+}
+.device.landscape.typing .language-bar {
+  position: absolute;
+  right: 12px;
+  top: 5px;
+  width: 46%;
+  margin: 0;
+}
+.device.landscape.typing .language-chip {
+  min-height: 34px;
+}
+.device.landscape.typing .language-add {
+  height: 34px;
+  width: 34px;
+  min-height: 34px;
+}
+.device.landscape.typing .type-toolbar {
+  height: 34px;
+  width: 48%;
+  margin-bottom: 6px;
+}
+.device.landscape.typing .compose-wrap textarea {
+  min-height: 29px;
+  height: 29px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.device.landscape.typing .custom-keyboard-panel {
+  margin-top: 4px;
+}
+.device.landscape.typing #keyboard-rows {
+  gap: 3px;
+}
+.device.landscape.typing .keyboard-row {
+  gap: 5px;
+}
+.device.landscape.typing .keyboard-row button {
+  min-height: 31px;
+  font-size: 13px;
+}
+.device.landscape.typing .keyboard-row .split-start {
+  margin-left: 42px;
+}
+.device.landscape.typing .keyboard-row:nth-child(2) {
+  padding-left: 15px;
+  padding-right: 15px;
+}
+.device.landscape.typing .keyboard-bottom {
+  margin-top: 3px;
+  gap: 5px;
+}
+.device.landscape.typing .keyboard-bottom button {
+  min-height: 31px;
+  font-size: 10px;
+  min-width: 48px;
+}
+.device.landscape.typing .keyboard-bottom #keyboard-return {
+  font-size: 17px;
+}
+.device.landscape.typing .typing-help,
+.device.landscape.typing .ime-example {
+  display: none;
+}
+.device.landscape.typing .thumb-dock {
+  padding: 3px 0;
+  margin-top: 4px;
+  gap: 8px;
+}
+.device.landscape.typing .thumb-dock button {
+  height: 44px;
+  flex-direction: row;
+  gap: 8px;
+}
+.device.landscape.typing .thumb-dock small {
+  font-size: 8px;
+}
+.device.landscape.typing .candidate-bar {
+  min-height: 26px;
+  height: 26px;
+  margin-top: 2px;
+}
+.device.landscape.typing .candidate-bar button {
+  min-height: 24px;
+  height: 24px;
+  font-size: 12px;
+}
+.device.landscape.typing.native-input .remote-screen {
+  min-height: 100px;
+}
+.device.landscape.typing.native-input .typing-help {
+  display: flex;
+  height: 22px;
+}
+.device.landscape.typing.native-input .ime-example {
+  display: block;
+}
+.native-input .compose-wrap textarea {
+  border-color: #95ab7a;
+  background: white;
+}
+@media (max-width: 380px) {
+  .keyboard-row {
+    gap: 3px;
+  }
+  .keyboard-row button {
+    font-size: 13px;
+  }
+  .keyboard-row:nth-child(2) {
+    padding-left: 4px;
+    padding-right: 4px;
+  }
+  .typing .control-deck {
+    padding-left: 7px;
+    padding-right: 7px;
+  }
+  .typing .keyboard-source {
+    font-size: 8px;
+  }
+}
