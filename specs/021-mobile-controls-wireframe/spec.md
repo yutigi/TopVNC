@@ -18,6 +18,12 @@ Keep the working web viewer and transport code unchanged.
 - Users can select, add, remove, and favorite language profiles through the icon
   inside the custom keyboard; preferences stay on the current device. Previously
   saved pins become picker favorites. System language switching remains explicit.
+- The globe key cycles languages on tap. Holding opens an anchored menu; sliding
+  highlights a language and releasing selects it. Releasing over the globe keeps
+  the menu open for tapping/scrolling; releasing outside cancels. Current language
+  and hover state are distinct. The menu includes a separate management action,
+  keyboard/assistive access, and dismissal on Escape, outside press, focus loss,
+  rotation, mode/source changes and pointer cancellation. Composition is preserved.
 - Type opens a custom TopVNC on-screen keyboard by default. Language profiles
   include editable character rows; English and Thai example layouts type locally.
 - Chinese Pinyin and Japanese romaji demonstrate explicit candidate selection

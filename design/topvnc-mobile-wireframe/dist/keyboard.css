@@ -146,6 +146,99 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.keyboard-bottom #keyboard-languages {
+  min-width: 44px;
+  touch-action: none;
+  -webkit-touch-callout: none;
+}
+#keyboard-languages svg {
+  width: 21px;
+  height: 21px;
+  vertical-align: middle;
+  pointer-events: none;
+}
+#keyboard-languages.language-key-held {
+  background: #697a50;
+  border-color: #697a50;
+  color: white;
+}
+.language-popover {
+  position: absolute;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: #fcfdf8f5;
+  backdrop-filter: blur(16px);
+  border: 1px solid #bac6ac;
+  border-radius: 14px;
+  box-shadow: 0 8px 28px #28341d38, 0 2px 5px #28341d18;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.language-popover-title {
+  padding: 10px 14px 8px;
+  flex-shrink: 0;
+  color: #71835d;
+  font-size: 10px;
+  border-bottom: 1px solid #dfe5d7;
+}
+.language-popover-list {
+  overflow-y: auto;
+  min-height: 0;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+.language-menu-item,
+.language-menu-manage {
+  width: 100%;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 14px;
+  border: 0;
+  border-radius: 0;
+  border-bottom: 1px solid #e8ecdf;
+  background: transparent;
+  text-align: left;
+  font-size: 13px;
+  touch-action: pan-y;
+}
+.language-menu-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.language-menu-name small {
+  display: block;
+  font-size: 10px;
+  color: #7f8d70;
+  margin-top: 2px;
+}
+.language-check {
+  color: #556b3d;
+  padding-left: 10px;
+}
+.language-menu-item[aria-checked=true] {
+  background: #edf2e5;
+}
+.language-popover .language-hover {
+  background: #697a50;
+  color: #fff;
+}
+.language-hover small,
+.language-hover .language-check {
+  color: #edf3e5;
+}
+.language-menu-manage {
+  flex-shrink: 0;
+  border-top: 1px solid #cdd7c0;
+  border-bottom: 0;
+  color: #536a3a;
+  font-size: 11px;
+}
 .keyboard-bottom #keyboard-return {
   min-width: 46px;
   background: #dce6cd;
