@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
-
 export async function verifyAccess(origin, issuer, request = fetch) {
   for (const path of ["/", "/ws"]) {
     const response = await request(new URL(path, origin), { redirect: "manual", signal: AbortSignal.timeout(15000) });
@@ -13,9 +10,4 @@ export async function verifyAccess(origin, issuer, request = fetch) {
     }
     console.log(`Access protection verified for ${path}.`);
   }
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const { vars } = JSON.parse(readFileSync("wrangler.ci.json", "utf8"));
-  await verifyAccess(vars.APP_ORIGIN, vars.ACCESS_ISSUER);
 }
