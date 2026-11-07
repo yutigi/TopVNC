@@ -8,6 +8,7 @@
 **/.wrangler/
 **/.dev.vars
 **/wrangler.local.toml
+**/wrangler.ci.json
 **/host.local.toml
 **/tunnel-token.txt
 /gateway/cloudflare/spike/worker/build/
