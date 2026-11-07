@@ -397,6 +397,20 @@ pub struct UiState {
 }
 
 impl UiState {
+    /// A new landing window must describe an existing run accurately. When
+    /// stopped, a fresh window still defaults to Access.
+    pub fn for_landing(error: Option<String>, web: &WebRuntime) -> Self {
+        Self {
+            error,
+            web_route: if web.is_idle() {
+                RouteKind::default()
+            } else {
+                web.route().unwrap_or_default()
+            },
+            ..Self::default()
+        }
+    }
+
     /// Handle an editing key; returns whether it was one.
     pub fn key(&mut self, config: &mut Config, key: KeyCode) -> bool {
         match key {
@@ -2043,7 +2057,7 @@ fn web_panel(canvas: &mut Canvas<'_>, state: &UiState, web: &WebRuntime) {
         small(
             canvas,
             &mut y,
-            "START RUNS THIS DESKTOP SERVER ON LOOPBACK WITH YOUR PASSWORD, THEN A QUICK TUNNEL, THEN THE GATEWAY, WHICH ALSO SERVES THE WEB APP. NO CLOUDFLARE ACCOUNT OR SETUP FILES.",
+            "START RUNS THIS DESKTOP SERVER ON LOOPBACK WITH YOUR PASSWORD, THEN THE GATEWAY AND QUICK TUNNEL. THE GATEWAY ALSO SERVES THE WEB APP. NO CLOUDFLARE ACCOUNT OR SETUP FILES.",
             MUTED,
         );
     } else {

@@ -48,13 +48,19 @@ Decisions agreed with the owner on 2026-11-05:
 
 Design choices made while implementing (within the approved plan):
 
-- **The origin is a gateway argument.** The WEB tab already starts the
-  gateway only after the tunnel is ready, so it starts the gateway with the
-  URL cloudflared printed. It is set once per gateway process.
+- **Bind before publishing.** The WEB tab starts the gateway first, waits
+  for `bound <address>`, then starts cloudflared with a generated configuration
+  whose only ingress is that listener. Existing cloudflared configurations
+  and inherited `TUNNEL_*` options cannot change this route. After learning
+  the URL and a registered connection, the tab sends `origin <url>` on stdin.
+  The gateway retains the same socket until shutdown and admits no HTTP
+  before the origin is set. A second origin command ends the gateway.
+- **Stop forwarding first.** Gateway or tunnel failure ends the Quick Tunnel
+  run; forwarding stops before the gateway listener is released on shutdown.
 - **Each run gets a new host identity.** Browser pairing storage is per
   origin, and every start gives a new origin, so every run needs a new pairing
   anyway. The gateway creates a fresh host key in memory and keeps enrolled
-  browser keys in memory only. Nothing is written to disk, the eight-key
+  browser keys in memory only. No identity is written to disk, the eight-key
   enrollment list never fills with dead keys, and a browser key enrolled on the
   Access route is never accepted without Access.
 
@@ -108,18 +114,23 @@ Quick Tunnel mode and fetch the page and complete a paired session.
    only for `cloudflared`, the gateway program, and the built `web/dist`, and
    names whichever is missing.
 3. **Given** Start, **Then** TopVNC serves on `127.0.0.1:5900` (loopback, plain
-   RFB, password required), runs
-   `cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080`, and marks
-   the tunnel Ready only after cloudflared has printed a valid
+   RFB, password required), starts the gateway and waits for it to bind
+   `127.0.0.1:6080`, then runs
+   cloudflared with an explicit per-run configuration pinned to that listener,
+   and marks the tunnel Ready only after cloudflared has printed a valid
    `https://<label>.trycloudflare.com` URL **and** registered a connection.
-4. **Given** the tunnel is Ready, **Then** the gateway starts in Quick Tunnel
-   mode with that exact origin and serves the page and `/ws` on
+4. **Given** the tunnel is Ready, **Then** the already-bound gateway receives
+   that exact origin over stdin and serves the page and `/ws` on
    `127.0.0.1:6080`.
 5. **Given** the gateway is Ready, **When** the user pairs, **Then** the QR
    code encodes the temporary URL with the invite in the fragment.
 6. **Given** a running Quick Tunnel, **When** the user stops and starts again,
    **Then** a new URL and a new host key fingerprint are shown, and the old
    pairing no longer works.
+7. An occupied gateway port starts no connector. A gateway failure stops
+   forwarding immediately; graceful shutdown stops the connector before
+   closing the gateway. Returning from a native viewer restores the active
+   route, its URL, and its route-specific security explanation.
 
 ### User Story 2 - The route stays as safe as pairing allows (Priority: P1)
 
