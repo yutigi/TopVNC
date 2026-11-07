@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { productionConfig } from "../scripts/prepare-deploy.mjs";
+import { assertPublishable, deploymentConfig } from "../scripts/deployment-config.mjs";
 import { verifyAccess } from "../scripts/verify-access.mjs";
 
 const fixture = () => ({
@@ -16,17 +16,24 @@ const fixture = () => ({
   vpc_services: [{ binding: "HOST_NET", service_id: "12345678-1234-1234-1234-123456789abc", remote: true }],
 });
 
-test("deployment configuration strips executable settings and extra infrastructure", () => {
+const prepare = (config) => deploymentConfig(config, "/checkout/worker", "/checkout/web");
+
+test("manual deployment strips extra infrastructure and always builds this checkout", () => {
   const config = fixture();
   config.build = { command: "unexpected command" };
   config.routes = ["public.example.com/*"];
   config.vars.EXTRA = "do not publish";
   config.assets.binding = "EXTRA_ASSETS";
-  assert.deepEqual(productionConfig(JSON.stringify(config)), fixture());
+  config.assets.run_worker_first = ["/*"];
+  config.main = "/another-checkout/src/index.mjs";
+  const expected = fixture();
+  expected.main = "/checkout/worker/src/index.mjs";
+  expected.assets.directory = "/checkout/web/dist";
+  assert.deepEqual(prepare(config), expected);
 });
 
-test("deployment rejects missing configuration, changed destination, preview URLs and invalid Access policy", () => {
-  for (const input of [undefined, "", "{", "null", "[]"]) assert.throws(() => productionConfig(input));
+test("manual deployment rejects placeholders, public upstreams, previews and invalid Access policy", () => {
+  for (const input of [undefined, "", null, []]) assert.throws(() => prepare(input));
   const mutations = [
     (c) => { c.name = "another-worker"; },
     (c) => { c.preview_urls = true; },
@@ -37,13 +44,24 @@ test("deployment rejects missing configuration, changed destination, preview URL
     (c) => { c.vars.UPSTREAM_URL = "https://public.example.com/ws"; },
     (c) => { c.vpc_services[0].remote = false; },
     (c) => { c.vpc_services[0].service_id = "-".repeat(36); },
+    (c) => { c.vpc_services[0].service_id = "00000000-0000-0000-0000-000000000000"; },
     (c) => { c.vpc_services.push(c.vpc_services[0]); },
-    (c) => { c.assets.run_worker_first = ["/*"]; },
+    (c) => { c.compatibility_date = "2999-01-01"; },
   ];
   for (const mutate of mutations) {
     const config = fixture(); mutate(config);
-    assert.throws(() => productionConfig(JSON.stringify(config)));
+    assert.throws(() => prepare(config));
   }
+});
+
+test("publishing refuses unmerged, dirty, outdated and unverifiable checkouts", () => {
+  const state = { branch: "main", status: "", head: "a".repeat(40), remoteHead: "a".repeat(40) };
+  assert.doesNotThrow(() => assertPublishable(state));
+  for (const invalid of [
+    { branch: "feature" }, { branch: "" }, { status: " M web/app.mjs" },
+    { status: "?? unexpected.js" }, { remoteHead: "b".repeat(40) },
+    { remoteHead: "" }, { head: "", remoteHead: "" },
+  ]) assert.throws(() => assertPublishable({ ...state, ...invalid }));
 });
 
 test("Access verification checks both page and WebSocket path without following redirects", async () => {
