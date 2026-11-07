@@ -414,6 +414,111 @@ On the phone, open the app URL, sign in if asked, press **Connect**, and
 enter the VNC password. Disconnect from the ☰ menu. When you are done, press
 Ctrl+C in all three windows.
 
+## Multiple machines on one website
+
+Use one Access-protected app origin with a static registry of up to 32 machines.
+Start from [`wrangler.multi-host.example.toml`](../gateway/cloudflare/worker/wrangler.multi-host.example.toml)
+for the shared Worker. Each host still runs its own TopVNC server, loopback
+gateway, and private tunnel. Configure the same `APP_ORIGIN`, Access issuer,
+audience, and owner email on all of them. Keep the hostname-based Access
+application covering the entire website, including `/api/hosts` and `/ws/*`.
+
+Repeat setup steps 5-7 **on each machine**. Create a separate tunnel and VPC
+service per machine. Never copy a tunnel token, host private key, or browser
+enrollment file from another machine. The loopback ports may be identical on
+different machines; the VPC service binding selects which machine receives
+the request.
+
+For example, fill in these associations in the shared Worker configuration:
+
+| Machine ID | Label | Binding | VPC service | Gateway upstream |
+| --- | --- | --- | --- | --- |
+| `gaming-pc` | Gaming PC | `GAMING_NET` | Service attached to Gaming PC's tunnel | `http://127.0.0.1:6080/ws` |
+| `office-pc` | Office PC | `OFFICE_NET` | Service attached to Office PC's tunnel | `http://127.0.0.1:6080/ws` |
+
+`HOSTS_JSON` contains those IDs, names, binding names, and upstreams, as in the
+example. Each `[[vpc_services]]` entry supplies that binding's actual
+`service_id`. Use stable IDs: 1-48 lowercase ASCII letters, digits, or hyphens,
+starting with a letter or digit. Names may be up to 80 characters. IDs are the
+browser pairing namespace; do not reuse an ID for a different machine.
+`HOSTS_JSON` replaces legacy routing: `/ws` has no implicit default in this
+mode. Keep `run_worker_first = ["/ws", "/ws/*", "/api/hosts"]`.
+
+On Gaming PC, add this to `gateway/cloudflare/gateway.local.toml`:
+
+```toml
+app_origin = "https://topvnc.YOUR_SUBDOMAIN.workers.dev"
+host_id = "gaming-pc"
+```
+
+Set `host_id = "office-pc"` on Office PC instead. Keep `listen` at
+`127.0.0.1:6080` and `rfb_target` at `127.0.0.1:5900` on each host unless its
+local ports differ. Both stay loopback-only. The native **WEB** tab accepts
+this field and generates the same machine-specific QR links as `cargo web-pair`.
+**Copy app URL** still opens the shared website; select the machine there.
+
+Build and validate locally using the commands below before the owner deploys
+the Worker. This implementation does not create cloud resources or deploy them.
+
+```powershell
+npm --prefix gateway/cloudflare/worker test
+npm --prefix web test
+npm --prefix web run build
+npm --prefix web run test:wasm
+```
+
+**Pair each machine separately.** Sign in on the shared site, open pairing
+on the intended host, and scan its QR code. Its link is
+`https://<app>/?host=gaming-pc#pair=<one-time-invite>`: the machine ID is public;
+the invite remains in the fragment and is removed from history immediately.
+The browser selects Gaming PC and asks you to compare its fingerprint before
+connecting. It saves a distinct browser key only after the encrypted host
+acknowledges enrollment. A QR link for an unknown ID or an old link lacking
+`?host=` is rejected in registry mode. Update/restart that gateway and make a
+new invite. A link with a changed pinned key cannot replace the old pairing:
+select that machine, **Forget pairing**, then scan and verify its new invite.
+
+**Keep the old single-host pairing deliberately.** If Gaming PC is exactly
+the old deployment's host identity, set `LEGACY_HOST_ID = "gaming-pc"` in the
+Worker's `[vars]`. The browser moves its v1 pairing into Gaming PC's slot on
+the next load, and removes the old entry only after saving succeeds. Existing
+scoped keys are never overwritten by this migration. Without this setting,
+legacy keys are left untouched and each machine must be paired separately.
+Leave it set while browsers still need migration. To retain the old behavior
+entirely, omit `HOSTS_JSON` and `host_id`, and keep `HOST_NET` / `UPSTREAM_URL`:
+the page uses `/ws` and the original pairing slot.
+
+**Switch control.** Choose a machine on the connection page or under
+**☰ → Switch machine** while connected. Switching releases held inputs,
+exits pointer lock, closes the old session, clears its image and password,
+and returns to the connection page. Press **Connect** and enter that machine's
+VNC password. Passwords are never saved or reused across machines. Forgetting
+one pairing does not change the others or revoke the host's enrollment.
+
+**Add or remove a machine.** Provision its own tunnel, gateway, and identity;
+add its registry and service-binding entries; deploy the updated Worker when
+ready. Reload the browser to refresh the list, then pair it. To remove one,
+remove both entries. Removing a registry entry prevents future upgrades;
+stop its gateway to end an already established session. Changing a label
+preserves pairing because the ID remains the same.
+
+**An offline machine** still appears in the configured list. Its connection
+fails with the private-gateway message; select another machine to continue.
+There is no background health polling or automatic fallback to another host.
+The protected `/api/hosts` response exposes only IDs, labels, and migration
+policy. Worker routing rewrites `/ws/<id>` to that configured gateway's fixed
+`/ws`; browser-provided destinations and query strings are rejected.
+
+**Validation:** local automated routing, authentication, storage, invite and
+session-lifecycle checks cover this mode. `npm --prefix web run test:browser`
+(after the build) runs the actual page in a temporary headless Chromium profile
+against a controlled session Worker; set `TOPVNC_TEST_BROWSER` if Chromium is
+not found automatically. It covers UI switching and late messages, rather
+than a live remote desktop. A two-machine live Cloudflare run,
+mobile switching with held input, cold Worker CPU, and offline-tunnel recovery
+still need owner/device validation. No new platform support or performance
+improvement is claimed.
+
 ## Troubleshooting
 
 | What you see | What to do |
@@ -446,7 +551,8 @@ appear as `1011` there.
 ## Free-plan Worker CPU
 
 This is an **open risk, not a passed check.** Workers Free allows 10 ms of
-CPU per invocation. Only `/ws` upgrades run Worker code; the page's files are
+CPU per invocation. `/ws` and `/ws/<id>` upgrades and `/api/hosts` metadata run
+Worker code; the page's files are
 served without it. No paid plan is assumed.
 
 **Rust Worker, 2026-10-30 to 2026-10-31.** Workers analytics counted 88
@@ -581,10 +687,11 @@ is dropped, never replayed.
   application that allows only the owner's email. The Worker and the gateway
   both verify the `Cf-Access-Jwt-Assertion` JWT: signature, issuer, audience,
   expiry, and owner email. A decoded or unverified token is never trusted.
-- **Fixed destinations.** The Worker forwards only `/ws` to its one VPC
-  service. The gateway connects only to its configured loopback `rfb_target`.
-  The browser cannot name a host, port, or path: query strings, other paths,
-  other origins, and other subprotocols are rejected.
+- **Fixed destinations.** The Worker forwards legacy `/ws` to its one VPC
+  service, or `/ws/<id>` to an explicitly configured registry entry. The
+  gateway receives `/ws` and connects only to its loopback `rfb_target`.
+  The browser can select a configured ID, never an arbitrary destination:
+  query strings, unknown IDs, other origins, and non-binary upgrades are rejected.
 - **End-to-end encryption** (Noise `XK_25519_ChaChaPoly_BLAKE2s`, `snow`) runs
   between the browser and the gateway on the host. The Worker, VPC, and Tunnel
   carry only ciphertext: RFB credentials, frames, input, and clipboard are

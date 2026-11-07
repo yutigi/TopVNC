@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { forgetPairing, inviteFromHash, isKey, loadPairing, savePairing } from "../pairing-store.mjs";
+import { forgetPairing, inviteFromHash, isKey, loadPairing, savePairing, migratePairing } from "../pairing-store.mjs";
 
 class MemoryStorage {
   #items = new Map();
@@ -11,6 +11,37 @@ class MemoryStorage {
 
 const host = "A".repeat(43);
 const browser = "b_-".repeat(14) + "c";
+
+test("machine pairings never read, overwrite, or forget another machine's keys", () => {
+  const storage = new MemoryStorage();
+  savePairing(storage, { host, browser });
+  assert.equal(loadPairing(storage, "gaming-pc"), undefined);
+  savePairing(storage, { host, browser }, "gaming-pc");
+  const office = { host: "C".repeat(43), browser: "D".repeat(43) };
+  savePairing(storage, office, "office-pc");
+  forgetPairing(storage, "gaming-pc");
+  assert.deepEqual(loadPairing(storage, "office-pc"), office);
+  assert.deepEqual(loadPairing(storage), { host, browser });
+  assert.throws(() => savePairing(storage, office, "../bad"));
+});
+
+test("legacy migration requires an explicit target and preserves existing pins or failed writes", () => {
+  const storage = new MemoryStorage();
+  savePairing(storage, { host, browser });
+  migratePairing(storage, null);
+  assert.deepEqual(loadPairing(storage), { host, browser });
+  const different = { host: "C".repeat(43), browser };
+  savePairing(storage, different, "office-pc");
+  migratePairing(storage, "office-pc");
+  assert.deepEqual(loadPairing(storage, "office-pc"), different);
+  assert.ok(loadPairing(storage));
+  assert.throws(() => migratePairing({ getItem: storage.getItem.bind(storage), setItem() { throw Error("blocked"); } }, "gaming-pc"));
+  assert.ok(loadPairing(storage));
+  migratePairing(storage, "gaming-pc");
+  assert.equal(loadPairing(storage), undefined);
+  assert.deepEqual(loadPairing(storage, "gaming-pc"), { host, browser });
+  assert.equal(loadPairing(storage, "other"), undefined);
+});
 
 test("stores, reloads and forgets one pairing", () => {
   const storage = new MemoryStorage();

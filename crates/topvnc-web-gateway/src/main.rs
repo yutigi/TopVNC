@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let listen = config.listen;
     let target = config.rfb_target;
-    let origin = config.app_origin.clone();
+    let link_config = config.clone();
     let gateway = Gateway::new(config)?;
     eprintln!(
         "Host key fingerprint: {} ({} enrolled browser key(s))",
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if pair {
         let invite = gateway.open_pairing()?;
-        let link = format!("{origin}/#pair={}", invite.encode());
+        let link = link_config.pairing_link(&invite);
         // Light modules print as blocks so the code reads on a dark console.
         let qr = QrCode::new(link.as_bytes())?
             .render::<Dense1x2>()
@@ -141,7 +141,7 @@ async fn supervised(config_path: &str) -> Result<(), Box<dyn std::error::Error>>
     let config = load_config(config_path)?;
     let listen = config.listen;
     let target = config.rfb_target;
-    let origin = config.app_origin.clone();
+    let link_config = config.clone();
     let gateway = Gateway::new(config)?;
     let fingerprint = e2e::fingerprint(&gateway.host_public());
     eprintln!(
@@ -178,7 +178,10 @@ async fn supervised(config_path: &str) -> Result<(), Box<dyn std::error::Error>>
             match command {
                 Command::Pair => match control.open_pairing() {
                     Ok(invite) => {
-                        println!("pair {PAIRING_SECONDS} {origin}/#pair={}", invite.encode());
+                        println!(
+                            "pair {PAIRING_SECONDS} {}",
+                            link_config.pairing_link(&invite)
+                        );
                         eprintln!("Pairing invite open for {} minutes.", PAIRING_SECONDS / 60);
                     }
                     Err(reason) => println!("pair-error {reason}"),

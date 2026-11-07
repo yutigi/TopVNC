@@ -232,6 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listen: "127.0.0.1:0".parse()?,
         rfb_target,
         app_origin: fixtures::ORIGIN.into(),
+        host_id: None,
         issuer: policy.issuer,
         audience: policy.audience,
         owner_email: policy.owner_email,

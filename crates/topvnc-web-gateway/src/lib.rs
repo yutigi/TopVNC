@@ -54,6 +54,9 @@ pub struct Config {
     pub listen: SocketAddr,
     pub rfb_target: SocketAddr,
     pub app_origin: String,
+    /// Stable machine selector ID in a shared website; absent for legacy links.
+    #[serde(default)]
+    pub host_id: Option<String>,
     pub issuer: String,
     pub audience: String,
     pub owner_email: String,
@@ -62,6 +65,16 @@ pub struct Config {
     pub host_key_file: PathBuf,
     /// Enrolled browser public keys, one per line; written by pairing.
     pub browser_keys_file: PathBuf,
+}
+
+impl Config {
+    pub fn pairing_link(&self, invite: &PairingInvite) -> String {
+        let selector = self
+            .host_id
+            .as_ref()
+            .map_or(String::new(), |id| format!("?host={id}"));
+        format!("{}/{selector}#pair={}", self.app_origin, invite.encode())
+    }
 }
 
 #[derive(Default)]
@@ -187,6 +200,9 @@ pub fn unix_now() -> u64 {
 impl Gateway {
     pub fn new(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         validate_origin(&config.app_origin)?;
+        if let Some(id) = &config.host_id {
+            topvnc_access::validate_host_id(id)?;
+        }
         if !config.listen.ip().is_loopback()
             || !config.rfb_target.ip().is_loopback()
             || config.rfb_target.port() == 0

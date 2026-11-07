@@ -39,6 +39,11 @@ fn next_line(lines: &mpsc::Receiver<String>) -> String {
 #[test]
 fn supervised_protocol_pairs_and_stops_on_stdin_eof() {
     let dir = scratch();
+    // Exercise the shared-website link through the actual supervised process.
+    let config_path = dir.join("gateway.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str("host_id = \"gaming-pc\"\n");
+    std::fs::write(&config_path, config).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_topvnc-web-gateway"))
         .arg("--supervised")
         .arg(dir.join("gateway.toml"))
@@ -73,7 +78,10 @@ fn supervised_protocol_pairs_and_stops_on_stdin_eof() {
     writeln!(stdin, "pair").unwrap();
     let pair = next_line(&lines);
     let rest = pair.strip_prefix("pair 600 ").expect("pair line");
-    assert!(rest.starts_with(&format!("{ORIGIN}/#pair=")), "{pair}");
+    assert!(
+        rest.starts_with(&format!("{ORIGIN}/?host=gaming-pc#pair=")),
+        "{pair}"
+    );
     writeln!(stdin, "cancel-pair").unwrap();
     writeln!(stdin, "unknown").unwrap();
     stdin.flush().unwrap();

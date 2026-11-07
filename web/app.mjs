@@ -5,7 +5,9 @@
 // not to substitute it (see docs/cloudflare-gateway.md).
 
 import init, { fingerprint, newBrowserKey, parseInvite, publicKey } from "./build/pkg/topvnc_web.js";
-import { forgetPairing, inviteFromHash, loadPairing, savePairing } from "./pairing-store.mjs";
+import { forgetPairing, inviteFromHash, loadPairing, savePairing, migratePairing } from "./pairing-store.mjs";
+import { fetchHosts, inviteTarget, invitePolicy, socketPath } from "./hosts.mjs";
+import { SessionSlot } from "./session-slot.mjs";
 import { TouchGestures } from "./gestures.mjs";
 import { attachTextInput } from "./text-input.mjs";
 import { View } from "./view.mjs";
@@ -22,7 +24,7 @@ const statusLine = $("#status");
 const log = $("#log");
 const viewer = $("#viewer");
 const screen = $("#screen");
-const canvas = $("#canvas");
+let canvas = $("#canvas");
 const cursor = $("#cursor");
 const statsLine = $("#stats");
 const toolbar = $("#toolbar");
@@ -69,7 +71,13 @@ let touchInput = matchMedia("(pointer: coarse)").matches;
 const latched = new Set();
 const view = new View();
 let lines = [];
-let post;
+let registry;
+let queuedInvite;
+let selected;
+let selectionRevision = 0;
+const machineSelectors = [$("#machine"), $("#menu-machine")];
+const sessions = new SessionSlot(onSessionMessage);
+const pairingId = () => registry?.legacy ? undefined : selected;
 
 function preference(name, fallback) {
   try {
@@ -110,7 +118,7 @@ function report(message) {
 }
 
 function pairing() {
-  return pending ?? loadPairing(storage);
+  return registry ? pending ?? loadPairing(storage, pairingId()) : undefined;
 }
 
 function describeIdentity() {
@@ -137,29 +145,81 @@ function describeIdentity() {
 // A #pair= link, from the camera or pasted into this tab. The fragment is
 // removed from the address bar and this history entry at once.
 function readInvite() {
-  const invite = inviteFromHash(location.hash);
+  const incoming = location.hash ? { hash: location.hash, search: location.search } : queuedInvite;
   if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+  queuedInvite = undefined;
+  const invite = inviteFromHash(incoming?.hash);
   if (!invite) return;
+  if (!registry) { queuedInvite = incoming; return; }
   let parsed;
   try {
+    const target = inviteTarget(registry, incoming.search);
     parsed = parseInvite(invite);
+    const saved = loadPairing(storage, registry.legacy ? undefined : target);
+    const policy = invitePolicy(saved, parsed.host);
+    if (policy === "changed-key") {
+      report("The pairing link has a different pinned host key. Select that machine and forget its pairing first, then verify the new fingerprint on the host.");
+      return;
+    }
+    if (target !== selected || (policy === "accept" && state !== "idle")) switchMachine(target);
+    if (policy === "already-paired") {
+      report("This browser is already paired with this host; the pairing link was ignored.");
+    } else {
+      pending = { host: parsed.host, secret: parsed.secret, browser: newBrowserKey() };
+      report("Pairing invite read. Compare the host fingerprint with the host console, then connect.");
+    }
   } catch {
-    report("The pairing link is invalid. Scan the host's QR code again.");
-    return;
+    report("The pairing link is invalid or does not name a configured machine. Scan that machine's new QR code.");
+  } finally {
+    parsed?.free();
   }
-  const saved = loadPairing(storage);
-  if (saved && saved.host === parsed.host) {
-    // A used or reopened link must not replace a working pairing.
-    report("This browser is already paired with this host; the pairing link was ignored.");
-  } else {
-    pending = { host: parsed.host, secret: parsed.secret, browser: newBrowserKey() };
-    report(saved
-      ? "Pairing invite read for a different host key. Connecting replaces this browser's pairing."
-      : "Pairing invite read. Compare the host fingerprint with the host console, then connect.");
-  }
-  parsed.free();
   describeIdentity();
 }
+
+function clearViewer() {
+  frame = { width: 0, height: 0 };
+  oversized = relativePointer = false;
+  wheelX = wheelY = 0;
+  view.reset();
+  passwordInput.value = "";
+  passwordForm.hidden = true;
+  statsLine.textContent = "";
+  cursor.hidden = true;
+  showViewer(false);
+  showCapabilities({ serveScale: 0, displays: [] });
+  // Detach any old OffscreenCanvas immediately; late drawing cannot be seen.
+  const fresh = document.createElement("canvas");
+  fresh.id = "canvas";
+  fresh.width = fresh.height = 1;
+  canvas.replaceWith(fresh);
+  canvas = fresh;
+}
+
+function switchMachine(id) {
+  if (!registry.hosts.some((host) => host.id === id)) return;
+  releaseEverything();
+  const revision = ++selectionRevision;
+  const stopped = sessions.stop();
+  state = "switching";
+  pending = undefined;
+  selected = id;
+  clearViewer();
+  for (const selector of machineSelectors) selector.value = id;
+  const url = new URL(location.href);
+  if (!registry.legacy) url.searchParams.set("host", id);
+  history.replaceState(null, "", url.pathname + url.search);
+  connectButton.textContent = "Connect";
+  describeIdentity();
+  report(`Selected ${registry.hosts.find((host) => host.id === id).name}. Closing the previous session…`);
+  stopped.then(() => {
+    if (revision !== selectionRevision) return;
+    state = "idle";
+    describeIdentity();
+    report(`Ready for ${registry.hosts.find((host) => host.id === id).name}.`);
+  });
+}
+
+for (const selector of machineSelectors) selector.addEventListener("change", () => switchMachine(selector.value));
 
 // ---- Session messages -----------------------------------------------------
 
@@ -182,7 +242,7 @@ async function closeReason(message) {
   return "The private gateway is unavailable: the host, its tunnel connector, or the gateway is not running.";
 }
 
-async function onSessionMessage(message) {
+async function onSessionMessage(message, active = () => true) {
   switch (message.type) {
     case "secure":
       report("Encrypted channel to the host established. Signing in to TopVNC…");
@@ -190,7 +250,7 @@ async function onSessionMessage(message) {
     case "verified":
       if (pending) {
         try {
-          savePairing(storage, pending);
+          savePairing(storage, pending, pairingId());
           report("This browser is enrolled. The pairing is saved in this browser only.");
         } catch {
           report("Enrolled, but this browser could not save the pairing. Pair again next time.");
@@ -248,11 +308,13 @@ async function onSessionMessage(message) {
       state = "idle";
       passwordForm.hidden = true;
       passwordInput.value = "";
-      showViewer(false);
+      clearViewer();
       // The next host may not offer these controls.
       showCapabilities({ serveScale: 0, displays: [] });
       describeIdentity();
-      report(`${wasConnected ? "Disconnected" : "Connection failed"} (${message.code}). ${await closeReason(message)}`);
+      const reason = await closeReason(message);
+      if (!active()) return;
+      report(`${wasConnected ? "Disconnected" : "Connection failed"} (${message.code}). ${reason}`);
       connectButton.textContent = wasConnected ? "Reconnect" : "Connect";
       break;
     }
@@ -262,7 +324,7 @@ async function onSessionMessage(message) {
 }
 
 function send(message) {
-  post?.(message);
+  sessions.send(message);
 }
 
 function input(message) {
@@ -591,8 +653,7 @@ for (const bar of [toolbar, functionKeys]) {
 }
 
 $("#disconnect").addEventListener("click", () => {
-  input({ kind: "release" });
-  send({ type: "close" });
+  switchMachine(selected);
 });
 $("#stats-toggle").addEventListener("change", (event) => {
   statsLine.hidden = !event.target.checked;
@@ -609,40 +670,41 @@ $("#close-menu").addEventListener("click", () => showMenu(false));
 
 // ---- Connecting -----------------------------------------------------------------
 
-let worker;
-let transferred = false;
-
 async function startSession() {
-  if (!post) {
-    if (typeof canvas.transferControlToOffscreen === "function" && typeof Worker === "function") {
-      worker = new Worker(new URL("./session-worker.js", import.meta.url), { type: "module" });
-      worker.onmessage = (event) => onSessionMessage(event.data);
-      worker.onerror = () => onSessionMessage({ type: "closed", code: 4007, reason: "The viewer worker failed to start." });
-      post = (message, transfer) => worker.postMessage(message, transfer ?? []);
-    } else {
-      const { createSession } = await import("./session.mjs");
-      const handle = createSession((message) => onSessionMessage(message));
-      post = (message) => handle(message);
-    }
-  }
+  const revision = selectionRevision;
   const keys = pairing();
   const message = {
     type: "connect",
-    // Always this page's own origin; nothing chooses another destination.
-    url: `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`,
+    url: `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${socketPath(registry, selected)}`,
     browser: keys.browser,
     host: keys.host,
     secret: pending?.secret,
     quality: Number(chosen("quality")),
   };
-  if (worker && !transferred) {
-    message.canvas = canvas.transferControlToOffscreen();
-    transferred = true;
-    post(message, [message.canvas]);
-  } else {
-    if (!worker) message.canvas = canvas;
-    post(message);
-  }
+  await sessions.stop();
+  if (revision !== selectionRevision) return;
+  return sessions.start(async (emit, active) => {
+    if (!active()) return;
+    if (typeof canvas.transferControlToOffscreen === "function" && typeof Worker === "function") {
+      const worker = new Worker(new URL("./session-worker.js", import.meta.url), { type: "module" });
+      worker.onmessage = (event) => emit(event.data);
+      worker.onerror = () => emit({ type: "closed", code: 4007, reason: "The viewer worker failed to start." });
+      try {
+        message.canvas = canvas.transferControlToOffscreen();
+        worker.postMessage(message, [message.canvas]);
+      } catch (error) {
+        worker.terminate();
+        throw error;
+      }
+      return { post: (message) => worker.postMessage(message), dispose: () => worker.terminate() };
+    } else {
+      const { createSession } = await import("./session.mjs");
+      if (!active()) return;
+      const handle = createSession(emit);
+      handle({ ...message, canvas });
+      return { post: handle, dispose: () => handle({ type: "close" }) };
+    }
+  });
 }
 
 connectForm.addEventListener("submit", (event) => {
@@ -655,9 +717,12 @@ connectForm.addEventListener("submit", (event) => {
     return;
   }
   state = "connecting";
+  const revision = selectionRevision;
   describeIdentity();
   report(pending ? "Connecting to enroll this browser…" : "Connecting to the host…");
-  startSession().catch(() => onSessionMessage({ type: "closed", code: 4007, reason: "The viewer failed to start." }));
+  startSession().catch(() => {
+    if (revision === selectionRevision) onSessionMessage({ type: "closed", code: 4007, reason: "The viewer failed to start." }, () => revision === selectionRevision);
+  });
 });
 
 passwordForm.addEventListener("submit", (event) => {
@@ -673,7 +738,7 @@ passwordForm.addEventListener("submit", (event) => {
 
 forgetButton.addEventListener("click", () => {
   if (state !== "idle") return;
-  forgetPairing(storage);
+  forgetPairing(storage, pairingId());
   pending = undefined;
   describeIdentity();
   report("Pairing removed from this browser. The host still lists its key until you remove it there.");
@@ -713,6 +778,7 @@ window.addEventListener("pagehide", () => {
   send({ type: "close" });
 });
 window.addEventListener("hashchange", readInvite);
+readInvite(); // Remove invite secrets even while WASM or metadata is loading.
 window.addEventListener("resize", layout);
 window.visualViewport?.addEventListener("resize", () => {
   // The on-screen keyboard shrinks the visual viewport; keep the toolbar above it.
@@ -724,10 +790,23 @@ new ResizeObserver(layout).observe(screen);
 
 async function main() {
   await init({ module_or_path: "/topvnc_web_bg.wasm" });
+  // Only the legacy local harness can lack this endpoint. HTTP errors on the
+  // protected production website must never silently select a legacy host.
+  const local = location.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
+  registry = await fetchHosts(fetch, local);
+  try { migratePairing(storage, registry.legacyHostId); } catch { report("Could not migrate the old pairing. Browser storage may be blocked."); }
+  selected = registry.hosts[0].id;
+  const requested = new URLSearchParams(location.search).get("host");
+  if (registry.hosts.some((host) => host.id === requested)) selected = requested;
+  for (const selector of machineSelectors) {
+    selector.replaceChildren(...registry.hosts.map(({ id, name }) => Object.assign(document.createElement("option"), { value: id, textContent: name })));
+    selector.value = selected;
+    selector.disabled = false;
+  }
   setQuality(preference("quality", "6"));
   $("#toggle-mode").textContent = mode === "trackpad" ? "Trackpad" : "Direct";
   readInvite();
   describeIdentity();
 }
 
-main().catch(() => report("The encryption module failed to load. Connections stay disabled."));
+main().catch(() => report("The encryption module or protected machine list failed to load. Reload to sign in again. Connections stay disabled."));

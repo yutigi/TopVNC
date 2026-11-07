@@ -16,6 +16,8 @@
       <h1><svg class="wordmark" viewBox="0 0 35 7" role="img" aria-label="TopVNC"><path d="M0 0h5v1h-5zM2 1h1v6h-1zM7 0h3v1h-3zM6 1h1v5h-1zM10 1h1v5h-1zM7 6h3v1h-3zM12 0h4v1h-4zM12 1h1v6h-1zM16 1h1v2h-1zM13 3h3v1h-3zM18 0h1v5h-1zM22 0h1v5h-1zM19 5h1v1h-1zM21 5h1v1h-1zM20 6h1v1h-1zM24 0h1v7h-1zM28 0h1v7h-1zM25 1h1v1h-1zM26 2h1v1h-1zM27 3h1v1h-1zM31 0h3v1h-3zM30 1h1v5h-1zM34 1h1v1h-1zM34 5h1v1h-1zM31 6h3v1h-3z"/></svg></h1>
       <p class="subtitle">Connect to a remote desktop</p>
     </header>
+    <label class="label" for="machine">Machine</label>
+    <select id="machine" disabled aria-label="Machine"><option>Loading machines…</option></select>
     <h2 class="label">Pairing</h2>
     <p id="identity" class="readout">Loading the encryption module…</p>
     <p class="notice">The connection is encrypted from this browser to your host: Cloudflare relays only ciphertext.
@@ -86,6 +88,9 @@
         <button type="button" id="close-menu">Close</button>
       </div>
       <!-- The host display and served size are shared by every viewer. -->
+      <label class="label" for="menu-machine">Switch machine</label>
+      <select id="menu-machine" disabled aria-label="Switch machine"></select>
+      <p class="note">Switching disconnects this session. Connect and enter the selected machine's password.</p>
       <fieldset class="choices">
         <legend class="label">Display</legend>
         <div id="serve-display" class="row" hidden></div>

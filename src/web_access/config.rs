@@ -50,6 +50,8 @@ struct GatewayFile {
     listen: SocketAddr,
     rfb_target: SocketAddr,
     app_origin: String,
+    #[serde(default)]
+    host_id: Option<String>,
     issuer: String,
     audience: String,
     owner_email: String,
@@ -98,6 +100,9 @@ pub fn parse_gateway(text: &str, base: &Path) -> Result<GatewaySettings, Problem
             Some(3),
         )
     })?;
+    if let Some(id) = &file.host_id {
+        topvnc_access::validate_host_id(id).map_err(|reason| Problem::new(reason, Some(3)))?;
+    }
     if [&file.issuer, &file.audience, &file.owner_email]
         .iter()
         .any(|value| placeholder(value))
@@ -279,6 +284,28 @@ browser_keys_file = "browsers.txt"
         assert_eq!(settings.listen, "127.0.0.1:6080".parse().unwrap());
         assert_eq!(settings.rfb_target, "127.0.0.1:5900".parse().unwrap());
         assert_eq!(settings.host_key_file, Path::new("base").join("host.key"));
+    }
+
+    #[test]
+    fn optional_machine_id_matches_gateway_rules() {
+        assert!(
+            parse_gateway(&format!("{VALID}\nhost_id = \"gaming-pc\""), Path::new(".")).is_ok()
+        );
+        for id in [
+            "",
+            "UPPER",
+            "-bad",
+            "a/b",
+            "a?b",
+            "a#b",
+            "ไทย",
+            &"x".repeat(49),
+        ] {
+            let problem =
+                parse_gateway(&format!("{VALID}\nhost_id = \"{id}\""), Path::new(".")).unwrap_err();
+            assert_eq!(problem.step, Some(3));
+            assert!(problem.message.contains("host_id"));
+        }
     }
 
     #[test]

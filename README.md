@@ -175,6 +175,13 @@ cargo web-gateway                # 3. the gateway for already paired browsers
 
 Then open the app URL on the phone and press **Connect**. If something fails, the page names the missing piece; the guide's [troubleshooting table](docs/cloudflare-gateway.md#troubleshooting) lists each message.
 
+For several machines behind one website, configure the [machine registry](docs/cloudflare-gateway.md#multiple-machines-on-one-website).
+The browser offers a machine selector and keeps each machine's pairing separate.
+Switching closes the previous session; press **Connect** and enter the selected
+machine's password. Existing single-host configurations keep working. This
+multi-host path has local automated coverage; live Cloudflare and device
+validation remain pending.
+
 ## Controls and display settings
 
 | Control or setting | Behavior |
