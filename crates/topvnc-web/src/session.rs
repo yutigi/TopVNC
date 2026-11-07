@@ -11,8 +11,8 @@ use topvnc_e2e::{Channel, Initiator, Key, MAX_PLAINTEXT_BYTES};
 use topvnc_rfb::messages::{continuous_updates_message, fence_message, update_request};
 use topvnc_rfb::protocol::{FENCE_REQUEST, FENCE_SUPPORTED_FLAGS};
 use topvnc_rfb::{
-    ClientHandshake, Encoding, HandshakeStatus, InputState, MessageReader, RectDecoder, ServerInfo,
-    ServerMessage,
+    CaptureStatus, ClientHandshake, Encoding, HandshakeStatus, InputState, MessageReader,
+    RectDecoder, ServerInfo, ServerMessage,
 };
 
 /// The host proved the pinned key: the encrypted channel is up.
@@ -36,6 +36,9 @@ pub const EVENT_RTT: u32 = 1 << 8;
 /// drawn and a size that fits was asked for. See
 /// [`ClientSession::oversize`].
 pub const EVENT_OVERSIZE: u32 = 1 << 9;
+/// The host can or can no longer capture its desktop; see
+/// [`ClientSession::capture_status`].
+pub const EVENT_CAPTURE_STATUS: u32 = 1 << 10;
 
 /// The largest framebuffer the browser shows: two 4K displays side by side,
 /// 64 MiB as RGBA, and the canvas area iOS Safari allows. A host serving more
@@ -337,6 +340,12 @@ impl ClientSession {
                     running.input.set_serve_display(displays);
                     events |= EVENT_CAPABILITIES;
                 }
+                ServerMessage::CaptureStatus(status) => {
+                    if running.input.capture_status() != status {
+                        running.input.set_capture_status(status);
+                        events |= EVENT_CAPTURE_STATUS;
+                    }
+                }
                 ServerMessage::PointerMode { relative } => {
                     running.input.server_pointer_mode(relative);
                     events |= EVENT_POINTER_MODE;
@@ -585,6 +594,14 @@ impl ClientSession {
         match &self.phase {
             Phase::Running(running) => running.input.serve_display(),
             _ => None,
+        }
+    }
+
+    /// Whether the host can capture its desktop; live unless it said not.
+    pub fn capture_status(&self) -> CaptureStatus {
+        match &self.phase {
+            Phase::Running(running) => running.input.capture_status(),
+            _ => CaptureStatus::Live,
         }
     }
 

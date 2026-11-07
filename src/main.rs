@@ -6,9 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
-    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, Encoding, Framebuffer, InputWriter,
-    ListenerId, ListenerSecurity, PerformanceMode, ServerListeners, Session, StatsSnapshot,
-    encoding_name,
+    BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, CaptureStatus, Encoding, Framebuffer,
+    InputWriter, ListenerId, ListenerSecurity, PerformanceMode, ServerListeners, Session,
+    StatsSnapshot, encoding_name,
 };
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -21,9 +21,14 @@ mod desktop_host;
 #[cfg(target_os = "macos")]
 mod macos_server;
 #[cfg(windows)]
+mod service_pipe;
+#[cfg(windows)]
 mod windows_server;
+#[cfg(windows)]
+mod windows_service;
 
 mod helpers;
+mod host_service;
 mod settings;
 mod ui;
 mod web_access;
@@ -563,11 +568,18 @@ fn apply_viewer_arguments(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments
-        .first()
-        .is_some_and(|argument| argument == "--serve")
-    {
-        return run_server(&arguments[1..]);
+    match arguments.first().map(String::as_str) {
+        Some("--serve") => return run_server(&arguments[1..]),
+        // The host service, which serves the lock and sign-in screens.
+        #[cfg(windows)]
+        Some("--install-service") => return windows_service::install(&arguments[1..]),
+        #[cfg(windows)]
+        Some("--uninstall-service") => return windows_service::uninstall(&arguments[1..]),
+        #[cfg(windows)]
+        Some("--host-service") => return windows_service::run_service(),
+        #[cfg(windows)]
+        Some("--host-agent") => return windows_service::run_agent(&arguments[1..]),
+        _ => {}
     }
     let mut config = Config::default();
     settings::load(&mut config);
@@ -583,6 +595,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Declared after the server so it is dropped first: the gateway and the
     // tunnel stop before the server they relay to.
     let mut web = WebRuntime::new(Box::new(web_access::process::ProcessSpawner));
+    // Keeps an installer's report while a viewer session runs.
+    let mut service = host_service::ServiceRuntime::default();
     loop {
         let Some((next_config, session)) = show_landing(
             &mut ui,
@@ -590,6 +604,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             connection_error.take(),
             &mut server,
             &mut web,
+            &mut service,
         )?
         else {
             return Ok(());
@@ -785,6 +800,9 @@ struct HostedServer {
     first: Option<Owner>,
     /// Listener failures that did not stop the server, for the next poll.
     failure: Option<String>,
+    /// An installed service used by the WEB tab. It owns its listener and
+    /// lifecycle; stopping this tab only forgets this reference.
+    web_service: Option<(std::net::SocketAddr, HostServer)>,
 }
 
 impl HostedServer {
@@ -829,11 +847,46 @@ impl HostedServer {
 
     /// The WEB tab's listener, as it needs to see it.
     fn web_view(&self) -> HostServer {
+        if let Some((_, phase)) = &self.web_service {
+            return phase.clone();
+        }
         match self.phase_for(Owner::Web) {
             ServerPhase::Stopped => HostServer::Stopped,
             ServerPhase::Starting => HostServer::Starting,
             ServerPhase::Serving { .. } => HostServer::Serving,
             ServerPhase::Stopping => HostServer::Stopping,
+        }
+    }
+
+    fn start_web(
+        &mut self,
+        form: &ui::ServeForm,
+        address: std::net::SocketAddr,
+        service: &host_service::ServiceRuntime,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        if let Some(error) = &service.view.status_error {
+            return Err(format!("Could not check the TopVNC Host service: {error}"));
+        }
+        if let Some(phase) = service.web_server(address)? {
+            self.web_service = Some((address, phase));
+            Ok(())
+        } else {
+            self.start(Owner::Web, web_serve_request(form, address)?)
+        }
+    }
+
+    fn poll_web_service(&mut self, service: &host_service::ServiceRuntime) {
+        if let Some((address, phase)) = &mut self.web_service {
+            *phase = if service.view.status_error.is_some() {
+                HostServer::Stopped
+            } else {
+                service
+                    .web_server(*address)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(HostServer::Stopped)
+            };
         }
     }
 
@@ -977,6 +1030,9 @@ impl HostedServer {
 
     /// Close `owner`'s listener, and the server when no tab has one left.
     fn stop(&mut self, owner: Owner) {
+        if owner == Owner::Web && self.web_service.take().is_some() {
+            return;
+        }
         let Some(claim) = self.claims[owner.index()].take() else {
             return;
         };
@@ -1131,6 +1187,7 @@ fn show_landing(
     error: Option<String>,
     server: &mut HostedServer,
     web: &mut WebRuntime,
+    service: &mut host_service::ServiceRuntime,
 ) -> Result<Option<(Config, Session)>, Box<dyn Error>> {
     const WIDTH: usize = 800;
     const HEIGHT: usize = 640;
@@ -1159,6 +1216,8 @@ fn show_landing(
     let mut cursor: Option<(usize, usize)> = None;
     loop {
         helpers.poll();
+        service.poll(state.tab == Tab::Service || server.web_service.is_some());
+        server.poll_web_service(service);
         // Permissions can change in System Settings while the window is open.
         // So can the attached displays, which the Server tab lists.
         if server.view.phase == ServerPhase::Stopped
@@ -1179,8 +1238,8 @@ fn show_landing(
         }
         match web.poll(&server.web_view(), Instant::now()) {
             Some(ServerRequest::Start(address)) => {
-                let started = web_serve_request(&config.serve, address)
-                    .and_then(|request| server.start(Owner::Web, request));
+                service.refresh();
+                let started = server.start_web(&config.serve, address, service);
                 if let Err(error) = started {
                     state.error = Some(error);
                     web.stop();
@@ -1190,6 +1249,11 @@ fn show_landing(
             Some(ServerRequest::Stop) => server.stop(Owner::Web),
             None => {}
         }
+        // If the service already stopped, the runtime finishes without a
+        // Stop request. Release its reference so a later run starts fresh.
+        if web.is_idle() {
+            server.web_service = None;
+        }
         ui::landing(
             &mut Canvas::new(&mut pixels, WIDTH, HEIGHT),
             &config,
@@ -1198,6 +1262,7 @@ fn show_landing(
             &server.view,
             &helpers,
             web,
+            &service.view,
         );
         if redraw || pixels != shown {
             layer.upload(&pixels, WIDTH, 0, 0, WIDTH, HEIGHT);
@@ -1231,6 +1296,7 @@ fn show_landing(
         let mut pair_clicked = false;
         let mut copy_url_clicked = false;
         let mut helper_action = None;
+        let mut service_action = None;
         // Woken by input; the timeout picks up server status and the
         // connection result.
         for event in ui.pump(Duration::from_millis(50)) {
@@ -1263,6 +1329,9 @@ fn show_landing(
                                 Tab::Work => helper_action = Some(helpers::Action::CheckWork),
                                 Tab::Network => helper_action = Some(helpers::Action::Network),
                                 Tab::Firewall => helper_action = Some(helpers::Action::Firewall),
+                                // Installing asks for administrator approval,
+                                // so it takes a click.
+                                Tab::Service => {}
                             }
                         }
                         PhysicalKey::Code(code) if state.key(&mut config, code) => {}
@@ -1449,6 +1518,20 @@ fn show_landing(
                         pair_clicked |= ui::WEB_PAIR.contains(x, y);
                         copy_url_clicked |=
                             ui::web_copy_url_shown(web) && ui::WEB_COPY_URL.contains(x, y);
+                    } else if state.tab == Tab::Service
+                        && !ui::TAB_MORE.contains(x, y)
+                        && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                        && !ui::MENU_TABS.iter().any(|(area, _, _)| area.contains(x, y))
+                    {
+                        state.focus = ui::SERVICE_PASSWORD
+                            .contains(x, y)
+                            .then_some(Field::ServicePassword);
+                        if ui::SERVICE_INSTALL.contains(x, y) {
+                            service_action = Some(host_service::ServiceAction::Install);
+                        }
+                        if ui::SERVICE_REMOVE.contains(x, y) {
+                            service_action = Some(host_service::ServiceAction::Remove);
+                        }
                     } else if state.tab == Tab::Connect
                         && !ui::TAB_MORE.contains(x, y)
                         && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
@@ -1531,14 +1614,47 @@ fn show_landing(
                 ..helpers::Report::default()
             };
         }
+        if let Some(action) = service_action {
+            let serving = match &server.view.phase {
+                ServerPhase::Serving { address, .. } => Some(address.as_str()),
+                _ => None,
+            };
+            let started = match (action, serving) {
+                // The service could not listen while the Server tab does.
+                (host_service::ServiceAction::Install, Some(address))
+                    if host_service::same_port(
+                        address,
+                        &format!("{}:{}", config.serve.host.trim(), config.serve.port.trim()),
+                    ) =>
+                {
+                    Err(format!(
+                        "Stop the Server tab's server on {address} first: the service needs \
+                         the same port."
+                    ))
+                }
+                _ => service.start(action, &config.serve),
+            };
+            match started {
+                Ok(()) => {
+                    state.error = None;
+                    state.focus = None;
+                }
+                Err(error) => state.error = Some(error),
+            }
+        }
         if server_clicked {
             match server.view.phase {
                 ServerPhase::Stopped => match config.serve.request() {
                     Ok(request) => {
-                        state.error = None;
-                        state.focus = None;
-                        if let Err(error) = server.start(Owner::ServerTab, request) {
-                            state.error = Some(error);
+                        service.refresh();
+                        if let Some(conflict) = service.port_conflict(&request.address) {
+                            state.error = Some(conflict);
+                        } else {
+                            state.error = None;
+                            state.focus = None;
+                            if let Err(error) = server.start(Owner::ServerTab, request) {
+                                state.error = Some(error);
+                            }
                         }
                     }
                     Err(error) => state.error = Some(error),
@@ -1901,9 +2017,14 @@ fn run_session_inner(
     let mut debug_status = title.clone();
     let mut known_serve_scale = None;
     let mut known_serve_display = None;
+    let mut capture_status = CaptureStatus::Live;
     loop {
         let mut title_changed = false;
         remote = frames.dimensions();
+        if writer.capture_status() != capture_status {
+            capture_status = writer.capture_status();
+            title_changed = true;
+        }
         let serve_scale = writer.serve_scale();
         let serve_display = writer.serve_display();
         if (known_serve_scale, known_serve_display) != (serve_scale, serve_display) {
@@ -2269,16 +2390,22 @@ fn run_session_inner(
             last_stats = now;
         }
         if title_changed {
-            let status = if config.debug {
-                &debug_status
+            let mut status = if config.debug {
+                debug_status.clone()
             } else {
-                &compact_status
+                compact_status.clone()
             };
-            if locked {
-                window.set_title(&format!("{status} · locked (F8)"));
-            } else {
-                window.set_title(status);
+            // The picture stays; say why it is not changing.
+            match capture_status {
+                CaptureStatus::Live => {}
+                CaptureStatus::NoDisplay => status += " · host has no display",
+                CaptureStatus::SecureDesktop => status += " · host screen locked",
+                CaptureStatus::Unavailable => status += " · host capture paused",
             }
+            if locked {
+                status += " · locked (F8)";
+            }
+            window.set_title(&status);
         }
         let mut options = RenderOptions::new(config, &window);
         options.open = settings_open;
@@ -2786,6 +2913,59 @@ mod tests {
 
     fn listener(hosted: &HostedServer, owner: Owner) -> ListenerId {
         hosted.claim(owner).unwrap().listener.as_ref().unwrap().0
+    }
+
+    #[test]
+    fn web_uses_the_service_without_binding_or_owning_its_listener() {
+        // A real listener already holds the configured target. Starting a
+        // local desktop server on it would fail.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let mut service = host_service::ServiceRuntime::default();
+        service.view.status = ui::ServiceStatus {
+            state: ui::ServiceState::Starting,
+            address: Some(target.to_string()),
+            unencrypted: true,
+        };
+        let mut server = HostedServer::default();
+        server
+            .start_web(&ui::ServeForm::default(), target, &service)
+            .unwrap();
+        assert_eq!(server.web_view(), HostServer::Starting);
+        assert!(server.running.is_none());
+        assert!(server.claim(Owner::Web).is_none());
+        service.view.status.state = ui::ServiceState::Running;
+        server.poll_web_service(&service);
+        assert_eq!(server.web_view(), HostServer::Serving);
+
+        // The Server tab can independently serve native viewers. Closing
+        // browser access must leave both servers alone.
+        let host = fake_start(
+            &mut server,
+            Owner::ServerTab,
+            plain_request("127.0.0.1:0", "pw"),
+        );
+        host.serve(&mut server);
+        server.stop(Owner::Web);
+        assert_eq!(server.web_view(), HostServer::Stopped);
+        assert!(!host.shutdown.load(Ordering::Acquire));
+        assert_eq!(service.view.status.state, ui::ServiceState::Running);
+        std::net::TcpStream::connect(target).unwrap();
+        // Reuse works again, and a service outage is reflected without
+        // starting a replacement local server.
+        server
+            .start_web(&ui::ServeForm::default(), target, &service)
+            .unwrap();
+        service.view.status.state = ui::ServiceState::Stopped;
+        server.poll_web_service(&service);
+        assert_eq!(server.web_view(), HostServer::Stopped);
+        assert!(server.claim(Owner::Web).is_none());
+        service.view.status.state = ui::ServiceState::Running;
+        service.view.status_error = Some("service status unavailable".into());
+        server.poll_web_service(&service);
+        assert_eq!(server.web_view(), HostServer::Stopped);
+        drop(server);
+        std::net::TcpStream::connect(target).unwrap();
     }
 
     #[test]
