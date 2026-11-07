@@ -244,6 +244,8 @@ pub struct ServiceStatus {
     pub state: ServiceState,
     /// Where the installed service listens, from its command line.
     pub address: Option<String>,
+    /// The gateway speaks plain RFB to its loopback target.
+    pub unencrypted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2919,6 +2921,7 @@ mod tests {
         service.status = ServiceStatus {
             state: ServiceState::Running,
             address: Some("127.0.0.1:5900".into()),
+            unencrypted: true,
         };
         assert_eq!(
             service_status_line(&service),

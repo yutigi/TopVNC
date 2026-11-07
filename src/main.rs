@@ -800,6 +800,9 @@ struct HostedServer {
     first: Option<Owner>,
     /// Listener failures that did not stop the server, for the next poll.
     failure: Option<String>,
+    /// An installed service used by the WEB tab. It owns its listener and
+    /// lifecycle; stopping this tab only forgets this reference.
+    web_service: Option<(std::net::SocketAddr, HostServer)>,
 }
 
 impl HostedServer {
@@ -844,11 +847,46 @@ impl HostedServer {
 
     /// The WEB tab's listener, as it needs to see it.
     fn web_view(&self) -> HostServer {
+        if let Some((_, phase)) = &self.web_service {
+            return phase.clone();
+        }
         match self.phase_for(Owner::Web) {
             ServerPhase::Stopped => HostServer::Stopped,
             ServerPhase::Starting => HostServer::Starting,
             ServerPhase::Serving { .. } => HostServer::Serving,
             ServerPhase::Stopping => HostServer::Stopping,
+        }
+    }
+
+    fn start_web(
+        &mut self,
+        form: &ui::ServeForm,
+        address: std::net::SocketAddr,
+        service: &host_service::ServiceRuntime,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        if let Some(error) = &service.view.status_error {
+            return Err(format!("Could not check the TopVNC Host service: {error}"));
+        }
+        if let Some(phase) = service.web_server(address)? {
+            self.web_service = Some((address, phase));
+            Ok(())
+        } else {
+            self.start(Owner::Web, web_serve_request(form, address)?)
+        }
+    }
+
+    fn poll_web_service(&mut self, service: &host_service::ServiceRuntime) {
+        if let Some((address, phase)) = &mut self.web_service {
+            *phase = if service.view.status_error.is_some() {
+                HostServer::Stopped
+            } else {
+                service
+                    .web_server(*address)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(HostServer::Stopped)
+            };
         }
     }
 
@@ -992,6 +1030,9 @@ impl HostedServer {
 
     /// Close `owner`'s listener, and the server when no tab has one left.
     fn stop(&mut self, owner: Owner) {
+        if owner == Owner::Web && self.web_service.take().is_some() {
+            return;
+        }
         let Some(claim) = self.claims[owner.index()].take() else {
             return;
         };
@@ -1175,7 +1216,8 @@ fn show_landing(
     let mut cursor: Option<(usize, usize)> = None;
     loop {
         helpers.poll();
-        service.poll(state.tab == Tab::Service);
+        service.poll(state.tab == Tab::Service || server.web_service.is_some());
+        server.poll_web_service(service);
         // Permissions can change in System Settings while the window is open.
         // So can the attached displays, which the Server tab lists.
         if server.view.phase == ServerPhase::Stopped
@@ -1196,8 +1238,8 @@ fn show_landing(
         }
         match web.poll(&server.web_view(), Instant::now()) {
             Some(ServerRequest::Start(address)) => {
-                let started = web_serve_request(&config.serve, address)
-                    .and_then(|request| server.start(Owner::Web, request));
+                service.refresh();
+                let started = server.start_web(&config.serve, address, service);
                 if let Err(error) = started {
                     state.error = Some(error);
                     web.stop();
@@ -1206,6 +1248,11 @@ fn show_landing(
             // The Server tab keeps its own listener on the server.
             Some(ServerRequest::Stop) => server.stop(Owner::Web),
             None => {}
+        }
+        // If the service already stopped, the runtime finishes without a
+        // Stop request. Release its reference so a later run starts fresh.
+        if web.is_idle() {
+            server.web_service = None;
         }
         ui::landing(
             &mut Canvas::new(&mut pixels, WIDTH, HEIGHT),
@@ -2866,6 +2913,59 @@ mod tests {
 
     fn listener(hosted: &HostedServer, owner: Owner) -> ListenerId {
         hosted.claim(owner).unwrap().listener.as_ref().unwrap().0
+    }
+
+    #[test]
+    fn web_uses_the_service_without_binding_or_owning_its_listener() {
+        // A real listener already holds the configured target. Starting a
+        // local desktop server on it would fail.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let mut service = host_service::ServiceRuntime::default();
+        service.view.status = ui::ServiceStatus {
+            state: ui::ServiceState::Starting,
+            address: Some(target.to_string()),
+            unencrypted: true,
+        };
+        let mut server = HostedServer::default();
+        server
+            .start_web(&ui::ServeForm::default(), target, &service)
+            .unwrap();
+        assert_eq!(server.web_view(), HostServer::Starting);
+        assert!(server.running.is_none());
+        assert!(server.claim(Owner::Web).is_none());
+        service.view.status.state = ui::ServiceState::Running;
+        server.poll_web_service(&service);
+        assert_eq!(server.web_view(), HostServer::Serving);
+
+        // The Server tab can independently serve native viewers. Closing
+        // browser access must leave both servers alone.
+        let host = fake_start(
+            &mut server,
+            Owner::ServerTab,
+            plain_request("127.0.0.1:0", "pw"),
+        );
+        host.serve(&mut server);
+        server.stop(Owner::Web);
+        assert_eq!(server.web_view(), HostServer::Stopped);
+        assert!(!host.shutdown.load(Ordering::Acquire));
+        assert_eq!(service.view.status.state, ui::ServiceState::Running);
+        std::net::TcpStream::connect(target).unwrap();
+        // Reuse works again, and a service outage is reflected without
+        // starting a replacement local server.
+        server
+            .start_web(&ui::ServeForm::default(), target, &service)
+            .unwrap();
+        service.view.status.state = ui::ServiceState::Stopped;
+        server.poll_web_service(&service);
+        assert_eq!(server.web_view(), HostServer::Stopped);
+        assert!(server.claim(Owner::Web).is_none());
+        service.view.status.state = ui::ServiceState::Running;
+        service.view.status_error = Some("service status unavailable".into());
+        server.poll_web_service(&service);
+        assert_eq!(server.web_view(), HostServer::Stopped);
+        drop(server);
+        std::net::TcpStream::connect(target).unwrap();
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use crate::desktop_host::{DisplaySelection, MouseMode};
 use crate::ui::ServeForm;
 pub use crate::ui::{ServiceAction, ServiceState, ServiceView};
+use crate::web_access::runtime::HostServer;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use topvnc::{PerformanceMode, UpdatePriority};
@@ -166,6 +167,35 @@ impl ServiceRuntime {
                  the service in ... > SERVICE."
             )
         })
+    }
+
+    /// Reuse only the installed service configured for the gateway's exact
+    /// plain-RFB loopback endpoint. A busy port alone is never proof that
+    /// a listener is our service or that its transport is compatible.
+    pub fn web_server(&self, target: std::net::SocketAddr) -> Result<Option<HostServer>, String> {
+        let status = &self.view.status;
+        let Some(address) = &status.address else {
+            return Ok(None);
+        };
+        if status.state == ServiceState::NotInstalled || !same_port(address, &target.to_string()) {
+            return Ok(None);
+        }
+        if !target.ip().is_loopback()
+            || address.parse::<std::net::SocketAddr>().ok() != Some(target)
+            || !status.unencrypted
+        {
+            return Err(format!(
+                "The TopVNC Host service uses {address}. Browser access needs the service \
+                 installed with {target} --unencrypted, or a gateway target on another port."
+            ));
+        }
+        match status.state {
+            ServiceState::Starting => Ok(Some(HostServer::Starting)),
+            ServiceState::Running => Ok(Some(HostServer::Serving)),
+            _ => Err(
+                "Start the TopVNC Host service in Windows before starting browser access.".into(),
+            ),
+        }
     }
 
     /// Ask Windows for administrator approval and run the installer for
@@ -360,6 +390,7 @@ mod tests {
         runtime.view.status = ServiceStatus {
             state: ServiceState::Running,
             address: Some("127.0.0.1:5900".into()),
+            unencrypted: true,
         };
         assert!(runtime.port_conflict("127.0.0.1:5900").is_some());
         // Any host on the same port collides.
@@ -381,8 +412,45 @@ mod tests {
         runtime.view.status = ServiceStatus {
             state: ServiceState::Running,
             address: None,
+            unencrypted: false,
         };
         assert!(runtime.port_conflict("127.0.0.1:5900").is_none());
+    }
+
+    #[test]
+    fn web_reuses_only_a_compatible_active_service() {
+        let target = "127.0.0.1:5900".parse().unwrap();
+        let mut runtime = ServiceRuntime::default();
+        assert_eq!(runtime.web_server(target), Ok(None));
+        runtime.view.status = ServiceStatus {
+            state: ServiceState::Running,
+            address: Some(target.to_string()),
+            unencrypted: true,
+        };
+        assert_eq!(runtime.web_server(target), Ok(Some(HostServer::Serving)));
+        runtime.view.status.state = ServiceState::Starting;
+        assert_eq!(runtime.web_server(target), Ok(Some(HostServer::Starting)));
+        for state in [ServiceState::Stopped, ServiceState::Stopping] {
+            runtime.view.status.state = state;
+            assert!(runtime.web_server(target).is_err());
+        }
+        runtime.view.status.state = ServiceState::Running;
+        runtime.view.status.unencrypted = false;
+        assert!(
+            runtime.web_server(target).is_err(),
+            "TLS cannot be used by a plain-RFB gateway"
+        );
+        runtime.view.status.unencrypted = true;
+        for address in ["[::1]:5900", "0.0.0.0:5900", "127.0.0.2:5900"] {
+            runtime.view.status.address = Some(address.into());
+            assert!(runtime.web_server(target).is_err(), "{address}");
+        }
+        runtime.view.status.address = Some("127.0.0.1:5901".into());
+        assert_eq!(
+            runtime.web_server(target),
+            Ok(None),
+            "another port can host locally"
+        );
     }
 
     #[test]

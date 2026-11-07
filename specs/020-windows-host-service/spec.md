@@ -76,6 +76,15 @@ Acceptance criteria for the window:
 13. REMOVE, once approved, stops and removes the service, and the tab shows NOT INSTALLED.
 14. With the service running on port P, START SERVER on port P is refused with an explanation, and another port still starts.
 
+## PR review follow-up: browser access and incomplete removal
+
+- The WEB tab reuses a starting or running service when its configured address exactly matches the gateway's loopback `rfb_target` and the service uses `--unencrypted`. It starts no in-process listener on that target. The installed password and capture settings remain in effect.
+- The WEB tab observes the service's state while using it. A stopped service or unreadable status fails the server row without starting a local replacement. Stopping browser access or exiting the window never stops the service. The Server tab's separate listener remains independent.
+- A conflicting service address or TLS transport is reported before starting a local listener. Another gateway target port can still use the in-process server.
+- Uninstall succeeds only after deleting the copied executable (or finding it already absent). If deletion fails, including an uninstaller running from that executable, report incomplete removal, the remaining path, and instructions to exit and remove it as administrator. The service and secret have already been removed at that point.
+
+Acceptance checks: reuse a held target without rebinding it; track starting, running, and stopped service states; preserve both the service listener and an independent Server tab listener when stopping browser access; reject incompatible address/transport; report persistent file-sharing failures and the running executable, and accept successful deletion or an absent file. Installed-service and physical-display checks below remain manual.
+
 ## Validation (Windows 11, 2026-11-05)
 
 - Unit tests:

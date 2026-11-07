@@ -488,12 +488,15 @@ pub fn query_status() -> Result<ServiceStatus, String> {
     let state = service
         .state()
         .map_err(|error| format!("could not read the {SERVICE_NAME} service: {error}"))?;
+    let command = service
+        .binary_path()
+        .map_err(|error| format!("could not read the {SERVICE_NAME} configuration: {error}"))?;
+    let options = service_options(&command)
+        .ok_or_else(|| format!("could not parse the {SERVICE_NAME} configuration"))?;
     Ok(ServiceStatus {
         state: service_state(state),
-        address: service
-            .binary_path()
-            .ok()
-            .and_then(|command| service_address(&command)),
+        address: Some(options.address),
+        unencrypted: options.tls.unencrypted,
     })
 }
 
@@ -507,15 +510,13 @@ fn service_state(state: SERVICE_STATUS_CURRENT_STATE) -> ServiceState {
     }
 }
 
-/// The address an installed service's command line listens on.
-fn service_address(command: &str) -> Option<String> {
+/// The installed service's transport and address, without its password.
+fn service_options(command: &str) -> Option<crate::desktop_host::ServeOptions> {
     if command.trim().is_empty() {
         return None;
     }
     match split_command_line(command).as_slice() {
-        [_, mode, options @ ..] if mode == "--host-service" => parse_serve_arguments(options)
-            .ok()
-            .map(|options| options.address),
+        [_, mode, options @ ..] if mode == "--host-service" => parse_serve_arguments(options).ok(),
         _ => None,
     }
 }
@@ -721,22 +722,42 @@ fn uninstall_with(out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     }
     drop(service);
     store_password(None)?;
-    // The process may take a moment to release its executable.
     let executable = install_folder()?.join("topvnc.exe");
-    for _ in 0..25 {
-        match std::fs::remove_file(&executable) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            _ => break,
-        }
-    }
+    remove_installed_executable(&executable).map_err(|error| {
+        format!(
+            "Removed the {SERVICE_NAME} service and its stored password, but removal is \
+             incomplete: could not delete {}: {error}. Exit TopVNC, then delete this file \
+             from an administrator terminal.",
+            executable.display()
+        )
+    })?;
     let _ = std::fs::remove_dir(install_folder()?);
     let _ = writeln!(
         out,
         "Removed the {SERVICE_NAME} service and its stored password."
     );
     Ok(())
+}
+
+fn remove_installed_executable(executable: &Path) -> std::io::Result<()> {
+    // An uninstaller running from this copy cannot delete its own image.
+    if let Ok(installed) = executable.canonicalize()
+        && std::env::current_exe()?.canonicalize()? == installed
+    {
+        return Err(std::io::Error::other(
+            "the uninstaller is running from this executable",
+        ));
+    }
+    // A stopped service may take a moment to release its executable.
+    for attempt in 0..25 {
+        match std::fs::remove_file(executable) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if attempt == 24 => return Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    unreachable!("the last attempt returns")
 }
 
 // ---- The service process -----------------------------------------------
@@ -1637,18 +1658,61 @@ mod tests {
             program,
             &arguments(&["--host-service", "127.0.0.1:5901", "--unencrypted"]),
         );
-        assert_eq!(service_address(&line).as_deref(), Some("127.0.0.1:5901"));
+        let options = service_options(&line).unwrap();
+        assert_eq!(options.address, "127.0.0.1:5901");
+        assert!(options.tls.unencrypted);
+        let tls = command_line(
+            program,
+            &arguments(&[
+                "--host-service",
+                "--tls-cert",
+                "cert.pem",
+                "--tls-key",
+                "key.pem",
+            ]),
+        );
+        assert!(!service_options(&tls).unwrap().tls.unencrypted);
         // The default address, when none was given.
         let line = command_line(program, &arguments(&["--host-service", "--unencrypted"]));
-        assert_eq!(service_address(&line).as_deref(), Some("127.0.0.1:5900"));
+        assert_eq!(service_options(&line).unwrap().address, "127.0.0.1:5900");
         // Anything that is not this service's command line has no address.
         for line in [
             String::new(),
             command_line(program, &arguments(&["--host-agent", "127.0.0.1:5901"])),
             command_line(program, &arguments(&["--host-service", "--bogus"])),
         ] {
-            assert_eq!(service_address(&line), None);
+            assert!(service_options(&line).is_none());
         }
+    }
+
+    #[test]
+    fn uninstall_deletes_the_copy_and_reports_a_loaded_executable() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let folder = PathBuf::from(format!("target/service-removal-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let executable = folder.join("topvnc.exe");
+        std::fs::write(&executable, b"copy").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&executable)
+            .unwrap();
+        assert!(remove_installed_executable(&executable).is_err());
+        assert!(executable.exists());
+        drop(held);
+        remove_installed_executable(&executable).unwrap();
+        assert!(!executable.exists());
+        remove_installed_executable(&executable).unwrap();
+        std::fs::remove_dir(folder).unwrap();
+        // Never attempt to delete the running image, or wait for our own exit.
+        let current = std::env::current_exe().unwrap();
+        assert!(
+            remove_installed_executable(&current)
+                .unwrap_err()
+                .to_string()
+                .contains("uninstaller")
+        );
+        assert!(current.exists());
     }
 
     #[test]
