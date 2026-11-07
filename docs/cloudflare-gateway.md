@@ -446,10 +446,14 @@ Use it:
 
 1. On the **WEB** tab, choose **QUICK TUNNEL** and read the warning.
 2. Type a VNC password and press **Start browser access**. TopVNC serves this
-   desktop on `127.0.0.1:5900` as on the Access route, runs
-   `cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080`, and waits
-   until cloudflared prints its `https://<random>.trycloudflare.com` URL and
-   registers a connection. It then starts the gateway for that exact URL. The
+   desktop on `127.0.0.1:5900` as on the Access route, then starts the gateway
+   and waits until it owns `127.0.0.1:6080`. Only then does it run
+   `cloudflared tunnel --no-autoupdate --config <per-run-config> --url http://127.0.0.1:6080`.
+   This private configuration pins ingress to the bound gateway; existing
+   cloudflared configuration and inherited `TUNNEL_*` options are not used.
+   After cloudflared prints its `https://<random>.trycloudflare.com` URL and
+   registers a connection, TopVNC sends the exact origin to the gateway over
+   stdin. The same listener stays held throughout startup. The
    gateway serves the web app itself, with the same Content-Security-Policy
    as the Worker, next to `/ws`. The panel shows the temporary app URL.
 3. Press **Pair a browser** and scan the QR code with the phone camera. It
@@ -457,6 +461,12 @@ Use it:
    same key as the TopVNC window, press **Connect**, and enter the VNC password.
 4. **Stop browser access**, or closing TopVNC, ends the server, the tunnel,
    and the URL.
+
+An occupied gateway port prevents cloudflared from starting. Gateway or
+tunnel failure automatically ends this run. Stop and shutdown end public
+forwarding before releasing the gateway listener. The generated configuration
+contains no credentials and is removed after the connector stops. Returning
+from a native viewer session preserves the running route in the WEB tab.
 
 How it differs from the Access route:
 

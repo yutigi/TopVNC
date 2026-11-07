@@ -12,6 +12,7 @@ const USAGE: &str = "Usage:
   topvnc-web-gateway [--pair] <gateway.toml>
   topvnc-web-gateway --synthetic-echo [--pair] <gateway.toml>
   topvnc-web-gateway --supervised <gateway.toml>
+  topvnc-web-gateway --supervised-quick-tunnel <listen> <rfb-target> <web-dist>
   topvnc-web-gateway --supervised-quick-tunnel <listen> <rfb-target> <app-origin> <web-dist>
 Relays Cloudflare Access-authenticated, end-to-end encrypted browser sessions
 to the configured loopback rfb_target, normally `topvnc --serve` with a VNC
@@ -24,7 +25,10 @@ commands on stdin, stops when stdin closes, and reports `fingerprint`,
 sign-in, only pairing and the VNC password. It serves the built web app from
 <web-dist>, accepts upgrades only from <app-origin> (an exact
 https://<label>.trycloudflare.com origin), and keeps a new host key and its
-enrollments in memory for this run only.";
+enrollments in memory for this run only. Without <app-origin>, it reports
+`bound <address>` while holding its listener and waits for one `origin <url>`
+command before serving and reporting `ready`. Closing stdin also stops it
+while waiting. The origin cannot be replaced after it is set.";
 
 /// Key paths are resolved relative to the configuration file.
 fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
@@ -72,6 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
             .await;
+        }
+        ["--supervised-quick-tunnel", listen, target, web_root] => {
+            return supervised_quick_pending(listen.parse()?, target.parse()?, web_root.into())
+                .await;
         }
         [
             "--supervised-quick-tunnel",
@@ -166,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 enum Command {
     Pair,
     CancelPair,
+    Origin(String),
     Unknown,
 }
 
@@ -173,7 +182,12 @@ fn parse_command(line: &str) -> Command {
     match line.trim() {
         "pair" => Command::Pair,
         "cancel-pair" => Command::CancelPair,
-        _ => Command::Unknown,
+        command => match command.strip_prefix("origin ") {
+            Some(origin) if topvnc_access::validate_quick_tunnel_origin(origin).is_ok() => {
+                Command::Origin(origin.to_owned())
+            }
+            _ => Command::Unknown,
+        },
     }
 }
 
@@ -185,6 +199,72 @@ async fn supervised(
     gateway: Arc<Gateway>,
     listen: std::net::SocketAddr,
     serving: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    supervised_on(gateway, listener, serving, supervisor_commands()?).await
+}
+
+type Commands = tokio::sync::mpsc::UnboundedReceiver<Option<Command>>;
+
+/// Bind before the supervisor publishes this port. Do not accept HTTP until
+/// a validated origin arrives; the listener is never released and rebound.
+async fn supervised_quick_pending(
+    listen: std::net::SocketAddr,
+    target: std::net::SocketAddr,
+    web_root: std::path::PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !listen.ip().is_loopback() || !target.ip().is_loopback() || target.port() == 0 {
+        return Err("Quick Tunnel requires loopback addresses and an RFB port".into());
+    }
+    // Fail before publishing if the page cannot be served.
+    topvnc_web_gateway::assets::WebAssets::load(&web_root)?;
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let mut received = supervisor_commands()?;
+    println!("bound {}", listener.local_addr()?);
+    let command = tokio::select! {
+        command = received.recv() => command,
+        _ = tokio::signal::ctrl_c() => return Ok(()),
+    };
+    let origin = match command {
+        Some(Some(Command::Origin(origin))) => origin,
+        Some(Some(_)) => return Err("expected one validated Quick Tunnel origin".into()),
+        _ => return Ok(()),
+    };
+    let gateway = Gateway::quick_tunnel(QuickTunnelConfig {
+        listen,
+        rfb_target: target,
+        app_origin: origin.clone(),
+        max_session_seconds: QUICK_TUNNEL_SESSION_SECONDS,
+        web_root,
+    })?;
+    supervised_on(gateway, listener,
+        &format!("for the RFB server at {target}, serving the web app for {origin} (Quick Tunnel: no Access sign-in; an enrolled browser and the VNC password required)"),
+        received).await
+}
+
+/// A plain thread: blocked stdin must not hold up tokio runtime shutdown.
+fn supervisor_commands() -> Result<Commands, std::io::Error> {
+    let (commands, received) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("supervisor-stdin".into())
+        .spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if commands.send(Some(parse_command(&line))).is_err() {
+                    return;
+                }
+            }
+            let _ = commands.send(None);
+        })?;
+    Ok(received)
+}
+
+async fn supervised_on(
+    gateway: Arc<Gateway>,
+    listener: tokio::net::TcpListener,
+    serving: &str,
+    mut received: Commands,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let origin = gateway.app_origin().to_owned();
     let fingerprint = e2e::fingerprint(&gateway.host_public());
@@ -198,26 +278,10 @@ async fn supervised(
         }
     );
     println!("fingerprint {fingerprint}");
-    let listener = tokio::net::TcpListener::bind(listen).await?;
     let address = listener.local_addr()?;
     eprintln!("Gateway listening on {address} {serving}");
     println!("ready {address}");
 
-    // A plain thread: a blocked tokio stdin read would hold up runtime
-    // shutdown, and this thread simply ends with the process.
-    let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
-    std::thread::Builder::new()
-        .name("supervisor-stdin".into())
-        .spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::stdin().lock().lines() {
-                let Ok(line) = line else { break };
-                if commands.send(Some(parse_command(&line))).is_err() {
-                    return;
-                }
-            }
-            let _ = commands.send(None);
-        })?;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let control = Arc::clone(&gateway);
     let control_task = tokio::spawn(async move {
@@ -234,6 +298,12 @@ async fn supervised(
                     if control.cancel_pairing() {
                         eprintln!("Pairing invite cancelled.");
                     }
+                }
+                Command::Origin(_) => {
+                    // The origin is immutable. Fail closed if the supervisor
+                    // attempts to replace it after admission starts.
+                    eprintln!("refused to replace the gateway origin");
+                    break;
                 }
                 Command::Unknown => eprintln!("ignored an unknown supervisor command"),
             }
@@ -265,5 +335,17 @@ mod supervisor_tests {
         assert_eq!(parse_command("cancel-pair"), Command::CancelPair);
         assert_eq!(parse_command("pair now"), Command::Unknown);
         assert_eq!(parse_command(""), Command::Unknown);
+        assert_eq!(
+            parse_command("origin https://a.trycloudflare.com"),
+            Command::Origin("https://a.trycloudflare.com".into())
+        );
+        assert_eq!(
+            parse_command("origin https://a.workers.dev"),
+            Command::Unknown
+        );
+        assert_eq!(
+            parse_command("origin https://a.trycloudflare.com/path"),
+            Command::Unknown
+        );
     }
 }

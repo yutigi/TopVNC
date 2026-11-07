@@ -595,7 +595,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Ok(());
         };
         config = next_config;
-        connection_error = match run_session(&mut ui, session, &mut config, input_debug) {
+        connection_error = match run_session(
+            &mut ui,
+            session,
+            &mut config,
+            input_debug,
+            &mut server,
+            &mut web,
+        ) {
             Ok(error) => error,
             Err(error) => Some(error.to_string()),
         };
@@ -1146,10 +1153,7 @@ fn show_landing(
     // The pixels last presented; the form is presented again only when it changes.
     let mut shown = Vec::new();
     let mut redraw = true;
-    let mut state = UiState {
-        error,
-        ..UiState::default()
-    };
+    let mut state = UiState::for_landing(error, web);
     let (result_tx, result_rx) = mpsc::channel::<Result<Session, String>>();
     let mut connecting = false;
     let mut helpers = helpers::HelperRuntime::default();
@@ -1177,18 +1181,8 @@ fn show_landing(
             }
             state.error = Some(error);
         }
-        match web.poll(&server.web_view(), Instant::now()) {
-            Some(ServerRequest::Start(address)) => {
-                let started = web_serve_request(&config.serve, address)
-                    .and_then(|request| server.start(Owner::Web, request));
-                if let Err(error) = started {
-                    state.error = Some(error);
-                    web.stop();
-                }
-            }
-            // The Server tab keeps its own listener on the server.
-            Some(ServerRequest::Stop) => server.stop(Owner::Web),
-            None => {}
+        if let Err(error) = poll_browser_access(server, web, &config) {
+            state.error = Some(error);
         }
         ui::landing(
             &mut Canvas::new(&mut pixels, WIDTH, HEIGHT),
@@ -1612,6 +1606,29 @@ fn show_landing(
     }
 }
 
+/// Advance browser access from either window, including failure shutdown.
+fn poll_browser_access(
+    server: &mut HostedServer,
+    web: &mut WebRuntime,
+    config: &Config,
+) -> Result<(), String> {
+    match web.poll(&server.web_view(), Instant::now()) {
+        Some(ServerRequest::Start(address)) => {
+            let started = web_serve_request(&config.serve, address)
+                .and_then(|request| server.start(Owner::Web, request));
+            if started.is_err() {
+                web.stop();
+            }
+            started
+        }
+        Some(ServerRequest::Stop) => {
+            server.stop(Owner::Web);
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
 /// Check the chosen route's files and start the WEB tab's run.
 fn start_web(
     web: &mut WebRuntime,
@@ -1761,9 +1778,11 @@ fn run_session(
     session: Session,
     config: &mut Config,
     input_debug: bool,
+    server: &mut HostedServer,
+    web: &mut WebRuntime,
 ) -> Result<Option<String>, Box<dyn Error>> {
     let writer = session.writer();
-    let result = run_session_inner(ui, session, config, input_debug);
+    let result = run_session_inner(ui, session, config, input_debug, server, web);
     let _ = writer.shutdown();
     result
 }
@@ -1773,6 +1792,8 @@ fn run_session_inner(
     mut session: Session,
     config: &mut Config,
     input_debug: bool,
+    server: &mut HostedServer,
+    web: &mut WebRuntime,
 ) -> Result<Option<String>, Box<dyn Error>> {
     let info = session.info.clone();
     eprintln!(
@@ -1915,6 +1936,15 @@ fn run_session_inner(
     let mut known_serve_scale = None;
     let mut known_serve_display = None;
     loop {
+        // Hosting and browser access survive viewer sessions. Keep failure
+        // handling active here, including stopping public forwarding when
+        // the gateway exits, rather than waiting for the landing window.
+        if let Some(error) = server.poll() {
+            eprintln!("Hosted server: {error}");
+        }
+        if let Err(error) = poll_browser_access(server, web, config) {
+            eprintln!("Browser access: {error}");
+        }
         let mut title_changed = false;
         remote = frames.dimensions();
         let serve_scale = writer.serve_scale();
@@ -1926,6 +1956,11 @@ fn run_session_inner(
         }
         // Presentation waits never run on the input event thread.
         let timeout = (last_stats.0 + STATS_INTERVAL).saturating_duration_since(Instant::now());
+        let timeout = if web.is_idle() {
+            timeout
+        } else {
+            timeout.min(Duration::from_millis(50))
+        };
         for event in ui.pump(timeout) {
             match event {
                 UiEvent::Device(DeviceEvent::MouseMotion { delta }) if locked => {

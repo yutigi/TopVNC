@@ -83,12 +83,7 @@ fn wait_for_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
 fn quick_tunnel_mode_serves_the_page_pairs_and_stops_on_stdin_eof() {
     let dir = quick_scratch("quick");
     let mut child = Command::new(env!("CARGO_BIN_EXE_topvnc-web-gateway"))
-        .args([
-            "--supervised-quick-tunnel",
-            "127.0.0.1:0",
-            "127.0.0.1:5900",
-            QUICK,
-        ])
+        .args(["--supervised-quick-tunnel", "127.0.0.1:0", "127.0.0.1:5900"])
         .arg(dir.join("dist"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -111,10 +106,35 @@ fn quick_tunnel_mode_serves_the_page_pairs_and_stops_on_stdin_eof() {
         text
     });
 
+    let bound = next_line(&lines);
+    let bound_address = bound
+        .strip_prefix("bound ")
+        .expect("bound before publication");
+    assert!(
+        std::net::TcpListener::bind(bound_address).is_err(),
+        "the child retains its listener"
+    );
+    // The socket is held but no HTTP is admitted before setting the origin.
+    let mut premature = std::net::TcpStream::connect(bound_address).unwrap();
+    premature
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    write!(premature, "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
+    let mut byte = [0];
+    assert!(premature.read(&mut byte).is_err());
+    drop(premature);
+    assert!(lines.try_recv().is_err(), "not Ready without the origin");
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "origin {QUICK}").unwrap();
+    stdin.flush().unwrap();
     let fingerprint = next_line(&lines);
     assert!(fingerprint.starts_with("fingerprint "), "{fingerprint}");
     let ready = next_line(&lines);
     let address = ready.strip_prefix("ready ").expect("ready line").to_owned();
+    assert_eq!(
+        address, bound_address,
+        "the same listener is served without rebinding"
+    );
     let page = http_get(&address, "/");
     assert!(page.starts_with("HTTP/1.0 200"), "{page}");
     assert!(
@@ -124,7 +144,6 @@ fn quick_tunnel_mode_serves_the_page_pairs_and_stops_on_stdin_eof() {
     assert!(page.ends_with("contents of index.html"), "{page}");
     assert!(http_get(&address, "/host.key").starts_with("HTTP/1.0 404"));
 
-    let mut stdin = child.stdin.take().unwrap();
     writeln!(stdin, "pair").unwrap();
     stdin.flush().unwrap();
     let pair = next_line(&lines);
@@ -166,6 +185,51 @@ fn quick_tunnel_mode_refuses_other_origins_and_a_missing_build() {
             !String::from_utf8_lossy(&output.stdout).contains("ready"),
             "{origin}"
         );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn pending_quick_gateway_refuses_occupied_ports_and_bad_origins_and_obeys_eof() {
+    let dir = quick_scratch("pending-refused");
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    for (address, command, success, bound) in [
+        (occupied.local_addr().unwrap().to_string(), "", false, false),
+        (
+            "127.0.0.1:0".into(),
+            "origin https://a.workers.dev\n",
+            false,
+            true,
+        ),
+        (
+            "127.0.0.1:0".into(),
+            "origin https://a.trycloudflare.com/path\n",
+            false,
+            true,
+        ),
+        ("127.0.0.1:0".into(), "", true, true),
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_topvnc-web-gateway"))
+            .args(["--supervised-quick-tunnel", &address, "127.0.0.1:5900"])
+            .arg(dir.join("dist"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(command.as_bytes()).unwrap();
+        }
+        assert_eq!(wait_for_exit(&mut child).success(), success);
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(stdout.contains("bound "), bound, "{stdout}");
+        assert!(!stdout.contains("ready "), "{stdout}");
     }
     let _ = std::fs::remove_dir_all(dir);
 }

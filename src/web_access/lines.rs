@@ -10,6 +10,8 @@ pub enum Event {
     Fingerprint(String),
     /// The gateway is listening at this address.
     GatewayReady(String),
+    /// The Quick Tunnel gateway owns this listener, awaiting its origin.
+    GatewayBound(String),
     /// A one-time pairing invite. The link is a secret for the QR code only.
     Pair {
         seconds: u64,
@@ -59,6 +61,7 @@ fn gateway_stdout(line: &str) -> Option<Event> {
     match word {
         "fingerprint" if !rest.is_empty() => Some(Event::Fingerprint(rest.into())),
         "ready" if !rest.is_empty() => Some(Event::GatewayReady(rest.into())),
+        "bound" if !rest.is_empty() => Some(Event::GatewayBound(rest.into())),
         "pair" => {
             let (seconds, link) = rest.split_once(' ')?;
             let seconds = seconds.parse().ok().filter(|s| (1..=3600).contains(s))?;
@@ -156,6 +159,10 @@ mod tests {
         assert_eq!(
             g("pair-error browser enrollment list is full"),
             Some(Event::PairError("browser enrollment list is full".into()))
+        );
+        assert_eq!(
+            g("bound 127.0.0.1:6080"),
+            Some(Event::GatewayBound("127.0.0.1:6080".into()))
         );
         for ignored in [
             "",

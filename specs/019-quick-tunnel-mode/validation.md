@@ -86,3 +86,36 @@ both the URL and registration before starting the gateway.
 
 These results establish the tested Windows Chromium route only. They do
 not establish phone or cross-platform support or a latency improvement.
+
+## Review fixes (2026-11-07)
+
+PR #10 review found that inherited cloudflared ingress could bypass the
+gateway, an occupied gateway port could be published before its bind failed,
+and reopening the landing window could label an active Quick Tunnel as Access.
+The revised flow binds the gateway before starting cloudflared, supplies a
+per-run configuration with exactly that ingress, and removes inherited
+`TUNNEL_*` options from this child. The origin arrives once on stdin; the
+gateway keeps the same listener throughout startup. Shutdown stops forwarding
+first, including on failures. Supervision continues during native viewer
+sessions, and a reopened landing window restores the active route.
+
+Local Windows validation:
+
+- `cargo fmt --all --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- `cargo test --workspace`: 348 passed, 7 existing tests ignored;
+  `npm test` in `web/`: all 25 passed.
+- The real supervised gateway holds its listener before receiving an origin,
+  admits no HTTP in that phase, serves on the same socket after configuration,
+  refuses occupied ports and invalid origins, and exits on stdin EOF.
+- Runtime regression tests cover separate bind/origin readiness deadlines,
+  stopping on gateway failure, ordering connector termination before gateway
+  shutdown, generated-config cleanup, and active-route restoration.
+- With cloudflared 2026.10.3 and a disposable user profile, the original
+  `--url` invocation selected a conflicting user-config service on port 18080.
+  Adding the generated configuration selected the intended port 6080. The
+  `ingress rule` check created no public tunnel.
+
+The earlier live Chromium record precedes these review fixes. This revised
+startup/shutdown flow has not been rerun through a real Quick Tunnel or the
+real-desktop WEB tab. The phone, platform, and long-session limits above remain.

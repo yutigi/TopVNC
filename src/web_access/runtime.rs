@@ -1,5 +1,7 @@
 //! The WEB tab's run state: the desktop server, the tunnel connector, and the
-//! gateway, started in that order and stopped in reverse. The desktop server
+//! gateway. Access starts in that order and stops in reverse. Quick Tunnel
+//! binds the gateway before publishing its port, and stops forwarding first.
+//! The desktop server
 //! is the landing window's in-process host; this module only asks for its
 //! loopback listener and watches it. The landing window adds that listener to
 //! a server the Server tab already runs, so both can serve at once. The
@@ -8,9 +10,9 @@
 //! On the Quick Tunnel route the connector also decides the page origin: the
 //! tunnel is Ready only once cloudflared has printed its
 //! `https://<label>.trycloudflare.com` URL and registered a connection, and
-//! the gateway then starts with that exact origin.
+//! the already-bound gateway then receives that exact origin over stdin.
 
-use super::config::{Launch, Route, RouteKind};
+use super::config::{Launch, QuickTunnelFile, Route, RouteKind};
 use super::lines::{Event, Program};
 use super::pairing::PairingCode;
 use super::process::{Spawner, Supervised};
@@ -100,6 +102,9 @@ pub struct WebRuntime {
     tunnel_was_ready: bool,
     /// The Quick Tunnel's origin, from cloudflared's first valid URL line.
     quick_origin: Option<String>,
+    gateway_bound: bool,
+    origin_sent: bool,
+    quick_config: Option<QuickTunnelFile>,
     gateway_stop_deadline: Option<Instant>,
     /// Pair as soon as the gateway is ready.
     pair_wanted: bool,
@@ -126,6 +131,9 @@ impl WebRuntime {
             connections: BTreeSet::new(),
             tunnel_was_ready: false,
             quick_origin: None,
+            gateway_bound: false,
+            origin_sent: false,
+            quick_config: None,
             gateway_stop_deadline: None,
             pair_wanted: false,
             pair_pending: false,
@@ -349,10 +357,13 @@ impl WebRuntime {
             }
             _ => {}
         }
+        if launch.route.kind() == RouteKind::QuickTunnel {
+            return self.poll_quick(server, now, request);
+        }
         // Tunnel connector.
         if *self.row(Row::Server) == RowState::Ready && *self.row(Row::Tunnel) == RowState::Waiting
         {
-            let args = tunnel_args(&launch);
+            let args = tunnel_args(&launch, None);
             match self
                 .spawner
                 .spawn(Program::Tunnel, &launch.cloudflared, &args)
@@ -381,6 +392,81 @@ impl WebRuntime {
             }
         }
         self.poll_gateway(now);
+        request
+    }
+
+    /// Own the HTTP listener before publishing it. The gateway holds the
+    /// same socket while waiting for the tunnel's origin on its stdin.
+    fn poll_quick(
+        &mut self,
+        server: &HostServer,
+        now: Instant,
+        request: Option<ServerRequest>,
+    ) -> Option<ServerRequest> {
+        let launch = self.launch.clone()?;
+        if *self.row(Row::Server) == RowState::Ready && *self.row(Row::Gateway) == RowState::Waiting
+        {
+            let spawned = gateway_args(&launch, None).and_then(|args| {
+                self.spawner
+                    .spawn(Program::Gateway, &launch.gateway_program, &args)
+            });
+            match spawned {
+                Ok(child) => {
+                    self.gateway = Some(child);
+                    self.set(Row::Gateway, RowState::Starting, now);
+                }
+                Err(error) => self.set(Row::Gateway, RowState::Failed(error), now),
+            }
+        }
+        self.poll_gateway(now);
+        if self.gateway_bound
+            && *self.row(Row::Gateway) == RowState::Starting
+            && *self.row(Row::Tunnel) == RowState::Waiting
+        {
+            let spawned = QuickTunnelFile::new(launch.listen).and_then(|config| {
+                let args = tunnel_args(&launch, Some(config.path()));
+                self.quick_config = Some(config);
+                self.spawner
+                    .spawn(Program::Tunnel, &launch.cloudflared, &args)
+            });
+            match spawned {
+                Ok(child) => {
+                    self.tunnel = Some(child);
+                    self.set(Row::Tunnel, RowState::Starting, now);
+                }
+                Err(error) => self.set(Row::Tunnel, RowState::Failed(error), now),
+            }
+        }
+        self.poll_tunnel(now);
+        if *self.row(Row::Tunnel) == RowState::Ready
+            && *self.row(Row::Gateway) == RowState::Starting
+            && !self.origin_sent
+        {
+            let command = format!("origin {}", self.quick_origin.as_deref()?);
+            if self
+                .gateway
+                .as_mut()
+                .is_some_and(|gateway| gateway.send(&command))
+            {
+                self.origin_sent = true;
+                self.since[Row::Gateway.index()] = Some(now);
+            } else {
+                self.set(
+                    Row::Gateway,
+                    RowState::Failed("the gateway is not accepting its origin".into()),
+                    now,
+                );
+            }
+        }
+        if self
+            .rows
+            .iter()
+            .any(|row| matches!(row, RowState::Failed(_)))
+        {
+            self.stop();
+            let stopped = self.poll_stopping(server, now);
+            return request.or(stopped);
+        }
         request
     }
 
@@ -447,10 +533,41 @@ impl WebRuntime {
             return;
         }
         let mut ready = false;
+        let mut invalid_bound = false;
         for event in gateway.take_events() {
             match event {
                 Event::Fingerprint(fingerprint) => self.fingerprint = Some(fingerprint),
-                Event::GatewayReady(_) => ready = true,
+                Event::GatewayBound(address) => {
+                    if self
+                        .launch
+                        .as_ref()
+                        .is_some_and(|launch| launch.route.kind() == RouteKind::QuickTunnel)
+                    {
+                        if address.parse::<SocketAddr>().ok()
+                            == self.launch.as_ref().map(|launch| launch.listen)
+                            && !self.gateway_bound
+                        {
+                            self.gateway_bound = true;
+                            // The origin may take TUNNEL_START to arrive. The
+                            // ready timeout starts once we send it, not now.
+                            self.since[Row::Gateway.index()] = None;
+                        } else {
+                            invalid_bound = true;
+                        }
+                    }
+                }
+                Event::GatewayReady(_) => {
+                    if self
+                        .launch
+                        .as_ref()
+                        .is_some_and(|launch| launch.route.kind() == RouteKind::QuickTunnel)
+                        && !self.origin_sent
+                    {
+                        invalid_bound = true;
+                    } else {
+                        ready = true;
+                    }
+                }
                 Event::Pair { seconds, link } if self.pair_pending => {
                     self.pair_pending = false;
                     match PairingCode::new(link, now + Duration::from_secs(seconds)) {
@@ -477,6 +594,16 @@ impl WebRuntime {
                 Event::Registered(_) | Event::Lost(_) | Event::QuickTunnelUrl(_) => {}
             }
         }
+        if invalid_bound {
+            self.set(
+                Row::Gateway,
+                RowState::Failed(
+                    "the gateway reported an unexpected listener or origin state".into(),
+                ),
+                now,
+            );
+            return;
+        }
         if ready && self.rows[Row::Gateway.index()] == RowState::Starting {
             self.rows[Row::Gateway.index()] = RowState::Ready;
             if self.pair_wanted && gateway.send("pair") {
@@ -490,8 +617,17 @@ impl WebRuntime {
                 RowState::Failed(format!("the gateway {exit}")),
                 now,
             );
-        } else if late && self.rows[Row::Gateway.index()] == RowState::Starting {
-            gateway.kill();
+        } else if late
+            && self.since[Row::Gateway.index()].is_some()
+            && self.rows[Row::Gateway.index()] == RowState::Starting
+        {
+            if !self
+                .launch
+                .as_ref()
+                .is_some_and(|launch| launch.route.kind() == RouteKind::QuickTunnel)
+            {
+                gateway.kill();
+            }
             self.set(
                 Row::Gateway,
                 RowState::Failed("the gateway did not report ready in time".into()),
@@ -501,6 +637,11 @@ impl WebRuntime {
     }
 
     fn poll_stopping(&mut self, server: &HostServer, now: Instant) -> Option<ServerRequest> {
+        if self.route() == Some(RouteKind::QuickTunnel) {
+            // Stop forwarding before releasing the gateway's listener.
+            self.stop_tunnel();
+            self.quick_origin = None;
+        }
         if let Some(gateway) = &mut self.gateway {
             let deadline = *self.gateway_stop_deadline.get_or_insert_with(|| {
                 gateway.close_input();
@@ -517,12 +658,7 @@ impl WebRuntime {
             self.gateway = None;
             self.finish(Row::Gateway);
         }
-        if let Some(mut tunnel) = self.tunnel.take() {
-            tunnel.kill();
-            self.kept[0] = tunnel.output();
-            self.connections.clear();
-            self.finish(Row::Tunnel);
-        }
+        self.stop_tunnel();
         self.finish(Row::Gateway);
         self.finish(Row::Tunnel);
         match server {
@@ -541,6 +677,16 @@ impl WebRuntime {
         None
     }
 
+    fn stop_tunnel(&mut self) {
+        if let Some(mut tunnel) = self.tunnel.take() {
+            tunnel.kill();
+            self.kept[0] = tunnel.output();
+        }
+        self.quick_config = None;
+        self.connections.clear();
+        self.finish(Row::Tunnel);
+    }
+
     /// A stopped row shows Stopped, unless it failed first.
     fn finish(&mut self, row: Row) {
         if !matches!(self.rows[row.index()], RowState::Failed(_)) {
@@ -551,6 +697,9 @@ impl WebRuntime {
 
 impl Drop for WebRuntime {
     fn drop(&mut self) {
+        if self.route() == Some(RouteKind::QuickTunnel) {
+            self.stop_tunnel();
+        }
         // Let the gateway close its sessions; the children's own drop, and
         // the Windows job, end anything left.
         if let Some(gateway) = &mut self.gateway {
@@ -569,7 +718,7 @@ impl Drop for WebRuntime {
 
 /// cloudflared's arguments. The Access route's token stays in its file;
 /// only the path is passed. A Quick Tunnel needs no token at all.
-fn tunnel_args(launch: &Launch) -> Vec<OsString> {
+fn tunnel_args(launch: &Launch, quick_config: Option<&std::path::Path>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["tunnel".into(), "--no-autoupdate".into()];
     match &launch.route {
         Route::Access { token_file, .. } => {
@@ -577,6 +726,14 @@ fn tunnel_args(launch: &Launch) -> Vec<OsString> {
             args.push(token_file.clone().into_os_string());
         }
         Route::QuickTunnel { .. } => {
+            // This branch is only called after creating the per-run file.
+            args.extend([
+                "--config".into(),
+                quick_config
+                    .expect("Quick Tunnel configuration")
+                    .as_os_str()
+                    .to_owned(),
+            ]);
             args.push("--url".into());
             args.push(format!("http://{}", launch.listen).into());
         }
@@ -591,15 +748,18 @@ fn gateway_args(launch: &Launch, quick_origin: Option<&str>) -> Result<Vec<OsStr
             "--supervised".into(),
             gateway_config.clone().into_os_string(),
         ],
-        Route::QuickTunnel { web_root } => vec![
-            "--supervised-quick-tunnel".into(),
-            launch.listen.to_string().into(),
-            launch.rfb_target.to_string().into(),
-            quick_origin
-                .ok_or("the Quick Tunnel URL is not known")?
-                .into(),
-            web_root.clone().into_os_string(),
-        ],
+        Route::QuickTunnel { web_root } => {
+            let mut args = vec![
+                "--supervised-quick-tunnel".into(),
+                launch.listen.to_string().into(),
+                launch.rfb_target.to_string().into(),
+            ];
+            if let Some(origin) = quick_origin {
+                args.push(origin.into());
+            }
+            args.push(web_root.clone().into_os_string());
+            args
+        }
     })
 }
 

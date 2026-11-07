@@ -15,6 +15,8 @@ struct FakeState {
     exit: Option<String>,
     killed: bool,
     output: Vec<String>,
+    /// Assert shutdown ordering when a public route uses this gateway.
+    tunnel_before_close: Option<Handle>,
 }
 
 type Handle = Arc<Mutex<FakeState>>;
@@ -37,7 +39,14 @@ impl Supervised for FakeChild {
         true
     }
     fn close_input(&mut self) {
-        self.0.lock().unwrap().input_closed = true;
+        let mut state = self.0.lock().unwrap();
+        if let Some(tunnel) = &state.tunnel_before_close {
+            assert!(
+                tunnel.lock().unwrap().killed,
+                "stop forwarding before gateway shutdown"
+            );
+        }
+        state.input_closed = true;
     }
     fn exit(&mut self) -> Option<String> {
         self.0.lock().unwrap().exit.clone()

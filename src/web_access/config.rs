@@ -6,6 +6,7 @@
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::fmt;
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
@@ -31,6 +32,51 @@ const PAGE_FILES: [&str; 5] = [
 pub const QUICK_LISTEN: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6080));
 pub const QUICK_RFB_TARGET: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5900));
+
+/// An application-owned cloudflared configuration, retained until its child
+/// has stopped. Explicit ingress prevents user configuration or CLI origin
+/// defaults from publishing anything except our already-bound gateway.
+pub struct QuickTunnelFile {
+    path: PathBuf,
+}
+
+impl QuickTunnelFile {
+    pub fn new(listen: SocketAddr) -> Result<Self, String> {
+        if !listen.ip().is_loopback() || listen.port() == 0 {
+            return Err("Quick Tunnel needs a bound loopback gateway".into());
+        }
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|e| e.to_string())?;
+        let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("topvnc-quick-{name}"));
+        std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+        let config = Self {
+            path: dir.join("config.yml"),
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&config.path)
+            .map_err(|e| e.to_string())?;
+        writeln!(file, "ingress:\n  - service: http://{listen}")
+            .and_then(|()| file.flush())
+            .map_err(|e| e.to_string())?;
+        Ok(config)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for QuickTunnelFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
 
 /// Which public route browser access uses. Access is the default; the
 /// Quick Tunnel is an explicit, temporary choice (specs/019-quick-tunnel-mode).
@@ -446,6 +492,23 @@ browser_keys_file = "browsers.txt"
         assert!(example.contains(&format!("listen = \"{QUICK_LISTEN}\"")));
         assert!(example.contains(&format!("rfb_target = \"{QUICK_RFB_TARGET}\"")));
         assert_eq!(RouteKind::default(), RouteKind::Access);
+    }
+
+    #[test]
+    fn quick_tunnel_config_pins_only_the_bound_gateway_and_cleans_up() {
+        let config = QuickTunnelFile::new(QUICK_LISTEN).unwrap();
+        let path = config.path().to_owned();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ingress:\n  - service: http://127.0.0.1:6080\n"
+        );
+        let other = QuickTunnelFile::new(QUICK_LISTEN).unwrap();
+        assert_ne!(path, other.path());
+        drop(config);
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+        assert!(QuickTunnelFile::new("127.0.0.1:0".parse().unwrap()).is_err());
+        assert!(QuickTunnelFile::new("0.0.0.0:6080".parse().unwrap()).is_err());
     }
 
     #[test]
