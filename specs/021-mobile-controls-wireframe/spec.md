@@ -33,6 +33,13 @@ Keep the working web viewer and transport code unchanged.
 - Connection/security labels identify simulated state. No real host connections,
   credentials, performance claims, or new platform-support claims are introduced.
 - Publish the wireframe privately in Sites and provide its URL for review.
+- A visible Customize menu creates, edits, removes, and reorders up to eight
+  labeled custom keys. Keys run a demo shortcut or insert a bounded text snippet.
+- Users can rearrange language, custom-key, and input groups, reorder the thumb
+  dock, choose deck placement, and show/hide optional groups independently for
+  portrait and landscape. Layout changes require an explicit Save or reset.
+- Saved customization is validated before use, stays local to the browser, and
+  preserves reachable Customize and mode controls even when groups are hidden.
 
 ## Validation
 

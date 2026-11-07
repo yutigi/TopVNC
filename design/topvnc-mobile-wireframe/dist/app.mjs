@@ -1,3 +1,4 @@
+import { createCustomization } from './customize.mjs';
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const defaults = [
@@ -30,6 +31,7 @@ let composing = false;
 let focusMode = false;
 let lastFocus;
 let sheetKind;
+let customization;
 const modifiers = new Set();
 function save() {
   try { localStorage.setItem('topvnc-wireframe-v1', JSON.stringify({ profiles, pins, selected })); } catch { /* Session-only preferences still work. */ }
@@ -40,7 +42,7 @@ function el(tag, text, className) {
   if (className) node.className = className;
   return node;
 }
-function feedback(text) { $('#key-feedback').textContent = text; }
+function feedback(text) { $('#key-feedback').textContent = text; $('#session-feedback').textContent = text; }
 function release() {
   modifiers.clear();
   keyboardShift = false;
@@ -94,6 +96,7 @@ function setMode(next) {
   $('#deck-label').textContent = { keys: 'QUICK KEYS', type: 'MULTILINGUAL TYPING', pointer: 'TRACKPAD' }[next];
   $('#remote-hint-text').textContent = next === 'type' ? 'Compose below · insert when ready' : 'Drag to move · tap to click';
   updateCaption();
+  customization?.apply(orientation);
 }
 function updateCaption() {
   $('#preview-caption').textContent = orientation === 'portrait' ? 'The remote view stays above a fixed control deck.' : mode === 'type' ? 'Split key rows below the view. The dock keeps its order.' : 'The same dock order, alongside your remote view.';
@@ -107,6 +110,7 @@ function setOrientation(value) {
   $('#canvas-title').textContent = value === 'portrait' ? 'Portrait / two-thumb reach' : 'Landscape / room to play';
   $('#dimension-label').textContent = value === 'portrait' ? '390 × 740 / logical preview' : '844 × 414 / logical preview';
   updateCaption();
+  customization?.apply(orientation);
   feedback('View rotated · modifiers released');
 }
 function pressKey(key, button) {
@@ -173,7 +177,8 @@ function openSheet(kind, trigger = document.activeElement) {
   sheetKind = kind;
   const content = $('#sheet-content');
   content.replaceChildren();
-  $('#sheet-title').textContent = { languages: 'Your languages', layout: 'Edit keyboard layout', pins: 'Your pinned keys', settings: 'Session settings', host: 'Your machines', fn: 'Function keys' }[kind];
+  $('#sheet-title').textContent = { customize: 'Make it yours', languages: 'Your languages', layout: 'Edit keyboard layout', pins: 'Your pinned keys', settings: 'Session settings', host: 'Your machines', fn: 'Function keys' }[kind];
+  if (kind === 'customize') customization.build(content);
   if (kind === 'languages') buildLanguages(content);
   if (kind === 'pins') buildPins(content);
   if (kind === 'layout') buildLayout(content);
@@ -186,7 +191,9 @@ function openSheet(kind, trigger = document.activeElement) {
     languages.addEventListener('click', () => openSheet('languages'));
     const pinButton = el('button', 'Edit pinned shortcuts →', 'wide-button');
     pinButton.addEventListener('click', () => openSheet('pins'));
-    content.append(languages, pinButton, el('p', 'Production design: show authentication and encryption state here. Never silently connect without authentication.', 'sheet-notice'));
+    const customizeButton = el('button', 'Customize keys & UI layout →', 'wide-button');
+    customizeButton.addEventListener('click', () => openSheet('customize'));
+    content.append(customizeButton, languages, pinButton, el('p', 'Production design: show authentication and encryption state here. Never silently connect without authentication.', 'sheet-notice'));
   }
   if (kind === 'host') {
     content.append(el('p', 'Machine picker placement. These are sample machines only.', 'sheet-description'));
@@ -268,6 +275,7 @@ $('#close-sheet').addEventListener('click', closeSheet);
 $('#language-settings').addEventListener('click', () => openSheet('languages'));
 $('#inspector-languages').addEventListener('click', () => openSheet('languages'));
 $('#settings-button').addEventListener('click', () => openSheet('settings'));
+$('#customize-button').addEventListener('click', () => openSheet('customize'));
 $('#host-button').addEventListener('click', () => openSheet('host'));
 $('#edit-pins').addEventListener('click', () => openSheet('pins'));
 $$('[data-view]').forEach(b => b.addEventListener('click', () => setOrientation(b.dataset.view)));
@@ -422,4 +430,10 @@ const mobileApple = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Mac/.test(
 const osName = mobileApple ? 'iOS' : /Android/.test(navigator.userAgent) ? 'Android' : /Win/.test(platformText) ? 'Windows' : /Mac/.test(platformText) ? 'macOS' : /Linux/.test(platformText) ? 'Linux' : 'device';
 $('#native-keyboard').textContent = `Native · ${osName}`;
 $('#native-keyboard').setAttribute('aria-label', `Switch to native ${osName} keyboard input`);
+customization = createCustomization({
+  el, $, orientation: () => orientation, close: closeSheet, feedback,
+  switchOrientation: setOrientation,
+  key: (value, button) => { if (composing) { feedback('Finish composing before using a custom key'); return; } pressKey(value, button); },
+  text: value => { if (composing) { feedback('Finish composing before inserting custom text'); return; } $('#remote-output').textContent = value; release(); feedback('Custom text inserted in demo screen'); },
+});
 renderLanguages(); renderPins(); setMode('type'); setOrientation('portrait'); feedback('Try the TopVNC keyboard');

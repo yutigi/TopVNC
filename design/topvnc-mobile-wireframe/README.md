@@ -2,15 +2,10 @@
 
 Interactive design prototype only. No live hosts, passwords, or remote input.
 
-## Run locally
+## Review in Sites
 
-From this directory:
-
-```powershell
-python -m http.server 4178 --bind 127.0.0.1 --directory dist
-```
-
-Open <http://127.0.0.1:4178/>. Select Portrait or Landscape; use **Try full
+Open the [published wireframe](https://topvnc-mobile-wireframe-nov26.js-sookudom-temp.chatgpt.site).
+Select Portrait or Landscape; use **Try full
 viewport** on a phone to try the layout at its actual viewport size.
 
 ## Review flows
@@ -30,6 +25,14 @@ viewport** on a phone to try the layout at its actual viewport size.
 - **Keys:** tap modifiers for the next key, configure four pinned shortcuts, or
   open the Fn grid. Mode/rotation/focus changes release modifiers.
 - **Pointer:** drag in the demo trackpad to move the sample cursor.
+- **Customize → Your keys:** create up to eight labeled single-key shortcuts,
+  modifier chords, or text snippets. Edit, remove, move up/down, and choose a
+  two-column button. Changes save in this browser and appear in the custom pad.
+- **Customize → UI layout:** independently configure portrait and landscape deck
+  placement, control-group order, mode-dock order, optional language/custom-key
+  visibility, and standard/large custom-key sizing. Save applies the arrangement;
+  Reset selects defaults for the chosen orientation. All modes and the header's
+  Customize entry stay reachable. Longer custom decks scroll above a sticky dock.
 
 In landscape, Type uses a wide split keyboard below the remote display. Keys
 and Pointer use a side deck. Character keys use compact keyboard spacing; the
@@ -37,7 +40,9 @@ primary dock controls remain at least 44 CSS pixels high.
 
 ## Verification limits
 
-JavaScript syntax, HTML element references, and local HTTP assets are checked.
+JavaScript syntax, CSS parsing, HTML element references, and the customization
+model tests are checked. The initial version also passed local HTTP checks;
+subsequent review uses Sites without starting a local server.
 Browser automation was unavailable: the browser host failed, and the Windows
 fallback stopped because it could not verify the active URL. Visual rendering,
 real-device thumb reach, native keyboard visibility, and IME behavior need
