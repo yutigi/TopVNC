@@ -15,8 +15,9 @@ Keep the working web viewer and transport code unchanged.
 - Keyboard, pointer, and quick-key modes have fixed, labeled controls.
 - Escape, Tab, modifier keys, navigation, and user-pinned shortcuts are easy to
   reach without horizontally scrolling the primary controls.
-- Users can select, add, remove, and pin language profiles; preferences stay on
-  the current device. System keyboard language switching remains explicit.
+- Users can select, add, remove, and favorite language profiles through the icon
+  inside the custom keyboard; preferences stay on the current device. Previously
+  saved pins become picker favorites. System language switching remains explicit.
 - Type opens a custom TopVNC on-screen keyboard by default. Language profiles
   include editable character rows; English and Thai example layouts type locally.
 - Chinese Pinyin and Japanese romaji demonstrate explicit candidate selection
@@ -27,6 +28,12 @@ Keep the working web viewer and transport code unchanged.
   is not sent while a native IME is composing. The prototype only changes demo text.
 - Modifier state is visible, reset after a chord, and released on mode changes,
   orientation changes, cancellation, or focus loss.
+- Type replaces the separate pinned-language row with Ctrl, Alt and Shift.
+  Shift shares state with the keyboard Shift and updates character labels.
+  Shifted characters insert locally; Ctrl/Alt character and control-key chords
+  produce simulated key feedback without inserting text or the composed phrase.
+  Native input uses OS modifiers; its Type modifier buttons are disabled. Native
+  IME composition guards prevent shortcuts, profile changes and insertion.
 - Primary controls target at least 44 CSS pixels. Keyboard character keys use
   compact phone-like spacing; landscape splits their rows for two-thumb reach.
   Rotation preserves control order and labels.
@@ -35,12 +42,14 @@ Keep the working web viewer and transport code unchanged.
 - Publish the wireframe privately in Sites and provide its URL for review.
 - A visible Customize menu creates, edits, removes, and reorders up to eight
   labeled custom keys. Keys run a demo shortcut or insert a bounded text snippet.
-- Users can rearrange language, custom-key, and input groups, reorder the thumb
+- Users can rearrange Type-modifier, custom-key, and input groups, reorder the thumb
   dock, choose deck placement, and show/hide optional groups independently for
   portrait and landscape. Layout changes require an explicit Save or reset.
 - Saved customization is validated before use, stays local to the browser, and
   preserves reachable Customize and mode controls even when groups are hidden.
-- Language pins appear only in Type, never Quick Keys, Pointer, or FPS Play.
+- The replacement modifier row appears only in Type, never Quick Keys, Pointer,
+  or FPS Play. Saved language-row order migrates to modifier-row order; the old
+  hide-language preference cannot hide modifiers. No language chips remain above Type.
 - An FPS preset provides WASD, sprint/crouch, fire/aim, jump, reload, use, and
   weapon controls over a clearly simulated training view. It supports independent
   simultaneous touch holds and a drag-to-look zone in both orientations.

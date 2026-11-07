@@ -132,8 +132,7 @@
 }
 .fps-active .control-deck > .deck-grip,
 .fps-active .control-deck > .deck-top,
-.fps-active .control-deck > .language-bar,
-.fps-active .control-deck > .language-hint,
+.fps-active .control-deck > .type-modifiers,
 .fps-active .control-deck > .custom-action-pad,
 .fps-active .control-deck > .callout {
   display: none !important;

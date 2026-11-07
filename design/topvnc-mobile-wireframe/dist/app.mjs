@@ -22,7 +22,6 @@ try {
 } catch { /* Storage can be unavailable in private browser contexts. */ }
 let mode = 'type';
 let keyboardSource = 'custom';
-let keyboardShift = false;
 let symbols = false;
 const latinRows = ['q w e r t y u i o p', 'a s d f g h j k l', 'z x c v b n m'];
 const thaiRows = ['ๆ ไ ำ พ ะ ั ี ร น ย บ ล', 'ฟ ห ก ด เ ้ ่ า ส ว ง', 'ผ ป แ อ ิ ื ท ม ใ ฝ'];
@@ -48,25 +47,14 @@ function feedback(text) { $('#key-feedback').textContent = text; $('#session-fee
 function release() {
   fps?.release();
   modifiers.clear();
-  keyboardShift = false;
   stopErase();
   renderKeyboard();
-  $$('[data-mod]').forEach(b => b.setAttribute('aria-pressed', 'false'));
 }
 function currentProfile() { return profiles.find(p => p.id === selected) ?? profiles[0]; }
 function renderLanguages() {
-  const container = $('#language-pins');
-  container.replaceChildren();
-  profiles.filter(p => p.pinned).forEach(profile => {
-    const button = el('button', profile.label, 'language-chip');
-    button.lang = profile.tag;
-    button.setAttribute('aria-label', `${profile.name} typing profile`);
-    button.setAttribute('aria-pressed', String(selected === profile.id));
-    button.addEventListener('click', () => selectLanguage(profile.id));
-    container.append(button);
-  });
   const profile = currentProfile();
-  $('#language-hint').textContent = `${profile.name} · ${keyboardSource === 'custom' ? 'TopVNC on-screen layout' : 'native OS input'}`;
+  $('#keyboard-languages').setAttribute('aria-label', `Switch or configure keyboard language · ${profile.name} selected`);
+  $('#keyboard-languages').title = `${profile.name} · switch language`;
   $('#compose').lang = profile.tag;
   $('#ime-example').textContent = keyboardSource === 'native' ? 'Native input: use the OS globe key to switch languages. Keyboard visibility is controlled by your OS.' : profile.id === 'zh' ? 'Demo Pinyin: try nihao or zhongwen. A full custom IME is future implementation.' : profile.id === 'ja' ? 'Demo romaji: try nihon or arigatou. A full custom IME is future implementation.' : 'TopVNC keys · edit the layout to match your habits.';
   renderKeyboard();
@@ -117,8 +105,9 @@ function setOrientation(value) {
   feedback('View rotated · modifiers released');
 }
 function pressKey(key, button) {
+  if (composing) { feedback('Finish composing before using a shortcut'); return; }
   if (key === 'Fn') { release(); openSheet('fn', button); return; }
-  if (key === 'Enter' && mode === 'type' && $('#compose').value) { insertText(); return; }
+  if (key === 'Enter' && !modifiers.size && mode === 'type' && $('#compose').value) { insertText(); return; }
   const combined = [...new Set([...modifiers, ...key.split('+')])].join(' + ');
   feedback(`${combined} · demo press`);
   release();
@@ -134,24 +123,28 @@ document.addEventListener('click', event => {
   const changeMode = event.target.closest('[data-mode]');
   if (key) pressKey(key.dataset.key, key);
   if (modifier) {
+    if (composing) { feedback('Finish composing before using modifiers'); return; }
     const value = modifier.dataset.mod;
     modifiers.has(value) ? modifiers.delete(value) : modifiers.add(value);
-    modifier.setAttribute('aria-pressed', String(modifiers.has(value)));
+    renderKeyboard();
     feedback(modifiers.size ? `${[...modifiers].join(' + ')} · next key` : 'Modifiers released');
   }
   if (changeMode) setMode(changeMode.dataset.mode);
 });
 function insertText() {
   if (composing) { feedback('Confirm your IME composition first'); return; }
+  if (modifiers.size) { pressKey('Enter'); return; }
   const value = $('#compose').value;
   if (!value.trim()) { feedback('Type something to insert'); $('#compose').focus(); return; }
   $('#remote-output').textContent = value.slice(0, 2000);
   $('#compose').value = '';
   feedback('Text inserted in demo screen');
   $('#composition-status').textContent = 'Inserted · ready for the next phrase';
+  release();
   renderCandidates();
 }
 $('#compose').addEventListener('compositionstart', () => {
+  release();
   composing = true;
   $('#insert-text').disabled = true;
   $('#composition-status').textContent = 'Composing… choose characters first';
@@ -218,19 +211,20 @@ function openSheet(kind, trigger = document.activeElement) {
   $('#close-sheet').focus();
 }
 function buildLanguages(content, message = '') {
-  content.replaceChildren(el('p', 'Pin up to four keyboard profiles for one-tap access. Edit their key layouts or add your own.', 'sheet-description'));
+  content.replaceChildren(el('p', 'Choose a keyboard language. Favorite up to four profiles to keep them first in this picker. Edit layouts or add your own.', 'sheet-description'));
   if (message) { const status = el('p', message, 'sheet-description'); status.setAttribute('role', 'status'); content.append(status); }
-  profiles.forEach(profile => {
+  [...profiles.filter(p => p.pinned), ...profiles.filter(p => !p.pinned)].forEach(profile => {
     const row = el('div', undefined, 'language-option');
     const choose = el('button', profile.name);
     choose.className = 'profile-choose';
     choose.setAttribute('aria-label', `Use ${profile.name}`);
+    choose.setAttribute('aria-pressed', String(selected === profile.id));
     choose.addEventListener('click', () => { if (composing) { buildLanguages(content, 'Finish composing before changing profile.'); return; } closeSheet(); selectLanguage(profile.id); });
-    const pin = el('button', profile.pinned ? 'Pinned' : 'Pin');
-    pin.setAttribute('aria-label', `${profile.pinned ? 'Unpin' : 'Pin'} ${profile.name}`);
+    const pin = el('button', profile.pinned ? '★' : '☆');
+    pin.setAttribute('aria-label', `${profile.pinned ? 'Unfavorite' : 'Favorite'} ${profile.name}`);
     pin.setAttribute('aria-pressed', String(profile.pinned));
     pin.addEventListener('click', () => {
-      if (!profile.pinned && profiles.filter(p => p.pinned).length >= 4) { buildLanguages(content, 'Four profiles are pinned. Unpin one to make room.'); return; }
+      if (!profile.pinned && profiles.filter(p => p.pinned).length >= 4) { buildLanguages(content, 'Four favorites selected. Unfavorite one to make room.'); return; }
       profile.pinned = !profile.pinned; save(); renderLanguages(); buildLanguages(content);
     });
     const edit = el('button', 'Edit');
@@ -257,7 +251,7 @@ function buildLanguages(content, message = '') {
     if (profiles.length >= 16) { buildLanguages(content, 'Up to 16 profiles are available in this wireframe.'); return; }
     if (profiles.some(p => p.name.toLowerCase() === name.toLowerCase())) { buildLanguages(content, 'That language is already in your list.'); return; }
     profiles.push({ id: `custom-${Date.now()}`, name, label: name, tag: 'und', pinned: profiles.filter(p => p.pinned).length < 4 });
-    save(); renderLanguages(); buildLanguages(content, `${name} added. Pin it for direct access.`);
+    save(); renderLanguages(); buildLanguages(content, `${name} added. Choose it here to start typing.`);
   });
   content.append(form, el('p', 'TopVNC keys are independent of your OS keyboard. Custom profiles start with editable QWERTY rows. Chinese/Japanese candidate examples are simulated; use native input for a complete device IME.', 'sheet-notice'));
 }
@@ -275,7 +269,6 @@ function buildPins(content) {
   content.append(group, button);
 }
 $('#close-sheet').addEventListener('click', closeSheet);
-$('#language-settings').addEventListener('click', () => openSheet('languages'));
 $('#inspector-languages').addEventListener('click', () => openSheet('languages'));
 $('#settings-button').addEventListener('click', () => openSheet('settings'));
 $('#customize-button').addEventListener('click', () => openSheet('customize'));
@@ -330,6 +323,8 @@ function profileRows(profile = currentProfile()) {
   return (profile.id === 'th' ? thaiRows : latinRows).map(row => row.split(' '));
 }
 function renderKeyboard() {
+  const keyboardShift = modifiers.has('Shift');
+  $$('[data-mod]').forEach(button => button.setAttribute('aria-pressed', String(modifiers.has(button.dataset.mod))));
   const rows = symbols ? symbolRows.map(row => row.split(' ')) : profileRows();
   const thaiShift = ['๐ " ฎ ฑ ธ ํ ๊ ณ ฯ ญ ฐ ,', 'ฤ ฆ ฏ โ ฌ ็ ๋ ษ ศ ซ .', '( ) ฉ ฮ ฺ ์ ? ฒ ฬ ฦ'].map(row => row.split(' '));
   $('#keyboard-rows').replaceChildren();
@@ -338,7 +333,7 @@ function renderKeyboard() {
     if (rowIndex === 2) {
       const shift = el('button', '⇧', 'keyboard-shift');
       shift.setAttribute('aria-label', 'Shift'); shift.setAttribute('aria-pressed', String(keyboardShift));
-      shift.addEventListener('click', () => { keyboardShift = !keyboardShift; renderKeyboard(); });
+      shift.dataset.mod = 'Shift';
       row.append(shift);
     }
     keys.forEach((character, index) => {
@@ -357,10 +352,11 @@ function renderKeyboard() {
 }
 function addCharacter(value) {
   if (composing || keyboardSource !== 'custom') return;
+  if (modifiers.has('Ctrl') || modifiers.has('Alt')) { pressKey(value === ' ' ? 'Space' : value.toLocaleUpperCase()); return; }
   const field = $('#compose');
-  if (field.value.length + value.length > 2000) { feedback('Demo text limit reached'); return; }
+  if (field.value.length + value.length > 2000) { release(); feedback('Demo text limit reached'); return; }
   field.value += value;
-  if (keyboardShift) { keyboardShift = false; renderKeyboard(); }
+  release();
   $('#composition-status').textContent = 'Composed locally · tap Insert when ready';
   feedback(value === ' ' ? 'Space · custom key' : `${value} · custom key`);
   renderCandidates();
@@ -378,13 +374,16 @@ $('#keyboard-languages').addEventListener('click', () => openSheet('languages'))
 $('#keyboard-layout').addEventListener('click', () => openSheet('layout'));
 $('#keyboard-return').addEventListener('click', insertText);
 function backspace() {
+  if (composing || keyboardSource !== 'custom') return false;
+  if (modifiers.size) { pressKey('Backspace'); return false; }
   const field = $('#compose');
   field.value = Array.from(field.value).slice(0, -1).join('');
   renderCandidates(); feedback('Backspace · custom key');
+  return true;
 }
 let eraseDelay; let eraseRepeat;
 function stopErase() { clearTimeout(eraseDelay); clearInterval(eraseRepeat); }
-$('#keyboard-backspace').addEventListener('pointerdown', event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); backspace(); stopErase(); eraseDelay = setTimeout(() => { eraseRepeat = setInterval(backspace, 70); }, 350); });
+$('#keyboard-backspace').addEventListener('pointerdown', event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); stopErase(); if (backspace()) eraseDelay = setTimeout(() => { eraseRepeat = setInterval(backspace, 70); }, 350); });
 $('#keyboard-backspace').addEventListener('click', event => { if (event.detail === 0) backspace(); });
 window.addEventListener('pointerup', stopErase); window.addEventListener('pointercancel', stopErase); window.addEventListener('blur', stopErase); document.addEventListener('visibilitychange', stopErase);
 function renderCandidates() {
@@ -402,7 +401,8 @@ function renderCandidates() {
 }
 function setKeyboardSource(source) {
   if (composing) { feedback('Confirm the current IME composition first'); return; }
-  release(); keyboardShift = false; keyboardSource = source;
+  release(); keyboardSource = source;
+  $$('.type-modifiers [data-mod]').forEach(button => { button.disabled = source === 'native'; button.title = source === 'native' ? 'Use TopVNC keys for simulated modifier chords; native input uses the OS keyboard.' : 'Apply to the next key'; });
   $('#custom-keyboard-panel').hidden = source !== 'custom';
   $('#compose').readOnly = source === 'custom';
   $('#compose').inputMode = source === 'custom' ? 'none' : 'text';

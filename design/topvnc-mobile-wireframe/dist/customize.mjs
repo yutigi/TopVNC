@@ -1,11 +1,11 @@
 import { defaultFpsSettings, normalizeFpsSettings, normalizeFpsKey, FPS_ACTIONS } from './fps.mjs';
 const STORAGE_KEY = 'topvnc-wireframe-customize-v1';
-const GROUPS = ['languages', 'actions', 'input'];
+const GROUPS = ['modifiers', 'actions', 'input'];
 const DOCK = ['keys', 'type', 'pointer', 'enter'];
-const GROUP_NAMES = { languages: 'Typing language switcher', actions: 'Your custom keys', input: 'Keyboard / active input' };
+const GROUP_NAMES = { modifiers: 'Type · Ctrl / Alt / Shift', actions: 'Your custom keys', input: 'Keyboard / active input' };
 const DOCK_NAMES = { keys: 'Keys', type: 'Type', pointer: 'Pointer', enter: 'Enter' };
 export function defaultCustomization() {
-  const layout = () => ({ position: 'auto', groups: [...GROUPS], dock: [...DOCK], showLanguages: true, showActions: true, size: 'standard' });
+  const layout = () => ({ position: 'auto', groups: [...GROUPS], dock: [...DOCK], showActions: true, size: 'standard' });
   return {
     actions: [],
     preset: 'standard', fps: defaultFpsSettings(),
@@ -40,11 +40,13 @@ export function normalizeCustomization(value) {
   for (const orientation of ['portrait', 'landscape']) {
     const input = value.layouts?.[orientation]; const layout = result.layouts[orientation];
     if (!input || typeof input !== 'object') continue;
-    if (permutation(input.groups, GROUPS)) layout.groups = [...input.groups];
+    // Preserve the old row's position, but never apply its hide-language preference to modifiers.
+    const groups = Array.isArray(input.groups) ? input.groups.map(group => group === 'languages' ? 'modifiers' : group) : [];
+    if (permutation(groups, GROUPS)) layout.groups = [...groups];
     if (permutation(input.dock, DOCK)) layout.dock = [...input.dock];
     if ((orientation === 'portrait' ? ['auto', 'top', 'bottom'] : ['auto', 'left', 'right', 'bottom']).includes(input.position)) layout.position = input.position;
     if (['standard', 'large'].includes(input.size)) layout.size = input.size;
-    for (const option of ['showLanguages', 'showActions']) if (typeof input[option] === 'boolean') layout[option] = input[option];
+    if (typeof input.showActions === 'boolean') layout.showActions = input.showActions;
   }
   return result;
 }
@@ -67,11 +69,10 @@ export function createCustomization(api) {
     const layout = state.layouts[orientation]; const device = $('#device');
     device.dataset.layoutPosition = layout.position;
     device.dataset.keySize = layout.size;
-    const groups = { languages: [$('.language-bar'), $('#language-hint')], actions: [$('#custom-action-pad')], input: [$('#keys-panel'), $('#type-panel'), $('#pointer-panel')] };
+    const groups = { modifiers: [$('.type-modifiers')], actions: [$('#custom-action-pad')], input: [$('#keys-panel'), $('#type-panel'), $('#pointer-panel')] };
     layout.groups.forEach((group, index) => groups[group].forEach(node => { node.style.order = String(index * 10); }));
     const typing = api.mode() === 'type';
-    $('.language-bar').hidden = !layout.showLanguages || !typing;
-    $('#language-hint').classList.toggle('layout-hidden', !layout.showLanguages || !typing);
+    $('.type-modifiers').hidden = !typing;
     const pad = $('#custom-action-pad'); pad.replaceChildren(); pad.hidden = !layout.showActions || !state.actions.length;
     state.actions.forEach(action => {
       const button = el('button', action.label, action.wide ? 'custom-key wide-key' : 'custom-key');
@@ -180,19 +181,19 @@ export function createCustomization(api) {
     }
     function buildLayoutMenu() {
       const layout = draftLayouts[editingOrientation];
-      body.append(el('p', 'Arrange standard controls per orientation. Language pins appear only in Type. FPS Play uses its own thumb overlay; customize that in Presets.', 'sheet-description'));
+      body.append(el('p', 'Arrange standard controls per orientation. Ctrl, Alt and Shift appear only in Type; switch languages from the keyboard icon. FPS Play uses its own thumb overlay; customize that in Presets.', 'sheet-description'));
       const orientationButtons = el('div', undefined, 'customize-tabs');
       ['portrait', 'landscape'].forEach(value => { const button = el('button', value === 'portrait' ? '▯ Portrait' : '▭ Landscape'); button.setAttribute('aria-pressed', String(editingOrientation === value)); button.addEventListener('click', () => { editingOrientation = value; show('layout'); }); orientationButtons.append(button); }); body.append(orientationButtons);
       const field = el('label', 'Control deck position', 'customize-field'); const position = el('select');
       (editingOrientation === 'portrait' ? [['auto', 'Default · bottom'], ['bottom', 'Bottom'], ['top', 'Top']] : [['auto', 'Default · adapt to input'], ['left', 'Left side'], ['right', 'Right side'], ['bottom', 'Bottom']]).forEach(([value, name]) => { const option = el('option', name); option.value = value; position.append(option); }); position.value = layout.position;
       position.addEventListener('change', () => { layout.position = position.value; updateSketch(); }); field.append(position); body.append(field);
       const sketch = el('div', undefined, 'layout-sketch'); sketch.setAttribute('aria-label', 'Layout order preview');
-      function updateSketch() { sketch.replaceChildren(el('span', `REMOTE VIEW · ${layout.position.toUpperCase()} DECK`, 'sketch-screen')); layout.groups.forEach(group => { if (group === 'languages' && !layout.showLanguages || group === 'actions' && !layout.showActions) return; sketch.append(el('span', GROUP_NAMES[group], 'sketch-group')); }); sketch.append(el('span', layout.dock.map(id => DOCK_NAMES[id]).join('  ·  '), 'sketch-dock')); }
+      function updateSketch() { sketch.replaceChildren(el('span', `REMOTE VIEW · ${layout.position.toUpperCase()} DECK`, 'sketch-screen')); layout.groups.forEach(group => { if (group === 'actions' && !layout.showActions) return; sketch.append(el('span', GROUP_NAMES[group], 'sketch-group')); }); sketch.append(el('span', layout.dock.map(id => DOCK_NAMES[id]).join('  ·  '), 'sketch-dock')); }
       updateSketch(); body.append(sketch, el('h4', 'Control group order', 'customize-subheading'));
       body.append(reorderList(layout.groups, GROUP_NAMES, (index, direction) => { layout.groups = moveItem(layout.groups, index, direction); show('layout'); }));
       body.append(el('h4', 'Thumb dock order', 'customize-subheading'));
       body.append(reorderList(layout.dock, DOCK_NAMES, (index, direction) => { layout.dock = moveItem(layout.dock, index, direction); show('layout'); }));
-      for (const [key, title] of [['showLanguages', 'Show language switcher in Type only'], ['showActions', 'Show custom key pad']]) { const label = el('label', undefined, 'customize-check'); const checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.checked = layout[key]; checkbox.addEventListener('change', () => { layout[key] = checkbox.checked; updateSketch(); }); label.append(checkbox, el('span', title)); body.append(label); }
+      for (const [key, title] of [['showActions', 'Show custom key pad']]) { const label = el('label', undefined, 'customize-check'); const checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.checked = layout[key]; checkbox.addEventListener('change', () => { layout[key] = checkbox.checked; updateSketch(); }); label.append(checkbox, el('span', title)); body.append(label); }
       const sizeLabel = el('label', 'Custom key size', 'customize-field'); const size = el('select'); [['standard', 'Standard · 44 px'], ['large', 'Large · 52 px']].forEach(([value, title]) => { const option = el('option', title); option.value = value; size.append(option); }); size.value = layout.size; size.addEventListener('change', () => { layout.size = size.value; }); sizeLabel.append(size); body.append(sizeLabel);
       const save = el('button', 'Save layout · view changes', 'wide-button'); save.addEventListener('click', () => { state.layouts = structuredClone(draftLayouts); persist(); api.close(); api.switchOrientation(editingOrientation); apply(); api.feedback('Your layout saved · stable until you change it'); });
       const reset = el('button', 'Reset this orientation to defaults', 'cancel-customize'); reset.addEventListener('click', () => { draftLayouts[editingOrientation] = defaultCustomization().layouts[editingOrientation]; show('layout'); message('Default layout selected. Press Save layout to apply.'); });
