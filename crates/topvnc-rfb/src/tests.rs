@@ -1,8 +1,8 @@
 use super::*;
 use flate2::{Compress, Compression, FlushCompress};
 use protocol::{
-    CONTINUOUS_UPDATES_MESSAGE, FENCE_MESSAGE, FENCE_REQUEST, MAX_FENCE_PAYLOAD,
-    MAX_SERVER_CUT_TEXT_BYTES,
+    CAPTURE_STATUS_ENCODING, CONTINUOUS_UPDATES_MESSAGE, FENCE_MESSAGE, FENCE_REQUEST,
+    MAX_FENCE_PAYLOAD, MAX_SERVER_CUT_TEXT_BYTES,
 };
 
 fn rect_header(x: u16, y: u16, width: u16, height: u16, encoding: i32) -> Vec<u8> {
@@ -98,6 +98,7 @@ fn mixed_stream() -> Vec<u8> {
         tight_palette,
         zlib_rect(&mut compressor, 0, 0, 8, 8),
         rect_header(1, 2, 0, 0, SERVE_DISPLAY_ENCODING),
+        rect_header(1, 0, 0, 0, CAPTURE_STATUS_ENCODING),
         rect_header(0, 0, 0, 0, EXTENDED_MOUSE_BUTTONS_ENCODING),
     ]));
     stream.extend_from_slice(&update(&[]));
@@ -160,6 +161,7 @@ fn messages_are_independent_of_chunk_boundaries() {
             "rect 0 12 3x1 7",
             "rect 0 0 8x8 6",
             "ServeDisplay(ServedDisplays { served: 1, count: 2 })",
+            "CaptureStatus(NoDisplay)",
             "ExtendedMouseButtons",
             "UpdateEnd",
             "UpdateStart",
@@ -250,6 +252,14 @@ fn malformed_headers_are_rejected_before_their_bodies_arrive() {
         (
             update(&[rect_header(3, 2, 0, 0, SERVE_DISPLAY_ENCODING)]),
             "invalid display capability",
+        ),
+        (
+            update(&[rect_header(1, 0, 0, 1, CAPTURE_STATUS_ENCODING)]),
+            "invalid capture status",
+        ),
+        (
+            update(&[rect_header(1, 1, 0, 0, CAPTURE_STATUS_ENCODING)]),
+            "invalid capture status",
         ),
         (
             update(&[rect_header(0, 0, 1, 1, tight::TIGHT_ENCODING), vec![0xa0]]),
