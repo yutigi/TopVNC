@@ -40,6 +40,14 @@ Keep the working web viewer and transport code unchanged.
   portrait and landscape. Layout changes require an explicit Save or reset.
 - Saved customization is validated before use, stays local to the browser, and
   preserves reachable Customize and mode controls even when groups are hidden.
+- Language pins appear only in Type, never Quick Keys, Pointer, or FPS Play.
+- An FPS preset provides WASD, sprint/crouch, fire/aim, jump, reload, use, and
+  weapon controls over a clearly simulated training view. It supports independent
+  simultaneous touch holds and a drag-to-look zone in both orientations.
+- FPS bindings, aiming hand, and simulated look sensitivity are configurable.
+  The preset preserves standard layouts, language preferences, and custom keys.
+- Mode/orientation changes, focus loss, pointer cancellation, and hidden-page
+  events release simulated held input. No real FPS/game support is claimed.
 
 ## Validation
 

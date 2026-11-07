@@ -25,6 +25,15 @@ viewport** on a phone to try the layout at its actual viewport size.
 - **Keys:** tap modifiers for the next key, configure four pinned shortcuts, or
   open the Fn grid. Mode/rotation/focus changes release modifiers.
 - **Pointer:** drag in the demo trackpad to move the sample cursor.
+- **FPS preset:** select FPS preset in the sidebar or Customize → Presets → Use
+  FPS preset. The Play dock button opens thumb controls over a simulated training
+  scene: WASD, sprint, crouch, fire, aim, jump, reload, use and weapon. Hold multiple
+  buttons with separate fingers and drag the look zone to move the demo crosshair.
+  The same controls work in portrait, with a larger view in landscape.
+- **FPS configuration:** remap each game button, mirror the aiming hand, and set
+  simulated look sensitivity in Presets. Standard layouts and custom keys stay
+  saved. Switch to Type for chat; the Play button returns to the FPS overlay.
+- **Language pins:** appear only in Type, never in Quick Keys or FPS Play.
 - **Customize → Your keys:** create up to eight labeled single-key shortcuts,
   modifier chords, or text snippets. Edit, remove, move up/down, and choose a
   two-column button. Changes save in this browser and appear in the custom pad.
