@@ -170,9 +170,158 @@ Checks for the copy-button revision:
   The copy action changes only the native panel and its invite state.
 - `git diff --check`: passed.
 
-The revised build was opened for the owner's copy/phone check. Copy/paste,
-real desktop display/input, Safari camera pairing, background/resume,
+The revised build was opened for the owner's copy/phone check. The owner
+confirmed that the copy action worked on 2026-11-07. This confirmation alone
+does not establish a complete Safari session. Real desktop display/input,
+Safari camera pairing, background/resume,
 reconnect, public-URL shutdown/restart, and live gateway-failure supervision
 are still pending in this continuation. Startup readiness alone is not
 evidence that the desktop was displayed or controlled. The older synthetic
 Chromium run remains separate evidence and predates both review revisions.
+
+## Limitations popup (2026-11-07)
+
+The owner confirmed testing the implemented popup in the next continuation.
+The local build passed formatting, 351 Rust tests (7 existing ignored),
+Clippy with warnings denied, and `cargo build --workspace --locked`.
+Earlier agent UI checks observed Start and Enter opening the modal, blocked
+underlying controls, and Escape/default Enter cancelling without closing
+TopVNC or starting children. The owner stopped Computer Use with Escape
+before the final live startup/cleanup check; that check was not completed.
+The popup confirmation is not evidence of email-gated WebSockets or iPhone
+background/resume behavior.
+
+## Repeatable live checks and native failure cleanup (2026-11-07)
+
+Added `scripts/check-quick-tunnel.mjs`, with a bounded loopback-only synthetic
+RFB fixture, mandatory disposable VNC authentication, isolated cloudflared
+configuration/environment, bind-before-publish, and connector-first shutdown.
+Browser login uses a private disposable Chromium session. Reports contain
+only selected outcomes and timings, not addresses, PINs, cookies, pairing
+storage, passwords, raw logs, or saved screenshots. Capture verification
+uses synthetic viewer images only in memory.
+
+The completed pairing-only run at 09:39:59-09:41:56 UTC passed:
+
+- Real Quick Tunnel HTTP 101, mandatory pairing/password, matching host
+  fingerprint, and changing rendered synthetic frames.
+- Key and pointer input reached only the synthetic server. A browser blur
+  released the held key/button at that server.
+- Chromium page freezes of 2 and 65 seconds each disconnected. Both resumed
+  with an enrolled reconnect and new frames, without another invite.
+- A second run created a different URL and host identity. The prior pairing
+  was rejected; fresh pairing, frames, input release, and reconnect passed.
+- Connector-first stop disconnected the browser and made the old public URL
+  unavailable. All owned child processes exited and scratch profiles were
+  removed. This is direct harness evidence, not real-desktop WEB-tab evidence.
+
+Separately, the actual native Windows WEB tab passed the popup Continue/start
+flow with eight individually entered disposable password characters. The
+gateway bound before connector registration; all rows became Ready. Its
+public page returned 200. Only the gateway identified as a child of this
+test-owned native client was terminated. The connector exited, the desktop
+listener on 5900 closed, and the old public URL became unavailable. The panel
+showed Gateway Failed with Server/Tunnel Stopped and restored Start/Pair
+controls. No pairing invite was issued or captured in this native run.
+Failure supervision while a native viewer is active still needs a live check.
+
+The owner subsequently reported "test success" after entering the email PIN.
+The email-gated harness run at 09:44:31-09:45:45 UTC independently recorded:
+
+- Before login, page, app asset, and `/ws` requests all returned 302.
+- After owner sign-in, the authenticated upgrade returned 101 and the
+  encrypted synthetic session, safe input release, and enrolled reconnect
+  passed. Fresh clients still received 302 for page, asset, and `/ws`.
+- The earliest recorded browser-cookie expiry was about five seconds away.
+  The existing encrypted session stayed connected after that time. Replaying
+  captured cookies redirected page/asset requests but the WebSocket rejection
+  assertion failed. That first report did not save the failing response status.
+- Cleanup completed with no owned children remaining. Cookie-removal and
+  normal shutdown assertions were not reached before this failure.
+
+This is partial success, not an email-support claim. The harness is being
+tightened to inspect the specific cloudflared auth cookie and its expiry
+claim, use independent probes with random handshake keys, and retain only
+status-code diagnostics even on failure. Cloudflare's
+[session implementation](https://github.com/cloudflare/cloudflared/blob/2026.10.3/quicktunnelauth/session.go)
+caps sessions at the earlier of identity expiry and four hours. A
+[public upstream issue](https://github.com/cloudflare/cloudflared/issues/1752)
+reports roughly five-second protected sessions; it corroborates the short
+lifetime symptom but does not establish this run's cause or explain the
+WebSocket replay result. Product email configuration remains deferred.
+
+Current local gates: formatting, Rust workspace (351 passed, 7 existing
+ignored), Clippy with warnings denied, native build, rebuilt web assets,
+25 JavaScript and 8 WASM tests passed. The new live-harness regression tests
+cover launch isolation, refusal to classify service failures as login gates,
+auth-cookie selection/redaction, the DES challenge vector, and bad-password
+rejection. Physical iPhone results still require device/version and concrete
+observations; neither Chromium freezes nor the owner's general confirmation
+establishes them.
+
+### Email retry with explicit auth-cookie inspection
+
+The owner completed the fresh private-browser login in the
+10:01:57-10:05:00 UTC run and observed the window closing automatically.
+Cleanup closed that window after an assertion failed; it was not an
+all-checks-passed signal. All owned processes exited.
+
+This retry inspected exactly one
+`__Host-cloudflared-qt-auth-session` cookie. Its browser expiry and parsed
+signed expiry claim agreed (within the browser's fractional timestamp), with
+four seconds remaining immediately after app load and two at the authenticated
+upgrade. This confirms that the short lifetime belongs to the actual auth
+cookie, rather than a different login-state cookie. The parser inspects the
+expiry claim; it does not independently verify cloudflared's HMAC signature.
+
+Before login, page/asset/WebSocket probes returned 302. Authenticated upgrade
+returned 101; encrypted synthetic frames, input release, and enrolled
+reconnect passed again. The subsequent fresh-client WebSocket rejection check
+failed before natural-expiry and cookie-removal stages. Its exact response
+status was not retained, so this record does not establish an authentication
+bypass or an expired-cookie rejection result.
+
+The harness now preserves allowlisted status diagnostics before validating
+every gate probe and collects later negative checks even if one fails. A
+failed negative check still makes the overall run fail; this is not a retry
+without email protection. Six harness regressions pass, including failed
+assessment diagnostics without leaking response bodies or redirect secrets.
+The corrected diagnostic run completed below.
+
+### Completed email-gate diagnostic run
+
+The owner completed sign-in for the 10:08:27-10:12:29 UTC run. All
+implemented checks passed with cloudflared 2026.10.3 and a disposable private
+Chromium browser:
+
+- Before login, `/`, `/app.js`, and `/ws` each returned 302 with a login
+  location. After login, the authenticated upgrade returned 101, the paired
+  and password-authenticated synthetic viewer rendered changing frames, key
+  and pointer input released on blur, and enrolled reconnect passed.
+- A fresh client after login still received 302 for all three paths.
+- The actual auth cookie had four seconds remaining just after app load and
+  two at the authenticated upgrade. The parsed expiry claim agreed with its
+  browser expiry. After that deadline, replaying the original cookies gave
+  302 with a login location for page, asset, and WebSocket alike.
+- The existing encrypted session remained connected after cookie expiry.
+  This does not establish revocation of an already-open connection; TopVNC's
+  per-connection cap remains separate from email admission.
+- Clearing the disposable browser's cookies blocked an actual browser
+  WebSocket attempt. Fresh HTTP/asset/upgrade probes again returned 302.
+  This cookie-removal result is separate from the timed expiry replay above.
+- Normal shutdown made the old public app URL unavailable. The browser,
+  connector, gateway, and fixture were closed; zero owned children remained,
+  scratch cleanup succeeded, and the harness exited successfully.
+
+The report is `target/quick-tunnel-checks/1794046107039/report.json` (ignored,
+local evidence). It contains status codes and selected expiry metadata only,
+not email, PIN, tokens, invite, password, or browser keys. Earlier failed
+assertions remain part of the record; their missing status codes prevent a
+root-cause conclusion, and they were not reproduced in this completed run.
+
+This establishes the tested Windows Chromium email-gated path and rejection
+behavior, not reliable login duration or physical iPhone behavior. The short
+observed auth lifetime makes reload and new connections require email sign-in
+again very quickly. The WEB tab's optional email field remains deferred for
+that usability limit; the harness continues to require the email flag without
+an ungated fallback. No product authentication behavior was changed.

@@ -1224,6 +1224,7 @@ fn show_landing(
         let mut web_clicked = false;
         let mut pair_clicked = false;
         let mut copy_url_clicked = false;
+        let mut quick_confirmed = false;
         let mut helper_action = None;
         // Woken by input; the timeout picks up server status and the
         // connection result.
@@ -1242,6 +1243,17 @@ fn show_landing(
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == ElementState::Pressed =>
                 {
+                    if state.quick_notice.is_some() {
+                        if !event.repeat
+                            && let PhysicalKey::Code(code) = event.physical_key
+                            && let Some(pair) = state.quick_notice_key(code)
+                        {
+                            quick_confirmed = true;
+                            web_clicked = !pair;
+                            pair_clicked = pair;
+                        }
+                        continue;
+                    }
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::Escape) => return Ok(None),
                         _ if connecting => {}
@@ -1295,6 +1307,17 @@ fn show_landing(
                     let Some((x, y)) = cursor else {
                         continue;
                     };
+                    if state.quick_notice.is_some() {
+                        let accept = ui::QUICK_NOTICE_CONTINUE.contains(x, y);
+                        if (accept || ui::QUICK_NOTICE_CANCEL.contains(x, y))
+                            && let Some(pair) = state.close_quick_notice(accept)
+                        {
+                            quick_confirmed = true;
+                            web_clicked = !pair;
+                            pair_clicked = pair;
+                        }
+                        continue;
+                    }
                     if let Some((_, tab, _)) = ui::MENU_TABS
                         .iter()
                         .find(|(area, _, _)| state.menu_open && area.contains(x, y))
@@ -1451,6 +1474,11 @@ fn show_landing(
                         pair_clicked |= ui::WEB_PAIR.contains(x, y);
                         copy_url_clicked |=
                             ui::web_copy_url_shown(&state, web) && ui::WEB_COPY_URL.contains(x, y);
+                        if state.web_route == web_access::config::RouteKind::QuickTunnel
+                            && ui::WEB_LIMITATIONS.contains(x, y)
+                        {
+                            state.open_quick_notice(ui::QuickTunnelNotice::Details);
+                        }
                     } else if state.tab == Tab::Connect
                         && !ui::TAB_MORE.contains(x, y)
                         && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
@@ -1567,6 +1595,13 @@ fn show_landing(
         if web_clicked || pair_clicked {
             state.notice = None;
             let start = web.is_idle() && (web_clicked || (pair_clicked && !web.pairing_active()));
+            if start
+                && state.web_route == web_access::config::RouteKind::QuickTunnel
+                && !quick_confirmed
+            {
+                state.open_quick_notice(ui::QuickTunnelNotice::Start { pair: pair_clicked });
+                continue;
+            }
             let started = if start {
                 state.web_row = None;
                 start_web(web, state.web_route, &config, server)
