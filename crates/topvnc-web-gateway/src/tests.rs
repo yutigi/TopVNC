@@ -10,6 +10,8 @@ use topvnc_access::fixtures;
 use topvnc_e2e::Initiator;
 use topvnc_rfb::{ClientHandshake, Encoding, HandshakeStatus, MessageReader, ServerMessage};
 
+mod quick;
+
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
 #[tokio::test]

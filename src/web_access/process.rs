@@ -165,6 +165,27 @@ impl Drop for ProcessChild {
 /// job on Windows.
 pub struct ProcessSpawner;
 
+/// Remove cloudflared routing options only for the application-owned Quick
+/// Tunnel. Keep unrelated environment (for example HTTPS_PROXY) intact.
+fn isolate_quick_tunnel(
+    command: &mut Command,
+    program: Program,
+    args: &[OsString],
+    inherited_names: impl Iterator<Item = OsString>,
+) {
+    if program == Program::Tunnel && args.iter().any(|arg| arg == "--url") {
+        for name in inherited_names {
+            if name
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("TUNNEL_")
+            {
+                command.env_remove(name);
+            }
+        }
+    }
+}
+
 impl Spawner for ProcessSpawner {
     fn spawn(
         &mut self,
@@ -178,6 +199,12 @@ impl Spawner for ProcessSpawner {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        isolate_quick_tunnel(
+            &mut command,
+            program,
+            args,
+            std::env::vars_os().map(|(name, _)| name),
+        );
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -241,6 +268,40 @@ impl Spawner for ProcessSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quick_tunnel_cannot_inherit_named_routes_but_keeps_network_environment() {
+        for quick in [false, true] {
+            let mut command = Command::new("cloudflared");
+            command.env("HTTPS_PROXY", "http://127.0.0.1:3128");
+            let args = if quick {
+                vec!["--url".into(), "http://127.0.0.1:6080".into()]
+            } else {
+                vec!["run".into()]
+            };
+            isolate_quick_tunnel(
+                &mut command,
+                Program::Tunnel,
+                &args,
+                ["TUNNEL_NAME", "TUNNEL_URL", "HTTPS_PROXY"]
+                    .into_iter()
+                    .map(OsString::from),
+            );
+            let env: Vec<_> = command.get_envs().collect();
+            assert!(env.contains(&(
+                std::ffi::OsStr::new("HTTPS_PROXY"),
+                Some(std::ffi::OsStr::new("http://127.0.0.1:3128"))
+            )));
+            assert_eq!(
+                env.contains(&(std::ffi::OsStr::new("TUNNEL_NAME"), None)),
+                quick
+            );
+            assert_eq!(
+                env.contains(&(std::ffi::OsStr::new("TUNNEL_URL"), None)),
+                quick
+            );
+        }
+    }
 
     #[test]
     fn output_is_bounded_and_sanitized() {

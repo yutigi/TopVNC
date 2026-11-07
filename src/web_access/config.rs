@@ -6,7 +6,8 @@
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::fmt;
-use std::net::SocketAddr;
+use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
 /// The config directory, relative to the repository root.
@@ -16,6 +17,99 @@ const LOCAL_CONFIG: &str = "gateway.local.toml";
 const TOKEN_FILE: &str = "tunnel-token.txt";
 /// Larger files are not a gateway configuration.
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
+/// The built web app, relative to the repository root.
+const WEB_DIST: &str = "web/dist";
+/// The files the Quick Tunnel gateway serves (its `assets::PAGE_FILES`).
+const PAGE_FILES: [&str; 5] = [
+    "index.html",
+    "app.js",
+    "session-worker.js",
+    "style.css",
+    "topvnc_web_bg.wasm",
+];
+/// The Quick Tunnel route's fixed loopback addresses, the same as the
+/// example gateway configuration's.
+pub const QUICK_LISTEN: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6080));
+pub const QUICK_RFB_TARGET: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5900));
+
+/// An application-owned cloudflared configuration, retained until its child
+/// has stopped. Explicit ingress prevents user configuration or CLI origin
+/// defaults from publishing anything except our already-bound gateway.
+pub struct QuickTunnelFile {
+    path: PathBuf,
+}
+
+impl QuickTunnelFile {
+    pub fn new(listen: SocketAddr) -> Result<Self, String> {
+        if !listen.ip().is_loopback() || listen.port() == 0 {
+            return Err("Quick Tunnel needs a bound loopback gateway".into());
+        }
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|e| e.to_string())?;
+        let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("topvnc-quick-{name}"));
+        std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+        let config = Self {
+            path: dir.join("config.yml"),
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&config.path)
+            .map_err(|e| e.to_string())?;
+        writeln!(file, "ingress:\n  - service: http://{listen}")
+            .and_then(|()| file.flush())
+            .map_err(|e| e.to_string())?;
+        Ok(config)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for QuickTunnelFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
+/// Which public route browser access uses. Access is the default; the
+/// Quick Tunnel is an explicit, temporary choice (specs/019-quick-tunnel-mode).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RouteKind {
+    /// The owner's Worker and Cloudflare Access, through a named tunnel.
+    #[default]
+    Access,
+    /// A temporary `trycloudflare.com` URL with no Cloudflare sign-in;
+    /// pairing and the VNC password are the only locks.
+    QuickTunnel,
+}
+
+/// The route-specific part of a launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Route {
+    Access {
+        app_origin: String,
+        gateway_config: PathBuf,
+        token_file: PathBuf,
+    },
+    /// The origin is learned from cloudflared once it runs.
+    QuickTunnel { web_root: PathBuf },
+}
+
+impl Route {
+    pub fn kind(&self) -> RouteKind {
+        match self {
+            Self::Access { .. } => RouteKind::Access,
+            Self::QuickTunnel { .. } => RouteKind::QuickTunnel,
+        }
+    }
+}
 
 /// A reason the WEB tab cannot start, with the runbook/Setup step that
 /// fixes it (`docs/cloudflare-gateway.md`, "One-time setup").
@@ -138,10 +232,12 @@ pub fn parse_gateway(text: &str, base: &Path) -> Result<GatewaySettings, Problem
 /// Everything needed to start browser access, after every local check passed.
 #[derive(Clone, Debug)]
 pub struct Launch {
-    pub settings: GatewaySettings,
-    pub gateway_config: PathBuf,
+    /// Where the gateway listens, and the tunnel forwards to.
+    pub listen: SocketAddr,
+    /// The desktop server the gateway connects to.
+    pub rfb_target: SocketAddr,
+    pub route: Route,
     pub gateway_program: PathBuf,
-    pub token_file: PathBuf,
     pub cloudflared: PathBuf,
 }
 
@@ -175,14 +271,65 @@ fn find_cloudflared(variable: Option<OsString>, path: Option<OsString>) -> Optio
         .find(|candidate| candidate.is_file())
 }
 
-/// Check the files and programs browser access needs, in setup order.
-pub fn prepare() -> Result<Launch, Problem> {
+/// Check the files and programs the chosen route needs, in setup order.
+pub fn prepare(kind: RouteKind) -> Result<Launch, Problem> {
     let root = find_root().ok_or_else(|| {
         Problem::new(
             format!("TopVNC could not find the repository's {CLOUDFLARE_DIR} folder next to it"),
             None,
         )
     })?;
+    let (listen, rfb_target, route) = match kind {
+        RouteKind::Access => access_route(&root)?,
+        RouteKind::QuickTunnel => (QUICK_LISTEN, QUICK_RFB_TARGET, quick_route(&root)?),
+    };
+    let gateway_program = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join(executable("topvnc-web-gateway"))))
+        .filter(|program| program.is_file())
+        .ok_or_else(|| {
+            Problem::new(
+                "topvnc-web-gateway is not built next to TopVNC: run cargo build --release -p topvnc-web-gateway (or without --release for a debug TopVNC)",
+                None,
+            )
+        })?;
+    let cloudflared = find_cloudflared(std::env::var_os("CLOUDFLARED"), std::env::var_os("PATH"))
+        .ok_or_else(|| {
+        Problem::new(
+            "cloudflared was not found: install it, or set CLOUDFLARED to its full path",
+            Some(1),
+        )
+    })?;
+    Ok(Launch {
+        listen,
+        rfb_target,
+        route,
+        gateway_program,
+        cloudflared,
+    })
+}
+
+/// The Quick Tunnel needs no Cloudflare files, only the built web app,
+/// which the gateway serves itself.
+fn quick_route(root: &Path) -> Result<Route, Problem> {
+    let web_root = root.join(WEB_DIST);
+    if let Some(missing) = PAGE_FILES
+        .iter()
+        .find(|name| !web_root.join(name).is_file())
+    {
+        return Err(Problem::new(
+            format!(
+                "{WEB_DIST}/{missing} is missing: build the web app with npm run build in web/ (docs/cloudflare-gateway.md, Quick Tunnel)"
+            ),
+            None,
+        ));
+    }
+    Ok(Route::QuickTunnel { web_root })
+}
+
+/// `gateway.local.toml`, the token file, and the host key of the Access
+/// route.
+fn access_route(root: &Path) -> Result<(SocketAddr, SocketAddr, Route), Problem> {
     let dir = root.join(CLOUDFLARE_DIR);
     let gateway_config = dir.join(LOCAL_CONFIG);
     let text = match std::fs::metadata(&gateway_config) {
@@ -217,30 +364,15 @@ pub fn prepare() -> Result<Launch, Problem> {
             Some(7),
         ));
     }
-    let gateway_program = std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.join(executable("topvnc-web-gateway"))))
-        .filter(|program| program.is_file())
-        .ok_or_else(|| {
-            Problem::new(
-                "topvnc-web-gateway is not built next to TopVNC: run cargo build --release -p topvnc-web-gateway (or without --release for a debug TopVNC)",
-                None,
-            )
-        })?;
-    let cloudflared = find_cloudflared(std::env::var_os("CLOUDFLARED"), std::env::var_os("PATH"))
-        .ok_or_else(|| {
-        Problem::new(
-            "cloudflared was not found: install it, or set CLOUDFLARED to its full path",
-            Some(1),
-        )
-    })?;
-    Ok(Launch {
-        settings,
-        gateway_config,
-        gateway_program,
-        token_file,
-        cloudflared,
-    })
+    Ok((
+        settings.listen,
+        settings.rfb_target,
+        Route::Access {
+            app_origin: settings.app_origin,
+            gateway_config,
+            token_file,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -326,6 +458,57 @@ browser_keys_file = "browsers.txt"
             parse_gateway(&missing, Path::new(".")).unwrap_err().step,
             Some(3)
         );
+    }
+
+    #[test]
+    fn the_quick_tunnel_needs_only_the_built_page() {
+        let root = std::env::temp_dir().join(format!("topvnc-quick-root-{}", std::process::id()));
+        let dist = root.join(WEB_DIST);
+        std::fs::create_dir_all(&dist).unwrap();
+        for name in PAGE_FILES {
+            std::fs::write(dist.join(name), b"x").unwrap();
+        }
+        // No gateway.local.toml, token, or host key is needed.
+        assert_eq!(
+            quick_route(&root),
+            Ok(Route::QuickTunnel {
+                web_root: dist.clone()
+            })
+        );
+        assert_eq!(quick_route(&root).unwrap().kind(), RouteKind::QuickTunnel);
+        std::fs::remove_file(dist.join("app.js")).unwrap();
+        let problem = quick_route(&root).unwrap_err();
+        assert!(
+            problem.message.contains("web/dist/app.js")
+                && problem.message.contains("npm run build"),
+            "{problem}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quick_tunnel_addresses_match_the_example_configuration() {
+        let example = include_str!("../../gateway/cloudflare/gateway.example.toml");
+        assert!(example.contains(&format!("listen = \"{QUICK_LISTEN}\"")));
+        assert!(example.contains(&format!("rfb_target = \"{QUICK_RFB_TARGET}\"")));
+        assert_eq!(RouteKind::default(), RouteKind::Access);
+    }
+
+    #[test]
+    fn quick_tunnel_config_pins_only_the_bound_gateway_and_cleans_up() {
+        let config = QuickTunnelFile::new(QUICK_LISTEN).unwrap();
+        let path = config.path().to_owned();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ingress:\n  - service: http://127.0.0.1:6080\n"
+        );
+        let other = QuickTunnelFile::new(QUICK_LISTEN).unwrap();
+        assert_ne!(path, other.path());
+        drop(config);
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+        assert!(QuickTunnelFile::new("127.0.0.1:0".parse().unwrap()).is_err());
+        assert!(QuickTunnelFile::new("0.0.0.0:6080".parse().unwrap()).is_err());
     }
 
     #[test]

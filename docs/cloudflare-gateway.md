@@ -26,6 +26,9 @@ lists what still needs a live run by the owner.
 - [One-time setup](#one-time-setup) (about 30 minutes)
 - [Pair your phone](#pair-your-phone) (once per browser)
 - [Each session](#each-session)
+- [Quick Tunnel (temporary, no account)](#quick-tunnel-temporary-no-account):
+  a temporary URL with no setup, protected only by pairing and the VNC
+  password; phone and long-session checks pending
 - [Troubleshooting](#troubleshooting)
 - [Runbook verification](#runbook-verification)
 
@@ -348,6 +351,10 @@ cargo build --release -p topvnc-web-gateway
 cargo run --release
 ```
 
+The tab's **ACCESS** and **QUICK TUNNEL** buttons choose the route for the next
+start. This section describes **ACCESS**, the default; see
+[Quick Tunnel](#quick-tunnel-temporary-no-account) for the other.
+
 On the **WEB** tab, type the VNC password and press **Start browser access**.
 The Server, Tunnel, and Gateway rows turn **Ready** in that order, on the same
 ready signals as the console table below. TopVNC serves this desktop as plain
@@ -413,6 +420,90 @@ program printed the ready line with a scratch config.
 On the phone, open the app URL, sign in if asked, press **Connect**, and
 enter the VNC password. Disconnect from the ☰ menu. When you are done, press
 Ctrl+C in all three windows.
+
+## Quick Tunnel (temporary, no account)
+
+**Partially validated live (2026-11-06).** Windows Chromium paired, signed in
+with a VNC password, and displayed a moving synthetic test pattern through a
+real `trycloudflare.com` URL for ten minutes. Reconnect, restart with a new
+URL/key, rejection of the old pairing, and fresh pairing also passed.
+This does not validate iPhone Safari, macOS, or the real desktop flow from
+the WEB tab. See the recorded checks and remaining limits in [Quick Tunnel validation](../specs/019-quick-tunnel-mode/validation.md).
+
+For a temporary session, the **WEB** tab can use a Cloudflare
+[Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+instead of the route above. It needs no Cloudflare account, Worker, Access
+application, tunnel token, VPC service, `gateway.local.toml`, or host key file.
+It needs only:
+
+- `cloudflared` on `PATH`, or `CLOUDFLARED` set to its full path;
+- the gateway built next to TopVNC: `cargo build --release -p topvnc-web-gateway`;
+- the web app built: `npm run build` in `web/`. This needs the WebAssembly
+  target and the pinned `wasm-bindgen-cli` from
+  [step 1](#1-install-the-pinned-build-tools), but nothing from Cloudflare.
+
+Use it:
+
+1. On the **WEB** tab, choose **QUICK TUNNEL** and read the warning.
+2. Type a VNC password and press **Start browser access**. TopVNC serves this
+   desktop on `127.0.0.1:5900` as on the Access route, then starts the gateway
+   and waits until it owns `127.0.0.1:6080`. Only then does it run
+   `cloudflared tunnel --no-autoupdate --config <per-run-config> --url http://127.0.0.1:6080`.
+   This private configuration pins ingress to the bound gateway; existing
+   cloudflared configuration and inherited `TUNNEL_*` options are not used.
+   After cloudflared prints its `https://<random>.trycloudflare.com` URL and
+   registers a connection, TopVNC sends the exact origin to the gateway over
+   stdin. The same listener stays held throughout startup. The
+   gateway serves the web app itself, with the same Content-Security-Policy
+   as the Worker, next to `/ws`. The panel shows the temporary app URL.
+3. Press **Pair a browser** and scan the QR code with the phone camera. It
+   opens the temporary URL with the invite. Check that the phone shows the
+   same key as the TopVNC window, press **Connect**, and enter the VNC password.
+4. **Stop browser access**, or closing TopVNC, ends the server, the tunnel,
+   and the URL.
+
+An occupied gateway port prevents cloudflared from starting. Gateway or
+tunnel failure automatically ends this run. Stop and shutdown end public
+forwarding before releasing the gateway listener. The generated configuration
+contains no credentials and is removed after the connector stops. Returning
+from a native viewer session preserves the running route in the WEB tab.
+
+How it differs from the Access route:
+
+| | Access route | Quick Tunnel |
+| --- | --- | --- |
+| Setup | About 30 minutes, with a Cloudflare account | Build only; no account |
+| Address | Fixed `workers.dev` URL | A new random `trycloudflare.com` URL on every start |
+| Who can open the page | Only the owner, after the Access sign-in | Anyone with the URL |
+| What protects the desktop | Access, pairing, and the VNC password | Pairing and the VNC password only |
+| Pairing | Once per browser | After every start: new URL, new host key |
+| Enrolled browsers | Saved in `browsers.txt` | Kept in the gateway's memory for this run only |
+| Page served by | The Worker | The gateway on the host, through the tunnel |
+| Session limit | `max_session_seconds` and the Access sign-in expiry | 7200 s |
+| Service | Cloudflare's free plans | Cloudflare's testing service, with no uptime guarantee |
+
+Limitations:
+
+- **A new URL every start.** The phone cannot find it again unless it can see
+  the host's screen. Browser storage is per address, so every start also
+  loses the phone's pairing.
+- **Anyone with the URL can load the page and try to connect.** Only a browser
+  paired in this run, which then also passes the VNC password, gets in.
+  Strangers can, however, hold the gateway's eight pending-handshake slots for
+  ten seconds each and delay your own connection.
+- **For testing, per Cloudflare.** Quick Tunnels have no uptime guarantee, at
+  most 200 requests in flight, and no Server-Sent Events. Cloudflare can
+  throttle or end them at any time. Their docs do not cover WebSocket
+  support, header forwarding, rate limits on creating tunnels, or traffic
+  terms. A long, high-bitrate session is the main risk.
+- **Often blocked.** The `trycloudflare.com` domain is widely abused, so some
+  networks and security tools block it or flag cloudflared.
+- **`--allowed-mail` is not used.** Cloudflare's optional email one-time PIN
+  for Quick Tunnels is not known to cover WebSocket upgrades, so TopVNC does
+  not rely on it.
+- **Same trust limit.** TLS still ends at Cloudflare. The page now comes from
+  the host through the tunnel, so no Worker can replace it, but Cloudflare's
+  edge still could. See [Security model](#security-model).
 
 ## Troubleshooting
 
@@ -612,6 +703,16 @@ is dropped, never replayed.
   sleeping phone does, is disconnected.
 - **Logging.** The gateway logs close reasons, byte counts, and key
   fingerprints. It never logs JWTs, passwords, pixels, input, or clipboard data.
+- **Quick Tunnel mode** ([details](#quick-tunnel-temporary-no-account)) has no
+  Access. It is explicit and opt-in, and is never a fallback. The gateway
+  then requires no JWT. It accepts upgrades only from the exact
+  `https://<label>.trycloudflare.com` origin cloudflared printed, which it
+  receives at start from the WEB tab, never from a browser. A `workers.dev`
+  origin is refused in this mode, and a `trycloudflare.com` origin on the
+  Access route. Its host key is new for each run and held only in memory.
+  Only browsers enrolled in that run are accepted, and the VNC password is
+  still required. End-to-end encryption, fixed destinations, and the bounds
+  above are unchanged.
 
 ## Local test harness
 
@@ -634,6 +735,7 @@ must stay on loopback.
 | Live route, desktop control of a Windows host | iPhone Safari | Owner-reported (2026-10-31): display, pointer, tap clicks, two-finger scroll, pinch zoom, on-screen typing, toolbar keys, disconnect and reconnect. Background return not confirmed; iOS version not recorded. Host ran plain `--serve`, before native TLS became the default; the page deployed then predates the 2026-10-31 restyle |
 | Worker CPU within the Free plan's 10 ms | Workers analytics | **Not passed; open risk.** Warm upgrades about 1.6-4 ms; 7 of 88 upgrades, the cold ones, used 13.0-18.7 ms. None was terminated. See [Free-plan Worker CPU](#free-plan-worker-cpu) |
 | WEB tab start, stop, and pairing | Windows 11 | Locally tested with simulated programs and the real gateway binary (2026-11-04); live route not run |
+| Quick Tunnel route | Windows 11 | Local WEB-tab simulations and real gateway tests; Windows Chromium paired and displayed a synthetic VNC test pattern over a real Quick Tunnel (2026-11-06). Captured cloudflared output is a regression fixture. Phone, real-desktop WEB-tab, macOS, and long-session checks remain pending; see [validation](../specs/019-quick-tunnel-mode/validation.md) |
 | This runbook, end to end on a fresh account | Any | Not run. Steps checked locally and by dry run on 2026-11-01; see [Runbook verification](#runbook-verification) |
 | Two-hour soak, mobile link latency | iPhone Safari | Not tested |
 | macOS or Linux host | Any | Not tested |

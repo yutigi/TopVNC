@@ -240,6 +240,37 @@ pub fn validate_origin(origin: &str) -> PolicyResult<()> {
     Ok(())
 }
 
+/// The DNS suffix of Cloudflare Quick Tunnel hostnames.
+pub const QUICK_TUNNEL_SUFFIX: &str = ".trycloudflare.com";
+
+/// A Quick Tunnel's page origin, as cloudflared prints it: exactly
+/// `https://<label>.trycloudflare.com`, one lowercase DNS label, with no
+/// port, path, query, fragment, or user information.
+pub fn validate_quick_tunnel_origin(origin: &str) -> PolicyResult<()> {
+    const REJECTED: &str =
+        "Quick Tunnel origin must be an exact HTTPS <label>.trycloudflare.com origin";
+    let url = Url::parse(origin).map_err(|_| REJECTED)?;
+    let label = url
+        .host_str()
+        .and_then(|host| host.strip_suffix(QUICK_TUNNEL_SUFFIX))
+        .ok_or(REJECTED)?;
+    let label_ok = (1..=63).contains(&label.len())
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !label.starts_with('-')
+        && !label.ends_with('-');
+    if url.scheme() != "https"
+        || !label_ok
+        || url.port().is_some()
+        || url.origin().ascii_serialization() != origin
+    {
+        return Err(REJECTED);
+    }
+    Ok(())
+}
+
+/// An upgrade for the Access route, whose page is on `workers.dev`.
 pub fn validate_upgrade(
     method: &str,
     path: &str,
@@ -250,6 +281,35 @@ pub fn validate_upgrade(
     app_origin: &str,
 ) -> PolicyResult<()> {
     validate_origin(app_origin)?;
+    upgrade_request(method, path, query, origin, protocols, upgrade, app_origin)
+}
+
+/// An upgrade for the Quick Tunnel route, whose page is on
+/// `trycloudflare.com`. A `workers.dev` origin is refused here, and a
+/// `trycloudflare.com` origin by [`validate_upgrade`].
+pub fn validate_quick_upgrade(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    origin: Option<&str>,
+    protocols: Option<&str>,
+    upgrade: Option<&str>,
+    app_origin: &str,
+) -> PolicyResult<()> {
+    validate_quick_tunnel_origin(app_origin)?;
+    upgrade_request(method, path, query, origin, protocols, upgrade, app_origin)
+}
+
+/// The route rules both upgrades share, for an already validated origin.
+fn upgrade_request(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    origin: Option<&str>,
+    protocols: Option<&str>,
+    upgrade: Option<&str>,
+    app_origin: &str,
+) -> PolicyResult<()> {
     if method != "GET" || path != "/ws" || query.is_some() {
         return Err("invalid upgrade route");
     }
@@ -377,6 +437,105 @@ mod tests {
     }
 
     const ORIGIN: &str = "https://topvnc.owner.workers.dev";
+    const QUICK: &str = "https://seasonal-deck-organisms-sf.trycloudflare.com";
+
+    #[test]
+    fn quick_tunnel_origins_are_one_exact_lowercase_label() {
+        for valid in [
+            QUICK,
+            "https://a.trycloudflare.com",
+            "https://x-1-y.trycloudflare.com",
+        ] {
+            assert_eq!(validate_quick_tunnel_origin(valid), Ok(()), "{valid}");
+        }
+        let long = format!("https://{}.trycloudflare.com", "a".repeat(64));
+        for invalid in [
+            "http://seasonal-deck-organisms-sf.trycloudflare.com",
+            "https://seasonal-deck-organisms-sf.trycloudflare.com/",
+            "https://seasonal-deck-organisms-sf.trycloudflare.com/ws",
+            "https://seasonal-deck-organisms-sf.trycloudflare.com:443",
+            "https://seasonal-deck-organisms-sf.trycloudflare.com:8443",
+            "https://seasonal-deck-organisms-sf.trycloudflare.com?x=1",
+            "https://seasonal-deck-organisms-sf.trycloudflare.com#x",
+            "https://user@seasonal-deck-organisms-sf.trycloudflare.com",
+            "https://Seasonal-Deck.trycloudflare.com",
+            "https://a.b.trycloudflare.com",
+            "https://-a.trycloudflare.com",
+            "https://a-.trycloudflare.com",
+            "https://a_b.trycloudflare.com",
+            "https://trycloudflare.com",
+            "https://.trycloudflare.com",
+            "https://a.trycloudflare.com.attacker.example",
+            "https://atrycloudflare.com",
+            "https://www.cloudflare.com/website-terms/",
+            long.as_str(),
+            ORIGIN,
+            "",
+        ] {
+            assert!(validate_quick_tunnel_origin(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn each_route_accepts_only_its_own_origin_kind() {
+        let quick = |app_origin, origin| {
+            validate_quick_upgrade(
+                "GET",
+                "/ws",
+                None,
+                Some(origin),
+                Some("binary"),
+                Some("websocket"),
+                app_origin,
+            )
+        };
+        let access = |app_origin, origin| {
+            validate_upgrade(
+                "GET",
+                "/ws",
+                None,
+                Some(origin),
+                Some("binary"),
+                Some("websocket"),
+                app_origin,
+            )
+        };
+        assert!(quick(QUICK, QUICK).is_ok());
+        assert!(access(ORIGIN, ORIGIN).is_ok());
+        // A workers.dev page is not a Quick Tunnel page, and the reverse.
+        assert!(quick(ORIGIN, ORIGIN).is_err());
+        assert!(access(QUICK, QUICK).is_err());
+        // The browser's Origin must be the configured one exactly.
+        assert!(quick(QUICK, "https://other.trycloudflare.com").is_err());
+        assert!(quick(QUICK, ORIGIN).is_err());
+        for (method, path, query, protocols, upgrade) in [
+            ("POST", "/ws", None, "binary", "websocket"),
+            ("GET", "/", None, "binary", "websocket"),
+            (
+                "GET",
+                "/ws",
+                Some("target=127.0.0.1:22"),
+                "binary",
+                "websocket",
+            ),
+            ("GET", "/ws", None, "text", "websocket"),
+            ("GET", "/ws", None, "binary", "h2c"),
+        ] {
+            assert!(
+                validate_quick_upgrade(
+                    method,
+                    path,
+                    query,
+                    Some(QUICK),
+                    Some(protocols),
+                    Some(upgrade),
+                    QUICK
+                )
+                .is_err(),
+                "{method} {path} {query:?} {protocols} {upgrade}"
+            );
+        }
+    }
 
     #[test]
     fn restricts_upstream_to_configured_private_websocket_service() {

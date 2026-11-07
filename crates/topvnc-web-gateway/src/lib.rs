@@ -5,14 +5,23 @@
 //! VNC password authentication. Cloudflare's Worker, VPC service, and Tunnel
 //! carry only ciphertext. The gateway never interprets RFB and never takes a
 //! destination from the browser.
+//!
+//! The Quick Tunnel route (specs/019-quick-tunnel-mode) has no Access and no
+//! Worker in front: [`Gateway::quick_tunnel`] admits upgrades without a JWT,
+//! from one exact `trycloudflare.com` origin, serves the page itself, and
+//! relies on pairing alone, with a host key and enrollments that live only as
+//! long as the process.
 
+pub mod assets;
+
+use assets::WebAssets;
 use axum::{
     Router,
     extract::{
         FromRequestParts, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
+    http::{Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
 };
@@ -33,7 +42,8 @@ use tokio::{
 };
 use topvnc_access::{
     AccessPolicy, Identity, KEY_REFRESH_SECONDS, KEY_TTL_SECONDS, KeySet, MAX_JWKS_BYTES,
-    READ_CHUNK_BYTES, token_key_id, validate_origin, validate_upgrade,
+    READ_CHUNK_BYTES, token_key_id, validate_origin, validate_quick_tunnel_origin,
+    validate_quick_upgrade, validate_upgrade,
 };
 use topvnc_e2e::{
     self as e2e, Channel, Key, Keypair, MAX_CIPHERTEXT_BYTES, MAX_PLAINTEXT_BYTES, Mode,
@@ -64,6 +74,45 @@ pub struct Config {
     pub browser_keys_file: PathBuf,
 }
 
+/// The session cap on the Quick Tunnel route, where no Access sign-in
+/// expiry shortens it.
+pub const QUICK_TUNNEL_SESSION_SECONDS: u64 = 7200;
+
+/// A gateway for a Quick Tunnel: no Access, no files on disk except the
+/// built page.
+pub struct QuickTunnelConfig {
+    pub listen: SocketAddr,
+    pub rfb_target: SocketAddr,
+    /// The `https://<label>.trycloudflare.com` origin cloudflared printed.
+    pub app_origin: String,
+    pub max_session_seconds: u64,
+    /// The built web app (`web/dist`), which this gateway serves.
+    pub web_root: PathBuf,
+}
+
+/// How an upgrade is admitted before the Noise handshake. Either way, only
+/// an enrolled browser key (or the one live invite) gets a session, and the
+/// TopVNC server then asks for the VNC password.
+enum Admission {
+    /// Behind Cloudflare Access, on a `workers.dev` page: the owner's Access
+    /// JWT is required and also bounds the session.
+    Access(AccessPolicy),
+    /// A Quick Tunnel page with nothing in front: no JWT, pairing only.
+    PairingOnly,
+}
+
+/// What does not change while the gateway runs.
+struct Settings {
+    rfb_target: SocketAddr,
+    app_origin: String,
+    max_session_seconds: u64,
+    admission: Admission,
+    /// Where enrollments are appended; `None` keeps them in memory only.
+    browser_keys_file: Option<PathBuf>,
+    /// The page, when this gateway serves it.
+    assets: Option<WebAssets>,
+}
+
 #[derive(Default)]
 struct KeyCache {
     set: Option<KeySet>,
@@ -85,8 +134,7 @@ struct ActiveSession {
 }
 
 pub struct Gateway {
-    config: Config,
-    policy: AccessPolicy,
+    settings: Settings,
     http: reqwest::Client,
     keys: Mutex<KeyCache>,
     handshakes: Arc<Semaphore>,
@@ -184,29 +232,77 @@ pub fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn check_addresses(
+    listen: SocketAddr,
+    rfb_target: SocketAddr,
+    max_session_seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !listen.ip().is_loopback()
+        || !rfb_target.ip().is_loopback()
+        || rfb_target.port() == 0
+        || !(1..=7200).contains(&max_session_seconds)
+    {
+        return Err(
+            "the gateway requires loopback listen and RFB target addresses, an RFB port, and a 1-7200 second session cap"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 impl Gateway {
+    /// The Access route, from `gateway.local.toml`.
     pub fn new(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         validate_origin(&config.app_origin)?;
-        if !config.listen.ip().is_loopback()
-            || !config.rfb_target.ip().is_loopback()
-            || config.rfb_target.port() == 0
-            || !(1..=7200).contains(&config.max_session_seconds)
-        {
-            return Err(
-                "the gateway requires loopback listen and RFB target addresses, an RFB port, and a 1-7200 second session cap"
-                    .into(),
-            );
-        }
+        check_addresses(config.listen, config.rfb_target, config.max_session_seconds)?;
         let policy = AccessPolicy::new(&config.issuer, &config.audience, &config.owner_email)?;
         let host = load_host_key(&config.host_key_file)?;
         let keys = load_browser_keys(&config.browser_keys_file)?;
+        let settings = Settings {
+            rfb_target: config.rfb_target,
+            app_origin: config.app_origin,
+            max_session_seconds: config.max_session_seconds,
+            admission: Admission::Access(policy),
+            browser_keys_file: Some(config.browser_keys_file),
+            assets: None,
+        };
+        Self::assemble(settings, host, keys)
+    }
+
+    /// The Quick Tunnel route: pairing only, with a new host key and an
+    /// empty enrollment list held in memory for this process alone. Every
+    /// start gives the browser a new origin, whose storage holds no earlier
+    /// pairing, so nothing from an earlier run, or from the Access route,
+    /// is accepted.
+    pub fn quick_tunnel(
+        config: QuickTunnelConfig,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        validate_quick_tunnel_origin(&config.app_origin)?;
+        check_addresses(config.listen, config.rfb_target, config.max_session_seconds)?;
+        let assets = WebAssets::load(&config.web_root)?;
+        let host = Keypair::generate()?;
+        let settings = Settings {
+            rfb_target: config.rfb_target,
+            app_origin: config.app_origin,
+            max_session_seconds: config.max_session_seconds,
+            admission: Admission::PairingOnly,
+            browser_keys_file: None,
+            assets: Some(assets),
+        };
+        Self::assemble(settings, host, Vec::new())
+    }
+
+    fn assemble(
+        settings: Settings,
+        host: Keypair,
+        keys: Vec<Key>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
             .build()?;
         Ok(Arc::new(Self {
-            config,
-            policy,
+            settings,
             http,
             keys: Mutex::new(KeyCache::default()),
             handshakes: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
@@ -230,6 +326,16 @@ impl Gateway {
 
     pub fn host_public(&self) -> Key {
         self.host.public
+    }
+
+    /// The only origin upgrades are accepted from.
+    pub fn app_origin(&self) -> &str {
+        &self.settings.app_origin
+    }
+
+    /// No Access in front: pairing and the VNC password are the only locks.
+    pub fn is_pairing_only(&self) -> bool {
+        matches!(self.settings.admission, Admission::PairingOnly)
     }
 
     pub fn enrolled_browsers(&self) -> usize {
@@ -288,8 +394,10 @@ impl Gateway {
             if enrollment.keys.len() >= MAX_BROWSER_KEYS {
                 return Err("browser enrollment list is full");
             }
-            append_browser_key(&self.config.browser_keys_file, &browser)
-                .map_err(|_| "could not save browser enrollment")?;
+            if let Some(path) = &self.settings.browser_keys_file {
+                append_browser_key(path, &browser)
+                    .map_err(|_| "could not save browser enrollment")?;
+            }
             enrollment.keys.push(browser);
         }
         eprintln!("enrolled browser key {}", e2e::fingerprint(&browser));
@@ -327,7 +435,11 @@ impl Gateway {
         })
     }
 
-    async fn authenticate(&self, token: &str) -> Result<Identity, &'static str> {
+    async fn authenticate(
+        &self,
+        policy: &AccessPolicy,
+        token: &str,
+    ) -> Result<Identity, &'static str> {
         let kid = token_key_id(token)?;
         // Serialize refreshes; at most eight handshakes may wait for this lock.
         let mut cache = self.keys.lock().await;
@@ -345,7 +457,7 @@ impl Gateway {
             cache.last_attempt = Some(Instant::now());
             let mut response = self
                 .http
-                .get(self.policy.jwks_url())
+                .get(policy.jwks_url())
                 .send()
                 .await
                 .map_err(|_| "JWKS unavailable")?;
@@ -370,12 +482,28 @@ impl Gateway {
             .set
             .as_ref()
             .ok_or("no signing keys")?
-            .verify(token, &self.policy, unix_now())
+            .verify(token, policy, unix_now())
     }
 }
 
+/// Every request is an upgrade attempt, except on a gateway that serves the
+/// page, where `/ws` is the upgrade and other paths are page files.
 pub fn routes(state: Arc<Gateway>) -> Router {
-    Router::new().fallback(any(upgrade)).with_state(state)
+    let router = match state.settings.assets {
+        Some(_) => Router::new().route("/ws", any(upgrade)).fallback(page),
+        None => Router::new().fallback(any(upgrade)),
+    };
+    router.with_state(state)
+}
+
+async fn page(State(state): State<Arc<Gateway>>, method: Method, uri: Uri) -> Response {
+    if method != Method::GET && method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    match &state.settings.assets {
+        Some(assets) => assets.response(uri.path()),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// A loopback-only, bounded synthetic target. Never connects to a desktop.
@@ -406,14 +534,19 @@ pub async fn spawn_synthetic_echo() -> std::io::Result<(SocketAddr, tokio::task:
 async fn upgrade(State(state): State<Arc<Gateway>>, request: axum::extract::Request) -> Response {
     let headers = request.headers();
     let header = |name: &str| headers.get(name).and_then(|h| h.to_str().ok());
-    if validate_upgrade(
+    // Each admission accepts only its own kind of page origin.
+    let check = match state.settings.admission {
+        Admission::Access(_) => validate_upgrade,
+        Admission::PairingOnly => validate_quick_upgrade,
+    };
+    if check(
         request.method().as_str(),
         request.uri().path(),
         request.uri().query(),
         header("origin"),
         header("sec-websocket-protocol"),
         header("upgrade"),
-        &state.config.app_origin,
+        &state.settings.app_origin,
     )
     .is_err()
     {
@@ -424,22 +557,39 @@ async fn upgrade(State(state): State<Arc<Gateway>>, request: axum::extract::Requ
     let Ok(pending) = state.handshakes.clone().try_acquire_owned() else {
         return (StatusCode::TOO_MANY_REQUESTS, "Too many handshakes").into_response();
     };
-    let Some(token) = header("cf-access-jwt-assertion").map(str::to_owned) else {
-        return (StatusCode::UNAUTHORIZED, "Access authentication required").into_response();
+    let token = match &state.settings.admission {
+        Admission::Access(_) => match header("cf-access-jwt-assertion") {
+            Some(token) => Some(token.to_owned()),
+            None => {
+                return (StatusCode::UNAUTHORIZED, "Access authentication required")
+                    .into_response();
+            }
+        },
+        Admission::PairingOnly => None,
     };
     let (mut parts, _) = request.into_parts();
     let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
         Ok(ws) => ws,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid WebSocket handshake").into_response(),
     };
-    let identity = match timeout(Duration::from_secs(6), state.authenticate(&token)).await {
-        Ok(Ok(identity)) => identity,
-        _ => return (StatusCode::UNAUTHORIZED, "Access authentication failed").into_response(),
+    let seconds = match (&state.settings.admission, token) {
+        (Admission::Access(policy), Some(token)) => {
+            let identity =
+                match timeout(Duration::from_secs(6), state.authenticate(policy, &token)).await {
+                    Ok(Ok(identity)) => identity,
+                    _ => {
+                        return (StatusCode::UNAUTHORIZED, "Access authentication failed")
+                            .into_response();
+                    }
+                };
+            identity
+                .expires_at
+                .saturating_sub(unix_now())
+                .min(state.settings.max_session_seconds)
+        }
+        (Admission::Access(_), None) => return StatusCode::UNAUTHORIZED.into_response(),
+        (Admission::PairingOnly, _) => state.settings.max_session_seconds,
     };
-    let seconds = identity
-        .expires_at
-        .saturating_sub(unix_now())
-        .min(state.config.max_session_seconds);
     if seconds == 0 {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -487,7 +637,7 @@ async fn session(
     };
     let tcp = match timeout(
         Duration::from_secs(3),
-        TcpStream::connect(state.config.rfb_target),
+        TcpStream::connect(state.settings.rfb_target),
     )
     .await
     {

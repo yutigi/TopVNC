@@ -10,6 +10,8 @@ pub enum Event {
     Fingerprint(String),
     /// The gateway is listening at this address.
     GatewayReady(String),
+    /// The Quick Tunnel gateway owns this listener, awaiting its origin.
+    GatewayBound(String),
     /// A one-time pairing invite. The link is a secret for the QR code only.
     Pair {
         seconds: u64,
@@ -22,6 +24,9 @@ pub enum Event {
     Registered(u32),
     /// cloudflared lost connection `connIndex`, or every connection.
     Lost(Option<u32>),
+    /// cloudflared created a Quick Tunnel at this exact
+    /// `https://<label>.trycloudflare.com` origin.
+    QuickTunnelUrl(String),
 }
 
 /// Which pipe a line came from.
@@ -56,6 +61,7 @@ fn gateway_stdout(line: &str) -> Option<Event> {
     match word {
         "fingerprint" if !rest.is_empty() => Some(Event::Fingerprint(rest.into())),
         "ready" if !rest.is_empty() => Some(Event::GatewayReady(rest.into())),
+        "bound" if !rest.is_empty() => Some(Event::GatewayBound(rest.into())),
         "pair" => {
             let (seconds, link) = rest.split_once(' ')?;
             let seconds = seconds.parse().ok().filter(|s| (1..=3600).contains(s))?;
@@ -75,8 +81,24 @@ fn conn_index(line: &str) -> Option<u32> {
         .and_then(|value| value.parse().ok())
 }
 
+/// The Quick Tunnel URL inside cloudflared's banner box. Other links in its
+/// output (terms of use, documentation) are not a single-label
+/// `trycloudflare.com` origin and fail the gateway's own origin rule.
+fn quick_tunnel_url(line: &str) -> Option<String> {
+    if !line.contains(topvnc_access::QUICK_TUNNEL_SUFFIX) {
+        return None;
+    }
+    line.split(|c: char| c.is_whitespace() || c == '|')
+        .find(|word| topvnc_access::validate_quick_tunnel_origin(word).is_ok())
+        .map(str::to_owned)
+}
+
 fn tunnel_line(line: &str) -> Option<Event> {
-    if line.contains("Unregistered tunnel connection") || line.contains("Connection terminated") {
+    if let Some(url) = quick_tunnel_url(line) {
+        Some(Event::QuickTunnelUrl(url))
+    } else if line.contains("Unregistered tunnel connection")
+        || line.contains("Connection terminated")
+    {
         Some(Event::Lost(conn_index(line)))
     } else if line.contains("Registered tunnel connection") {
         conn_index(line).map(Event::Registered)
@@ -138,6 +160,10 @@ mod tests {
             g("pair-error browser enrollment list is full"),
             Some(Event::PairError("browser enrollment list is full".into()))
         );
+        assert_eq!(
+            g("bound 127.0.0.1:6080"),
+            Some(Event::GatewayBound("127.0.0.1:6080".into()))
+        );
         for ignored in [
             "",
             "ready",
@@ -198,6 +224,51 @@ mod tests {
         );
         // Without an index, a registration cannot be tracked.
         assert_eq!(t("INF Registered tunnel connection"), None);
+    }
+
+    /// Captured from cloudflared 2026.10.3 on Windows during the live run on
+    /// 2026-11-05. Machine-specific addresses and identifiers are redacted;
+    /// the banner, readiness messages, and their order are preserved.
+    const QUICK_TUNNEL_OUTPUT: &str = include_str!("fixtures/cloudflared-quick-tunnel.txt");
+
+    #[test]
+    fn quick_tunnel_output_yields_its_url_once_and_its_connections() {
+        // cloudflared logs to stderr; the supervisor also accepts stdout.
+        for stream in [Stream::Stdout, Stream::Stderr] {
+            let events: Vec<Event> = QUICK_TUNNEL_OUTPUT
+                .lines()
+                .filter_map(|line| classify(Program::Tunnel, stream, line))
+                .collect();
+            assert_eq!(
+                events,
+                [
+                    Event::QuickTunnelUrl(
+                        "https://brian-crm-produce-intelligence.trycloudflare.com".into()
+                    ),
+                    Event::Registered(0),
+                ]
+            );
+        }
+        let t = |line| classify(Program::Tunnel, Stream::Stderr, line);
+        for ignored in [
+            "INF |  https://a.b.trycloudflare.com  |",
+            "INF |  https://Upper.trycloudflare.com  |",
+            "INF |  http://plain.trycloudflare.com  |",
+            "INF |  https://evil.trycloudflare.com.attacker.example  |",
+            "INF |  https://x.trycloudflare.com/path  |",
+            "INF see https://topvnc.owner.workers.dev",
+        ] {
+            assert_eq!(t(ignored), None, "{ignored}");
+        }
+        // The gateway's pipes never yield one.
+        assert_eq!(
+            classify(
+                Program::Gateway,
+                Stream::Stdout,
+                "https://brian-crm-produce-intelligence.trycloudflare.com"
+            ),
+            None
+        );
     }
 
     #[test]
