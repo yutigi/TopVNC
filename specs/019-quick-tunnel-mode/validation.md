@@ -119,3 +119,60 @@ Local Windows validation:
 The earlier live Chromium record precedes these review fixes. This revised
 startup/shutdown flow has not been rerun through a real Quick Tunnel or the
 real-desktop WEB tab. The phone, platform, and long-session limits above remain.
+
+## WEB-tab continuation and pairing URL copy (2026-11-07)
+
+The continuation started from `d30576e` in the dedicated
+`TopVNC-quick-tunnel` worktree. PR #10 was still open at that head; its Format,
+Windows Rust, Ubuntu Rust, and browser/Worker CI checks were successful.
+The project constitution is still an unfilled template; AGENTS.md applies.
+
+Built matching binaries with `cargo build --workspace --locked` and rebuilt
+the page with `node web/scripts/build.mjs` (run from `web/`). The build used
+the worktree's sources and target directory, wasm-bindgen 0.2.128, and
+cloudflared 2026.10.3. No main-checkout binaries or assets were used.
+
+Actual Windows WEB-tab observations, before the copy-button change:
+
+- Access was the default. Selecting Quick Tunnel displayed its pairing,
+  password, temporary-URL, and validation-limit explanations.
+- With a test-owned loopback HTTP listener occupying port 6080, Start
+  reported gateway address-in-use. Server and Tunnel returned to Stopped;
+  no cloudflared or gateway child remained. No public route was launched.
+- After releasing that listener, Start showed the gateway's
+  `bound 127.0.0.1:6080` message while Tunnel was Starting. The real connector
+  then registered one connection, both children became Ready, and the panel
+  displayed the temporary URL and Copy app URL control.
+- An earlier startup was stopped after noticing that bulk automated typing
+  had entered only one password character. It is not authentication or viewer
+  evidence. Subsequent startup used eight individually entered characters,
+  verified by the masked field. All test app/connector/gateway processes from
+  those runs exited before opening the revised build.
+
+The owner reported that the pairing URL could not be copied. The QR-only
+panel intentionally had no such action. At the owner's request the revised
+panel adds **Copy pairing URL**, retaining the invite only in memory while
+active. It copies the same fragment-bearing URL as the QR, refuses expired
+invites, and does not display or log the URL. Debug formatting omits both the
+link and the secret-bearing QR modules. Enrollment, cancellation, expiry,
+failure, and shutdown retain their existing invite-removal behavior. The OS
+clipboard copy remains until replaced and does not extend invite validity.
+
+Checks for the copy-button revision:
+
+- `cargo fmt --all --check`: passed.
+- `cargo test --workspace`: 349 passed, 7 existing tests ignored, with UTF-8
+  console input/output. Regression checks cover copying the active invite,
+  expiry at its deadline, redacted Debug output, pending pairing, enrollment,
+  route mismatch, and removal on stop.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- Rebuilt browser assets: JavaScript tests 25 passed; WASM tests 8 passed.
+  The copy action changes only the native panel and its invite state.
+- `git diff --check`: passed.
+
+The revised build was opened for the owner's copy/phone check. Copy/paste,
+real desktop display/input, Safari camera pairing, background/resume,
+reconnect, public-URL shutdown/restart, and live gateway-failure supervision
+are still pending in this continuation. Startup readiness alone is not
+evidence that the desktop was displayed or controlled. The older synthetic
+Chromium run remains separate evidence and predates both review revisions.

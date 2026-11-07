@@ -110,7 +110,15 @@ fn binds_gateway_then_starts_isolated_tunnel_and_sends_the_origin_once() {
     );
     web.poll(&ours(), now);
     assert!(web.pairing().is_some());
+    let mut ui = crate::ui::UiState::for_landing(None, &web);
+    assert_eq!(
+        crate::ui::web_copy_url(&ui, &web),
+        Some(format!("{URL}/#pair=SECRET").as_str())
+    );
+    ui.web_route = RouteKind::Access;
+    assert_eq!(crate::ui::web_copy_url(&ui, &web), None);
     web.stop();
+    assert!(web.pairing().is_none());
     web.poll(&ours(), now);
     assert!(
         !config_path.exists(),

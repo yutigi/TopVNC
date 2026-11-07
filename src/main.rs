@@ -1550,13 +1550,18 @@ fn show_landing(
                 ServerPhase::Starting | ServerPhase::Stopping => {}
             }
         }
-        if copy_url_clicked && let Some(origin) = web.app_origin() {
-            match copy_text(origin) {
+        if copy_url_clicked && let Some(url) = ui::web_copy_url(&state, web) {
+            let label = if web.pairing().is_some() {
+                "PAIRING"
+            } else {
+                "APP"
+            };
+            match copy_text(url) {
                 Ok(()) => {
                     state.error = None;
-                    state.notice = Some("APP URL COPIED TO THE CLIPBOARD.".into());
+                    state.notice = Some(format!("{label} URL COPIED TO THE CLIPBOARD."));
                 }
-                Err(error) => state.error = Some(format!("Could not copy the app URL: {error}")),
+                Err(error) => state.error = Some(format!("Could not copy the URL: {error}")),
             }
         }
         if web_clicked || pair_clicked {
