@@ -264,6 +264,9 @@ the probe's Worker `name`.
 
 ### 8. Build, test, and deploy
 
+Optional [Cloudflare setup helpers](../scripts/cloudflare/README.md) provide
+read-only account listings, Access redirect probes, and Wrangler wrappers.
+
 ```powershell
 cd web
 npm ci

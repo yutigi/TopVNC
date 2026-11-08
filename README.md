@@ -197,12 +197,82 @@ cargo web-gateway                # 3. the gateway for already paired browsers
 
 Then open the app URL on the phone and press **Connect**. If something fails, the page names the missing piece; the guide's [troubleshooting table](docs/cloudflare-gateway.md#troubleshooting) lists each message.
 
-For several machines behind one website, configure the [machine registry](docs/cloudflare-gateway.md#multiple-machines-on-one-website).
-The browser offers a machine selector and keeps each machine's pairing separate.
-Switching closes the previous session; press **Connect** and enter the selected
-machine's password. Existing single-host configurations keep working. This
-multi-host path has local automated coverage; live Cloudflare and device
-validation remain pending.
+### Set up multiple machines on one website
+
+The shared website offers a machine selector and keeps each machine's pairing
+separate. Each machine needs its own TopVNC server, gateway, host key, private
+Cloudflare Tunnel, and VPC service. Rebuilding the desktop app alone does not
+update the website: deploy the Worker and browser client from this branch too.
+Run the commands below from the repository root.
+
+1. **Prepare each machine.** Check out this branch on both hosts and complete
+   [setup steps 1–7](docs/cloudflare-gateway.md#one-time-setup). Use the same app
+   origin, Access issuer, audience, and owner email on both. Create a separate
+   private tunnel and VPC service for each machine; keep ports `5900` and `6080`
+   on loopback. Never copy tunnel tokens, host private keys, or browser enrollment
+   files between machines. An existing host can keep its tunnel, service, and keys.
+2. **Configure the shared Worker.** Use
+   [`wrangler.multi-host.example.toml`](gateway/cloudflare/worker/wrangler.multi-host.example.toml)
+   as the template for `gateway/cloudflare/worker/wrangler.local.toml`. For an
+   existing deployment, merge these settings into the local file, preserving
+   its Worker name, account, app origin, and Access settings:
+   - Replace `UPSTREAM_URL` with `HOSTS_JSON`, listing stable machine IDs such as
+     `gaming-pc` and `office-pc`, display names, bindings, and gateway upstreams.
+   - Configure one `[[vpc_services]]` binding per machine, using that machine's
+     VPC service ID. Its upstream can be `http://127.0.0.1:6080/ws` on both hosts.
+   - Set `run_worker_first = ["/ws", "/ws/*", "/api/hosts"]` under `[assets]`.
+   - Keep Cloudflare Access protecting the entire website, including `/api/hosts`
+     and `/ws/*`.
+3. **Identify each gateway.** In each host's
+   `gateway/cloudflare/gateway.local.toml`, set `host_id = "gaming-pc"` or
+   `host_id = "office-pc"`, matching its Worker registry entry exactly. Keep
+   `app_origin` pointed at the shared website. To preserve an existing browser's
+   single-host pairing, set `LEGACY_HOST_ID = "gaming-pc"` in the Worker's `[vars]`
+   only if that entry still points to the original host with the same host key.
+   Otherwise, pair each machine again.
+4. **Build, validate, and publish the shared website.** With the
+   [build prerequisites](docs/cloudflare-gateway.md#before-you-start) installed:
+
+   ```powershell
+   npm --prefix web ci
+   npm --prefix gateway/cloudflare/worker ci
+   npm --prefix web test
+   npm --prefix web run build
+   npm --prefix web run test:wasm
+   npm --prefix web run test:browser # requires Chrome/Edge/Chromium
+   npm --prefix gateway/cloudflare/worker run deploy:check
+   npm --prefix gateway/cloudflare/worker run deploy # publishes the website
+   ```
+
+   Open the app URL in a private browser window and confirm that Access requires
+   sign-in before displaying TopVNC. After signing in, both machines should appear.
+5. **Start and pair each host.** On each machine, run these in three separate
+   terminals. If its loopback server is already running through the Server tab
+   or host service, reuse that server instead of starting another on port `5900`.
+
+   ```powershell
+   cargo run --release -- --serve --unencrypted # prompts for this host's VNC password
+   cargo web-tunnel                           # wait for Registered tunnel connection
+   cargo web-pair                             # gateway with a one-time pairing QR
+   ```
+
+   Sign in to the shared website before scanning each host's QR code. The link
+   selects that machine; compare its fingerprint, press **Connect**, and enter
+   its VNC password. For later sessions, use `cargo web-gateway` in place of
+   `cargo web-pair`. The native **WEB** tab can also start access and show pairing
+   after its local gateway and tunnel configuration is ready.
+6. **Test switching.** Connect to one machine, then choose **☰ → Switch machine**.
+   The previous session should close, release held keys/buttons, and clear its
+   image and password. Select the other machine, press **Connect**, and enter its
+   password. Switch back to confirm that its pairing remains saved. Stop one
+   gateway and confirm that the other machine still connects. Repeat on the phone
+   browser you intend to use.
+
+See the [full multi-host guide](docs/cloudflare-gateway.md#multiple-machines-on-one-website)
+for registry limits, pairing migration, and adding or removing machines.
+Existing single-host configurations keep working. The multi-host path has
+local automated coverage; live two-machine Cloudflare and device validation
+remain pending.
 
 ## Controls and display settings
 
