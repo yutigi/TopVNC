@@ -29,12 +29,12 @@ function run(command, argv, cwd = rootDir, capture = false) {
   return capture ? result.stdout.trim() : undefined;
 }
 const npm = (argv, cwd) => run(process.execPath, [npmCli, ...argv], cwd);
-function publishState() {
+function publishState(checkedHead) {
   const head = run("git", ["rev-parse", "HEAD"], rootDir, true);
   const state = {
     branch: run("git", ["branch", "--show-current"], rootDir, true),
     status: run("git", ["status", "--porcelain"], rootDir, true), head,
-    remoteHead: head,
+    remoteHead: head, checkedHead,
   };
   assertPublishable(state); // Reject local mistakes without making a network request.
   state.remoteHead = run("git", ["ls-remote", "origin", "refs/heads/main"], rootDir, true).split(/\s/)[0];
@@ -47,7 +47,7 @@ let temporaryDir;
 try {
   if (!npmCli || !existsSync(npmCli)) throw new Error("Run this helper through npm run deploy or npm run deploy:check.");
   if (!existsSync(configPath)) throw new Error("Local config not found. Copy wrangler.example.toml to wrangler.local.toml and fill in the existing app values, or pass --config /absolute/path/to/your/existing/wrangler.local.toml.");
-  if (!checkOnly) publishState();
+  const checkedHead = checkOnly ? undefined : publishState();
   if (process.platform === "win32") run("chcp.com", ["65001"], rootDir, true);
   // Suppress Wrangler's informational binding summary containing personal values.
   process.env.WRANGLER_LOG = "error";
@@ -82,8 +82,8 @@ try {
   run(process.execPath, [wrangler, "deploy", "--dry-run", "--config", temporary], workerDir);
   if (checkOnly) console.log("All deployment checks passed. Nothing was published.");
   else {
-    const head = publishState(); // Recheck after tests/builds and immediately before upload.
     await verifyAccess(config.vars.APP_ORIGIN, config.vars.ACCESS_ISSUER);
+    const head = publishState(checkedHead); // Publish only the commit these checks built.
     console.log(`Publishing main commit ${head}...`);
     run(process.execPath, [wrangler, "deploy", "--config", temporary, "--message", `Manual main ${head}`], workerDir);
     await verifyAccess(config.vars.APP_ORIGIN, config.vars.ACCESS_ISSUER);

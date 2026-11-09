@@ -25,3 +25,18 @@ Safari/other browser behavior, full device IME behavior, a live encrypted remote
 session with the new UI, game compatibility or latency. Chinese/Japanese fixture
 conversion was deliberately excluded; native IME and editable direct characters
 are the implemented paths. No production hosting deployment was performed.
+
+## PR 12 review follow-up — 2026-11-09
+
+- Reproduced premature key releases when hardware and touch controls held the
+  same keysym. The browser session now tracks each source separately, releases
+  only after both let go, clears both on lifecycle release, and prevents text
+  taps or late touch releases from cancelling hardware holds. Encrypted-session
+  regressions cover movement keys, Control, Shift, both press orders and reset.
+- Reproduced the deployment guard accepting a newer clean `main` commit than
+  the one validated. The helper now retains the initial commit and checks it
+  again immediately before publishing; a focused regression rejects changes.
+- Windows workspace tests and Clippy, web and Worker tests, browser/WASM build
+  checks, and the offline Chromium mobile checks were rerun for these fixes.
+  The original device, live-session and performance verification limits remain.
+- No production deployment was performed during this review.
