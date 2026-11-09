@@ -3,6 +3,7 @@ use crate::desktop_host::{
     choose_displays, normalize_serve_scale,
 };
 use crate::helpers::{Helper, HelperForm, HelperRuntime};
+use crate::web_access::config::RouteKind;
 use crate::web_access::runtime::{Row, RowState, WebRuntime};
 use topvnc::presentation::MotionPresentation;
 use topvnc::{PerformanceMode, ServedDisplays, UpdatePriority};
@@ -441,9 +442,71 @@ pub struct UiState {
     pub notice: Option<String>,
     /// The WEB tab row whose output is shown; `None` picks one.
     pub web_row: Option<Row>,
+    /// The WEB tab's route for the next start. Not saved: the Quick Tunnel
+    /// is chosen each time, never by default.
+    pub web_route: RouteKind,
+    /// An informational notice, or the start action awaiting confirmation.
+    pub quick_notice: Option<QuickTunnelNotice>,
+    /// Cancel/Close is focused initially; Enter cannot accept a new notice.
+    pub quick_notice_continue: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuickTunnelNotice {
+    Details,
+    Start { pair: bool },
 }
 
 impl UiState {
+    pub fn open_quick_notice(&mut self, notice: QuickTunnelNotice) {
+        self.quick_notice = Some(notice);
+        self.quick_notice_continue = false;
+        self.menu_open = false;
+        self.focus = None;
+    }
+
+    /// Only explicit acceptance of a pending start returns an action.
+    /// The bool remembers whether the original action also requested pairing.
+    pub fn close_quick_notice(&mut self, accept: bool) -> Option<bool> {
+        let notice = self.quick_notice.take();
+        self.quick_notice_continue = false;
+        match notice {
+            Some(QuickTunnelNotice::Start { pair }) if accept => Some(pair),
+            _ => None,
+        }
+    }
+
+    /// Consume all keyboard input while modal, including editing keys.
+    pub fn quick_notice_key(&mut self, key: KeyCode) -> Option<bool> {
+        match key {
+            KeyCode::Escape => self.close_quick_notice(false),
+            KeyCode::Tab | KeyCode::ArrowLeft | KeyCode::ArrowRight => {
+                if matches!(self.quick_notice, Some(QuickTunnelNotice::Start { .. })) {
+                    self.quick_notice_continue = !self.quick_notice_continue;
+                }
+                None
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => {
+                self.close_quick_notice(self.quick_notice_continue)
+            }
+            _ => None,
+        }
+    }
+
+    /// A new landing window must describe an existing run accurately. When
+    /// stopped, a fresh window still defaults to Access.
+    pub fn for_landing(error: Option<String>, web: &WebRuntime) -> Self {
+        Self {
+            error,
+            web_route: if web.is_idle() {
+                RouteKind::default()
+            } else {
+                web.route().unwrap_or_default()
+            },
+            ..Self::default()
+        }
+    }
+
     /// Handle an editing key; returns whether it was one.
     pub fn key(&mut self, config: &mut Config, key: KeyCode) -> bool {
         match key {
@@ -1228,6 +1291,9 @@ pub fn landing(
             canvas.button(area, label, state.tab == tab);
         }
     }
+    if state.quick_notice.is_some() {
+        quick_tunnel_notice(canvas, state);
+    }
 }
 
 /// Preserve line breaks and wrap long commands without hiding their contents.
@@ -1815,6 +1881,30 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
     }
 }
 
+/// The route choice, changeable while browser access is stopped.
+pub const WEB_ROUTES: [(Box2, RouteKind, &str); 2] = [
+    (
+        Box2 {
+            x: 40,
+            y: 76,
+            w: 205,
+            h: 28,
+        },
+        RouteKind::Access,
+        "ACCESS",
+    ),
+    (
+        Box2 {
+            x: 255,
+            y: 76,
+            w: 205,
+            h: 28,
+        },
+        RouteKind::QuickTunnel,
+        "QUICK TUNNEL",
+    ),
+];
+
 /// The SERVICE tab's status line and indicator color.
 fn service_status_line(service: &ServiceView) -> (String, u32) {
     if let Some(error) = &service.status_error {
@@ -2036,8 +2126,7 @@ const WEB_PANEL: Box2 = Box2 {
     w: 278,
     h: 420,
 };
-/// Below the help text in the panel, while the app URL is known and no
-/// pairing code is shown.
+/// Below the help text or pairing code in the panel.
 pub const WEB_COPY_URL: Box2 = Box2 {
     x: 480,
     y: 476,
@@ -2045,10 +2134,98 @@ pub const WEB_COPY_URL: Box2 = Box2 {
     h: 36,
 };
 
-/// Whether the WEB tab offers [`WEB_COPY_URL`]: the app URL to copy is known
-/// and the panel is not showing pairing.
-pub fn web_copy_url_shown(web: &WebRuntime) -> bool {
-    web.app_origin().is_some() && !web.pairing_active()
+pub const WEB_LIMITATIONS: Box2 = Box2 {
+    x: 480,
+    y: 522,
+    w: 278,
+    h: 36,
+};
+
+const QUICK_NOTICE: Box2 = Box2 {
+    x: 24,
+    y: 24,
+    w: 752,
+    h: 592,
+};
+pub const QUICK_NOTICE_CANCEL: Box2 = Box2 {
+    x: 48,
+    y: 554,
+    w: 224,
+    h: 38,
+};
+pub const QUICK_NOTICE_CONTINUE: Box2 = Box2 {
+    x: 504,
+    y: 554,
+    w: 248,
+    h: 38,
+};
+const QUICK_NOTICE_CHARS: usize = 58;
+const QUICK_NOTICE_TEXT: [&str; 6] = [
+    "2-HOUR CONNECTIONS. TopVNC closes each connection after two hours. Reconnect with your paired browser and VNC password while this run is still active.",
+    "PHONE RESUME. Switching apps or locking your phone may disconnect. Return to Safari and reconnect. Phone and long-session tests are still pending.",
+    "RESTART = PAIR AGAIN. Stop ends the URL. Each start gives a new URL and host key. Open the new invite, check the key and pair again.",
+    "TESTING SERVICE. No uptime guarantee. Networks may block it and Cloudflare may interrupt service. One active browser, up to eight paired browsers per run.",
+    "DESKTOP ACCESS. No Cloudflare sign-in. Pairing and VNC password are required. Anyone with the URL can load the page or delay connections. You trust Cloudflare to deliver the page code safely.",
+    "PRIVATE INVITES. One use, 10 minutes. A copied invite stays on the clipboard until replaced. Keep it private and open it only in your browser.",
+];
+
+fn quick_tunnel_notice(canvas: &mut Canvas<'_>, state: &UiState) {
+    canvas.fill(
+        Box2 {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 640,
+        },
+        BG,
+    );
+    canvas.fill(QUICK_NOTICE, PANEL);
+    canvas.frame(QUICK_NOTICE, WARN);
+    canvas.text(48, 44, "QUICK TUNNEL LIMITATIONS", WARN, 2);
+    let mut y = 80;
+    for paragraph in QUICK_NOTICE_TEXT {
+        for line in wrap(paragraph, QUICK_NOTICE_CHARS) {
+            canvas.text(48, y, &line, TEXT, 2);
+            y += 18;
+        }
+        y += 10;
+    }
+    let pending = matches!(state.quick_notice, Some(QuickTunnelNotice::Start { .. }));
+    canvas.button(
+        QUICK_NOTICE_CANCEL,
+        if pending { "CANCEL" } else { "CLOSE" },
+        !state.quick_notice_continue,
+    );
+    if pending {
+        canvas.button(
+            QUICK_NOTICE_CONTINUE,
+            "CONTINUE",
+            state.quick_notice_continue,
+        );
+    }
+}
+
+/// The URL offered by the explicit copy action for the selected route.
+pub fn web_copy_url<'a>(state: &UiState, web: &'a WebRuntime) -> Option<&'a str> {
+    web_app_origin(state, web)?;
+    if let Some(code) = web.pairing() {
+        code.copy_url(std::time::Instant::now())
+    } else if !web.pairing_active() {
+        web_app_origin(state, web)
+    } else {
+        None
+    }
+}
+
+/// Whether the WEB tab offers [`WEB_COPY_URL`].
+pub fn web_copy_url_shown(state: &UiState, web: &WebRuntime) -> bool {
+    web_copy_url(state, web).is_some()
+}
+
+/// The app URL for the chosen route, if the last run knows one.
+fn web_app_origin<'a>(state: &UiState, web: &'a WebRuntime) -> Option<&'a str> {
+    web.app_origin()
+        .filter(|_| web.route() == Some(state.web_route))
 }
 const WEB_OUTPUT_Y: usize = 352;
 const WEB_OUTPUT_ROWS: usize = 14;
@@ -2078,7 +2255,9 @@ fn web_tab(
     server: &ServerView,
     web: &WebRuntime,
 ) {
-    canvas.text(42, 76, "BROWSER ACCESS THROUGH CLOUDFLARE", MUTED, 2);
+    for (area, route, label) in WEB_ROUTES {
+        canvas.button(area, label, state.web_route == route);
+    }
     canvas.label(40, 108, "VNC PASSWORD");
     canvas.field(
         WEB_PASSWORD,
@@ -2147,13 +2326,19 @@ fn web_tab(
     for (index, line) in lines[first..].iter().enumerate() {
         canvas.text(40, WEB_OUTPUT_Y + 24 + index * 10, line, TEXT, 1);
     }
-    web_panel(canvas, web);
+    web_panel(canvas, state, web);
+    // Keep messages clear of the Quick Tunnel limitations button.
+    let message_width = if state.web_route == RouteKind::QuickTunnel {
+        WEB_PASSWORD.w / 12
+    } else {
+        MESSAGE_LINE
+    };
     if let Some(error) = &state.error {
-        status_message(canvas, error, ERROR);
+        status_message_width(canvas, error, ERROR, message_width);
     } else if let Some(notice) = &state.notice {
-        status_message(canvas, notice, TEXT);
+        status_message_width(canvas, notice, TEXT, message_width);
     } else if let Some(message) = web.message() {
-        status_message(canvas, message, TEXT);
+        status_message_width(canvas, message, TEXT, message_width);
     }
     let (start, active) = if web.is_idle() {
         ("START BROWSER ACCESS", true)
@@ -2172,10 +2357,14 @@ fn web_tab(
         },
         false,
     );
+    if state.web_route == RouteKind::QuickTunnel {
+        canvas.button(WEB_LIMITATIONS, "LIMITATIONS", false);
+    }
 }
 
-fn web_panel(canvas: &mut Canvas<'_>, web: &WebRuntime) {
+fn web_panel(canvas: &mut Canvas<'_>, state: &UiState, web: &WebRuntime) {
     let panel = WEB_PANEL;
+    let quick = state.web_route == RouteKind::QuickTunnel;
     let small = |canvas: &mut Canvas<'_>, y: &mut usize, text: &str, color| {
         for line in wrap(text, panel.w / 6) {
             canvas.text(panel.x, *y, &line, color, 1);
@@ -2230,9 +2419,16 @@ fn web_panel(canvas: &mut Canvas<'_>, web: &WebRuntime) {
         small(
             canvas,
             &mut y,
-            "SIGN IN TO THE APP URL ON THE PHONE FIRST, THEN SCAN THIS CODE AND CHECK THAT THE PHONE SHOWS THE SAME KEY. SHOW IT ONLY ON THIS SCREEN.",
+            if quick {
+                "SCAN THIS CODE OR COPY THE PAIRING URL TO YOUR BROWSER. CHECK THE SAME KEY, THEN CONNECT. KEEP THE INVITE PRIVATE."
+            } else {
+                "SIGN IN TO THE APP URL FIRST, THEN SCAN OR COPY THE PAIRING URL. CHECK THE SAME KEY. KEEP THE INVITE PRIVATE."
+            },
             MUTED,
         );
+        if web_copy_url_shown(state, web) {
+            canvas.button(WEB_COPY_URL, "COPY PAIRING URL", false);
+        }
         return;
     }
     let mut y = panel.y;
@@ -2247,32 +2443,70 @@ fn web_panel(canvas: &mut Canvas<'_>, web: &WebRuntime) {
         );
         return;
     }
-    canvas.text(panel.x, y, "HOW IT WORKS", TEXT, 2);
-    y += 24;
-    small(
-        canvas,
-        &mut y,
-        "START RUNS THIS DESKTOP SERVER ON LOOPBACK WITH YOUR PASSWORD, THEN THE CLOUDFLARE TUNNEL, THEN THE WEB GATEWAY. STOP, OR CLOSING TOPVNC, ENDS ALL THREE.",
-        MUTED,
-    );
+    if quick {
+        // The opt-in warning AGENTS.md requires: no silent downgrade.
+        canvas.text(panel.x, y, "QUICK TUNNEL", WARN, 2);
+        y += 24;
+        small(
+            canvas,
+            &mut y,
+            "TEMPORARY URL, NO CLOUDFLARE SIGN-IN: PROTECTED ONLY BY PAIRING AND THE VNC PASSWORD. ANYONE WITH THE URL CAN OPEN THE PAGE. EVERY START GIVES A NEW URL AND HOST KEY, SO PAIR AGAIN EACH TIME. CLOUDFLARE OFFERS QUICK TUNNELS FOR TESTING, WITH NO UPTIME GUARANTEE.",
+            WARN,
+        );
+        y += 10;
+        small(
+            canvas,
+            &mut y,
+            "START RUNS THIS DESKTOP SERVER ON LOOPBACK WITH YOUR PASSWORD, THEN THE GATEWAY AND QUICK TUNNEL. THE GATEWAY ALSO SERVES THE WEB APP. NO CLOUDFLARE ACCOUNT OR SETUP FILES.",
+            MUTED,
+        );
+    } else {
+        canvas.text(panel.x, y, "HOW IT WORKS", TEXT, 2);
+        y += 24;
+        small(
+            canvas,
+            &mut y,
+            "START RUNS THIS DESKTOP SERVER ON LOOPBACK WITH YOUR PASSWORD, THEN THE CLOUDFLARE TUNNEL, THEN THE WEB GATEWAY. STOP, OR CLOSING TOPVNC, ENDS ALL THREE.",
+            MUTED,
+        );
+    }
     y += 10;
-    if let Some(origin) = web.app_origin() {
-        canvas.text(panel.x, y, "APP URL", TEXT, 2);
+    if let Some(origin) = web_app_origin(state, web) {
+        canvas.text(
+            panel.x,
+            y,
+            if quick {
+                "TEMPORARY APP URL"
+            } else {
+                "APP URL"
+            },
+            TEXT,
+            2,
+        );
         y += 22;
         small(canvas, &mut y, origin, ACCENT);
         y += 10;
     }
-    small(
-        canvas,
-        &mut y,
-        "SETTINGS: GATEWAY/CLOUDFLARE/GATEWAY.LOCAL.TOML. FIRST-TIME SETUP: DOCS/CLOUDFLARE-GATEWAY.MD.",
-        MUTED,
-    );
+    if quick {
+        small(
+            canvas,
+            &mut y,
+            "PHONE AND LONG-SESSION CHECKS STILL PENDING. DETAILS: DOCS/CLOUDFLARE-GATEWAY.MD.",
+            ERROR,
+        );
+    } else {
+        small(
+            canvas,
+            &mut y,
+            "SETTINGS: GATEWAY/CLOUDFLARE/GATEWAY.LOCAL.TOML. FIRST-TIME SETUP: DOCS/CLOUDFLARE-GATEWAY.MD.",
+            MUTED,
+        );
+    }
     if !cfg!(windows) {
         y += 10;
         small(canvas, &mut y, "NOT YET TESTED ON THIS PLATFORM.", ERROR);
     }
-    if web_copy_url_shown(web) {
+    if web_copy_url_shown(state, web) {
         canvas.button(WEB_COPY_URL, "COPY APP URL", false);
     }
 }
@@ -2331,7 +2565,11 @@ fn wrap(message: &str, width: usize) -> Vec<String> {
 /// The message below the server status: one large line, two when it does
 /// not fit, or small text for long instructions such as permission errors.
 fn status_message(canvas: &mut Canvas<'_>, message: &str, color: u32) {
-    let large = wrap(message, MESSAGE_LINE);
+    status_message_width(canvas, message, color, MESSAGE_LINE);
+}
+
+fn status_message_width(canvas: &mut Canvas<'_>, message: &str, color: u32, width: usize) {
+    let large = wrap(message, width);
     match large.as_slice() {
         [line] => canvas.text(40, 537, line, color, 2),
         [first, second] => {
@@ -2339,7 +2577,7 @@ fn status_message(canvas: &mut Canvas<'_>, message: &str, color: u32) {
             canvas.text(40, 546, second, color, 2);
         }
         _ => {
-            for (index, line) in wrap(message, MESSAGE_LINE * 2).iter().take(4).enumerate() {
+            for (index, line) in wrap(message, width * 2).iter().take(4).enumerate() {
                 canvas.text(40, 525 + index * 10, line, color, 1);
             }
         }
@@ -2876,6 +3114,16 @@ mod tests {
         const { assert!(WEB_START.x + WEB_START.w < WEB_PAIR.x) };
         const { assert!(WEB_COPY_URL.y >= WEB_PANEL.y) };
         const { assert!(WEB_COPY_URL.y + WEB_COPY_URL.h <= WEB_PANEL.y + WEB_PANEL.h) };
+        // The route choice sits between the tab bar and the password label.
+        const { assert!(WEB_ROUTES[0].0.y > TAB_WEB.y + TAB_WEB.h) };
+        const { assert!(WEB_ROUTES[0].0.y + WEB_ROUTES[0].0.h < 108) };
+        const { assert!(WEB_ROUTES[0].0.x + WEB_ROUTES[0].0.w < WEB_ROUTES[1].0.x) };
+        const { assert!(WEB_ROUTES[1].0.x + WEB_ROUTES[1].0.w <= WEB_PASSWORD.x + WEB_PASSWORD.w) };
+        for (area, _, label) in WEB_ROUTES {
+            assert!(24 + label.len() * 12 <= area.w, "{label}");
+        }
+        // Access stays the default; the Quick Tunnel is always a choice.
+        assert_eq!(UiState::default().web_route, RouteKind::Access);
 
         // The WEB tab edits the Server tab's password; neither is saved.
         let mut state = UiState::default();
@@ -2885,6 +3133,61 @@ mod tests {
         assert_eq!(state.focus, Some(Field::WebPassword));
         state.character(&mut config, 'p');
         assert_eq!(config.serve.password, "p");
+
+        // All notice text stays readable at the normal form font size.
+        let body_bottom = 80
+            + QUICK_NOTICE_TEXT
+                .iter()
+                .map(|text| wrap(text, QUICK_NOTICE_CHARS).len() * 18 + 10)
+                .sum::<usize>();
+        assert!(body_bottom < QUICK_NOTICE_CANCEL.y);
+        const { assert!(48 + QUICK_NOTICE_CHARS * 12 <= QUICK_NOTICE.x + QUICK_NOTICE.w - 24) };
+        const { assert!(WEB_LIMITATIONS.y > WEB_COPY_URL.y + WEB_COPY_URL.h) };
+        const { assert!(WEB_LIMITATIONS.y + WEB_LIMITATIONS.h < WEB_PAIR.y) };
+    }
+
+    #[test]
+    fn quick_notice_cancel_and_details_never_return_a_start_action() {
+        let mut state = UiState::default();
+        for pair in [false, true] {
+            state.open_quick_notice(QuickTunnelNotice::Start { pair });
+            assert_eq!(state.close_quick_notice(false), None);
+            assert!(state.quick_notice.is_none());
+            state.open_quick_notice(QuickTunnelNotice::Start { pair });
+            assert_eq!(state.close_quick_notice(true), Some(pair));
+            // Repeated acceptance must not reuse the previous action.
+            assert_eq!(state.close_quick_notice(true), None);
+        }
+        state.open_quick_notice(QuickTunnelNotice::Details);
+        assert_eq!(state.close_quick_notice(true), None);
+        assert_eq!(state.web_route, RouteKind::Access);
+    }
+
+    #[test]
+    fn quick_notice_keyboard_defaults_to_cancel_and_requires_explicit_selection() {
+        let mut state = UiState {
+            focus: Some(Field::WebPassword),
+            menu_open: true,
+            ..UiState::default()
+        };
+        state.open_quick_notice(QuickTunnelNotice::Start { pair: true });
+        assert_eq!(state.focus, None);
+        assert!(!state.menu_open);
+        assert_eq!(state.quick_notice_key(KeyCode::KeyA), None);
+        assert!(state.quick_notice.is_some());
+        assert_eq!(state.quick_notice_key(KeyCode::Enter), None);
+        assert!(state.quick_notice.is_none());
+        state.open_quick_notice(QuickTunnelNotice::Start { pair: true });
+        state.quick_notice_key(KeyCode::Tab);
+        assert_eq!(state.quick_notice_key(KeyCode::Enter), Some(true));
+        state.open_quick_notice(QuickTunnelNotice::Start { pair: false });
+        state.quick_notice_key(KeyCode::Tab);
+        assert_eq!(state.quick_notice_key(KeyCode::Escape), None);
+        state.open_quick_notice(QuickTunnelNotice::Details);
+        state.quick_notice_key(KeyCode::Tab);
+        assert!(!state.quick_notice_continue);
+        assert_eq!(state.quick_notice_key(KeyCode::Space), None);
+        assert!(state.quick_notice.is_none());
     }
 
     #[test]

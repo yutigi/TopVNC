@@ -1,6 +1,8 @@
 use super::*;
-use crate::web_access::config::{GatewaySettings, Launch};
+use crate::web_access::config::{Launch, QUICK_LISTEN, QUICK_RFB_TARGET};
 use std::path::PathBuf;
+
+mod quick;
 use std::sync::{Arc, Mutex};
 
 const ROWS: [Row; 3] = [Row::Server, Row::Tunnel, Row::Gateway];
@@ -13,6 +15,8 @@ struct FakeState {
     exit: Option<String>,
     killed: bool,
     output: Vec<String>,
+    /// Assert shutdown ordering when a public route uses this gateway.
+    tunnel_before_close: Option<Handle>,
 }
 
 type Handle = Arc<Mutex<FakeState>>;
@@ -35,7 +39,14 @@ impl Supervised for FakeChild {
         true
     }
     fn close_input(&mut self) {
-        self.0.lock().unwrap().input_closed = true;
+        let mut state = self.0.lock().unwrap();
+        if let Some(tunnel) = &state.tunnel_before_close {
+            assert!(
+                tunnel.lock().unwrap().killed,
+                "stop forwarding before gateway shutdown"
+            );
+        }
+        state.input_closed = true;
     }
     fn exit(&mut self) -> Option<String> {
         self.0.lock().unwrap().exit.clone()
@@ -104,15 +115,26 @@ impl FakeSpawner {
 
 fn launch() -> Launch {
     Launch {
-        settings: GatewaySettings {
-            listen: "127.0.0.1:6080".parse().unwrap(),
-            rfb_target: "127.0.0.1:5900".parse().unwrap(),
+        listen: "127.0.0.1:6080".parse().unwrap(),
+        rfb_target: "127.0.0.1:5900".parse().unwrap(),
+        route: Route::Access {
             app_origin: "https://topvnc.owner.workers.dev".into(),
-            host_key_file: "host.key".into(),
+            gateway_config: "gateway.local.toml".into(),
+            token_file: "tunnel-token.txt".into(),
         },
-        gateway_config: "gateway.local.toml".into(),
         gateway_program: "topvnc-web-gateway".into(),
-        token_file: "tunnel-token.txt".into(),
+        cloudflared: "cloudflared".into(),
+    }
+}
+
+fn quick_launch() -> Launch {
+    Launch {
+        listen: QUICK_LISTEN,
+        rfb_target: QUICK_RFB_TARGET,
+        route: Route::QuickTunnel {
+            web_root: "web/dist".into(),
+        },
+        gateway_program: "topvnc-web-gateway".into(),
         cloudflared: "cloudflared".into(),
     }
 }
@@ -158,7 +180,7 @@ fn service_backed_browser_access_stops_only_its_own_children() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let target = listener.local_addr().unwrap();
     let mut launch = launch();
-    launch.settings.rfb_target = target;
+    launch.rfb_target = target;
     let mut service = crate::host_service::ServiceRuntime::default();
     service.view.status = crate::ui::ServiceStatus {
         state: crate::ui::ServiceState::Running,
@@ -297,22 +319,30 @@ fn a_gateway_that_ignores_stdin_is_killed_after_the_grace_period() {
 #[test]
 fn starts_only_with_a_password_and_its_listener_closed() {
     let now = Instant::now();
-    // A listener left from an earlier run must close first; a server the
-    // Server tab runs does not show here, so it never blocks the start.
-    for (server, why) in [
-        (ours(), "serving"),
-        (HostServer::Starting, "starting"),
-        (HostServer::Stopping, "stopping"),
-    ] {
+    // Both routes need their own listener and a password, even while the
+    // Server tab serves through another listener on the same capture.
+    for launch in [launch(), quick_launch()] {
+        // A listener left from an earlier run must close first; a server the
+        // Server tab runs does not show here, so it never blocks the start.
+        for (server, why) in [
+            (ours(), "serving"),
+            (HostServer::Starting, "starting"),
+            (HostServer::Stopping, "stopping"),
+        ] {
+            let (mut web, spawner) = runtime();
+            assert!(
+                web.start(launch.clone(), "pw", &server, now).is_err(),
+                "{why}"
+            );
+            assert!(web.is_idle(), "{why}");
+            assert_eq!(web.poll(&server, now), None, "{why}");
+            assert_eq!(spawner.count(), 0, "{why}");
+        }
         let (mut web, spawner) = runtime();
-        assert!(web.start(launch(), "pw", &server, now).is_err(), "{why}");
-        assert!(web.is_idle(), "{why}");
-        assert_eq!(web.poll(&server, now), None, "{why}");
-        assert_eq!(spawner.count(), 0, "{why}");
+        assert!(web.start(launch, "", &HostServer::Stopped, now).is_err());
+        assert!(web.is_idle());
+        assert_eq!(spawner.count(), 0);
     }
-    let (mut web, _) = runtime();
-    assert!(web.start(launch(), "", &HostServer::Stopped, now).is_err());
-    assert!(web.is_idle());
 }
 
 #[test]
@@ -442,13 +472,20 @@ fn pairing_waits_for_the_gateway_and_ends_on_enrollment() {
         ["pair"]
     );
     assert!(web.pairing().is_none());
+    let ui = crate::ui::UiState::for_landing(None, &web);
+    assert_eq!(crate::ui::web_copy_url(&ui, &web), None);
     pair_line(&spawner);
     web.poll(&ours(), now);
     assert_eq!(web.pairing().unwrap().minutes_left(now), 10);
+    assert_eq!(
+        crate::ui::web_copy_url(&ui, &web),
+        Some("https://topvnc.owner.workers.dev/#pair=SECRET")
+    );
     spawner.push(Program::Gateway, Event::Enrolled("0a0b".into()));
     web.poll(&ours(), now);
     assert!(web.pairing().is_none());
     assert!(!web.pairing_active());
+    assert_eq!(crate::ui::web_copy_url(&ui, &web), web.app_origin());
     assert_eq!(web.message(), Some("Browser enrolled: key 0a0b."));
 }
 

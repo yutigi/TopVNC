@@ -16,7 +16,7 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
+    http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -29,25 +29,16 @@ use std::{
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 use topvnc::{ClientEvent, Framebuffer, ServerConfig, VncServer};
 use topvnc_access::fixtures;
-use topvnc_web_gateway::{Config, Gateway, create_host_key, routes, unix_now};
+use topvnc_web_gateway::{Config, Gateway, assets::WebAssets, create_host_key, routes, unix_now};
 
 const PASSWORD: &str = "topvnc-local";
 const SCENE: (u16, u16) = (1280, 720);
-/// Files served from web/dist; nothing else is reachable.
-const FILES: [(&str, &str); 6] = [
-    ("/", "index.html"),
-    ("/index.html", "index.html"),
-    ("/app.js", "app.js"),
-    ("/session-worker.js", "session-worker.js"),
-    ("/style.css", "style.css"),
-    ("/topvnc_web_bg.wasm", "topvnc_web_bg.wasm"),
-];
 
 struct Edge {
-    dist: PathBuf,
+    /// The page files from web/dist, as the Quick Tunnel gateway serves them.
+    assets: WebAssets,
     origin: String,
     gateway_url: String,
-    headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 /// A moving bar and a frame counter, scaled to the served size.
@@ -116,23 +107,7 @@ fn serve_scene(server: Arc<VncServer>) {
 }
 
 async fn file(State(edge): State<Arc<Edge>>, uri: Uri) -> Response {
-    let Some((_, name)) = FILES.iter().find(|(path, _)| *path == uri.path()) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Ok(body) = tokio::fs::read(edge.dist.join(name)).await else {
-        return (StatusCode::NOT_FOUND, "Build web/dist first").into_response();
-    };
-    let kind = match name.rsplit('.').next() {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") => "text/javascript",
-        Some("css") => "text/css",
-        _ => "application/wasm",
-    };
-    let mut response = ([(header::CONTENT_TYPE, kind)], body).into_response();
-    for (name, value) in &edge.headers {
-        response.headers_mut().insert(name.clone(), value.clone());
-    }
-    response
+    edge.assets.response(uri.path())
 }
 
 /// The edge's job: check the page's own origin, then forward to the gateway
@@ -264,17 +239,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(8765);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let origin = format!("http://{}", listener.local_addr()?);
-    let headers = std::fs::read_to_string(dist.join("_headers"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().split_once(": "))
-        .filter_map(|(name, value)| Some((name.parse().ok()?, value.parse().ok()?)))
-        .collect();
     let edge = Arc::new(Edge {
-        dist,
+        assets: WebAssets::load(&dist)?,
         origin: origin.clone(),
         gateway_url,
-        headers,
     });
     let app = Router::new()
         .route("/ws", get(upgrade))

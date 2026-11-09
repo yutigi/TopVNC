@@ -610,7 +610,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Ok(());
         };
         config = next_config;
-        connection_error = match run_session(&mut ui, session, &mut config, input_debug) {
+        connection_error = match run_session(
+            &mut ui,
+            session,
+            &mut config,
+            input_debug,
+            &mut server,
+            &mut web,
+            &mut service,
+        ) {
             Ok(error) => error,
             Err(error) => Some(error.to_string()),
         };
@@ -1203,10 +1211,7 @@ fn show_landing(
     // The pixels last presented; the form is presented again only when it changes.
     let mut shown = Vec::new();
     let mut redraw = true;
-    let mut state = UiState {
-        error,
-        ..UiState::default()
-    };
+    let mut state = UiState::for_landing(error, web);
     let (result_tx, result_rx) = mpsc::channel::<Result<Session, String>>();
     let mut connecting = false;
     let mut helpers = helpers::HelperRuntime::default();
@@ -1217,7 +1222,6 @@ fn show_landing(
     loop {
         helpers.poll();
         service.poll(state.tab == Tab::Service || server.web_service.is_some());
-        server.poll_web_service(service);
         // Permissions can change in System Settings while the window is open.
         // So can the attached displays, which the Server tab lists.
         if server.view.phase == ServerPhase::Stopped
@@ -1236,23 +1240,8 @@ fn show_landing(
             }
             state.error = Some(error);
         }
-        match web.poll(&server.web_view(), Instant::now()) {
-            Some(ServerRequest::Start(address)) => {
-                service.refresh();
-                let started = server.start_web(&config.serve, address, service);
-                if let Err(error) = started {
-                    state.error = Some(error);
-                    web.stop();
-                }
-            }
-            // The Server tab keeps its own listener on the server.
-            Some(ServerRequest::Stop) => server.stop(Owner::Web),
-            None => {}
-        }
-        // If the service already stopped, the runtime finishes without a
-        // Stop request. Release its reference so a later run starts fresh.
-        if web.is_idle() {
-            server.web_service = None;
+        if let Err(error) = poll_browser_access(server, web, &config, service) {
+            state.error = Some(error);
         }
         ui::landing(
             &mut Canvas::new(&mut pixels, WIDTH, HEIGHT),
@@ -1295,6 +1284,7 @@ fn show_landing(
         let mut web_clicked = false;
         let mut pair_clicked = false;
         let mut copy_url_clicked = false;
+        let mut quick_confirmed = false;
         let mut helper_action = None;
         let mut service_action = None;
         // Woken by input; the timeout picks up server status and the
@@ -1314,6 +1304,17 @@ fn show_landing(
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == ElementState::Pressed =>
                 {
+                    if state.quick_notice.is_some() {
+                        if !event.repeat
+                            && let PhysicalKey::Code(code) = event.physical_key
+                            && let Some(pair) = state.quick_notice_key(code)
+                        {
+                            quick_confirmed = true;
+                            web_clicked = !pair;
+                            pair_clicked = pair;
+                        }
+                        continue;
+                    }
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::Escape) => return Ok(None),
                         _ if connecting => {}
@@ -1370,6 +1371,17 @@ fn show_landing(
                     let Some((x, y)) = cursor else {
                         continue;
                     };
+                    if state.quick_notice.is_some() {
+                        let accept = ui::QUICK_NOTICE_CONTINUE.contains(x, y);
+                        if (accept || ui::QUICK_NOTICE_CANCEL.contains(x, y))
+                            && let Some(pair) = state.close_quick_notice(accept)
+                        {
+                            quick_confirmed = true;
+                            web_clicked = !pair;
+                            pair_clicked = pair;
+                        }
+                        continue;
+                    }
                     if let Some((_, tab, _)) = ui::MENU_TABS
                         .iter()
                         .find(|(area, _, _)| state.menu_open && area.contains(x, y))
@@ -1514,10 +1526,23 @@ fn show_landing(
                                 state.web_row = Some(row);
                             }
                         }
+                        // The route describes the next start, like the password.
+                        for (area, route, _) in ui::WEB_ROUTES {
+                            if web.is_idle() && area.contains(x, y) && state.web_route != route {
+                                state.web_route = route;
+                                state.error = None;
+                                state.notice = None;
+                            }
+                        }
                         web_clicked |= ui::WEB_START.contains(x, y);
                         pair_clicked |= ui::WEB_PAIR.contains(x, y);
                         copy_url_clicked |=
-                            ui::web_copy_url_shown(web) && ui::WEB_COPY_URL.contains(x, y);
+                            ui::web_copy_url_shown(&state, web) && ui::WEB_COPY_URL.contains(x, y);
+                        if state.web_route == web_access::config::RouteKind::QuickTunnel
+                            && ui::WEB_LIMITATIONS.contains(x, y)
+                        {
+                            state.open_quick_notice(ui::QuickTunnelNotice::Details);
+                        }
                     } else if state.tab == Tab::Service
                         && !ui::TAB_MORE.contains(x, y)
                         && !ui::TABS.iter().any(|(area, _, _)| area.contains(x, y))
@@ -1664,21 +1689,33 @@ fn show_landing(
                 ServerPhase::Starting | ServerPhase::Stopping => {}
             }
         }
-        if copy_url_clicked && let Some(origin) = web.app_origin() {
-            match copy_text(origin) {
+        if copy_url_clicked && let Some(url) = ui::web_copy_url(&state, web) {
+            let label = if web.pairing().is_some() {
+                "PAIRING"
+            } else {
+                "APP"
+            };
+            match copy_text(url) {
                 Ok(()) => {
                     state.error = None;
-                    state.notice = Some("APP URL COPIED TO THE CLIPBOARD.".into());
+                    state.notice = Some(format!("{label} URL COPIED TO THE CLIPBOARD."));
                 }
-                Err(error) => state.error = Some(format!("Could not copy the app URL: {error}")),
+                Err(error) => state.error = Some(format!("Could not copy the URL: {error}")),
             }
         }
         if web_clicked || pair_clicked {
             state.notice = None;
             let start = web.is_idle() && (web_clicked || (pair_clicked && !web.pairing_active()));
+            if start
+                && state.web_route == web_access::config::RouteKind::QuickTunnel
+                && !quick_confirmed
+            {
+                state.open_quick_notice(ui::QuickTunnelNotice::Start { pair: pair_clicked });
+                continue;
+            }
             let started = if start {
                 state.web_row = None;
-                start_web(web, &config, server)
+                start_web(web, state.web_route, &config, server)
             } else {
                 Ok(())
             };
@@ -1720,9 +1757,46 @@ fn show_landing(
     }
 }
 
-/// Check the browser-access files and start the WEB tab's run.
-fn start_web(web: &mut WebRuntime, config: &Config, server: &HostedServer) -> Result<(), String> {
-    let launch = web_access::config::prepare().map_err(|problem| problem.to_string())?;
+/// Advance browser access from either window, including failure shutdown.
+fn poll_browser_access(
+    server: &mut HostedServer,
+    web: &mut WebRuntime,
+    config: &Config,
+    service: &mut host_service::ServiceRuntime,
+) -> Result<(), String> {
+    service.poll(server.web_service.is_some());
+    server.poll_web_service(service);
+    let result = match web.poll(&server.web_view(), Instant::now()) {
+        Some(ServerRequest::Start(address)) => {
+            service.refresh();
+            let started = server.start_web(&config.serve, address, service);
+            if started.is_err() {
+                web.stop();
+            }
+            started
+        }
+        Some(ServerRequest::Stop) => {
+            server.stop(Owner::Web);
+            Ok(())
+        }
+        None => Ok(()),
+    };
+    // If the service already stopped, the runtime finishes without a
+    // Stop request. Release its reference so a later run starts fresh.
+    if web.is_idle() {
+        server.web_service = None;
+    }
+    result
+}
+
+/// Check the chosen route's files and start the WEB tab's run.
+fn start_web(
+    web: &mut WebRuntime,
+    route: web_access::config::RouteKind,
+    config: &Config,
+    server: &HostedServer,
+) -> Result<(), String> {
+    let launch = web_access::config::prepare(route).map_err(|problem| problem.to_string())?;
     web.start(
         launch,
         &config.serve.password,
@@ -1864,9 +1938,12 @@ fn run_session(
     session: Session,
     config: &mut Config,
     input_debug: bool,
+    server: &mut HostedServer,
+    web: &mut WebRuntime,
+    service: &mut host_service::ServiceRuntime,
 ) -> Result<Option<String>, Box<dyn Error>> {
     let writer = session.writer();
-    let result = run_session_inner(ui, session, config, input_debug);
+    let result = run_session_inner(ui, session, config, input_debug, server, web, service);
     let _ = writer.shutdown();
     result
 }
@@ -1876,6 +1953,9 @@ fn run_session_inner(
     mut session: Session,
     config: &mut Config,
     input_debug: bool,
+    server: &mut HostedServer,
+    web: &mut WebRuntime,
+    service: &mut host_service::ServiceRuntime,
 ) -> Result<Option<String>, Box<dyn Error>> {
     let info = session.info.clone();
     eprintln!(
@@ -2019,6 +2099,15 @@ fn run_session_inner(
     let mut known_serve_display = None;
     let mut capture_status = CaptureStatus::Live;
     loop {
+        // Hosting and browser access survive viewer sessions. Keep failure
+        // handling active here, including stopping public forwarding when
+        // the gateway exits, rather than waiting for the landing window.
+        if let Some(error) = server.poll() {
+            eprintln!("Hosted server: {error}");
+        }
+        if let Err(error) = poll_browser_access(server, web, config, service) {
+            eprintln!("Browser access: {error}");
+        }
         let mut title_changed = false;
         remote = frames.dimensions();
         if writer.capture_status() != capture_status {
@@ -2034,6 +2123,11 @@ fn run_session_inner(
         }
         // Presentation waits never run on the input event thread.
         let timeout = (last_stats.0 + STATS_INTERVAL).saturating_duration_since(Instant::now());
+        let timeout = if web.is_idle() {
+            timeout
+        } else {
+            timeout.min(Duration::from_millis(50))
+        };
         for event in ui.pump(timeout) {
             match event {
                 UiEvent::Device(DeviceEvent::MouseMotion { delta }) if locked => {
