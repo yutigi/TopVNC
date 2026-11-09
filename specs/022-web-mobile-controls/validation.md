@@ -36,6 +36,9 @@ are the implemented paths. No production hosting deployment was performed.
 - Reproduced the deployment guard accepting a newer clean `main` commit than
   the one validated. The helper now retains the initial commit and checks it
   again immediately before publishing; a focused regression rejects changes.
+- Screenshot review found the landscape pointer buttons overflowing the side
+  deck and clipping the mode toggle. Buttons now shrink and wrap within the
+  deck while retaining 44-pixel targets; Chromium checks enforce their bounds.
 - Windows workspace tests and Clippy, web and Worker tests, browser/WASM build
   checks, and the offline Chromium mobile checks were rerun for these fixes.
   The original device, live-session and performance verification limits remain.

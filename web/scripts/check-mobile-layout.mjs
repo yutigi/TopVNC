@@ -76,6 +76,9 @@ try {
       if (mode === 'type') {
         assert.ok(await evaluate(`(()=>{const r=document.querySelector('#keyboard-languages').getBoundingClientRect(), dock=document.querySelector('.thumb-dock').getBoundingClientRect();return r.width>=44&&r.height>=44&&r.bottom<=dock.top;})()`));
       }
+      if (mode === 'pointer') {
+        assert.ok(await evaluate(`(()=>{const deck=document.querySelector('#control-deck').getBoundingClientRect();return [...document.querySelectorAll('.pointer-buttons button')].every(button=>{const r=button.getBoundingClientRect();return r.left>=deck.left&&r.right<=deck.right&&r.width>=44&&r.height>=44&&button.scrollWidth<=button.clientWidth;});})()`), `Pointer buttons overflow at ${size.width}x${size.height}`);
+      }
       console.log(JSON.stringify({ size, mode, boxes }));
       const screenshot = await cdp('Page.captureScreenshot', { format: 'png' }); writeFileSync(`${dir}${size.width}-${mode}.png`, Buffer.from(screenshot.data, 'base64'));
     }

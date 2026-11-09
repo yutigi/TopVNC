@@ -233,6 +233,7 @@ input[type="range"]::-moz-range-thumb { width: 12px; height: 26px; border: 0; bo
 .control-groups { min-height: 0; overflow: auto; display: flex; flex-direction: column; padding: 6px; gap: 6px; overscroll-behavior: contain; }
 .type-modifiers, .input-source, .pointer-buttons, .draft-row { display: flex; gap: 5px; }
 .type-modifiers button, .input-source button, .pointer-buttons button { flex: 1; min-height: 44px; }
+.pointer-buttons button { min-width: 0; padding: 6px; white-space: normal; overflow-wrap: anywhere; }
 .quick-keys, #function-keys { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; }
 .quick-keys button, #function-keys button { min-width: 0; min-height: 44px; padding: 4px; }
 #function-keys { overflow: visible; width: auto; margin-top: 6px; }
