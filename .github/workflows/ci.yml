@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       # rust-toolchain.toml pins the compiler, Clippy and rustfmt.
@@ -46,7 +46,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       # display-info links libxcb with RandR and Render. winit loads Wayland,
@@ -59,7 +59,7 @@ jobs:
       # rust-toolchain.toml pins the compiler, Clippy and rustfmt.
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
@@ -70,7 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       # rust-toolchain.toml pins the compiler, Clippy and rustfmt.
@@ -78,7 +78,7 @@ jobs:
         run: rustup toolchain install
       - name: Add the WebAssembly target
         run: rustup target add wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Clippy, browser client (wasm32)
         run: cargo clippy --locked --target wasm32-unknown-unknown -p topvnc-web -- -D warnings
       # web/scripts/build.mjs requires the wasm-bindgen CLI that matches the
@@ -86,7 +86,7 @@ jobs:
       - name: Read the pinned wasm-bindgen version
         id: bindgen
         run: echo "version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: tools
         with:
           path: .tools
@@ -94,7 +94,7 @@ jobs:
       - name: Install wasm-bindgen CLI
         if: steps.tools.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version "${{ steps.bindgen.outputs.version }}" --locked --root .tools
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm

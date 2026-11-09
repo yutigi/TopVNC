@@ -493,7 +493,9 @@ impl ClientSession {
     /// A keysym press or release, for toolbar keys.
     pub fn key_sym(&mut self, keysym: u32, down: bool) -> io::Result<()> {
         self.input(|running, out| {
-            running.input.key(keysym, down, out);
+            if let Some((keysym, down)) = running.keyboard.symbol_event(keysym, down) {
+                running.input.key(keysym, down, out);
+            }
             Ok(())
         })
     }
@@ -508,7 +510,10 @@ impl ClientSession {
                     .iter()
                     .any(|key| matches!(key, 0xffe1 | 0xffe2));
             for (keysym, down) in text_key_events(text, shift_held) {
-                running.input.key(keysym, down, out);
+                // A text tap must not release a hardware or touch hold.
+                if !running.keyboard.held(keysym) {
+                    running.input.key(keysym, down, out);
+                }
             }
             Ok(())
         })

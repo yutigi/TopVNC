@@ -34,6 +34,18 @@ function fire(field, type, props = {}, cancelable = false) {
   return event;
 }
 
+test('lifecycle cancellation rejects stale IME commits until a fresh focus', () => {
+  const field = new Field(); const sent = [];
+  const adapter = attachTextInput(field, { active: () => true, text: value => sent.push(value), tap: () => assert.fail('unexpected key') });
+  fire(field, 'compositionstart'); field.value += '日本';
+  adapter.cancel();
+  field.value += '日本'; fire(field, 'compositionend'); fire(field, 'input', { inputType: 'insertText', data: '日本' });
+  assert.deepEqual(sent, []);
+  fire(field, 'focus');
+  edit(field, 'insertText', { data: 'ไทย' });
+  assert.deepEqual(sent, ['ไทย']);
+});
+
 // What a browser does for one edit: beforeinput, then, unless cancelled,
 // the edit at the caret and an input event if the field changed.
 function edit(field, inputType, { data = null, cancelable = true, isComposing = false, ios = false } = {}) {

@@ -9,6 +9,7 @@ import { forgetPairing, inviteFromHash, loadPairing, savePairing } from "./pairi
 import { TouchGestures } from "./gestures.mjs";
 import { attachTextInput } from "./text-input.mjs";
 import { View } from "./view.mjs";
+import { createMobileControls } from "./mobile-controls.mjs";
 
 const $ = (selector) => document.querySelector(selector);
 const home = $("#home");
@@ -34,7 +35,6 @@ const keyboard = $("#keyboard");
 const BUTTON = { left: 1, middle: 2, right: 4, wheelUp: 8, wheelDown: 16, wheelLeft: 32, wheelRight: 64, back: 128, forward: 256 };
 // KeyboardEvent.buttons bits, in order: left, right, middle, back, forward.
 const DOM_BUTTONS = [BUTTON.left, BUTTON.right, BUTTON.middle, BUTTON.back, BUTTON.forward];
-const MODIFIERS = { ctrl: 0xffe3, alt: 0xffe9, shift: 0xffe1, super: 0xffeb };
 const CLOSE_HINTS = {
   "browser key is not enrolled": "This browser is not enrolled on the host. Run the gateway with --pair and scan its code again.",
   "no pairing invite is active": "The pairing invite expired or was already used. Run the gateway with --pair again.",
@@ -67,7 +67,7 @@ let buttons = 0;
 let pointerPosition = { x: 0, y: 0 };
 // Mouse users see their own cursor; touch input aims a drawn one.
 let touchInput = matchMedia("(pointer: coarse)").matches;
-const latched = new Set();
+let mobile;
 const view = new View();
 let lines = [];
 let post;
@@ -275,6 +275,7 @@ async function onSessionMessage(message) {
       passwordForm.hidden = true;
       passwordInput.value = "";
       showViewer(false);
+      mobile?.closed();
       // The next host may not offer these controls.
       showCapabilities({ serveScale: 0, displays: [] });
       showCaptureStatus(0);
@@ -302,7 +303,7 @@ function showViewer(visible) {
   viewer.hidden = !visible;
   home.hidden = visible;
   document.body.classList.toggle("viewing", visible);
-  if (visible) layout();
+  if (visible) { layout(); screen.focus({ preventScroll: true }); }
   else {
     showMenu(false);
     showFunctionKeys(false);
@@ -446,6 +447,7 @@ screen.addEventListener("pointerdown", (event) => {
   if (state !== "connected") return;
   event.preventDefault();
   keyboard.blur();
+  screen.focus({ preventScroll: true });
   if (touchInput !== (event.pointerType === "touch")) {
     touchInput = event.pointerType === "touch";
     updateCursor();
@@ -521,13 +523,7 @@ screen.addEventListener("contextmenu", (event) => event.preventDefault());
 
 // ---- Keyboard input -----------------------------------------------------------
 
-function releaseLatched() {
-  for (const name of latched) {
-    input({ kind: "keysym", keysym: MODIFIERS[name], down: false });
-    toolbar.querySelector(`[data-modifier="${name}"]`)?.classList.remove("latched");
-  }
-  latched.clear();
-}
+function releaseLatched() { mobile?.clearModifiers(); }
 
 function tapKeysym(keysym) {
   input({ kind: "keysym", keysym, down: true });
@@ -535,26 +531,31 @@ function tapKeysym(keysym) {
   releaseLatched();
 }
 
+const physicalKeys = new Set();
 const MODIFIER_CODES = /^(Shift|Control|Alt|Meta|OS)(Left|Right)$/;
 
 window.addEventListener("keydown", (event) => {
-  if (state !== "connected" || event.target === keyboard || event.target.closest?.("#menu")) return;
+  if (state !== "connected" || event.defaultPrevented || event.target.closest?.("#menu, #control-sheet, #control-deck, #toolbar, #function-keys, input, textarea, select, button, .language-popover")) return;
   // Hardware keyboards report physical keys; text input methods use the
   // on-screen keyboard field instead.
   if (event.isComposing || !event.code || event.code === "Unidentified") return;
   event.preventDefault();
+  if (!physicalKeys.has(event.code) && physicalKeys.size >= 32) return;
+  if (!physicalKeys.has(event.code) && !MODIFIER_CODES.test(event.code)) mobile.beginPhysical(event.code);
+  physicalKeys.add(event.code);
   input({ kind: "code", code: event.code, down: true });
 });
 
 window.addEventListener("keyup", (event) => {
-  if (state !== "connected" || event.target === keyboard || !event.code) return;
+  if (state !== "connected" || !physicalKeys.delete(event.code)) return;
   event.preventDefault();
   input({ kind: "code", code: event.code, down: false });
+  mobile.endPhysical(event.code);
   if (!MODIFIER_CODES.test(event.code)) releaseLatched();
 });
 
-attachTextInput(keyboard, {
-  active: () => state === "connected",
+const nativeText = attachTextInput(keyboard, {
+  active: () => state === "connected" && Boolean(mobile?.nativeActive()),
   text: (text) => {
     input({ kind: "text", text });
     releaseLatched();
@@ -563,7 +564,7 @@ attachTextInput(keyboard, {
 });
 
 keyboard.addEventListener("keydown", (event) => {
-  if (state !== "connected") return;
+  if (state !== "connected" || event.isComposing) return;
   // Keys without text, from either keyboard.
   const keysym = { Escape: 0xff1b, Tab: 0xff09, ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54 }[event.key];
   if (keysym) {
@@ -574,39 +575,27 @@ keyboard.addEventListener("keydown", (event) => {
 
 // ---- Toolbar and menu ----------------------------------------------------------
 
-toolbar.addEventListener("click", (event) => {
+viewer.addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button || state !== "connected") return;
-  if (button.dataset.keysym) tapKeysym(Number(button.dataset.keysym));
-  else if (button.dataset.modifier) {
-    const name = button.dataset.modifier;
-    const down = !latched.has(name);
-    if (down) latched.add(name);
-    else latched.delete(name);
-    button.classList.toggle("latched", down);
-    input({ kind: "keysym", keysym: MODIFIERS[name], down });
-  } else if (button.id === "show-keyboard") {
-    keyboard.focus();
-  } else if (button.id === "show-function-keys") {
+  if (button.id === "show-function-keys") {
     showFunctionKeys(functionKeys.hidden);
     layout();
   } else if (button.id === "toggle-mode") {
+    releaseEverything();
     mode = mode === "trackpad" ? "direct" : "trackpad";
     remember("mode", mode);
     gestures.setMode(mode);
     button.textContent = mode === "trackpad" ? "Trackpad" : "Direct";
+    $("#pointer-mode-label").textContent = button.textContent;
     updateCursor();
   } else if (button.id === "fit") {
     view.reset();
     layout();
   } else if (button.id === "show-menu") {
+    releaseEverything();
     showMenu(menu.hidden);
   }
-});
-
-functionKeys.addEventListener("click", (event) => {
-  const button = event.target.closest("button");
-  if (button?.dataset.keysym) tapKeysym(Number(button.dataset.keysym));
 });
 
 // Keep the toolbar from taking focus away from the on-screen keyboard.
@@ -618,7 +607,7 @@ for (const bar of [toolbar, functionKeys]) {
 }
 
 $("#disconnect").addEventListener("click", () => {
-  input({ kind: "release" });
+  releaseEverything();
   send({ type: "close" });
 });
 $("#stats-toggle").addEventListener("change", (event) => {
@@ -633,6 +622,20 @@ $("#serve-scale").addEventListener("input", (event) => showServeScale(Number(eve
 $("#serve-scale").addEventListener("change", (event) => input({ kind: "serveScale", percent: Number(event.target.value) }));
 $("#serve-display").addEventListener("change", (event) => input({ kind: "serveDisplay", display: Number(event.target.value) }));
 $("#close-menu").addEventListener("click", () => showMenu(false));
+
+// Mount presentation controls; the session and its backpressure path stay shared.
+$("#keys-panel").append(functionKeys);
+$("#native-input-panel").append(keyboard);
+mobile = createMobileControls({
+  root: viewer, keyboard, storage,
+  active: () => state === "connected",
+  input, button: setButton, move: moveBy, reset: releaseEverything,
+  pointerMode: () => mode === "trackpad" ? "Trackpad" : "Direct",
+});
+for (const target of [$("#fullscreen"), $("#fullscreen-menu")]) target.addEventListener("click", () => {
+  const pending = document.fullscreenElement ? document.exitFullscreen?.() : viewer.requestFullscreen?.();
+  pending?.catch(() => report("Fullscreen is unavailable in this browser."));
+});
 
 // ---- Connecting -----------------------------------------------------------------
 
@@ -714,20 +717,23 @@ $("#quality").addEventListener("change", (event) => {
 // ---- Page lifecycle ---------------------------------------------------------------
 
 function resetInput() {
+  mobile?.release();
+  nativeText.cancel();
+  physicalKeys.clear();
   gestures.cancel();
   buttons = 0;
-  for (const name of latched) toolbar.querySelector(`[data-modifier="${name}"]`)?.classList.remove("latched");
-  latched.clear();
   if (document.pointerLockElement) document.exitPointerLock();
 }
 
 // Nothing stays held on the host when the page loses focus or hides.
 function releaseEverything() {
-  if (state === "connected") input({ kind: "release" });
   resetInput();
+  if (state === "connected") input({ kind: "release" });
+  keyboard.blur();
 }
 
 window.addEventListener("blur", releaseEverything);
+window.addEventListener("pointercancel", releaseEverything);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) releaseEverything();
   else if (state === "connected") {

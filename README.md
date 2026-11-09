@@ -197,6 +197,26 @@ cargo web-gateway                # 3. the gateway for already paired browsers
 
 Then open the app URL on the phone and press **Connect**. If something fails, the page names the missing piece; the guide's [troubleshooting table](docs/cloudflare-gateway.md#troubleshooting) lists each message.
 
+### Manual Cloudflare deployment
+
+Run these commands from the repository root with your existing Wrangler sign-in
+and ignored `gateway/cloudflare/worker/wrangler.local.toml` configuration:
+
+```powershell
+# Test, build and dry-run
+npm --prefix gateway/cloudflare/worker run deploy:check
+
+# Publish from clean, up-to-date main
+npm --prefix gateway/cloudflare/worker run deploy
+```
+
+The check command works on feature branches without publishing. Deployment
+requires a clean `main` checkout matching the current `origin/main`. If this
+worktree has no local config, append `-- --config "D:/path/to/wrangler.local.toml"`
+to use an existing one. GitHub Actions runs checks only. See the
+[manual deployment guide](docs/cloudflare-gateway.md#manual-deployment) for setup,
+verification and rollback.
+
 ## Controls and display settings
 
 | Control or setting | Behavior |
