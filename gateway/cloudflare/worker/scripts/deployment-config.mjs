@@ -33,8 +33,9 @@ export function deploymentConfig(config, workerDir, webDir) {
   };
 }
 
-export function assertPublishable({ branch, status, head, remoteHead }) {
+export function assertPublishable({ branch, status, head, remoteHead, checkedHead }) {
   if (branch !== "main") throw new Error("Publishing requires the main branch. Use deploy:check to validate an unmerged branch.");
   if (status.trim()) throw new Error("Publishing requires a clean checkout. Commit or move local changes first.");
   if (!/^[a-f0-9]{40}$/.test(head) || head !== remoteHead) throw new Error("Publishing requires HEAD to match origin's current main. Update main before deploying.");
+  if (checkedHead !== undefined && head !== checkedHead) throw new Error("The main commit changed during validation. Run deployment checks again before publishing.");
 }

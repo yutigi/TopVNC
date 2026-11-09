@@ -64,6 +64,15 @@ test("publishing refuses unmerged, dirty, outdated and unverifiable checkouts", 
   ]) assert.throws(() => assertPublishable({ ...state, ...invalid }));
 });
 
+test("publishing refuses a different main commit than the one validated", () => {
+  const state = {
+    branch: "main", status: "", head: "b".repeat(40), remoteHead: "b".repeat(40),
+    checkedHead: "a".repeat(40),
+  };
+  assert.throws(() => assertPublishable(state), /changed during validation/);
+  assert.doesNotThrow(() => assertPublishable({ ...state, checkedHead: state.head }));
+});
+
 test("Access verification checks both page and WebSocket path without following redirects", async () => {
   const { APP_ORIGIN: origin, ACCESS_ISSUER: issuer } = fixture().vars;
   const paths = [];

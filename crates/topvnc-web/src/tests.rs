@@ -288,6 +288,53 @@ fn input_is_encoded_bounded_to_the_framebuffer_and_released() {
     );
 }
 
+#[test]
+fn hardware_and_touch_holds_release_only_after_both_sources_let_go() {
+    for (code, sym) in [
+        ("KeyW", 119),
+        ("ControlLeft", 0xffe3),
+        ("ShiftLeft", 0xffe1),
+    ] {
+        for hardware_first in [true, false] {
+            let (mut session, mut host) = signed_in(4096);
+            if hardware_first {
+                session.key_code(code, true).unwrap();
+                host.expect(&mut session, &key_event(sym, true));
+                session.key_sym(sym, true).unwrap();
+                session.key_code(code, false).unwrap();
+                host.expect(&mut session, &[]);
+                session.key_sym(sym, false).unwrap();
+            } else {
+                session.key_sym(sym, true).unwrap();
+                host.expect(&mut session, &key_event(sym, true));
+                session.key_code(code, true).unwrap();
+                session.key_sym(sym, false).unwrap();
+                host.expect(&mut session, &[]);
+                session.key_code(code, false).unwrap();
+            }
+            host.expect(&mut session, &key_event(sym, false));
+        }
+    }
+}
+
+#[test]
+fn text_and_late_touch_releases_do_not_cancel_hardware_holds() {
+    let (mut session, mut host) = signed_in(4096);
+    session.key_code("KeyW", true).unwrap();
+    host.expect(&mut session, &key_event(119, true));
+    session.type_text("w").unwrap();
+    host.expect(&mut session, &[]);
+    session.key_sym(119, true).unwrap();
+    session.release_all().unwrap();
+    host.expect(&mut session, &key_event(119, false));
+    session.key_code("KeyW", true).unwrap();
+    host.expect(&mut session, &key_event(119, true));
+    session.key_sym(119, false).unwrap();
+    host.expect(&mut session, &[]);
+    session.key_code("KeyW", false).unwrap();
+    host.expect(&mut session, &key_event(119, false));
+}
+
 fn fence_request(prefix: &[u8], value: u8) -> Vec<u8> {
     let mut payload = prefix.to_vec();
     payload.push(value);

@@ -103,11 +103,12 @@ pub fn keysym_for_code(code: &str, shift: bool) -> Option<u32> {
     })
 }
 
-/// Physical keys held, each with the keysym its press sent, so the release
-/// sends the same keysym even if Shift changed in between.
+/// Physical and touch keys held. Each source keeps its own ownership, so
+/// releasing a touch control cannot release a key still held on hardware.
 #[derive(Default)]
 pub struct Keyboard {
     pressed: Vec<(String, u32)>,
+    symbols: Vec<u32>,
 }
 
 impl Keyboard {
@@ -116,9 +117,10 @@ impl Keyboard {
     pub fn event(&mut self, code: &str, down: bool) -> Option<(u32, bool)> {
         let index = self.pressed.iter().position(|(held, _)| held == code);
         if !down {
-            return index.map(|index| (self.pressed.remove(index).1, false));
+            let keysym = self.pressed.remove(index?).1;
+            return (!self.held(keysym)).then_some((keysym, false));
         }
-        if index.is_some() || self.pressed.len() >= MAX_PRESSED {
+        if index.is_some() || self.pressed.len() + self.symbols.len() >= MAX_PRESSED {
             return None;
         }
         let shift = self
@@ -126,13 +128,35 @@ impl Keyboard {
             .iter()
             .any(|(held, _)| held == "ShiftLeft" || held == "ShiftRight");
         let keysym = keysym_for_code(code, shift)?;
+        let held = self.held(keysym);
         self.pressed.push((code.to_owned(), keysym));
-        Some((keysym, true))
+        (!held).then_some((keysym, true))
+    }
+
+    /// A touch/control keysym, whose source already accounts for multiple
+    /// fingers. Send an edge only when the aggregate held state changes.
+    pub fn symbol_event(&mut self, keysym: u32, down: bool) -> Option<(u32, bool)> {
+        let index = self.symbols.iter().position(|held| *held == keysym);
+        if !down {
+            self.symbols.remove(index?);
+            return (!self.held(keysym)).then_some((keysym, false));
+        }
+        if index.is_some() || self.pressed.len() + self.symbols.len() >= MAX_PRESSED {
+            return None;
+        }
+        let held = self.held(keysym);
+        self.symbols.push(keysym);
+        (!held).then_some((keysym, true))
+    }
+
+    pub fn held(&self, keysym: u32) -> bool {
+        self.symbols.contains(&keysym) || self.pressed.iter().any(|(_, sym)| *sym == keysym)
     }
 
     /// Forget every held key, after the caller released them on the host.
     pub fn clear(&mut self) {
         self.pressed.clear();
+        self.symbols.clear();
     }
 
     pub fn shift_held(&self) -> bool {
