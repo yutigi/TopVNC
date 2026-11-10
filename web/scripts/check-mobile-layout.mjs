@@ -92,6 +92,19 @@ try {
     await evaluate(`testSessionMessage({type:'capabilities',serveScale:0,displays:[]})`);
   };
   const measure = () => evaluate(`(()=>{const ids=['screen','toolbar','control-deck'];return Object.fromEntries(ids.map(id=>{const r=document.getElementById(id).getBoundingClientRect();return[id,{x:r.x,y:r.y,width:r.width,height:r.height}]}));})()`);
+  const checkLanguageEditor = async label => {
+    await evaluate(`document.querySelector('#keyboard-layout').scrollIntoView({block:'nearest'})`); await frame();
+    const button = await evaluate(`(()=>{const n=document.querySelector('#keyboard-layout'),r=n.getBoundingClientRect(),x=r.x+r.width/2,y=r.y+r.height/2;return{x,y,reachable:r.width>0&&r.height>0&&document.elementFromPoint(x,y)===n};})()`);
+    assert.ok(button.reachable, `Language editor unreachable: ${label}`);
+    await evaluate(`document.querySelector('#keyboard-layout').focus()`);
+    await cdp('Input.dispatchMouseEvent',{type:'mousePressed',x:button.x,y:button.y,button:'left',buttons:1,clickCount:1});
+    await cdp('Input.dispatchMouseEvent',{type:'mouseReleased',x:button.x,y:button.y,button:'left',buttons:0,clickCount:1});
+    assert.ok(await evaluate(`!document.querySelector('#control-sheet').hidden&&document.querySelector('#sheet-title').textContent==='Keyboard languages'&&document.activeElement.id==='close-sheet'`),label);
+    await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+    await cdp('Input.dispatchKeyEvent',{type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+    assert.ok(await evaluate(`document.querySelector('#control-sheet').hidden&&document.activeElement.id==='keyboard-layout'`),label);
+    await evaluate(`document.querySelector('.control-groups').scrollTop=0;document.querySelector('#screen').focus()`); await frame();
+  };
   const checkPointerFill = async () => {
     const boxes = await evaluate(`(()=>{const box=s=>{const r=document.querySelector(s).getBoundingClientRect();return{top:r.top,bottom:r.bottom,height:r.height}};return{groups:box('.control-groups'),panel:box('#pointer-panel'),pad:box('#trackpad'),buttons:box('.pointer-buttons'),dock:box('.thumb-dock')};})()`);
     assert.ok(Math.abs(boxes.panel.bottom - boxes.groups.bottom) <= 1, `Unused Pointer space: ${JSON.stringify(boxes)}`);
@@ -110,6 +123,7 @@ try {
       const dock = await evaluate(`[...document.querySelectorAll('.thumb-dock button')].map(n=>{let r=n.getBoundingClientRect();return {width:r.width,height:r.height,y:r.y,bottom:r.bottom};})`);
       assert.ok(dock.every(r => r.width >= 44 && r.height >= 44 && r.y >= 0 && r.bottom <= size.height + 1), JSON.stringify({size,mode,dock,boxes}));
       if (mode === 'type') {
+        await checkLanguageEditor(`${size.width}x${size.height}`);
         // Compact landscape typing follows the reference's 31px character keys.
         const keyHeight = size.width > size.height && size.width >= 600 ? 31 : 44;
         // On short viewports the reference stacks more rows than fit at once.
@@ -141,6 +155,7 @@ try {
       assert.equal(boxes.screen.x, side === 'left' ? 310 : 0);
       assert.equal(boxes.screen.width, 534);
       if (mode === 'pointer') await checkPointerFill();
+      if (mode === 'type') await checkLanguageEditor(`landscape ${side}`);
       assert.ok(await evaluate(`(()=>{const s=getComputedStyle(document.querySelector('#control-deck'));return s.border${side === 'left' ? 'Right' : 'Left'}Width==='1px'&&s.border${side === 'left' ? 'Left' : 'Right'}Width==='0px';})()`));
       const shot = await cdp('Page.captureScreenshot', { format: 'png' });
       writeFileSync(`${dir}844-${side}-${mode}.png`, Buffer.from(shot.data, 'base64'));

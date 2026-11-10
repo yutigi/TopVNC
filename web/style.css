@@ -273,7 +273,10 @@ input[type="range"] { --fill: 100%; width: 100%; min-height: 36px; margin: 0; ac
   #viewer[data-control-mode="type"] .keyboard-bottom button { min-height: 31px; min-width: 48px; font-size: 10px; }
   #viewer[data-control-mode="type"] #keyboard-languages { min-width: 44px; }
   #viewer[data-control-mode="type"] #keyboard-return { min-width: 46px; font-size: 17px; }
-  #viewer[data-control-mode="type"] .typing-help, #viewer[data-control-mode="type"] #typing-help { display: none; }
+  /* Keep the language editor in the scrollable panel even on short side decks. */
+  #viewer[data-control-mode="type"] .typing-help { height: 44px; justify-content: flex-end; }
+  #viewer[data-control-mode="type"] .typing-help > span, #viewer[data-control-mode="type"] #typing-help { display: none; }
+  #viewer[data-control-mode="type"] .typing-help button { min-height: 44px; padding: 0 8px; font-size: 10px; }
   #viewer[data-control-mode="type"] .thumb-dock { padding: 3px 0; margin-top: 4px; gap: 8px; }
   #viewer[data-control-mode="type"] #control-deck .thumb-dock button { flex-direction: row; gap: 8px; }
   #viewer[data-layout-position="left"], #viewer[data-layout-position="right"] { grid-template: 44px minmax(0, 1fr) / 310px minmax(0, 1fr); }

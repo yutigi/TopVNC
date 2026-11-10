@@ -41,3 +41,9 @@
 - [x] Publish the requested mobile Site update while preserving owner-only access.
 - [x] Fill the available landscape Pointer area with the trackpad and both click
   buttons; verify panel, button and dock bounds on either side.
+
+## Review follow-up
+
+- [x] Restore the accepted reference snapshot so its recorded provenance passes.
+- [x] Keep the language editor reachable in landscape and verify clicking it,
+  Escape dismissal and focus return in bottom and side layouts.
