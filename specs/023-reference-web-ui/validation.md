@@ -284,3 +284,22 @@ Published the correction to the existing owner-only mobile Site. Source commit:
 The native Sites result confirmed the existing production URL and the audience
 was preserved. The full-width landscape Type layout is selected with Session
 settings → Landscape controls → Bottom (or Default), then Type in the dock.
+
+### Review follow-up — 2026-11-11
+
+The local preview commit accidentally changed the accepted reference's
+`customize.css`, causing `test:visual` to fail its provenance assertion. Restored
+that file to the recorded reference snapshot. No baseline hashes or PNGs were
+regenerated; all 30 reference comparisons now pass.
+
+Landscape Type now keeps its Edit layout action in the scrollable control panel
+with a 44px target. Short viewports can scroll to it above the fixed dock. The
+new browser regression failed at 844×390 before the CSS correction. It now
+checks actual pointer clicks, language-dialog opening, Escape dismissal and
+focus return across the existing portrait/landscape sizes and both side decks.
+
+Validation on Windows: 76 web tests, the behavioral browser suite and 30 visual
+comparisons passed. `cargo fmt --all`, `cargo test --workspace --locked`
+(355 passed, 8 ignored), Clippy for all workspace targets with warnings denied,
+and `git diff --check` passed. Browser evidence uses the offline session fixture;
+physical-device, Safari and live-host verification remain outside these checks.
