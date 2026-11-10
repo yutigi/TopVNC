@@ -46,7 +46,29 @@ tracked source are read-only for this work.
 - Verify production/offline UI at narrow portrait, mobile landscape and desktop
   widths, exercise input routing, and run the workspace checks in AGENTS.md.
 
-## Limits
+## Visual fidelity correction
+
+Compare against the immutable mobile wireframe source, including actual font
+weights, normal line height, button padding, tint, keyboard geometry, spacing
+and dock colors. Add reference-derived screenshot goldens for Keys, Type and
+Pointer controls at portrait and landscape sizes. Baselines must be generated
+from the reference, never approved from the implementation under test. Exclude
+the simulated framebuffer, prototype bezel/annotations and truthful production
+security copy from pixel comparisons. Keep accessible touch targets,
+host capability settings, desktop behavior and input routing intact. Record the
+font provenance and verify reference/source hashes so drift is explicit.
+
+## Follow-up control corrections
+
+- Remove the Pointer deck's extra screen-input label and mode toggle row.
+- Expose the existing landscape deck placement in Session settings; changes
+  apply immediately, persist on this device, and preserve the portrait layout.
+- Match the accepted Type composition controls and stacked landscape rows.
+  Keep text insertion, native IME, shortcuts, and every keyboard row usable.
+- In a landscape side deck, expand the trackpad to use the available height.
+  Keep both click buttons fully visible directly below it, above the mode dock.
+
+## Verification limits
 
 Screenshots use a clearly labeled offline session fixture. They do not establish
 physical-device, Safari, live game, latency or remote-session support. Production

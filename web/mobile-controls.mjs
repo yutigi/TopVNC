@@ -12,7 +12,7 @@ export function element(tag, text, className) {
   return node;
 }
 
-export function createMobileControls({ root, keyboard, storage, active, input, button, move, reset, pointerMode, modals }) {
+export function createMobileControls({ root, keyboard, storage, active, input, button, move, reset, modals }) {
   const $ = selector => selector === '#device' ? root : root.querySelector(selector);
   const el = element;
   let mode = 'keys'; let source = 'custom'; let symbols = false; let composing = false;
@@ -37,7 +37,7 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
   const pad = $('#trackpad'); const draft = $('#compose');
   const userAgent = globalThis.navigator?.userAgent ?? '';
   const os = /iPad|iPhone|iPod/u.test(userAgent) || (/Mac/u.test(userAgent) && globalThis.navigator?.maxTouchPoints > 1) ? 'iOS'
-    : /Android/u.test(userAgent) ? 'Android' : /Windows/u.test(userAgent) ? 'Win' : /Mac/u.test(userAgent) ? 'Mac' : /Linux/u.test(userAgent) ? 'Linux' : 'OS';
+    : /Android/u.test(userAgent) ? 'Android' : /Windows/u.test(userAgent) ? 'Windows' : /Mac/u.test(userAgent) ? 'macOS' : /Linux/u.test(userAgent) ? 'Linux' : 'device';
   $('#native-keyboard').textContent = `Native · ${os}`;
   $('#native-keyboard').setAttribute('aria-label', `Request native ${os} keyboard input`);
   function feedback(value) {
@@ -140,7 +140,7 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
       ? 'Native input sends committed text directly. Use your OS globe for languages; your OS controls keyboard visibility.'
       : ['zh', 'ja'].includes(profile().id)
         ? 'Direct character layout. For Chinese/Japanese conversion, use Native input and your device IME.'
-        : 'Compose locally, then Insert. Ctrl/Alt shortcuts send the next key directly.';
+        : 'TopVNC keys · edit the layout to match your habits.';
   }
   function setSource(next) {
     if (!canChange()) { feedback('Finish composing before changing input source.'); return; }
@@ -248,6 +248,7 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
     close: closeSheet, feedback, fps: fps.apply,
     enterPreset: () => setMode('pointer'),
   });
+  $('#landscape-controls').addEventListener('change', event => customization.setLandscapePosition(event.target.value));
   switcher = createLanguageSwitcher({
     key: $('#keyboard-languages'), host: root, el,
     profiles: () => languages.profiles, current: () => languages.selected,
@@ -288,7 +289,6 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
   });
   eraseKey.addEventListener('click', event => { if (event.detail === 0) backspace(); });
   for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) eraseKey.addEventListener(name, event => { if (erasing === event.pointerId) stopErase(); });
-  $('#clear-draft').addEventListener('click', () => { if (!composing) draft.value = ''; });
   $('#symbol-keyboard').addEventListener('click', () => { symbols = !symbols; renderKeyboard(); });
   $('#custom-keyboard').addEventListener('click', () => setSource('custom'));
   $('#native-keyboard').addEventListener('click', () => setSource('native'));
@@ -322,7 +322,6 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
       if (event.detail === 0 && active()) { button(Number(node.dataset.pointerButton), true); button(Number(node.dataset.pointerButton), false); }
     });
   });
-  $('#pointer-mode-label').textContent = pointerMode();
   function rotate() {
     const next = currentOrientation();
     if (next === orientation) return;

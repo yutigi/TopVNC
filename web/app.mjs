@@ -63,7 +63,7 @@ let frame = { width: 0, height: 0 };
 // The host serves more than this browser shows; a size that fits was asked for.
 let oversized = false;
 let relativePointer = false;
-let mode = preference("mode", "trackpad");
+const mode = preference("mode", "trackpad");
 let buttons = 0;
 let pointerPosition = { x: 0, y: 0 };
 // Mouse users see their own cursor; touch input aims a drawn one.
@@ -596,14 +596,6 @@ viewer.addEventListener("click", (event) => {
   if (button.dataset.toggleFunctions) {
     showFunctionKeys(functionKeys.hidden);
     layout();
-  } else if (button.id === "toggle-mode") {
-    releaseEverything();
-    mode = mode === "trackpad" ? "direct" : "trackpad";
-    remember("mode", mode);
-    gestures.setMode(mode);
-    button.textContent = mode === "trackpad" ? "Trackpad" : "Direct";
-    $("#pointer-mode-label").textContent = button.textContent;
-    updateCursor();
   } else if (button.id === "fit" || button.id === "fit-menu") {
     view.reset();
     layout();
@@ -646,7 +638,6 @@ mobile = createMobileControls({
   root: viewer, keyboard, storage,
   active: () => state === "connected",
   input, button: setButton, move: moveBy, reset: releaseEverything, modals,
-  pointerMode: () => mode === "trackpad" ? "Trackpad" : "Direct",
 });
 // Match style.css: hiding the touch deck must not leave its input held or focus
 // inside an invisible native field. This also covers attaching a mouse/resizing.
@@ -783,7 +774,6 @@ new ResizeObserver(layout).observe(screen);
 async function main() {
   await init({ module_or_path: "/topvnc_web_bg.wasm" });
   setQuality(preference("quality", "6"));
-  $("#toggle-mode").textContent = mode === "trackpad" ? "Trackpad" : "Direct";
   readInvite();
   describeIdentity();
 }

@@ -170,3 +170,93 @@ All 75 web unit tests, `cargo fmt --all -- --check`, `cargo test --workspace`,
 and `cargo clippy --workspace --all-targets` passed. Browser checks used local
 Chromium with GPU and sandbox disabled for the offline fixture. The production
 WASM build remains unverified because its Rust target is not installed.
+
+### Reference fidelity and golden tests — 2026-11-11
+
+The earlier viewport screenshots were not reference goldens. A new comparison
+renders the unchanged mobile wireframe source and the actual web UI, with the
+same locally bundled fonts. The hosted Site was identified through its Sites
+metadata, but its private live page could not be opened through the browser
+host. No source, publication or access changes target that Site.
+
+Corrected inherited session font metrics (16px/normal rather than 15px/1.5),
+reference button padding and gaps, the tinted Customize action, 44px arrow
+columns including the reference's late overrides, portrait hint spacing, Type
+modifier/source spacing, compose text size, keyboard bottom-row widths, split
+keyboard offsets and dock/trackpad colors. Host names and Insert use real
+weight 600. DM Sans's bundled variable font is byte-identical to the reference's
+official Google Fonts file; it did not need replacing. Preserve native text
+entry at 16px and the readonly local draft at the reference's 13px.
+
+`npm run test:visual` now compares 24 reference-derived component PNGs, exact
+computed typography/color/padding and <=1px geometry at 390×844 and 844×390.
+Portrait Keys/Type also compare deck offsets. Reference-only baseline generation,
+canonical source/font hashes, the renderer version, masks and intentional
+accessibility/layout adaptations are documented in
+`web/tests/golden/mobile-reference/README.md`. A Windows CI job runs the
+behavioral browser check and these goldens. Full viewport comparisons, measured
+differences and component diff PNGs are emitted to `web/build/reference-qa/`.
+
+All 24 goldens passed: 21 were pixel-identical, with the remaining three changing
+at most 1.2% of pixels within the documented small-text raster tolerance.
+A deliberate test-only weight-700 regression produced
+34 rejected style/pixel checks; a subsequent unmodified run passed again.
+The 75 web unit tests, all six touch and five desktop browser sizes, production
+WASM build, and eight WASM binding tests passed. With the repository's pinned
+Rust 1.99.0, `cargo fmt --all -- --check`, `cargo test --workspace` and
+`cargo clippy --workspace --all-targets` passed (the existing timing benchmark
+remains ignored). The inherited shell override selected Rust 1.95 initially;
+using 1.99.0 resolved the misleading missing-WASM-target build error.
+
+Visual QA uses offline session fixtures in local Windows Chromium. CI has been
+configured but not run remotely here. Physical-device/Safari/native-IME and
+live-host verification remain outside these results. The production client
+and reference Sites were not deployed.
+
+### Pointer, Type and placement follow-up — 2026-11-11
+
+Removed the Pointer footer containing `Screen input: Trackpad` and the mode
+toggle. Session settings now exposes the existing saved landscape placement
+(default, left, right, bottom) without changing portrait preferences. Both side
+layouts have the divider next to the remote view. Browser checks exercise
+Keys/Pointer/Type on both sides, reload persistence and rotation to/from portrait.
+
+Type now matches the accepted composition row: no extra Clear button, the
+reference Insert width/wrapping/border and regular weight 400. This supersedes
+the earlier statement that Insert uses 600. Landscape modifiers, input source
+and draft occupy separate full-width rows; compose height/padding and spacing
+match the reference. Short viewports scroll the keyboard above a fixed dock.
+English help copy matches the reference; native/Chinese/Japanese guidance stays
+specific to the implemented input path.
+
+Extended the unchanged reference's goldens from 24 to 30 to cover the draft,
+compose field and Insert, and removed the landscape width comparison exception.
+Landscape Type row offsets are now checked too. All 30 visual comparisons,
+76 web unit tests and the behavioral browser suite passed in local Windows
+Chromium with GPU and sandbox disabled for the offline fixture. Workspace
+format, tests, Clippy and the production WASM/web build passed with Rust 1.99.0. The reference source was not
+modified. No hosted application was deployed by this follow-up.
+
+### Requested mobile Site publication — 2026-11-11
+
+The user subsequently requested both the local comparison page and the existing
+mobile Site be updated. The regenerated comparison retains the 30 passing
+reference checks and now includes Settings and both landscape sides for
+Keys/Type/Pointer. The generator writes the page's refresh timestamp.
+
+Opened the mobile Site's current remote source in an isolated checkout under
+`web/build/mobile-site-source/.sites-checkout`. Added the same landscape setting
+to its Session settings, using its existing customization preference, and fixed
+the left-side divider. Its Pointer and Type controls already use the accepted
+layout. All 27 prototype tests and offline browser checks of both sides, modes,
+reload persistence and portrait isolation passed. The accepted reference
+snapshot in `design/topvnc-mobile-wireframe` remains unchanged for goldens.
+
+Published the mobile Site at its existing URL with owner-only access preserved:
+https://topvnc-mobile-wireframe-nov26.js-sookudom-temp.chatgpt.site/
+
+Source commit: `dd7dec62d7cba9c31392f1f3c8ed3897f3e075b9`.
+Deployment: `appgdep_6af36439a67c8191a07b26fa215b12cd` (`succeeded`).
+Saved version: `appgprj_6aeedaa6ea0c81918528d7a80229d4d3~appgver_a84960d192ac81919b679402553c5d55`.
+The native Sites result confirmed the production URL. This publishes the design
+prototype only; the production Cloudflare VNC client was not deployed.
