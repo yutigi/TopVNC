@@ -123,3 +123,36 @@ sessions. No physical phone, Safari, native OS keyboard, real IME, live encrypte
 remote session, game compatibility or latency validation is claimed. The
 user-facing browser preview host was unavailable; headless local Chromium
 provided visual QA. The production Cloudflare app was not deployed.
+
+## Review fixes — 2026-11-11
+
+A code review of `3272255` found regressions in the production viewer. Fixed:
+
+- Closing Settings returned focus to the header button, where hardware keys are
+  ignored. Settings and Customize now share one modal stack (`web/modal.mjs`)
+  that owns the inert background, Escape, Tab and focus return. Focus returns to
+  the opener, normally the remote screen. Escape and Tab work even when focus
+  has left the dialog, and no key reaches the host while a dialog is open.
+  Closing a dialog no longer un-inerts the page under another open dialog.
+- The draft row has a visible **✕** (Clear local draft) again.
+- Type and FPS hide the deck heading, so control messages also appear briefly
+  over the remote view. The status live region stays in the accessibility tree
+  in FPS.
+- The pinned **Win** is a one-shot modifier again, restoring Win+key chords.
+- If Fn is not pinned, **Fn keys** in the Keys hint row opens F1–F12, Del,
+  Home, End, PgUp and PgDn. The Fn toggles now show their open state.
+- Landscape Type with the deck at the bottom puts modifiers, input source and
+  draft on one row. At 844×390 the remote view is 104px tall instead of 61px.
+  The browser check is back to its 89px minimum in every mode. Character keys
+  stay at the reference's compact 31px.
+- `local_web` serves the two bundled fonts.
+
+Checks: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`,
+gateway clippy with `test-fixtures`, and `cargo test --workspace` passed.
+`npm test` passed 75 tests. `local_web` served both fonts as `font/woff2`. The
+offline Chromium check passed all touch and desktop sizes with new assertions
+for focus return, blocked keys while Settings is open, Escape from body focus,
+the visible Clear control, the Type message, Fn states and the footnote toggle.
+The production WASM build was not rerun here because the `wasm32-unknown-unknown`
+target is not installed in this environment; the WASM and Worker tests were not
+rerun.

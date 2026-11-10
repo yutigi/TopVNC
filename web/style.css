@@ -101,10 +101,14 @@ pre { margin: 0; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; 
 .thumb-dock small { font-size: 8px; }
 .thumb-dock button[aria-pressed="true"] { border-color: #d7dfca; background: #eef2e5; color: #566e39; }
 .thumb-dock .dock-enter { border-color: #899773; color: #506334; background: #f2f5eb; }
-#viewer [data-mod][aria-pressed="true"], #symbol-keyboard[aria-pressed="true"], #function-keys [aria-expanded="true"] { background: #697a50; color: white; border-color: #697a50; }
+#viewer [data-mod][aria-pressed="true"], #symbol-keyboard[aria-pressed="true"], #viewer [data-toggle-functions][aria-expanded="true"] { background: #697a50; color: white; border-color: #697a50; }
 /* Reference typing geometry. IME and committed text remain on the native path. */
 #viewer[data-control-mode="type"] .deck-grip { margin: 6px auto 8px; }
-#viewer[data-control-mode="type"] .deck-top { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+/* Type and FPS hide the deck heading but keep its status live region; #control-toast shows the text. */
+#viewer[data-control-mode="type"] .deck-top, #viewer.fps-active .deck-top { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+#control-toast { position: absolute; left: 50%; bottom: 10px; z-index: 2; transform: translateX(-50%); width: max-content; max-width: calc(100% - 24px); padding: 6px 12px; border: 1px solid #bfcbb0; border-radius: 14px; background: #fbfcf7f2; color: #465333; font-size: 12px; line-height: 1.4; text-align: center; pointer-events: none; }
+#viewer:not([data-control-mode="type"]):not(.fps-active) #control-toast { display: none; }
+#viewer.fps-active #control-toast { top: 10px; bottom: auto; }
 .type-modifiers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; margin-bottom: 2px; }
 .type-modifiers button { background: #edf2e4; border-color: #cbd4bf; font-size: 12px; }
 .input-source { display: flex; gap: 4px; padding: 3px; height: 34px; border: 1px solid #e3e8d9; border-radius: 6px; background: #f0f3e9; margin-bottom: 7px; }
@@ -129,7 +133,7 @@ pre { margin: 0; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; 
 .typing-help { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 22px; font-size: 8px; color: #748366; }
 .typing-help button { min-height: 22px; padding: 0; border: 0; background: transparent; color: #657c49; font-size: 8px; }
 #typing-help { font-size: 8px; margin: 1px 0 0; padding: 4px 5px; border: 1px dashed #d6dfc9; border-radius: 4px; background: #f3f5ed; color: #748366; }
-#clear-draft { display: none; }
+#clear-draft { min-height: 37px; min-width: 37px; padding: 0; background: transparent; border-color: #cbd4bf; color: #748366; font-size: 13px; }
 #keyboard { position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; resize: none; font-size: 16px; }
 #native-input-panel label { display: block; font-size: 10px; color: #657c49; margin: 6px 0; }
 #native-input-panel #keyboard { position: static; opacity: 1; width: 100%; height: 54px; padding: 8px; border: 1px solid #95ab7a; border-radius: 6px; background: white; color: var(--ink); }
@@ -190,7 +194,7 @@ input[type="range"] { --fill: 100%; width: 100%; min-height: 36px; margin: 0; ac
 /* FPS overlay follows the reference, over real pixels rather than a demo arena. */
 #viewer.fps-active #screen { grid-row: 2 / -1; grid-column: 1 / -1; margin-bottom: 64px; }
 #viewer.fps-active #control-deck { grid-row: 2 / -1; grid-column: 1 / -1; position: relative; height: 100%; max-height: none; padding: 0; border: 0; background: transparent; pointer-events: none; }
-.fps-active .deck-grip, .fps-active .deck-top, .fps-active #custom-action-pad { display: none !important; }
+.fps-active .deck-grip, .fps-active #custom-action-pad { display: none !important; }
 .fps-active .control-groups { position: absolute; inset: 0 0 64px; overflow: hidden; pointer-events: none; }
 .fps-active .thumb-dock { position: absolute; bottom: 0; left: 0; right: 0; margin: 0; padding: 5px 12px max(7px, env(safe-area-inset-bottom)); background: #f8faf2; pointer-events: auto; border-color: #c3d1b2; }
 #fps-panel { position: absolute; inset: 0; pointer-events: none; }
@@ -228,7 +232,7 @@ input[type="range"] { --fill: 100%; width: 100%; min-height: 36px; margin: 0; ac
 }
 @media (orientation: portrait) and (max-height: 650px) {
   #viewer[data-control-mode="type"] #control-deck { max-height: calc(100dvh - 148px); }
-  #viewer[data-control-mode="type"] #typing-help, #viewer[data-control-mode="type"] #clear-draft { display: none; }
+  #viewer[data-control-mode="type"] #typing-help { display: none; }
 }
 @media (orientation: landscape) and (min-width: 600px) {
   #viewer { grid-template: 44px minmax(0, 1fr) / minmax(0, 1fr) 310px; }
@@ -244,15 +248,22 @@ input[type="range"] { --fill: 100%; width: 100%; min-height: 36px; margin: 0; ac
   #viewer[data-control-mode="type"] #control-deck, #viewer[data-layout-position="bottom"] #control-deck { grid-row: 3; grid-column: 1; max-height: calc(100dvh - 98px); border-left: 0; border-top: 1px solid #d7dccb; padding: 5px 12px 0; }
   #viewer[data-control-mode="type"] .control-groups { flex: 1 1 auto; }
   #viewer[data-control-mode="type"] .type-modifiers { margin-bottom: 0; }
-  #viewer[data-control-mode="type"] .input-source { width: 48%; margin-bottom: 6px; }
-  #viewer[data-control-mode="type"] .draft-row { position: absolute; top: 55px; right: 12px; width: 48%; }
-  #viewer[data-control-mode="type"] #local-draft-panel { height: 0; }
+  /* A full-width typing deck puts modifiers, input source and draft on one row,
+     so the remote view keeps its height above the keyboard. Side decks stack. */
+  #viewer[data-control-mode="type"]:not([data-layout-position="left"], [data-layout-position="right"]) .control-groups { display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-items: center; gap: 4px 6px; }
+  #viewer[data-control-mode="type"]:not([data-layout-position="left"], [data-layout-position="right"]) :is(#type-panel, #local-draft-panel) { display: contents; }
+  #viewer[data-control-mode="type"]:not([data-layout-position="left"], [data-layout-position="right"]) .control-groups > * { grid-column: 1 / -1; }
+  #viewer[data-control-mode="type"]:not([data-layout-position="left"], [data-layout-position="right"]) #type-panel > * { grid-column: 1 / -1; }
+  #viewer[data-control-mode="type"]:not([data-layout-position="left"], [data-layout-position="right"]) .control-groups > .type-modifiers { grid-area: 1 / 1; }
+  #viewer[data-control-mode="type"]:not([data-layout-position="left"], [data-layout-position="right"]) #type-panel > .input-source { grid-area: 1 / 2; margin: 0; }
+  #viewer[data-control-mode="type"]:not([data-layout-position="left"], [data-layout-position="right"]) .draft-row { grid-area: 1 / 3; }
+  #viewer[data-control-mode="type"]:not([data-layout-position="left"], [data-layout-position="right"]) #custom-keyboard-panel { margin-top: 0; }
   #viewer[data-control-mode="type"] .keyboard-row button { min-height: 31px; font-size: 13px; }
   #viewer[data-control-mode="type"] .keyboard-row .split-start { margin-left: 42px; }
   #viewer[data-control-mode="type"] #keyboard-rows { gap: 3px; }
   #viewer[data-control-mode="type"] .keyboard-bottom { margin-top: 3px; gap: 5px; }
   #viewer[data-control-mode="type"] .keyboard-bottom button { min-height: 31px; font-size: 10px; }
-  #viewer[data-control-mode="type"] .typing-help, #viewer[data-control-mode="type"] #typing-help, #viewer[data-control-mode="type"] #clear-draft { display: none; }
+  #viewer[data-control-mode="type"] .typing-help, #viewer[data-control-mode="type"] #typing-help { display: none; }
   #viewer[data-control-mode="type"] .thumb-dock { padding: 3px 0; margin-top: 4px; }
   #viewer[data-control-mode="type"] .thumb-dock button { flex-direction: row; gap: 8px; }
   #viewer[data-layout-position="left"], #viewer[data-layout-position="right"] { grid-template: 44px minmax(0, 1fr) / 310px minmax(0, 1fr); }
@@ -261,9 +272,6 @@ input[type="range"] { --fill: 100%; width: 100%; min-height: 36px; margin: 0; ac
   #viewer[data-layout-position="right"] { grid-template-columns: minmax(0, 1fr) 310px; }
   #viewer[data-layout-position="right"] #control-deck { grid-row: 2; grid-column: 2; max-height: none; }
   #viewer[data-layout-position="right"] #screen { grid-row: 2; grid-column: 1; }
-  #viewer[data-control-mode="type"][data-layout-position="left"] .draft-row, #viewer[data-control-mode="type"][data-layout-position="right"] .draft-row { position: static; width: 100%; }
-  #viewer[data-control-mode="type"][data-layout-position="left"] #local-draft-panel, #viewer[data-control-mode="type"][data-layout-position="right"] #local-draft-panel { height: auto; }
-  #viewer[data-control-mode="type"][data-layout-position="left"] .input-source, #viewer[data-control-mode="type"][data-layout-position="right"] .input-source { width: 100%; }
   #viewer[data-control-mode="type"][data-layout-position="left"] .split-start, #viewer[data-control-mode="type"][data-layout-position="right"] .split-start { margin-left: 0; }
   #viewer.fps-active { grid-template: 44px minmax(0, 1fr) / minmax(0, 1fr); }
 }
@@ -283,7 +291,7 @@ input[type="range"] { --fill: 100%; width: 100%; min-height: 36px; margin: 0; ac
     grid-row: 2; grid-column: 1; margin-bottom: 0;
   }
   #viewer #control-deck, #viewer #function-keys, #viewer #show-keyboard,
-  #viewer #customize-button, #viewer .language-popover { display: none; }
+  #viewer #customize-button, #viewer .language-popover, #viewer #control-toast { display: none; }
   #toolbar { padding: 0 24px; }
   #toolbar strong { font-size: 14px; }
   #toolbar strong small { font-size: 9px; }

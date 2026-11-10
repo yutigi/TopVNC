@@ -88,8 +88,16 @@ try {
     await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:'Tab',code:'Tab',windowsVirtualKeyCode:9,modifiers:8});
     assert.equal(await evaluate('document.activeElement.id'),'disconnect',label);
     await click('#stats-toggle');
+    // Focus can leave the dialog (a click on its background): keys must not reach the host, and Escape still closes.
+    await evaluate(`document.activeElement.blur();sent.length=0`);
+    const typeW = async () => { for (const type of ['keyDown','keyUp']) await cdp('Input.dispatchKeyEvent',{type,code:'KeyW',key:'w',windowsVirtualKeyCode:87}); };
+    await typeW();
+    assert.equal(await evaluate('sent.length'),0,label);
     await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
-    assert.ok(await evaluate(`document.querySelector('#menu').hidden&&document.activeElement.id==='show-menu'&&!document.querySelector('#screen').inert&&document.querySelector('#stats').hidden`),label);
+    assert.ok(await evaluate(`document.querySelector('#menu').hidden&&document.activeElement.id==='screen'&&!document.querySelector('#screen').inert&&document.querySelector('#stats').hidden&&document.querySelector('#show-menu').getAttribute('aria-expanded')==='false'`),label);
+    // Focus returns to the remote screen it came from, so hardware keys reach the host again.
+    await typeW();
+    assert.deepEqual(await evaluate(`sent.filter(m=>m.kind==='code').map(m=>[m.code,m.down])`),[['KeyW',true],['KeyW',false]],label);
     await evaluate(`testSessionMessage({type:'capabilities',serveScale:0,displays:[]})`);
   };
   const measure = () => evaluate(`(()=>{const ids=['screen','toolbar','control-deck'];return Object.fromEntries(ids.map(id=>{const r=document.getElementById(id).getBoundingClientRect();return[id,{x:r.x,y:r.y,width:r.width,height:r.height}]}));})()`);
@@ -99,13 +107,15 @@ try {
     for (const mode of ['keys', 'type', 'pointer']) {
       await click(`[data-mode="${mode}"]`); await frame(); const boxes = await measure();
       const screenshot = await cdp('Page.captureScreenshot', { format: 'png' }); writeFileSync(`${dir}${size.width}-touch-${mode}.png`, Buffer.from(screenshot.data, 'base64'));
-      assert.ok(boxes.screen.height >= (mode === 'type' && size.width > size.height && size.height < 600 ? 54 : 89), JSON.stringify({size,mode,boxes}));
+      assert.ok(boxes.screen.height >= 89, JSON.stringify({size,mode,boxes}));
       assert.ok(boxes.screen.width > 150, JSON.stringify({size,mode,boxes}));
       const dock = await evaluate(`[...document.querySelectorAll('.thumb-dock button')].map(n=>{let r=n.getBoundingClientRect();return {width:r.width,height:r.height,y:r.y,bottom:r.bottom};})`);
       assert.ok(dock.every(r => r.width >= 44 && r.height >= 44 && r.y >= 0 && r.bottom <= size.height + 1), JSON.stringify({size,mode,dock,boxes}));
       if (mode === 'type') {
+        // Compact landscape typing follows the reference's 31px character keys.
         const keyHeight = size.width > size.height && size.width >= 600 ? 31 : 44;
         assert.ok(await evaluate(`(()=>{const r=document.querySelector('#keyboard-languages').getBoundingClientRect(), dock=document.querySelector('.thumb-dock').getBoundingClientRect();return r.width>=44&&r.height>=${keyHeight}&&r.bottom<=dock.top;})()`));
+        assert.ok(await evaluate(`(()=>{const r=document.querySelector('#clear-draft').getBoundingClientRect(),deck=document.querySelector('#control-deck').getBoundingClientRect();return r.width>=37&&r.height>=37&&r.top>=deck.top&&r.bottom<=deck.bottom;})()`), `Clear draft not visible at ${size.width}x${size.height}`);
       }
       if (mode === 'pointer') {
         assert.ok(await evaluate(`(()=>{const deck=document.querySelector('#control-deck').getBoundingClientRect();return [...document.querySelectorAll('.pointer-buttons button')].every(button=>{const r=button.getBoundingClientRect();return r.left>=deck.left&&r.right<=deck.right&&r.width>=44&&r.height>=44&&button.scrollWidth<=button.clientWidth;});})()`), `Pointer buttons overflow at ${size.width}x${size.height}`);
@@ -158,6 +168,14 @@ try {
   assert.ok(await evaluate('sent.some(m=>m.kind==="release")'));
   await evaluate(`document.querySelector('#viewer').dataset.layoutPosition='auto'`);
   await cdp('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true, screenOrientation: { type: 'portraitPrimary', angle: 0 } }); await frame();
+  // The pinned Fn shows its open state; with Fn unpinned the footnote still opens the F-key row.
+  await click('[data-mode="keys"]'); await click('#show-function-keys');
+  assert.ok(await evaluate(`(()=>{const b=document.querySelector('#show-function-keys');return !document.querySelector('#function-keys').hidden&&b.getAttribute('aria-expanded')==='true'&&getComputedStyle(b).backgroundColor==='rgb(105, 122, 80)';})()`));
+  await click('#show-function-keys'); await click('#edit-pins');
+  await evaluate(`document.querySelectorAll('#sheet-content select')[3].value='Ctrl+Z';[...document.querySelectorAll('#sheet-content button')].find(b=>b.textContent==='Save pinned keys').click();`);
+  await click('#footnote-functions');
+  assert.ok(await evaluate(`!document.querySelector('#function-keys').hidden&&document.querySelector('#footnote-functions').getClientRects().length>0&&!document.querySelector('#show-function-keys')`));
+  await click('#footnote-functions');
   await click('[data-mode="type"]');
   await evaluate(`sent.length=0;document.querySelector('.type-modifiers [data-mod="Ctrl"]').click();document.querySelector('[data-character="c"]').click();`);
   assert.deepEqual(await evaluate('sent.map(m=>[m.keysym,m.down])'), [[65507,true],[99,true],[99,false],[65507,false]]);
@@ -171,6 +189,10 @@ try {
   await click('#native-keyboard');
   await evaluate(`sent.length=0;let field=document.querySelector('#keyboard');field.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));field.value+='日本';field.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true}));field.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:'日本'}));`);
   assert.deepEqual(await evaluate(`sent.filter(m=>m.kind==='text').map(m=>m.text)`), ['日本']);
+  // Type hides the deck heading, so its status appears over the remote view.
+  await evaluate(`document.querySelector('#keyboard').dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));document.querySelector('[data-mode="keys"]').click();`);
+  assert.ok(await evaluate(`(()=>{const t=document.querySelector('#control-toast'),r=t.getBoundingClientRect(),s=document.querySelector('#screen').getBoundingClientRect();return t.getClientRects().length>0&&t.textContent.includes('Finish composing')&&r.top>=s.top&&r.bottom<=s.bottom;})()`));
+  await evaluate(`document.querySelector('#keyboard').dispatchEvent(new CompositionEvent('compositionend',{bubbles:true}))`);
   // A resizes-content native keyboard changes viewport shape, not screen angle.
   await cdp('Emulation.setDeviceMetricsOverride', { width: 390, height: 240, deviceScaleFactor: 1, mobile: true, screenOrientation: { type: 'portraitPrimary', angle: 0 } }); await frame();
   assert.equal(await evaluate(`document.activeElement.id`), 'keyboard');

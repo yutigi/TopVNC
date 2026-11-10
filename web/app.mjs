@@ -10,6 +10,7 @@ import { TouchGestures } from "./gestures.mjs";
 import { attachTextInput } from "./text-input.mjs";
 import { View } from "./view.mjs";
 import { createMobileControls } from "./mobile-controls.mjs";
+import { createModals } from "./modal.mjs";
 
 const $ = (selector) => document.querySelector(selector);
 const home = $("#home");
@@ -71,6 +72,12 @@ let mobile;
 const view = new View();
 let lines = [];
 let post;
+// A closed dialog returns focus to its opener; after a mouse click on the
+// header that is the remote screen, so hardware keys reach the host again.
+const modals = createModals({
+  background: [screen, toolbar, $("#control-deck")],
+  fallback: () => (state === "connected" ? screen : undefined),
+});
 
 function preference(name, fallback) {
   try {
@@ -313,21 +320,16 @@ function showViewer(visible) {
 }
 
 function showMenu(visible) {
-  menu.hidden = !visible;
-  $("#show-menu").setAttribute("aria-expanded", String(visible));
-  for (const element of [screen, toolbar, $("#control-deck")]) element.inert = visible;
-  if (visible) $("#close-menu").focus({ preventScroll: true });
-  else if (state === "connected" && $("#control-sheet").hidden) $("#show-menu").focus({ preventScroll: true });
+  if (!visible) {
+    modals.close(menu);
+    return;
+  }
+  $("#show-menu").setAttribute("aria-expanded", "true");
+  modals.open(menu, {
+    initial: $("#close-menu"),
+    closed: () => $("#show-menu").setAttribute("aria-expanded", "false"),
+  });
 }
-
-menu.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") { event.preventDefault(); showMenu(false); }
-  if (event.key !== "Tab") return;
-  const targets = [...menu.querySelectorAll("button, input, select")].filter(node => !node.disabled && node.getClientRects().length);
-  const first = targets[0]; const last = targets.at(-1);
-  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
-  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
-});
 
 function showFunctionKeys(visible) {
   functionKeys.hidden = !visible;
@@ -548,7 +550,7 @@ const physicalKeys = new Set();
 const MODIFIER_CODES = /^(Shift|Control|Alt|Meta|OS)(Left|Right)$/;
 
 window.addEventListener("keydown", (event) => {
-  if (state !== "connected" || event.defaultPrevented || event.target.closest?.("#menu, #control-sheet, #control-deck, #toolbar, #function-keys, input, textarea, select, button, .language-popover")) return;
+  if (state !== "connected" || event.defaultPrevented || modals.active() || event.target.closest?.("#menu, #control-sheet, #control-deck, #toolbar, #function-keys, input, textarea, select, button, .language-popover")) return;
   // Hardware keyboards report physical keys; text input methods use the
   // on-screen keyboard field instead.
   if (event.isComposing || !event.code || event.code === "Unidentified") return;
@@ -642,7 +644,7 @@ $("#native-input-panel").append(keyboard);
 mobile = createMobileControls({
   root: viewer, keyboard, storage,
   active: () => state === "connected",
-  input, button: setButton, move: moveBy, reset: releaseEverything,
+  input, button: setButton, move: moveBy, reset: releaseEverything, modals,
   pointerMode: () => mode === "trackpad" ? "Trackpad" : "Direct",
 });
 // Match style.css: hiding the touch deck must not leave its input held or focus
@@ -650,7 +652,7 @@ mobile = createMobileControls({
 const desktopLayout = matchMedia("(min-width: 900px) and (pointer: fine) and (hover: hover)");
 desktopLayout.addEventListener("change", () => {
   releaseEverything();
-  if (state === "connected" && !screen.closest("[hidden]") && menu.hidden && $("#control-sheet").hidden) {
+  if (state === "connected" && !screen.closest("[hidden]") && !modals.active()) {
     screen.focus({ preventScroll: true });
   }
 });
