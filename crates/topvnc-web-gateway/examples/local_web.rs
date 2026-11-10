@@ -33,14 +33,23 @@ use topvnc_web_gateway::{Config, Gateway, create_host_key, routes, unix_now};
 
 const PASSWORD: &str = "topvnc-local";
 const SCENE: (u16, u16) = (1280, 720);
-/// Files served from web/dist; nothing else is reachable.
-const FILES: [(&str, &str); 6] = [
+/// Files served from web/dist; nothing else is reachable. Keep this in step
+/// with what web/scripts/build.mjs copies, including the fonts style.css loads.
+const FILES: [(&str, &str); 8] = [
     ("/", "index.html"),
     ("/index.html", "index.html"),
     ("/app.js", "app.js"),
     ("/session-worker.js", "session-worker.js"),
     ("/style.css", "style.css"),
     ("/topvnc_web_bg.wasm", "topvnc_web_bg.wasm"),
+    (
+        "/assets/fonts/dm-sans-latin.woff2",
+        "assets/fonts/dm-sans-latin.woff2",
+    ),
+    (
+        "/assets/fonts/ibm-plex-mono-latin.woff2",
+        "assets/fonts/ibm-plex-mono-latin.woff2",
+    ),
 ];
 
 struct Edge {
@@ -126,6 +135,7 @@ async fn file(State(edge): State<Arc<Edge>>, uri: Uri) -> Response {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "text/javascript",
         Some("css") => "text/css",
+        Some("woff2") => "font/woff2",
         _ => "application/wasm",
     };
     let mut response = ([(header::CONTENT_TYPE, kind)], body).into_response();
