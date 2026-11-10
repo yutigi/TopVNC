@@ -40,6 +40,9 @@ production adaptations are explicit in the harness:
 - Landscape Type preserves full-width modifiers, source switch and draft rows.
   Short viewports allow scrolling the keyboard above the fixed dock.
 - The trackpad's different explanatory `<small>` text is masked on both sides.
+- The landscape trackpad grows to fill the available deck above both click
+  buttons. Its original styling is compared at the reference's compact height;
+  browser checks separately assert the real fill and button/dock bounds.
 - Components are captured on their white deck background at an integer origin,
   avoiding scroll clipping and the prototype's sticky dock overlapping a key.
 - Live feedback, host capabilities and desktop hardware input

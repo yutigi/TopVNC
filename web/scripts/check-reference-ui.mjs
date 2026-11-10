@@ -84,11 +84,16 @@ try {
           const metrics = await evaluate(`(()=>{const n=document.querySelector(${JSON.stringify(selector)}),r=n.getBoundingClientRect(),deck=document.querySelector('${kind === 'reference' ? '.control-deck' : '#control-deck'}').getBoundingClientRect(),s=getComputedStyle(n),b=getComputedStyle(n.querySelector('button')??n);return{width:r.width,height:r.height,offset:{left:r.left-deck.left,top:r.top-deck.top},styles:Object.fromEntries(${JSON.stringify(props)}.map(k=>[k,s[k]])),button:Object.fromEntries(${JSON.stringify(props)}.map(k=>[k,b[k]]))}})()`);
           const file = `${key}-${name}.png`;
           const width = metrics.width;
+          // The requested landscape trackpad fills the available side deck.
+          // Compare its original styling at the reference's compact height;
+          // the behavioral browser suite checks its real fill/button bounds.
+          const flexibleTrackpad = size.width > size.height && name === 'trackpad';
+          const height = flexibleTrackpad && kind === 'actual' ? expected[name].metrics.height : metrics.height;
           // Isolate each control at an integer origin so device scroll clipping,
           // sticky-dock overlap and fractional offsets cannot corrupt a golden.
-          await evaluate(`(()=>{const n=document.querySelector(${JSON.stringify(selector)});globalThis.savedGoldenStyle=n.getAttribute('style');const bg=getComputedStyle(n).backgroundColor;Object.assign(n.style,{position:'fixed',left:'0',top:'0',width:'${width}px',height:'${metrics.height}px',margin:'0',zIndex:'10000',backgroundColor:bg==='rgba(0, 0, 0, 0)'?'white':bg})})()`);
+          await evaluate(`(()=>{const n=document.querySelector(${JSON.stringify(selector)});globalThis.savedGoldenStyle=n.getAttribute('style');const bg=getComputedStyle(n).backgroundColor;Object.assign(n.style,{position:'fixed',left:'0',top:'0',width:'${width}px',height:'${height}px',margin:'0',zIndex:'10000',backgroundColor:bg==='rgba(0, 0, 0, 0)'?'white':bg})})()`);
           await frame();
-          const { data } = await cdp('Page.captureScreenshot', { format: 'png', clip: { x: 0, y: 0, width, height: metrics.height, scale: 1 } });
+          const { data } = await cdp('Page.captureScreenshot', { format: 'png', clip: { x: 0, y: 0, width, height, scale: 1 } });
           await evaluate(`(()=>{const n=document.querySelector(${JSON.stringify(selector)});savedGoldenStyle===null?n.removeAttribute('style'):n.setAttribute('style',savedGoldenStyle)})()`);
           await frame();
           writeFileSync(`${dir}${kind}-${file}`, Buffer.from(data, 'base64'));
@@ -105,7 +110,8 @@ try {
           for (const group of ['styles', 'button']) for (const property of props) {
             if (metrics[group][property] !== expectedMetrics[group][property]) failures.push(`${file}: ${group}.${property}: ${metrics[group][property]} (reference ${expectedMetrics[group][property]})`);
           }
-          for (const dimension of ['width', 'height']) if (Math.abs(metrics[dimension] - expectedMetrics[dimension]) > 1) failures.push(`${file}: ${dimension} ${metrics[dimension]} (reference ${expectedMetrics[dimension]})`);
+          for (const dimension of ['width', 'height']) if (!(flexibleTrackpad && dimension === 'height') && Math.abs(metrics[dimension] - expectedMetrics[dimension]) > 1) failures.push(`${file}: ${dimension} ${metrics[dimension]} (reference ${expectedMetrics[dimension]})`);
+          if (flexibleTrackpad && metrics.height < expectedMetrics.height) failures.push(`${file}: trackpad shrank below the reference minimum`);
           // Portrait Keys/Type should also preserve the reference's spacing,
           // rather than passing isolated screenshots with incorrect gaps.
           if ((size.width < size.height && mode !== 'pointer' && name !== 'customize') || (mode === 'type' && name !== 'dock')) {

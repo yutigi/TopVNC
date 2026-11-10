@@ -39,3 +39,5 @@
 - [x] Verify placement persistence, rotation, input behavior and scrollable keys.
 - [x] Refresh the comparison page with settings and left/right placement previews.
 - [x] Publish the requested mobile Site update while preserving owner-only access.
+- [x] Fill the available landscape Pointer area with the trackpad and both click
+  buttons; verify panel, button and dock bounds on either side.
