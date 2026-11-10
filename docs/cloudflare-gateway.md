@@ -624,7 +624,8 @@ background. Afterwards, read the `/ws` CPU times in Workers analytics.
   shows where touch input aims.
 - **Direct mode**: the pointer goes where you touch. Tap to click there, drag
   to hold the left button, and long-press to right-click.
-- **Zoom**: pinch with two fingers in either mode. **Fit** resets the view.
+- **Zoom**: pinch with two fingers in either mode. **Fit** in the toolbar or
+  **Settings → Fit to screen** resets the view.
   Zoom changes only this device's view, not what the host sends.
 - **Appearance** follows the accepted [mobile reference](https://topvnc-mobile-wireframe-nov26.js-sookudom-temp.chatgpt.site/): paper surfaces, olive accents, rounded controls and locally bundled DM Sans / IBM Plex Mono fonts. At widths of at least 900 CSS pixels with a fine primary pointer and hover, desktop browsers use a full-width remote view below the header, with physical keyboard/mouse input, Fit, Fullscreen and settings. The entire touch deck, dock and FPS overlay are hidden regardless of saved layout. Coarse-pointer devices retain mobile controls, including landscape phones and wide touch tablets. The [separate desktop design](https://topvnc-desktop-wireframe-nov26.js-sookudom-temp.chatgpt.site) is a simulated prototype.
 - **Session settings** stays in the header on desktop and mobile. It contains Display, Served size, Picture quality, fullscreen, Debug / Stats, encryption status and Disconnect. Display and served size appear only when advertised by the host; otherwise their unavailable explanations remain visible. While it is open, keys never reach the host; Escape closes it from anywhere on the page and returns focus to where it was, normally the remote screen, so hardware keys reach the host again. The desktop design Site includes clearly simulated equivalents and example diagnostic values.
