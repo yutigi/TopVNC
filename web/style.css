@@ -246,6 +246,9 @@ input[type="range"] { --fill: 100%; width: 100%; min-height: 36px; margin: 0; ac
   #control-deck { grid-row: 2; grid-column: 2; max-height: none; border-top: 0; border-left: 1px solid #d7dccb; padding: 0 9px; }
   .deck-grip { display: none; } .deck-top { margin: 10px 0 7px; }
   #trackpad { height: 98px; min-height: 98px; }
+  #viewer[data-control-mode="pointer"]:not(.fps-active) #pointer-panel { display: flex; flex: 1 0 auto; flex-direction: column; }
+  #viewer[data-control-mode="pointer"]:not(.fps-active) #trackpad { flex: 1 0 98px; height: auto; }
+  #viewer[data-control-mode="pointer"]:not(.fps-active) .pointer-buttons { flex-shrink: 0; }
   #keys-panel { min-height: 0; }
   .control-groups { flex: 1; } .thumb-dock { margin-top: auto; padding: 5px 0; }
   .thumb-dock button { height: 44px; }

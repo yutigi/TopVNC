@@ -260,3 +260,27 @@ Deployment: `appgdep_6af36439a67c8191a07b26fa215b12cd` (`succeeded`).
 Saved version: `appgprj_6aeedaa6ea0c81918528d7a80229d4d3~appgver_a84960d192ac81919b679402553c5d55`.
 The native Sites result confirmed the production URL. This publishes the design
 prototype only; the production Cloudflare VNC client was not deployed.
+
+### Landscape trackpad fill — 2026-11-11
+
+The side deck previously left 116px unused below its fixed-height trackpad and
+click buttons at 844×390. The Pointer panel and trackpad now grow within the
+available deck, with both 44px click buttons directly below the pad and above
+the dock. Portrait and FPS geometry stay unchanged. A browser assertion failed
+on the original unused space and passes with the correction, including both
+saved sides. The comparison page and placement screenshots were regenerated.
+
+The accepted reference snapshot remains unchanged: the landscape trackpad's
+styling is checked at its original height, while behavioral checks verify its
+actual fill and button/dock bounds. All 30 visual comparisons, 76 web tests,
+the behavioral browser suite, production build, Rust format/workspace tests/
+Clippy, and the prototype's 27 tests passed. Offline prototype browser checks
+also verify trackpad expansion and button placement on both sides.
+
+Published the correction to the existing owner-only mobile Site. Source commit:
+`6941b3f2e5b88703152d17bda5196547f032fff6`. Deployment:
+`appgdep_6af36781457c81918be3516c80a5fc87` (`succeeded`). Saved version:
+`appgprj_6aeedaa6ea0c81918528d7a80229d4d3~appgver_8f70ebe44ebc8191a07d51fe99195273`.
+The native Sites result confirmed the existing production URL and the audience
+was preserved. The full-width landscape Type layout is selected with Session
+settings → Landscape controls → Bottom (or Default), then Type in the dock.
