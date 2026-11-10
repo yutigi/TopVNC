@@ -455,6 +455,10 @@ For contributions, read [AGENTS.md](AGENTS.md), record scope and acceptance crit
 
 ## Roadmap
 
+See the [GStreamer/WebRTC research](specs/024-gstreamer-webrtc-research/research.md)
+and [proposed media ADR](docs/adr/0001-browser-gaming-media.md) for the Windows-to-browser
+gaming comparison and experiment gates. This is research; no video path is implemented.
+
 - Validate the Windows host and viewer live, including relative mouse motion and side buttons in games.
 - Validate unplugging monitors on live hardware, and the host service's lock, unlock, and sign-in transitions.
 - Measure input-to-display latency with live capture.
