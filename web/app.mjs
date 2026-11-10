@@ -219,6 +219,7 @@ function clearViewer() {
   // machines must reset the touch controls here rather than in that handler.
   mobile?.closed();
   showCapabilities({ serveScale: 0, displays: [] });
+  showCaptureStatus(0);
   // Detach any old OffscreenCanvas immediately; late drawing cannot be seen.
   const fresh = document.createElement("canvas");
   fresh.id = "canvas";
@@ -348,7 +349,6 @@ async function onSessionMessage(message, active = () => true) {
       clearViewer();
       // The next host may not offer these controls.
       showCapabilities({ serveScale: 0, displays: [] });
-      showCaptureStatus(0);
       describeIdentity();
       const reason = await closeReason(message);
       if (!active()) return;

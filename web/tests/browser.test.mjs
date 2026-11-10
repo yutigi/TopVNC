@@ -122,6 +122,8 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
   await waitFor("!document.querySelector('#password-form').hidden");
   await evaluate("document.querySelector('#password').value = 'ephemeral'; document.querySelector('#password-form').requestSubmit()");
   await waitFor("!document.querySelector('#viewer').hidden");
+  await evaluate("fixture.workers[0].emit({ type: 'captureStatus', status: 2 })");
+  assert.equal(await evaluate("!document.querySelector('#host-status').hidden && document.querySelector('#host-status').textContent.includes('lock screen')"), true);
   await evaluate(`
     fixture.oldCanvas = document.querySelector('#canvas');
     document.querySelector('.type-modifiers [data-mod="Ctrl"]').click();
@@ -129,17 +131,21 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
     const select = document.querySelector('#menu-machine'); select.value = 'office-pc'; select.dispatchEvent(new Event('change'));
   `);
   assert.equal(await evaluate("document.querySelector('#password').value"), "");
+  assert.equal(await evaluate("document.querySelector('#host-status').hidden && document.querySelector('#host-status').textContent === ''"), true, "switching clears the previous machine's capture warning");
   await waitFor("!document.querySelector('#connect').disabled");
   assert.equal(await evaluate("fixture.workers[0].terminated && !fixture.oldCanvas.isConnected && document.querySelector('#canvas').width === 1"), true);
   assert.equal(await evaluate("fixture.messages.filter(m => m.type === 'connect').length"), 1, "switching does not auto-connect");
   assert.equal(await evaluate("fixture.messages.some(m => m.kind === 'release') && fixture.messages.some(m => m.type === 'close')"), true);
   await evaluate("document.querySelector('#connect').click()");
   await waitFor("!document.querySelector('#password-form').hidden");
-  await evaluate(`fixture.workers[0].emit({ type: 'connected' }); fixture.workers[0].emit({ type: 'verified' }); fixture.workers[0].emit({ type: 'resized', width: 999, height: 999 });`);
+  await evaluate(`fixture.workers[0].emit({ type: 'connected' }); fixture.workers[0].emit({ type: 'verified' }); fixture.workers[0].emit({ type: 'resized', width: 999, height: 999 }); fixture.workers[0].emit({ type: 'captureStatus', status: 1 });`);
   assert.equal(await evaluate("document.querySelector('#viewer').hidden && !document.querySelector('#password-form').hidden && document.querySelector('#canvas').width === 1"), true);
   assert.equal(await evaluate("fixture.messages.filter(m => m.type === 'connect')[1].url.endsWith('/ws/office-pc')"), true);
+  await evaluate("document.querySelector('#password').value = 'office-password'; document.querySelector('#password-form').requestSubmit()");
+  await waitFor("!document.querySelector('#viewer').hidden");
+  assert.equal(await evaluate("document.querySelector('#host-status').hidden && document.querySelector('#host-status').textContent === ''"), true, "a healthy machine needs no capture-status event to clear the old warning");
 
-  // End the pending password session, forget B, and enroll its new invite.
+  // End B's session, forget B, and enroll its new invite.
   await evaluate("document.querySelector('#machine').dispatchEvent(new Event('change'))");
   await waitFor("!document.querySelector('#forget').disabled");
   await evaluate("document.querySelector('#forget').click()");
