@@ -414,6 +414,18 @@ cargo clippy --workspace --all-targets
 cargo run
 ```
 
+### Local interactive UI preview
+
+With Node.js installed, run this from the repository root:
+
+```sh
+node scripts/preview-ui.mjs
+```
+
+Open <http://127.0.0.1:4173/> to try the desktop and mobile designs. The previews
+use simulated sessions; no VNC host or credentials are needed. Stop the server
+with Ctrl+C. See [the preview guide](design/README.md) for controls and port options.
+
 ### Code layout
 
 | Path | Purpose |
