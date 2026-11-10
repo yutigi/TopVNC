@@ -66,7 +66,7 @@
         <button type="button" id="show-keyboard">Type</button>
         <button type="button" id="fit">Fit</button>
         <button type="button" id="fullscreen">Fullscreen</button>
-        <button type="button" id="customize-button" aria-label="Customize keys and layout"><span aria-hidden="true">✎</span><span>Customize</span></button>
+        <button type="button" id="customize-button" aria-label="Customize keys and layout">✎ Customize</button>
         <button type="button" id="show-menu" aria-label="Session settings" aria-haspopup="dialog" aria-controls="menu" aria-expanded="false"><span class="tool-icon" aria-hidden="true">⚙</span><span class="tool-label">Settings</span></button>
       </div>
     </nav>
@@ -100,7 +100,7 @@
         <div id="type-panel" hidden>
           <div class="input-source"><button type="button" id="custom-keyboard" aria-pressed="true">TopVNC keys</button><button type="button" id="native-keyboard" aria-pressed="false">Native input</button></div>
           <div id="local-draft-panel">
-            <div class="draft-row"><textarea id="compose" rows="1" readonly inputmode="none" maxlength="2000" placeholder="Tap the keys below…" aria-label="Local text draft"></textarea><button type="button" id="clear-draft" aria-label="Clear local draft">✕</button><button type="button" id="insert-text">Insert ↗</button></div>
+            <div class="draft-row"><textarea id="compose" rows="1" readonly inputmode="none" maxlength="2000" placeholder="Tap the keys below…" aria-label="Local text draft"></textarea><button type="button" id="insert-text">Insert ↗</button></div>
           </div>
           <div id="custom-keyboard-panel">
             <div id="keyboard-rows"></div>
@@ -119,7 +119,6 @@
         <div id="pointer-panel" hidden>
           <div id="trackpad" aria-label="Remote trackpad"><span aria-hidden="true">＋</span><p>Move with one finger</p><small>Hold a button with another finger</small></div>
           <div class="pointer-buttons"><button type="button" data-pointer-button="1">Left click</button><button type="button" data-pointer-button="4">Right click</button></div>
-          <div class="deck-footnote"><span>Screen input: <span id="pointer-mode-label"></span></span><button type="button" id="toggle-mode">Trackpad</button></div>
         </div>
         <div id="fps-panel" hidden aria-label="FPS controls"></div>
       </div>
@@ -162,6 +161,15 @@
           <label class="choice"><input type="radio" name="menu-quality" value="9"><span>Best</span></label>
         </div>
       </fieldset>
+      <div class="landscape-setting">
+        <label class="label" for="landscape-controls">Landscape controls</label>
+        <select id="landscape-controls">
+          <option value="auto">Default · adapt to input</option>
+          <option value="left">Left side</option>
+          <option value="right">Right side</option>
+          <option value="bottom">Bottom</option>
+        </select>
+      </div>
       <div class="row">
         <button type="button" id="fit-menu">Fit to screen</button>
         <button type="button" id="fullscreen-menu">Toggle fullscreen</button>

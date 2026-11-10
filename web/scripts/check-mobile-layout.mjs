@@ -1,36 +1,15 @@
 // Optional Chromium QA of the actual app, with an offline session fixture.
 // No host credentials, network connection or local preview server.
-import { build } from 'esbuild';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { buildOfflineClient } from './offline-client.mjs';
+import { writeFileSync, mkdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
-const root = fileURLToPath(new URL('../../', import.meta.url));
 const dir = fileURLToPath(new URL('../build/mobile-qa/', import.meta.url));
 const browser = process.env.TOPVNC_BROWSER;
 if (!browser) throw new Error('Set TOPVNC_BROWSER to a Chromium/Chrome headless executable. This check uses an offline Worker fixture and starts no HTTP server.');
 mkdirSync(dir, { recursive: true });
-const bundle = await build({
-  absWorkingDir: root, entryPoints: ['web/app.mjs'], write: false, bundle: true, format: 'iife', define: { 'import.meta.url': '"file:///offline/"' },
-  plugins: [{ name: 'offline-session-fixture', setup(build) {
-    build.onResolve({ filter: /build\/pkg\/topvnc_web\.js$/ }, () => ({ path: 'wasm-fixture', namespace: 'fixture' }));
-    build.onLoad({ filter: /.*/, namespace: 'fixture' }, () => ({ contents: `export default async function init() {} export const fingerprint=()=> 'test-host', newBrowserKey=()=> 'A'.repeat(43), publicKey=()=> 'B'.repeat(43), parseInvite=()=>({free(){}}); export class Connection {}` }));
-    build.onLoad({ filter: /web[\\/]app\.mjs$/ }, args => ({ contents: readFileSync(args.path, 'utf8') + `\nglobalThis.testConnect=async()=>{pending={browser:'A'.repeat(43),host:'B'.repeat(43)};state='connecting';await startSession();};globalThis.testSessionMessage=onSessionMessage;` }));
-  } }],
-});
-const fixture = `try { localStorage.clear(); } catch {} globalThis.sent=[]; globalThis.Worker=class {
-  postMessage(message) { if(message.type==='input') sent.push(message);
-    if(message.type==='connect') queueMicrotask(()=>{
-      if(message.canvas) { const c=message.canvas.getContext('2d'); message.canvas.width=1280;message.canvas.height=720;c.fillStyle='#e7e9e0';c.fillRect(0,0,1280,720);c.fillStyle='#fafbf6';c.fillRect(100,110,1080,450);c.strokeStyle='#adb59f';c.strokeRect(100,110,1080,450);c.fillStyle='#f3f5ed';c.fillRect(101,111,1078,50);c.fillStyle='#747e62';c.font='20px monospace';c.fillText('Offline layout fixture — no live host',125,145);c.font='28px monospace';c.fillText('Your remote workspace',145,240);c.font='20px monospace';c.fillText('The session controls below are the actual application.',145,290); }
-      this.onmessage({data:{type:'connected',name:'Offline QA fixture'}});
-      this.onmessage({data:{type:'resized',width:1280,height:720}});
-    });
-  }
-};`;
-const css = readFileSync(root + 'web/style.css', 'utf8').replace(/url\("(assets\/fonts\/[^"]+)"\)/gu, (_, path) => `url("data:font/woff2;base64,${readFileSync(root + 'web/' + path).toString('base64')}")`);
-let html = readFileSync(root + 'web/index.html', 'utf8').replace(/<script[^>]*src="\/app.js"[^>]*><\/script>/u, '').replace('<link rel="stylesheet" href="/style.css">', `<style>${css}</style>`);
-html = html.replace('</body>', () => `<script>${fixture}\n${bundle.outputFiles[0].text}</script></body>`);
-writeFileSync(dir + 'index.html', html);
+await buildOfflineClient(dir);
 const child = spawn(browser, ['--headless', '--remote-debugging-pipe', '--no-first-run', `--user-data-dir=${dir}profile`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'], windowsHide: true });
 let seq = 0; let data = ''; const pending = new Map(); const errors = [];
 child.stderr.on('data', () => {});
@@ -113,28 +92,73 @@ try {
     await evaluate(`testSessionMessage({type:'capabilities',serveScale:0,displays:[]})`);
   };
   const measure = () => evaluate(`(()=>{const ids=['screen','toolbar','control-deck'];return Object.fromEntries(ids.map(id=>{const r=document.getElementById(id).getBoundingClientRect();return[id,{x:r.x,y:r.y,width:r.width,height:r.height}]}));})()`);
+  const checkPointerFill = async () => {
+    const boxes = await evaluate(`(()=>{const box=s=>{const r=document.querySelector(s).getBoundingClientRect();return{top:r.top,bottom:r.bottom,height:r.height}};return{groups:box('.control-groups'),panel:box('#pointer-panel'),pad:box('#trackpad'),buttons:box('.pointer-buttons'),dock:box('.thumb-dock')};})()`);
+    assert.ok(Math.abs(boxes.panel.bottom - boxes.groups.bottom) <= 1, `Unused Pointer space: ${JSON.stringify(boxes)}`);
+    assert.ok(Math.abs(boxes.pad.bottom + 6 - boxes.buttons.top) <= 1, JSON.stringify(boxes));
+    assert.ok(Math.abs(boxes.buttons.bottom - boxes.panel.bottom) <= 1 && boxes.buttons.bottom <= boxes.dock.top, JSON.stringify(boxes));
+  };
   for (const size of [{ width: 390, height: 844 }, { width: 844, height: 390 }, { width: 320, height: 568 }, { width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 899, height: 700 }]) {
     await cdp('Emulation.setDeviceMetricsOverride', { ...size, deviceScaleFactor: 1, mobile: true, screenOrientation: size.width > size.height ? { type: 'landscapePrimary', angle: 90 } : { type: 'portraitPrimary', angle: 0 } }); await frame();
     await checkSettings(`${size.width}-touch`);
     for (const mode of ['keys', 'type', 'pointer']) {
       await click(`[data-mode="${mode}"]`); await frame(); const boxes = await measure();
       const screenshot = await cdp('Page.captureScreenshot', { format: 'png' }); writeFileSync(`${dir}${size.width}-touch-${mode}.png`, Buffer.from(screenshot.data, 'base64'));
-      assert.ok(boxes.screen.height >= 89, JSON.stringify({size,mode,boxes}));
+      const minimumScreen = mode === 'type' && size.width > size.height && size.width >= 600 ? 54 : 89;
+      assert.ok(boxes.screen.height >= minimumScreen, JSON.stringify({size,mode,boxes}));
       assert.ok(boxes.screen.width > 150, JSON.stringify({size,mode,boxes}));
       const dock = await evaluate(`[...document.querySelectorAll('.thumb-dock button')].map(n=>{let r=n.getBoundingClientRect();return {width:r.width,height:r.height,y:r.y,bottom:r.bottom};})`);
       assert.ok(dock.every(r => r.width >= 44 && r.height >= 44 && r.y >= 0 && r.bottom <= size.height + 1), JSON.stringify({size,mode,dock,boxes}));
       if (mode === 'type') {
         // Compact landscape typing follows the reference's 31px character keys.
         const keyHeight = size.width > size.height && size.width >= 600 ? 31 : 44;
+        // On short viewports the reference stacks more rows than fit at once.
+        // Keep the dock fixed and verify that the bottom keys can scroll into view.
+        await evaluate(`document.querySelector('#keyboard-languages').scrollIntoView({block:'nearest'})`); await frame();
         assert.ok(await evaluate(`(()=>{const r=document.querySelector('#keyboard-languages').getBoundingClientRect(), dock=document.querySelector('.thumb-dock').getBoundingClientRect();return r.width>=44&&r.height>=${keyHeight}&&r.bottom<=dock.top;})()`));
-        assert.ok(await evaluate(`(()=>{const r=document.querySelector('#clear-draft').getBoundingClientRect(),deck=document.querySelector('#control-deck').getBoundingClientRect();return r.width>=37&&r.height>=37&&r.top>=deck.top&&r.bottom<=deck.bottom;})()`), `Clear draft not visible at ${size.width}x${size.height}`);
+        await evaluate(`document.querySelector('.control-groups').scrollTop=0`); await frame();
+        assert.ok(await evaluate(`(()=>{const r=document.querySelector('#insert-text').getBoundingClientRect(),deck=document.querySelector('#control-deck').getBoundingClientRect();return r.width>=48&&r.height>=29&&r.top>=deck.top&&r.bottom<=deck.bottom;})()`), `Insert not visible at ${size.width}x${size.height}`);
       }
       if (mode === 'pointer') {
+        await checkPointerFill();
         assert.ok(await evaluate(`(()=>{const deck=document.querySelector('#control-deck').getBoundingClientRect();return [...document.querySelectorAll('.pointer-buttons button')].every(button=>{const r=button.getBoundingClientRect();return r.left>=deck.left&&r.right<=deck.right&&r.width>=44&&r.height>=44&&button.scrollWidth<=button.clientWidth;});})()`), `Pointer buttons overflow at ${size.width}x${size.height}`);
       }
       console.log(JSON.stringify({ size, mode, boxes }));
     }
   }
+  // Exercise the public setting, its persistence, and both actual side layouts.
+  await cdp('Emulation.setDeviceMetricsOverride', { width: 844, height: 390, deviceScaleFactor: 1, mobile: true, screenOrientation: { type: 'landscapePrimary', angle: 90 } });
+  await click('[data-mode="keys"]'); await frame();
+  for (const side of ['left', 'right']) {
+    await click('#show-menu');
+    await evaluate(`(()=>{const select=document.querySelector('#landscape-controls');select.value='${side}';select.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+    await click('#close-menu'); await frame();
+    for (const mode of ['keys', 'pointer', 'type']) {
+      await click(`[data-mode="${mode}"]`); await frame();
+      const boxes = await measure(); const deck = boxes['control-deck'];
+      assert.equal(deck.width, 310);
+      assert.equal(deck.x, side === 'left' ? 0 : 534);
+      assert.equal(boxes.screen.x, side === 'left' ? 310 : 0);
+      assert.equal(boxes.screen.width, 534);
+      if (mode === 'pointer') await checkPointerFill();
+      assert.ok(await evaluate(`(()=>{const s=getComputedStyle(document.querySelector('#control-deck'));return s.border${side === 'left' ? 'Right' : 'Left'}Width==='1px'&&s.border${side === 'left' ? 'Left' : 'Right'}Width==='0px';})()`));
+      const shot = await cdp('Page.captureScreenshot', { format: 'png' });
+      writeFileSync(`${dir}844-${side}-${mode}.png`, Buffer.from(shot.data, 'base64'));
+    }
+    await cdp('Page.navigate', { url: pathToFileURL(dir + 'index.html').href + '?preserveStorage' });
+    await evaluate(`new Promise(resolve=>{const check=()=>typeof testConnect==='function'?resolve():setTimeout(check,10);check()})`);
+    await evaluate('testConnect()'); await evaluate('document.fonts.ready'); await frame();
+    assert.equal(await evaluate(`document.querySelector('#landscape-controls').value`), side);
+    assert.equal(await evaluate(`document.querySelector('#viewer').dataset.layoutPosition`), side);
+    await cdp('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true, screenOrientation: { type: 'portraitPrimary', angle: 0 } }); await frame();
+    assert.equal(await evaluate(`document.querySelector('#viewer').dataset.layoutPosition`), 'auto');
+    assert.equal((await measure())['control-deck'].width, 390);
+    await cdp('Emulation.setDeviceMetricsOverride', { width: 844, height: 390, deviceScaleFactor: 1, mobile: true, screenOrientation: { type: 'landscapePrimary', angle: 90 } }); await frame();
+    assert.equal(await evaluate(`document.querySelector('#viewer').dataset.layoutPosition`), side);
+  }
+  await click('#show-menu');
+  await evaluate(`(()=>{const select=document.querySelector('#landscape-controls');select.value='auto';select.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+  await click('#close-menu'); await frame();
   // Desktop occupies the full workspace, including short/portrait windows and
   // saved modes/placements. Width alone must not hide touch tablet controls.
   await cdp('Emulation.setTouchEmulationEnabled', { enabled: false });

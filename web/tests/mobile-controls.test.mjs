@@ -86,7 +86,7 @@ function app(saved = {}) {
     input: message => { if (connected) sent.push(JSON.parse(JSON.stringify(message))); },
     button: (bit, down) => { if (connected) sent.push({ bit, down }); },
     move: (dx, dy) => { if (connected) sent.push({ dx, dy }); },
-    reset: () => sent.push({ kind: 'release' }), pointerMode: () => 'Trackpad',
+    reset: () => sent.push({ kind: 'release' }),
   });
   sent.length = 0;
   return {
@@ -244,11 +244,37 @@ test('malformed pinned preferences fall back without removing controls', () => {
   }
 });
 
-test('the visible Clear button discards the local draft without sending it', () => {
-  const a = app(); type(a); a.character('q'); a.character('w');
-  assert.ok(a.$('.draft-row').children.includes(a.$('#clear-draft')));
-  a.click(a.$('#clear-draft'));
-  assert.equal(a.$('#compose').value, ''); assert.deepEqual(a.sent, []);
+test('Settings saves landscape placement across reloads without changing portrait', () => {
+  const key = 'topvnc.mobile.customize.v1';
+  const a = app({ [key]: JSON.stringify({ layouts: { portrait: { position: 'top' } } }) });
+  const select = a.$('#landscape-controls');
+  assert.equal(select.value, 'auto');
+  select.value = 'left'; a.fire(select, 'change');
+  assert.equal(a.$('#viewer').dataset.layoutPosition, 'top');
+  assert.equal(JSON.parse(a.store.get(key)).layouts.landscape.position, 'left');
+  a.landscape.matches = true; a.fire(a.landscape, 'change');
+  assert.equal(a.$('#viewer').dataset.layoutPosition, 'left');
+  const b = app(Object.fromEntries(a.store));
+  assert.equal(b.$('#landscape-controls').value, 'left');
+  b.landscape.matches = true; b.fire(b.landscape, 'change');
+  assert.equal(b.$('#viewer').dataset.layoutPosition, 'left');
+  b.$('#landscape-controls').value = 'right'; b.fire(b.$('#landscape-controls'), 'change');
+  assert.equal(b.$('#viewer').dataset.layoutPosition, 'right');
+  assert.equal(JSON.parse(b.store.get(key)).layouts.portrait.position, 'top');
+  assert.ok(b.sent.every(message => message.kind === 'release'));
+});
+
+test('Settings rejects placement changes during native composition and invalid values', () => {
+  const a = app(); type(a); a.click(a.$('#native-keyboard'));
+  a.fire(a.$('#keyboard'), 'compositionstart');
+  const select = a.$('#landscape-controls');
+  select.value = 'left'; a.fire(select, 'change');
+  assert.equal(select.value, 'auto');
+  assert.equal(a.$('#viewer').dataset.layoutPosition, 'auto');
+  a.fire(a.$('#keyboard'), 'compositionend');
+  select.value = 'invalid'; a.fire(select, 'change');
+  assert.equal(select.value, 'auto');
+  assert.equal(a.store.has('topvnc.mobile.customize.v1'), false);
 });
 
 test('Type mode shows deck feedback over the remote view, then hides it', () => {

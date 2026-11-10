@@ -65,6 +65,33 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
+  browser-ui:
+    name: Browser UI and reference goldens (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+      # These checks bundle an offline session fixture; no WASM build, server,
+      # credentials or connection to a remote desktop is needed.
+      - name: Check mobile and desktop behavior and reference screenshots
+        working-directory: web
+        shell: pwsh
+        run: |
+          $env:TOPVNC_BROWSER = Join-Path $env:ProgramFiles 'Google/Chrome/Application/chrome.exe'
+          npm run test:browser
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run test:visual
+
   web:
     name: Browser client and Worker
     runs-on: ubuntu-latest
