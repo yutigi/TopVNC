@@ -3,7 +3,7 @@
 // serves web/dist as static assets.
 import { build } from "esbuild";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 
@@ -35,6 +35,7 @@ const dist = `${webDir}dist/`;
 rmSync(dist, { recursive: true, force: true });
 mkdirSync(dist, { recursive: true });
 for (const file of ["index.html", "style.css", "_headers"]) copyFileSync(`${webDir}${file}`, `${dist}${file}`);
+cpSync(`${webDir}assets`, `${dist}assets`, { recursive: true });
 copyFileSync(`${webDir}build/pkg/topvnc_web_bg.wasm`, `${dist}topvnc_web_bg.wasm`);
 await build({
   absWorkingDir: webDir,

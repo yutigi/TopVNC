@@ -211,3 +211,29 @@ test('Customize remains reachable with hidden custom keys and migrates legacy ro
   assert.equal(a.$('#control-sheet').hidden, false); assert.equal(a.$('#control-deck').inert, true);
   a.click(a.$('#close-sheet')); assert.equal(a.$('#control-deck').inert, false);
 });
+
+test('reference pinned shortcuts route real chords and persist edited slots', () => {
+  const a = app();
+  assert.equal(a.$('#pin-row').children.length, 4);
+  a.click(a.$('#pin-row').children[0]);
+  assert.deepEqual(a.sent.map(m => [m.keysym, m.down]), [[0xffe3, true], [99, true], [99, false], [0xffe3, false]]);
+  a.click(a.$('#edit-pins'));
+  const fields = a.$('#sheet-content').querySelectorAll('select');
+  fields[0].value = 'Space'; fields[3].value = 'Delete';
+  a.click(a.$('#sheet-content').querySelectorAll('button').find(node => node.textContent === 'Save pinned keys'));
+  assert.equal(a.$('#control-sheet').hidden, true);
+  assert.deepEqual(JSON.parse(a.store.get('topvnc.mobile.pins.v1')), ['Space', 'Ctrl+V', 'Win', 'Delete']);
+  assert.equal(a.$('#show-function-keys'), undefined);
+  const b = app({ 'topvnc.mobile.pins.v1': a.store.get('topvnc.mobile.pins.v1') });
+  b.click(b.$('#pin-row').children[0]);
+  assert.deepEqual(b.sent, [{ kind: 'keysym', keysym: 32, down: true }, { kind: 'keysym', keysym: 32, down: false }]);
+});
+
+test('malformed pinned preferences fall back without removing controls', () => {
+  for (const saved of ['null', '{}', '["Space"]', '["Space","Delete","Home","<script>"]', 'x'.repeat(257)]) {
+    const a = app({ 'topvnc.mobile.pins.v1': saved });
+    assert.equal(a.$('#pin-row').children.length, 4);
+    assert.equal(a.$('#pin-row').children[0].dataset.mobileKey, 'Ctrl+C');
+    assert.ok(a.$('#show-function-keys'));
+  }
+});

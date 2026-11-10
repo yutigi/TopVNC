@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="theme-color" content="#0b1020">
+  <meta name="theme-color" content="#f5f5f2">
   <title>TopVNC</title>
   <link rel="stylesheet" href="/style.css">
   <script type="module" src="/app.js"></script>
@@ -59,16 +59,18 @@
       <button type="button" data-mobile-key="Delete">Del</button><button type="button" data-mobile-key="Home">Home</button><button type="button" data-mobile-key="End">End</button><button type="button" data-mobile-key="PageUp">PgUp</button><button type="button" data-mobile-key="PageDown">PgDn</button>
     </div>
     <nav id="toolbar" aria-label="Viewer controls">
-      <strong>TopVNC <small>Encrypted to host</small></strong>
+      <div class="session-host"><span class="host-icon" aria-hidden="true">▣</span><strong><span id="session-name">TopVNC</span><small><span class="connection-dot" aria-hidden="true"></span>Encrypted to host</small></strong></div>
       <div class="viewer-tools">
         <button type="button" id="show-keyboard">Type</button>
         <button type="button" id="fit">Fit</button>
         <button type="button" id="fullscreen">Fullscreen</button>
-        <button type="button" id="customize-button" aria-label="Customize keys and layout"><span class="tool-icon">⚙</span><span class="tool-label">Customize</span></button>
-        <button type="button" id="show-menu" aria-label="Session settings" aria-expanded="false"><span class="tool-icon">☰</span><span class="tool-label">Settings</span></button>
+        <button type="button" id="customize-button" aria-label="Customize keys and layout"><span aria-hidden="true">✎</span><span>Customize</span></button>
+        <button type="button" id="show-menu" aria-label="Session settings" aria-haspopup="dialog" aria-controls="menu" aria-expanded="false"><span class="tool-icon" aria-hidden="true">⚙</span><span class="tool-label">Settings</span></button>
       </div>
     </nav>
     <aside id="control-deck" aria-label="Remote input controls">
+      <div class="deck-grip" aria-hidden="true"></div>
+      <div class="deck-top"><span id="deck-label">QUICK KEYS</span><span id="control-status" role="status" aria-live="polite"></span></div>
       <div class="control-groups">
         <div class="type-modifiers" hidden>
           <button type="button" data-mod="Ctrl" aria-pressed="false">Ctrl</button>
@@ -77,44 +79,49 @@
         </div>
         <div id="custom-action-pad"></div>
         <div id="keys-panel">
-          <div class="quick-keys">
-            <button type="button" data-mobile-key="Esc">Esc</button><button type="button" data-mobile-key="Tab">Tab</button>
-            <button type="button" data-mod="Ctrl" aria-pressed="false">Ctrl</button><button type="button" data-mod="Alt" aria-pressed="false">Alt</button>
-            <button type="button" data-mod="Shift" aria-pressed="false">Shift</button><button type="button" data-mod="Win" aria-pressed="false">Win</button>
-            <button type="button" data-mobile-key="ArrowLeft" aria-label="Left arrow">←</button><button type="button" data-mobile-key="ArrowUp" aria-label="Up arrow">↑</button>
-            <button type="button" data-mobile-key="ArrowDown" aria-label="Down arrow">↓</button><button type="button" data-mobile-key="ArrowRight" aria-label="Right arrow">→</button>
-            <button type="button" id="show-function-keys" aria-expanded="false">Fn</button><button type="button" data-mobile-key="Space">Space</button>
-            <button type="button" data-mobile-key="Ctrl+C">Copy</button><button type="button" data-mobile-key="Ctrl+V">Paste</button>
+          <div id="pin-row" class="pin-row" aria-label="Pinned shortcuts"></div>
+          <div class="quick-controls">
+            <div class="modifier-grid">
+              <button type="button" data-mobile-key="Esc">Esc</button><button type="button" data-mobile-key="Tab">Tab ⇥</button>
+              <button type="button" data-mod="Ctrl" aria-pressed="false">Ctrl</button><button type="button" data-mod="Alt" aria-pressed="false">Alt</button>
+              <button type="button" data-mod="Shift" aria-pressed="false">Shift</button><button type="button" data-mobile-key="Backspace" aria-label="Backspace">⌫</button>
+            </div>
+            <div class="arrow-grid">
+              <button type="button" class="arrow-up" data-mobile-key="ArrowUp" aria-label="Up arrow">↑</button>
+              <button type="button" class="arrow-left" data-mobile-key="ArrowLeft" aria-label="Left arrow">←</button>
+              <button type="button" class="arrow-down" data-mobile-key="ArrowDown" aria-label="Down arrow">↓</button>
+              <button type="button" class="arrow-right" data-mobile-key="ArrowRight" aria-label="Right arrow">→</button>
+            </div>
           </div>
+          <div class="deck-footnote"><span>Tap modifier, then key</span><button type="button" id="edit-pins">Edit pinned keys ↗</button></div>
         </div>
         <div id="type-panel" hidden>
           <div class="input-source"><button type="button" id="custom-keyboard" aria-pressed="true">TopVNC keys</button><button type="button" id="native-keyboard" aria-pressed="false">Native input</button></div>
-          <p id="typing-help" class="note"></p>
           <div id="local-draft-panel">
-            <label class="draft-label" for="compose">Local draft</label>
-            <div class="draft-row"><textarea id="compose" rows="1" readonly inputmode="none" maxlength="2000" placeholder="Tap keys, then Insert" aria-label="Local text draft"></textarea><button type="button" id="clear-draft">Clear</button><button type="button" id="insert-text">Insert</button></div>
+            <div class="draft-row"><textarea id="compose" rows="1" readonly inputmode="none" maxlength="2000" placeholder="Tap the keys below…" aria-label="Local text draft"></textarea><button type="button" id="insert-text">Insert ↗</button></div>
           </div>
           <div id="custom-keyboard-panel">
             <div id="keyboard-rows"></div>
             <div class="keyboard-bottom">
+              <button type="button" id="keyboard-languages" aria-label="Keyboard languages"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><ellipse cx="12" cy="12" rx="4" ry="9"></ellipse><path d="M3 12h18M5 6.5h14M5 17.5h14"></path></svg></button>
               <button type="button" id="symbol-keyboard" aria-pressed="false">?123</button>
-              <button type="button" data-mod="Shift" aria-label="Keyboard Shift" aria-pressed="false">⇧</button>
-              <button type="button" id="keyboard-languages" aria-label="Keyboard languages">🌐</button>
               <button type="button" id="keyboard-space">English</button>
               <button type="button" id="keyboard-backspace" aria-label="Backspace">⌫</button>
-              <button type="button" id="keyboard-layout" aria-label="Edit keyboard languages and layouts">Edit</button>
+              <button type="button" id="keyboard-return" aria-label="Insert composed text">↵</button>
             </div>
           </div>
+          <div class="typing-help"><span>Tap globe to switch · hold &amp; slide to choose</span><button type="button" id="keyboard-layout" aria-label="Edit keyboard languages and layouts">Edit layout ↗</button></div>
+          <p id="typing-help" class="note"></p>
+          <button type="button" id="clear-draft" class="quiet-button">Clear local draft</button>
           <div id="native-input-panel" hidden><label for="keyboard">Native input · sends committed text directly</label></div>
         </div>
         <div id="pointer-panel" hidden>
-          <p class="note">Drag the pad to move; hold a button with another finger. Screen input: <span id="pointer-mode-label"></span>.</p>
-          <div id="trackpad" aria-label="Remote trackpad">Drag to move</div>
-          <div class="pointer-buttons"><button type="button" data-pointer-button="1">Left click</button><button type="button" data-pointer-button="4">Right click</button><button type="button" id="toggle-mode">Trackpad</button></div>
+          <div id="trackpad" aria-label="Remote trackpad"><span aria-hidden="true">＋</span><p>Move with one finger</p><small>Hold a button with another finger</small></div>
+          <div class="pointer-buttons"><button type="button" data-pointer-button="1">Left click</button><button type="button" data-pointer-button="4">Right click</button></div>
+          <div class="deck-footnote"><span>Screen input: <span id="pointer-mode-label"></span></span><button type="button" id="toggle-mode">Trackpad</button></div>
         </div>
         <div id="fps-panel" hidden aria-label="FPS controls"></div>
       </div>
-      <p id="control-status" role="status" aria-live="polite"></p>
       <nav class="thumb-dock" aria-label="Input mode">
         <button type="button" data-mode="keys" aria-pressed="true"><span>⌘</span><small>Keys</small></button>
         <button type="button" data-mode="type" aria-pressed="false"><span>⌨</span><small>Type</small></button>
@@ -126,7 +133,7 @@
       <div class="menu-head"><h2 id="sheet-title">Customize</h2><button type="button" id="close-sheet">Close</button></div>
       <div id="sheet-content"></div>
     </div>
-    <div id="menu" role="dialog" aria-labelledby="menu-title" hidden>
+    <div id="menu" role="dialog" aria-modal="true" aria-labelledby="menu-title" hidden>
       <div class="menu-head">
         <h2 id="menu-title">Session settings</h2>
         <button type="button" id="close-menu">Close</button>
@@ -157,7 +164,7 @@
       <button type="button" id="fullscreen-menu">Toggle fullscreen</button>
       <p class="transport">Encrypted to your host</p>
       <div class="row">
-        <label class="choice toggle"><input id="stats-toggle" type="checkbox"><span>Stats</span></label>
+        <label class="choice toggle"><input id="stats-toggle" type="checkbox"><span>Debug / Stats</span></label>
         <button type="button" id="disconnect">Disconnect</button>
       </div>
     </div>

@@ -230,6 +230,7 @@ async function onSessionMessage(message) {
       break;
     case "connected":
       state = "connected";
+      $("#session-name").textContent = message.name || "TopVNC";
       passwordForm.hidden = true;
       passwordInput.value = "";
       showViewer(true);
@@ -314,11 +315,23 @@ function showViewer(visible) {
 function showMenu(visible) {
   menu.hidden = !visible;
   $("#show-menu").setAttribute("aria-expanded", String(visible));
+  for (const element of [screen, toolbar, $("#control-deck")]) element.inert = visible;
+  if (visible) $("#close-menu").focus({ preventScroll: true });
+  else if (state === "connected" && $("#control-sheet").hidden) $("#show-menu").focus({ preventScroll: true });
 }
+
+menu.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") { event.preventDefault(); showMenu(false); }
+  if (event.key !== "Tab") return;
+  const targets = [...menu.querySelectorAll("button, input, select")].filter(node => !node.disabled && node.getClientRects().length);
+  const first = targets[0]; const last = targets.at(-1);
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+});
 
 function showFunctionKeys(visible) {
   functionKeys.hidden = !visible;
-  $("#show-function-keys").setAttribute("aria-expanded", String(visible));
+  viewer.querySelectorAll('[data-toggle-functions]').forEach(button => button.setAttribute("aria-expanded", String(visible)));
 }
 
 function layout() {
@@ -578,7 +591,7 @@ keyboard.addEventListener("keydown", (event) => {
 viewer.addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button || state !== "connected") return;
-  if (button.id === "show-function-keys") {
+  if (button.dataset.toggleFunctions) {
     showFunctionKeys(functionKeys.hidden);
     layout();
   } else if (button.id === "toggle-mode") {
@@ -631,6 +644,15 @@ mobile = createMobileControls({
   active: () => state === "connected",
   input, button: setButton, move: moveBy, reset: releaseEverything,
   pointerMode: () => mode === "trackpad" ? "Trackpad" : "Direct",
+});
+// Match style.css: hiding the touch deck must not leave its input held or focus
+// inside an invisible native field. This also covers attaching a mouse/resizing.
+const desktopLayout = matchMedia("(min-width: 900px) and (pointer: fine) and (hover: hover)");
+desktopLayout.addEventListener("change", () => {
+  releaseEverything();
+  if (state === "connected" && !screen.closest("[hidden]") && menu.hidden && $("#control-sheet").hidden) {
+    screen.focus({ preventScroll: true });
+  }
 });
 for (const target of [$("#fullscreen"), $("#fullscreen-menu")]) target.addEventListener("click", () => {
   const pending = document.fullscreenElement ? document.exitFullscreen?.() : viewer.requestFullscreen?.();

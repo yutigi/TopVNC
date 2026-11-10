@@ -15,20 +15,21 @@ const bundle = await build({
   plugins: [{ name: 'offline-session-fixture', setup(build) {
     build.onResolve({ filter: /build\/pkg\/topvnc_web\.js$/ }, () => ({ path: 'wasm-fixture', namespace: 'fixture' }));
     build.onLoad({ filter: /.*/, namespace: 'fixture' }, () => ({ contents: `export default async function init() {} export const fingerprint=()=> 'test-host', newBrowserKey=()=> 'A'.repeat(43), publicKey=()=> 'B'.repeat(43), parseInvite=()=>({free(){}}); export class Connection {}` }));
-    build.onLoad({ filter: /web[\\/]app\.mjs$/ }, args => ({ contents: readFileSync(args.path, 'utf8') + `\nglobalThis.testConnect=async()=>{pending={browser:'A'.repeat(43),host:'B'.repeat(43)};state='connecting';await startSession();};` }));
+    build.onLoad({ filter: /web[\\/]app\.mjs$/ }, args => ({ contents: readFileSync(args.path, 'utf8') + `\nglobalThis.testConnect=async()=>{pending={browser:'A'.repeat(43),host:'B'.repeat(43)};state='connecting';await startSession();};globalThis.testSessionMessage=onSessionMessage;` }));
   } }],
 });
 const fixture = `try { localStorage.clear(); } catch {} globalThis.sent=[]; globalThis.Worker=class {
   postMessage(message) { if(message.type==='input') sent.push(message);
     if(message.type==='connect') queueMicrotask(()=>{
-      if(message.canvas) { const c=message.canvas.getContext('2d'); message.canvas.width=1280;message.canvas.height=720;c.fillStyle='#142b3a';c.fillRect(0,0,1280,720);c.fillStyle='#90b6af';c.font='36px monospace';c.fillText('Offline layout fixture',80,100); }
+      if(message.canvas) { const c=message.canvas.getContext('2d'); message.canvas.width=1280;message.canvas.height=720;c.fillStyle='#e7e9e0';c.fillRect(0,0,1280,720);c.fillStyle='#fafbf6';c.fillRect(100,110,1080,450);c.strokeStyle='#adb59f';c.strokeRect(100,110,1080,450);c.fillStyle='#f3f5ed';c.fillRect(101,111,1078,50);c.fillStyle='#747e62';c.font='20px monospace';c.fillText('Offline layout fixture — no live host',125,145);c.font='28px monospace';c.fillText('Your remote workspace',145,240);c.font='20px monospace';c.fillText('The session controls below are the actual application.',145,290); }
       this.onmessage({data:{type:'connected',name:'Offline QA fixture'}});
       this.onmessage({data:{type:'resized',width:1280,height:720}});
     });
   }
 };`;
-let html = readFileSync(root + 'web/index.html', 'utf8').replace(/<script[^>]*src="\/app.js"[^>]*><\/script>/u, '').replace('<link rel="stylesheet" href="/style.css">', `<style>${readFileSync(root + 'web/style.css', 'utf8')}</style>`);
-html = html.replace('</body>', `<script>${fixture}\n${bundle.outputFiles[0].text}</script></body>`);
+const css = readFileSync(root + 'web/style.css', 'utf8').replace(/url\("(assets\/fonts\/[^"]+)"\)/gu, (_, path) => `url("data:font/woff2;base64,${readFileSync(root + 'web/' + path).toString('base64')}")`);
+let html = readFileSync(root + 'web/index.html', 'utf8').replace(/<script[^>]*src="\/app.js"[^>]*><\/script>/u, '').replace('<link rel="stylesheet" href="/style.css">', `<style>${css}</style>`);
+html = html.replace('</body>', () => `<script>${fixture}\n${bundle.outputFiles[0].text}</script></body>`);
 writeFileSync(dir + 'index.html', html);
 const child = spawn(browser, ['--headless', '--remote-debugging-pipe', '--no-first-run', `--user-data-dir=${dir}profile`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'], windowsHide: true });
 let seq = 0; let data = ''; const pending = new Map(); const errors = [];
@@ -51,6 +52,9 @@ try {
   const { sessionId } = await send('Target.attachToTarget', { targetId: targetInfos.find(t => t.type === 'page').targetId, flatten: true });
   const cdp = (method, params) => send(method, params, sessionId);
   await cdp('Runtime.enable'); await cdp('Page.enable');
+  // A background/headless page can update activeElement without focus events.
+  // Native text input deliberately requires a fresh focus after cancellation.
+  await cdp('Emulation.setFocusEmulationEnabled', { enabled: true });
   const evaluate = async expression => {
     const response = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
     if (response.exceptionDetails) throw new Error(JSON.stringify(response.exceptionDetails));
@@ -61,28 +65,99 @@ try {
   await cdp('Page.navigate', { url: pathToFileURL(dir + 'index.html').href });
   await evaluate(`new Promise(resolve=>{const check=()=>typeof testConnect==='function'?resolve():setTimeout(check,10);check();})`);
   await evaluate('testConnect()');
+  await evaluate('document.fonts.ready');
   await evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
   const click = selector => evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
   const frame = () => evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+  const checkSettings = async label => {
+    await evaluate(`testSessionMessage({type:'capabilities',serveScale:0,displays:[]})`);
+    await click('#show-menu'); await frame();
+    assert.equal(await evaluate('document.activeElement.id'), 'close-menu', label);
+    assert.ok(await evaluate(`(()=>{let m=document.querySelector('#menu'),r=m.getBoundingClientRect();return !m.hidden&&m.getAttribute('aria-modal')==='true'&&r.top>=document.querySelector('#toolbar').getBoundingClientRect().bottom-1&&r.bottom<=innerHeight+1;})()`),label);
+    assert.ok(await evaluate(`document.querySelector('#serve-display').hidden&&document.querySelector('#serve-scale').hidden&&!document.querySelector('#serve-display-missing').hidden&&!document.querySelector('#serve-scale-missing').hidden&&document.querySelector('#serve-scale-value').textContent==='Unavailable'`),label);
+    await evaluate(`testSessionMessage({type:'capabilities',serveScale:100,displays:[1,2]});sent.length=0;var scale=document.querySelector('#serve-scale');scale.value='75';scale.dispatchEvent(new Event('input',{bubbles:true}));scale.dispatchEvent(new Event('change',{bubbles:true}));var display=document.querySelector('[name="serve-display"][value="2"]');display.checked=true;display.dispatchEvent(new Event('change',{bubbles:true}));var q=document.querySelector('[name="menu-quality"][value="8"]');q.checked=true;q.dispatchEvent(new Event('change',{bubbles:true}));`);
+    assert.deepEqual(await evaluate('sent.map(m=>[m.kind,m.percent??m.display??m.quality])'),[['serveScale',75],['serveDisplay',2],['quality',8]],label);
+    assert.ok(await evaluate(`!document.querySelector('#serve-scale').hidden&&!document.querySelector('#serve-display').hidden&&document.querySelector('#serve-scale-value').textContent==='75% shared'&&document.querySelector('#serve-display-missing').hidden&&document.querySelector('#serve-scale-missing').hidden`),label);
+    await evaluate(`testSessionMessage({type:'capabilities',serveScale:75,displays:[2,2]});testSessionMessage({type:'stats',fps:60,presentedFps:59,mbps:12,rtt:8,continuous:true})`);
+    await click('#stats-toggle');
+    assert.ok(await evaluate(`!document.querySelector('#stats').hidden&&document.querySelector('#stats').textContent.includes('RTT 8 ms')&&document.querySelector('#menu .transport').textContent.includes('Encrypted')&&document.querySelector('#fullscreen-menu').getClientRects().length>0`),label);
+    const shot=await cdp('Page.captureScreenshot',{format:'png'});writeFileSync(`${dir}${label}-settings.png`,Buffer.from(shot.data,'base64'));
+    await evaluate(`document.querySelector('#disconnect').focus()`);
+    await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:'Tab',code:'Tab',windowsVirtualKeyCode:9});
+    assert.equal(await evaluate('document.activeElement.id'),'close-menu',label);
+    await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:'Tab',code:'Tab',windowsVirtualKeyCode:9,modifiers:8});
+    assert.equal(await evaluate('document.activeElement.id'),'disconnect',label);
+    await click('#stats-toggle');
+    await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+    assert.ok(await evaluate(`document.querySelector('#menu').hidden&&document.activeElement.id==='show-menu'&&!document.querySelector('#screen').inert&&document.querySelector('#stats').hidden`),label);
+    await evaluate(`testSessionMessage({type:'capabilities',serveScale:0,displays:[]})`);
+  };
   const measure = () => evaluate(`(()=>{const ids=['screen','toolbar','control-deck'];return Object.fromEntries(ids.map(id=>{const r=document.getElementById(id).getBoundingClientRect();return[id,{x:r.x,y:r.y,width:r.width,height:r.height}]}));})()`);
-  for (const size of [{ width: 390, height: 844 }, { width: 844, height: 390 }, { width: 320, height: 568 }]) {
+  for (const size of [{ width: 390, height: 844 }, { width: 844, height: 390 }, { width: 320, height: 568 }, { width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 899, height: 700 }]) {
     await cdp('Emulation.setDeviceMetricsOverride', { ...size, deviceScaleFactor: 1, mobile: true, screenOrientation: size.width > size.height ? { type: 'landscapePrimary', angle: 90 } : { type: 'portraitPrimary', angle: 0 } }); await frame();
+    await checkSettings(`${size.width}-touch`);
     for (const mode of ['keys', 'type', 'pointer']) {
       await click(`[data-mode="${mode}"]`); await frame(); const boxes = await measure();
-      assert.ok(boxes.screen.height >= 89, JSON.stringify({size,mode,boxes}));
+      const screenshot = await cdp('Page.captureScreenshot', { format: 'png' }); writeFileSync(`${dir}${size.width}-touch-${mode}.png`, Buffer.from(screenshot.data, 'base64'));
+      assert.ok(boxes.screen.height >= (mode === 'type' && size.width > size.height && size.height < 600 ? 54 : 89), JSON.stringify({size,mode,boxes}));
       assert.ok(boxes.screen.width > 150, JSON.stringify({size,mode,boxes}));
       const dock = await evaluate(`[...document.querySelectorAll('.thumb-dock button')].map(n=>{let r=n.getBoundingClientRect();return {width:r.width,height:r.height,y:r.y,bottom:r.bottom};})`);
-      assert.ok(dock.every(r => r.width >= 44 && r.height >= 44 && r.y >= 0 && r.bottom <= size.height + 1));
+      assert.ok(dock.every(r => r.width >= 44 && r.height >= 44 && r.y >= 0 && r.bottom <= size.height + 1), JSON.stringify({size,mode,dock,boxes}));
       if (mode === 'type') {
-        assert.ok(await evaluate(`(()=>{const r=document.querySelector('#keyboard-languages').getBoundingClientRect(), dock=document.querySelector('.thumb-dock').getBoundingClientRect();return r.width>=44&&r.height>=44&&r.bottom<=dock.top;})()`));
+        const keyHeight = size.width > size.height && size.width >= 600 ? 31 : 44;
+        assert.ok(await evaluate(`(()=>{const r=document.querySelector('#keyboard-languages').getBoundingClientRect(), dock=document.querySelector('.thumb-dock').getBoundingClientRect();return r.width>=44&&r.height>=${keyHeight}&&r.bottom<=dock.top;})()`));
       }
       if (mode === 'pointer') {
         assert.ok(await evaluate(`(()=>{const deck=document.querySelector('#control-deck').getBoundingClientRect();return [...document.querySelectorAll('.pointer-buttons button')].every(button=>{const r=button.getBoundingClientRect();return r.left>=deck.left&&r.right<=deck.right&&r.width>=44&&r.height>=44&&button.scrollWidth<=button.clientWidth;});})()`), `Pointer buttons overflow at ${size.width}x${size.height}`);
       }
       console.log(JSON.stringify({ size, mode, boxes }));
-      const screenshot = await cdp('Page.captureScreenshot', { format: 'png' }); writeFileSync(`${dir}${size.width}-${mode}.png`, Buffer.from(screenshot.data, 'base64'));
     }
   }
+  // Desktop occupies the full workspace, including short/portrait windows and
+  // saved modes/placements. Width alone must not hide touch tablet controls.
+  await cdp('Emulation.setTouchEmulationEnabled', { enabled: false });
+  for (const size of [{width:1440,height:900},{width:1024,height:768},{width:1100,height:500},{width:1000,height:1100},{width:900,height:700}]) {
+    await cdp('Emulation.setDeviceMetricsOverride', {...size,deviceScaleFactor:1,mobile:false}); await frame();
+    assert.equal(await evaluate('matchMedia("(pointer: fine) and (hover: hover)").matches'), true);
+    await checkSettings(`${size.width}-desktop`);
+    for (const mode of ['keys','type','pointer']) {
+      await click(`[data-mode="${mode}"]`);
+      for (const position of ['auto','top','bottom','left','right']) {
+        await evaluate(`document.querySelector('#viewer').dataset.layoutPosition=${JSON.stringify(position)}`); await frame();
+        const boxes = await measure();
+        assert.ok(Math.abs(boxes.screen.width-size.width)<1 && boxes.screen.x===0 && boxes.screen.y===64 && Math.abs(boxes.screen.height-(size.height-64))<1, JSON.stringify({size,mode,position,boxes}));
+        assert.equal(boxes['control-deck'].width,0);
+        assert.ok(await evaluate(`[...document.querySelectorAll('#control-deck, .thumb-dock, #customize-button, #show-keyboard, #fps-panel')].every(n=>n.getClientRects().length===0)`));
+      }
+    }
+    // A saved FPS preset must not expose an overlay or reserve a dock gap.
+    await evaluate(`document.querySelector('#viewer').classList.add('fps-active')`); await frame();
+    assert.ok(await evaluate(`(()=>{let r=document.querySelector('#screen').getBoundingClientRect();return r.width===innerWidth&&r.bottom===innerHeight&&document.querySelector('#control-deck').getClientRects().length===0;})()`));
+    const shot=await cdp('Page.captureScreenshot',{format:'png'}); writeFileSync(`${dir}${size.width}-desktop.png`,Buffer.from(shot.data,'base64'));
+    await evaluate(`document.querySelector('#viewer').classList.remove('fps-active')`);
+  }
+  // Actual mouse events focus the remote surface and route hardware keys/buttons.
+  await cdp('Input.dispatchMouseEvent',{type:'mousePressed',x:300,y:220,button:'left',buttons:1,clickCount:1});
+  await cdp('Input.dispatchMouseEvent',{type:'mouseReleased',x:300,y:220,button:'left',buttons:0,clickCount:1});
+  assert.equal(await evaluate('document.activeElement.id'),'screen');
+  await evaluate('sent.length=0');
+  await cdp('Input.dispatchKeyEvent',{type:'keyDown',code:'KeyW',key:'w',windowsVirtualKeyCode:87});
+  await cdp('Input.dispatchMouseEvent',{type:'mousePressed',x:300,y:220,button:'left',buttons:1,clickCount:1});
+  assert.ok(await evaluate(`sent.some(m=>m.kind==='code'&&m.code==='KeyW'&&m.down)&&sent.some(m=>m.kind==='pointer'&&m.buttons===1)`));
+  await evaluate(`window.dispatchEvent(new Event('blur'))`);
+  assert.equal(await evaluate('sent.at(-1).kind'),'release');
+  await cdp('Input.dispatchMouseEvent',{type:'mouseReleased',x:300,y:220,button:'left',buttons:0,clickCount:1});
+  await click('#show-menu');
+  assert.equal(await evaluate('document.querySelector("#menu").hidden'),false);
+  assert.ok(await evaluate('document.querySelector("#toolbar").textContent.includes("Encrypted")'));
+  await click('#close-menu'); await click('#fit');
+  // Changing input capability must release a hardware hold as the deck returns.
+  await evaluate('document.querySelector("#screen").focus();sent.length=0');
+  await cdp('Input.dispatchKeyEvent',{type:'keyDown',code:'KeyW',key:'w',windowsVirtualKeyCode:87});
+  await cdp('Emulation.setTouchEmulationEnabled',{enabled:true,maxTouchPoints:5}); await frame();
+  assert.ok(await evaluate('sent.some(m=>m.kind==="release")'));
+  await evaluate(`document.querySelector('#viewer').dataset.layoutPosition='auto'`);
+  await cdp('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true, screenOrientation: { type: 'portraitPrimary', angle: 0 } }); await frame();
   await click('[data-mode="type"]');
   await evaluate(`sent.length=0;document.querySelector('.type-modifiers [data-mod="Ctrl"]').click();document.querySelector('[data-character="c"]').click();`);
   assert.deepEqual(await evaluate('sent.map(m=>[m.keysym,m.down])'), [[65507,true],[99,true],[99,false],[65507,false]]);
@@ -119,6 +194,8 @@ try {
   await evaluate(`sent.length=0;document.querySelector('[data-fps-action="forward"]').dispatchEvent(new KeyboardEvent('keydown',{bubbles:true,key:'Enter'}));document.querySelector('[data-fps-action="fire"]').dispatchEvent(new KeyboardEvent('keydown',{bubbles:true,key:'Enter'}));window.dispatchEvent(new Event('blur'));`);
   assert.ok(await evaluate(`sent.some(m=>m.kind==='keysym'&&m.keysym===119&&m.down===false)`));
   assert.equal(await evaluate(`sent.at(-1).kind`), 'release');
+  await click('#disconnect');
+  assert.equal(await evaluate('sent.at(-1).kind'), 'release');
   assert.deepEqual(errors, []);
-  console.log('PASS: actual app layout, chord routing, native IME deduplication, multitouch and blur release (offline Worker fixture).');
+  console.log('PASS: desktop without touch deck, mobile layouts, hardware input, chord routing, native IME deduplication, multitouch and lifecycle release (offline Worker fixture).');
 } finally { clearTimeout(watchdog); await send('Browser.close').catch(() => {}); child.kill(); }
