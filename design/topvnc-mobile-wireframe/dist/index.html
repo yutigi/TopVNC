@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#f5f5f2">
+  <title>TopVNC · Mobile controls wireframe</title>
+  <meta name="description" content="A hands-on wireframe for configurable multilingual typing and familiar mobile remote controls.">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="keyboard.css">
+  <link rel="stylesheet" href="customize.css">
+  <link rel="stylesheet" href="fps.css">
+  <script type="module" src="app.mjs"></script>
+</head>
+<body>
+  <header class="workbench-header">
+    <a class="brand" href="./" aria-label="TopVNC wireframe home"><span class="brand-mark">↗</span>TOPVNC<span class="brand-divider"></span><span class="brand-sub">Design lab</span></a>
+    <div class="header-right"><span class="version">01 / WIREFRAME</span><span class="draft-dot"></span><span>Exploring controls</span></div>
+  </header>
+  <main class="workbench">
+    <aside class="project-nav">
+      <div class="section-label">WEB CLIENT / REDESIGN</div>
+      <h1>Built for<br>your thumbs.</h1>
+      <p class="intro">A familiar place for every key.<br>In either orientation.</p>
+      <nav class="design-nav" aria-label="Wireframe views">
+        <button class="nav-item selected" data-view="portrait"><span>▯</span>Portrait<span class="nav-index">01</span></button>
+        <button class="nav-item" data-view="landscape"><span>▭</span>Landscape<span class="nav-index">02</span></button>
+        <button id="fps-preset-button" class="nav-item"><span>⊕</span>FPS preset<span class="nav-index">03</span></button>
+      </nav>
+      <div class="nav-note"><span class="tiny-cross">+</span><p>Interactive, low-fidelity prototype.<br>Every session and keypress is simulated.</p></div>
+      <div class="review-card"><span class="section-label">DESIGN PRINCIPLE</span><p>Learn it once.<br>Find it by feel.</p><div class="mini-dock"><span>Esc</span><span>Ctrl</span><span>⌨</span><span>↵</span></div><small>Stable slots. No scrolling key rail.</small></div>
+      <p class="project-foot">TOPVNC / MOBILE EXPLORATION<br>NOVEMBER 2026</p>
+    </aside>
+
+    <section class="canvas-area" aria-labelledby="canvas-title">
+      <div class="canvas-heading"><div><span class="section-label">SESSION CONTROLS</span><h2 id="canvas-title">Portrait / two-thumb reach</h2></div><button id="focus-preview" class="quiet-button">↗ Try full viewport</button></div>
+      <div class="preview-stage">
+        <div class="stage-ruler"><span id="dimension-label">390 × 740 / logical preview</span><span>CLICK TO EXPLORE ↓</span></div>
+        <div id="device" class="device portrait">
+          <div class="device-status"><span>9:41</span><span class="device-camera"></span><span>▥ ▰</span></div>
+          <header class="session-bar"><button id="host-button" class="host-button"><span class="host-icon">▣</span><span>Gaming PC<small id="session-feedback" role="status">Simulated session</small></span><span>⌄</span></button><div class="session-actions"><button id="customize-button" class="customize-entry" aria-label="Customize keys and UI layout">✎ Customize</button><button id="settings-button" class="icon-button" aria-label="Session settings">⚙</button></div></header>
+          <div class="session-body">
+            <div id="remote" class="remote-screen">
+              <div class="fps-arena" aria-label="Simulated FPS training scene"><div class="fps-arena-title">TRAINING GRID <span>SIMULATED · NO LIVE GAME</span></div><div class="fps-horizon"></div><div class="fps-crate crate-one"></div><div class="fps-crate crate-two"></div><div class="fps-target">◎</div><div id="fps-crosshair" class="fps-crosshair">＋</div><div class="fps-scene-note">Control layout preview</div></div>
+              <div class="remote-top"><span>REMOTE DISPLAY</span><span>Fit to screen ↗</span></div>
+              <div class="remote-window"><div class="window-title"><span><i></i><i></i><i></i></span><span>Untitled — Text editor</span><span>− □</span></div><div class="editor-menu">File&nbsp;&nbsp; Edit&nbsp;&nbsp; View</div><div class="editor-content"><div class="line-numbers">1<br>2<br>3<br>4<br>5<br>6</div><div><span class="editor-comment">// Your remote workspace</span><p id="remote-output">Ready when you are.</p><span class="text-cursor"></span></div></div><div class="editor-status"><span>Plain text</span><span>UTF-8</span></div></div>
+              <div class="remote-cursor">↖</div><div class="remote-hint"><span>↔</span><span id="remote-hint-text">Drag to move · tap to click</span></div>
+              <span class="callout callout-screen">01</span>
+            </div>
+            <section class="control-deck" aria-label="Mobile input controls">
+              <div class="deck-grip"></div>
+              <div class="deck-top"><span id="deck-label">QUICK KEYS</span><span id="key-feedback" role="status" aria-live="polite">Try a key below</span></div>
+              <div class="type-modifiers" role="group" aria-label="Type modifiers · tap for next key"><button data-mod="Ctrl" aria-pressed="false">Ctrl</button><button data-mod="Alt" aria-pressed="false">Alt</button><button data-mod="Shift" aria-pressed="false">Shift</button></div>
+              <div id="custom-action-pad" class="custom-action-pad" aria-label="Your custom keys"></div>
+              <div id="keys-panel" class="mode-panel">
+                <div id="pin-row" class="key-row pin-row"></div>
+                <div class="quick-controls"><div class="modifier-grid"><button data-key="Esc">Esc</button><button data-key="Tab">Tab ⇥</button><button data-mod="Ctrl" aria-pressed="false">Ctrl</button><button data-mod="Alt" aria-pressed="false">Alt</button><button data-mod="Shift" aria-pressed="false">Shift</button><button data-key="Backspace" aria-label="Backspace">⌫</button></div><div class="arrow-grid"><button data-key="ArrowUp" class="arrow-up" aria-label="Arrow up">↑</button><button data-key="ArrowLeft" class="arrow-left" aria-label="Arrow left">←</button><button data-key="ArrowDown" class="arrow-down" aria-label="Arrow down">↓</button><button data-key="ArrowRight" class="arrow-right" aria-label="Arrow right">→</button></div></div>
+                <div class="deck-footnote"><span>Tap modifier, then key</span><button id="edit-pins">Edit pinned keys ↗</button></div>
+              </div>
+              <div id="type-panel" class="mode-panel" hidden><div class="type-toolbar" aria-label="Keyboard source"><button id="custom-keyboard" class="keyboard-source active" aria-pressed="true">TopVNC keys</button><button id="native-keyboard" class="keyboard-source" aria-pressed="false">Native input</button></div><label class="sr-only" for="compose">Compose locally, then insert</label><div class="compose-wrap"><textarea id="compose" rows="1" placeholder="Tap the keys below…" autocomplete="off" spellcheck="false" readonly inputmode="none"></textarea><button id="insert-text" class="insert-button">Insert ↗</button></div><div id="candidate-bar" class="candidate-bar" aria-label="Demo character candidates" hidden></div><div id="custom-keyboard-panel" class="custom-keyboard-panel" aria-label="TopVNC on-screen keyboard"><div id="keyboard-rows"></div><div class="keyboard-bottom"><button id="keyboard-languages" aria-label="Keyboard language · tap to switch, hold to choose" aria-describedby="language-gesture-hint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18M5 6.5h14M5 17.5h14"/></svg></button><span id="language-gesture-hint" class="sr-only">Tap for the next language. Hold, slide to a language, then release to select. Use arrow keys to open the list.</span><button id="symbol-keyboard" aria-pressed="false">?123</button><button id="keyboard-space" data-character=" " aria-label="Space">space</button><button id="keyboard-backspace" aria-label="Backspace">⌫</button><button id="keyboard-return" aria-label="Insert composed text">↵</button></div></div><div class="typing-help"><span id="composition-status">Tap globe to switch · hold &amp; slide to choose</span><button id="keyboard-layout">Edit layout ↗</button></div><div class="ime-example" id="ime-example">TopVNC keyboard · native input is optional.</div></div>
+              <div id="pointer-panel" class="mode-panel" hidden><div id="fps-panel" class="fps-panel" aria-label="FPS touch controls" hidden></div><div id="trackpad" class="trackpad" aria-label="Demo trackpad"><span>＋</span><p>Move with one finger</p><small>Tap to click · demo only</small></div><div class="mouse-buttons"><button data-key="Left click">Left click</button><button data-key="Right click">Right click</button></div></div>
+              <nav class="thumb-dock" aria-label="Fixed thumb dock"><button data-mode="keys" class="active" aria-pressed="true"><span>⌘</span><small>Keys</small></button><button data-mode="type" aria-pressed="false"><span>⌨</span><small>Type</small></button><button data-mode="pointer" aria-pressed="false"><span>↖</span><small>Pointer</small></button><button data-key="Enter" class="dock-enter"><span>↵</span><small>Enter</small></button></nav>
+              <span class="callout callout-dock">03</span>
+            </section>
+          </div>
+          <div id="sheet" class="sheet" hidden><div class="sheet-heading"><h3 id="sheet-title">Your languages</h3><button id="close-sheet" class="icon-button" aria-label="Close panel">✕</button></div><div id="sheet-content"></div></div>
+          <div class="home-indicator"></div>
+        </div>
+        <div class="preview-caption"><span class="caption-line"></span><span id="preview-caption">The remote view stays above a fixed control deck.</span><span class="caption-line"></span></div>
+      </div>
+      <div class="scenario-bar"><span class="scenario-label">TRY THE FLOW</span><button id="try-shortcut"><span>1</span> Ctrl + C</button><span class="scenario-divider">/</span><button id="try-language"><span>2</span> Change language</button><span class="scenario-divider">/</span><button id="try-rotate"><span>3</span> Rotate view</button></div>
+    </section>
+
+    <aside class="inspector"><div class="inspector-heading"><span class="section-label">THE THINKING</span><span class="annotation-icon">↙</span></div><article><span class="note-number">01</span><h3>Keep the screen in sight.</h3><p>Portrait stacks the view and controls. Landscape splits the keyboard below the view; quick keys and the trackpad use a side deck.</p></article><article><span class="note-number">02</span><h3>Your languages. In your keyboard.</h3><p>Use the keyboard’s globe key to choose English, ไทย, 中文, 日本語 — or build your own layout. Native OS input is available whenever you prefer.</p><button id="inspector-languages" class="text-link">Configure languages ↗</button></article><article><span class="note-number">03</span><h3>Build muscle memory.</h3><p>Arrange keys, control groups, and the thumb dock yourself. Save different portrait and landscape layouts. Nothing moves based on usage.</p></article><div class="decision-card"><span>↳ A deliberate detail</span><p>A lit modifier means “next key.” It clears after use or when you leave the view.</p><div><kbd>Ctrl</kbd><span>+</span><kbd>C</kbd><span>→</span><span class="released">released</span></div></div><div class="validation-note"><span class="section-label">NEXT TO VALIDATE</span><p>Thumb reach on real phones.<br>Keyboard behavior after rotation.<br>Chinese & Japanese IME flows.</p></div></aside>
+  </main>
+  <footer class="workbench-footer"><span><span class="outline-dot"></span> Wireframe first. Details next.</span><span>PROTOTYPE ONLY · NO LIVE HOST</span></footer>
+  <button id="exit-focus" hidden>↙ Back to wireframe</button>
+</body>
+</html>

@@ -197,12 +197,33 @@ cargo web-gateway                # 3. the gateway for already paired browsers
 
 Then open the app URL on the phone and press **Connect**. If something fails, the page names the missing piece; the guide's [troubleshooting table](docs/cloudflare-gateway.md#troubleshooting) lists each message.
 
+### Manual Cloudflare deployment
+
+Run these commands from the repository root with your existing Wrangler sign-in
+and ignored `gateway/cloudflare/worker/wrangler.local.toml` configuration:
+
+```powershell
+# Test, build and dry-run
+npm --prefix gateway/cloudflare/worker run deploy:check
+
+# Publish from clean, up-to-date main
+npm --prefix gateway/cloudflare/worker run deploy
+```
+
+The check command works on feature branches without publishing. Deployment
+requires a clean `main` checkout matching the current `origin/main`. If this
+worktree has no local config, append `-- --config "D:/path/to/wrangler.local.toml"`
+to use an existing one. GitHub Actions runs checks only. See the
+[manual deployment guide](docs/cloudflare-gateway.md#manual-deployment) for setup,
+verification and rollback.
+
 ### Set up multiple machines on one website
 
 The shared website offers a machine selector and keeps each machine's pairing
 separate. Each machine needs its own TopVNC server, gateway, host key, private
 Cloudflare Tunnel, and VPC service. Rebuilding the desktop app alone does not
-update the website: deploy the Worker and browser client from this branch too.
+update the website: publish the Worker and browser client too. Publishing runs
+only from `main` (see [Manual Cloudflare deployment](#manual-cloudflare-deployment)).
 Run the commands below from the repository root.
 
 1. **Prepare each machine.** Check out this branch on both hosts and complete
@@ -239,8 +260,9 @@ Run the commands below from the repository root.
    npm --prefix web test
    npm --prefix web run build
    npm --prefix web run test:wasm
-   npm --prefix web run test:browser # requires Chrome/Edge/Chromium
+   npm --prefix web run test:integration # requires Chrome/Edge/Chromium
    npm --prefix gateway/cloudflare/worker run deploy:check
+   # After merging, from a clean main checkout that matches origin/main:
    npm --prefix gateway/cloudflare/worker run deploy # publishes the website
    ```
 
@@ -470,6 +492,18 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo run
 ```
+
+### Local interactive UI preview
+
+With Node.js installed, run this from the repository root:
+
+```sh
+node scripts/preview-ui.mjs
+```
+
+Open <http://127.0.0.1:4173/> to try the desktop and mobile designs. The previews
+use simulated sessions; no VNC host or credentials are needed. Stop the server
+with Ctrl+C. See [the preview guide](design/README.md) for controls and port options.
 
 ### Code layout
 

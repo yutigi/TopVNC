@@ -124,7 +124,7 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
   await waitFor("!document.querySelector('#viewer').hidden");
   await evaluate(`
     fixture.oldCanvas = document.querySelector('#canvas');
-    document.querySelector('[data-modifier="ctrl"]').click();
+    document.querySelector('.type-modifiers [data-mod="Ctrl"]').click();
     document.querySelector('#password').value = 'discard-me';
     const select = document.querySelector('#menu-machine'); select.value = 'office-pc'; select.dispatchEvent(new Event('change'));
   `);

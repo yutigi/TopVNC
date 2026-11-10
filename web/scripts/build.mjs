@@ -3,11 +3,13 @@
 // serves web/dist as static assets.
 import { build } from "esbuild";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 
 const webDir = fileURLToPath(new URL("../", import.meta.url));
 const rootDir = fileURLToPath(new URL("../../", import.meta.url));
+const targetDir = resolve(rootDir, process.env.CARGO_TARGET_DIR || "target");
 const exe = process.platform === "win32" ? ".exe" : "";
 // Must equal the wasm-bindgen version in the root Cargo.lock.
 const BINDGEN_VERSION = "0.2.128";
@@ -27,12 +29,13 @@ if (version !== `wasm-bindgen ${BINDGEN_VERSION}`) throw new Error(`Expected was
 run("cargo", ["build", "--locked", "--release", "--target", "wasm32-unknown-unknown", "-p", "topvnc-web"], rootDir, "Browser client WASM build");
 rmSync(`${webDir}build/pkg`, { recursive: true, force: true });
 run(bindgen, ["--target", "web", "--no-typescript", "--out-dir", "web/build/pkg",
-  "target/wasm32-unknown-unknown/release/topvnc_web.wasm"], rootDir, "Browser client bindings");
+  `${targetDir}/wasm32-unknown-unknown/release/topvnc_web.wasm`], rootDir, "Browser client bindings");
 
 const dist = `${webDir}dist/`;
 rmSync(dist, { recursive: true, force: true });
 mkdirSync(dist, { recursive: true });
 for (const file of ["index.html", "style.css", "_headers"]) copyFileSync(`${webDir}${file}`, `${dist}${file}`);
+cpSync(`${webDir}assets`, `${dist}assets`, { recursive: true });
 copyFileSync(`${webDir}build/pkg/topvnc_web_bg.wasm`, `${dist}topvnc_web_bg.wasm`);
 await build({
   absWorkingDir: webDir,
