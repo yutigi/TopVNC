@@ -70,6 +70,7 @@ export function createCustomization(api) {
   }
   function apply(orientation = api.orientation()) {
     const layout = state.layouts[orientation]; const device = $('#device');
+    $('#landscape-controls').value = state.layouts.landscape.position;
     device.dataset.layoutPosition = layout.position;
     device.dataset.keySize = layout.size;
     const groups = { modifiers: [$('.type-modifiers')], actions: [$('#custom-action-pad')], input: [$('#keys-panel'), $('#type-panel'), $('#pointer-panel')] };
@@ -95,6 +96,15 @@ export function createCustomization(api) {
   function usePreset(preset) {
     if (!api.canChange()) { api.feedback('Finish composing before changing preset'); return; }
     state.preset = preset === 'fps' ? 'fps' : 'standard'; persist(); api.close(); api.enterPreset(state.preset); apply();
+  }
+  function setLandscapePosition(position) {
+    if (!api.canChange()) {
+      api.feedback('Finish composing before changing layout.'); apply(); return;
+    }
+    if (!['auto', 'left', 'right', 'bottom'].includes(position)) { apply(); return; }
+    state.layouts.landscape.position = position;
+    persist(); apply();
+    if (!storageAvailable) api.feedback('Storage unavailable: layout changes last for this session.');
   }
   function build(content) {
     let tab = 'keys'; let editingId;
@@ -204,5 +214,5 @@ export function createCustomization(api) {
     }
     show('presets');
   }
-  return { apply, build, usePreset, isFps: () => state.preset === 'fps' };
+  return { apply, build, usePreset, setLandscapePosition, isFps: () => state.preset === 'fps' };
 }

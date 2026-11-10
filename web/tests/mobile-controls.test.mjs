@@ -7,7 +7,10 @@ import vm from 'node:vm';
 
 // Run the real UI modules and markup with a DOM stand-in. This verifies event
 // routing and state, not rendering, browser pointer capture or device IMEs.
-const bundle = buildSync({ entryPoints: [fileURLToPath(new URL('../mobile-controls.mjs', import.meta.url))], bundle: true, write: false, format: 'iife', globalName: 'mobileUI' }).outputFiles[0].text;
+const bundle = buildSync({
+  stdin: { contents: "export * from './mobile-controls.mjs'; export { createModals } from './modal.mjs';", resolveDir: fileURLToPath(new URL('..', import.meta.url)) },
+  bundle: true, write: false, format: 'iife', globalName: 'mobileUI',
+}).outputFiles[0].text;
 function app(saved = {}) {
   let pointed; let nextTimer = 1; let connected = true;
   const timers = new Map(); const store = new Map(Object.entries(saved)); const sent = [];
@@ -74,17 +77,20 @@ function app(saved = {}) {
   }
   const context = vm.createContext({ document, window, matchMedia: () => landscape, structuredClone });
   vm.runInContext(bundle, context);
+  // As in app.mjs while connected: dialogs fall back to focusing the remote screen.
+  const modals = context.mobileUI.createModals({ background: ['#screen', '#toolbar', '#control-deck'].map($), fallback: () => $('#screen') });
   const ui = context.mobileUI.createMobileControls({
+    modals,
     root: $('#viewer'), keyboard: $('#keyboard'), storage: { getItem: key => store.get(key) ?? null, setItem: (key, value) => store.set(key, value) },
     active: () => connected,
     input: message => { if (connected) sent.push(JSON.parse(JSON.stringify(message))); },
     button: (bit, down) => { if (connected) sent.push({ bit, down }); },
     move: (dx, dy) => { if (connected) sent.push({ dx, dy }); },
-    reset: () => sent.push({ kind: 'release' }), pointerMode: () => 'Trackpad',
+    reset: () => sent.push({ kind: 'release' }),
   });
   sent.length = 0;
   return {
-    $, $$, fire, ui, sent, store, document, window, landscape,
+    $, $$, fire, ui, modals, sent, store, document, window, landscape,
     click: node => fire(node, 'click'), point: node => { pointed = node; },
     hold() { for (const [id, fn] of [...timers]) { timers.delete(id); fn(); } },
     character(value) { const node = $$('[data-character]').find(key => key.dataset.character === value); assert.ok(node, `character ${value}`); fire(node, 'click'); },
@@ -210,4 +216,119 @@ test('Customize remains reachable with hidden custom keys and migrates legacy ro
   a.click(a.$('#customize-button'));
   assert.equal(a.$('#control-sheet').hidden, false); assert.equal(a.$('#control-deck').inert, true);
   a.click(a.$('#close-sheet')); assert.equal(a.$('#control-deck').inert, false);
+});
+
+test('reference pinned shortcuts route real chords and persist edited slots', () => {
+  const a = app();
+  assert.equal(a.$('#pin-row').children.length, 4);
+  a.click(a.$('#pin-row').children[0]);
+  assert.deepEqual(a.sent.map(m => [m.keysym, m.down]), [[0xffe3, true], [99, true], [99, false], [0xffe3, false]]);
+  a.click(a.$('#edit-pins'));
+  const fields = a.$('#sheet-content').querySelectorAll('select');
+  fields[0].value = 'Space'; fields[3].value = 'Delete';
+  a.click(a.$('#sheet-content').querySelectorAll('button').find(node => node.textContent === 'Save pinned keys'));
+  assert.equal(a.$('#control-sheet').hidden, true);
+  assert.deepEqual(JSON.parse(a.store.get('topvnc.mobile.pins.v1')), ['Space', 'Ctrl+V', 'Win', 'Delete']);
+  assert.equal(a.$('#show-function-keys'), undefined);
+  const b = app({ 'topvnc.mobile.pins.v1': a.store.get('topvnc.mobile.pins.v1') });
+  b.click(b.$('#pin-row').children[0]);
+  assert.deepEqual(b.sent, [{ kind: 'keysym', keysym: 32, down: true }, { kind: 'keysym', keysym: 32, down: false }]);
+});
+
+test('malformed pinned preferences fall back without removing controls', () => {
+  for (const saved of ['null', '{}', '["Space"]', '["Space","Delete","Home","<script>"]', 'x'.repeat(257)]) {
+    const a = app({ 'topvnc.mobile.pins.v1': saved });
+    assert.equal(a.$('#pin-row').children.length, 4);
+    assert.equal(a.$('#pin-row').children[0].dataset.mobileKey, 'Ctrl+C');
+    assert.ok(a.$('#show-function-keys'));
+  }
+});
+
+test('Settings saves landscape placement across reloads without changing portrait', () => {
+  const key = 'topvnc.mobile.customize.v1';
+  const a = app({ [key]: JSON.stringify({ layouts: { portrait: { position: 'top' } } }) });
+  const select = a.$('#landscape-controls');
+  assert.equal(select.value, 'auto');
+  select.value = 'left'; a.fire(select, 'change');
+  assert.equal(a.$('#viewer').dataset.layoutPosition, 'top');
+  assert.equal(JSON.parse(a.store.get(key)).layouts.landscape.position, 'left');
+  a.landscape.matches = true; a.fire(a.landscape, 'change');
+  assert.equal(a.$('#viewer').dataset.layoutPosition, 'left');
+  const b = app(Object.fromEntries(a.store));
+  assert.equal(b.$('#landscape-controls').value, 'left');
+  b.landscape.matches = true; b.fire(b.landscape, 'change');
+  assert.equal(b.$('#viewer').dataset.layoutPosition, 'left');
+  b.$('#landscape-controls').value = 'right'; b.fire(b.$('#landscape-controls'), 'change');
+  assert.equal(b.$('#viewer').dataset.layoutPosition, 'right');
+  assert.equal(JSON.parse(b.store.get(key)).layouts.portrait.position, 'top');
+  assert.ok(b.sent.every(message => message.kind === 'release'));
+});
+
+test('Settings rejects placement changes during native composition and invalid values', () => {
+  const a = app(); type(a); a.click(a.$('#native-keyboard'));
+  a.fire(a.$('#keyboard'), 'compositionstart');
+  const select = a.$('#landscape-controls');
+  select.value = 'left'; a.fire(select, 'change');
+  assert.equal(select.value, 'auto');
+  assert.equal(a.$('#viewer').dataset.layoutPosition, 'auto');
+  a.fire(a.$('#keyboard'), 'compositionend');
+  select.value = 'invalid'; a.fire(select, 'change');
+  assert.equal(select.value, 'auto');
+  assert.equal(a.store.has('topvnc.mobile.customize.v1'), false);
+});
+
+test('Type mode shows deck feedback over the remote view, then hides it', () => {
+  const a = app(); type(a);
+  a.fire(a.$('#keyboard'), 'compositionstart'); a.click(a.$('[data-mode="keys"]'));
+  assert.equal(a.$('#control-toast').hidden, false);
+  assert.match(a.$('#control-toast').textContent, /Finish composing/u);
+  assert.equal(a.$('#control-toast').textContent, a.$('#control-status').textContent);
+  a.hold(); assert.equal(a.$('#control-toast').hidden, true);
+});
+
+test('pinned Win latches for Win+key chords like the other modifiers', () => {
+  const a = app();
+  const win = a.$('#pin-row').children.find(node => node.textContent === 'Win');
+  a.click(win);
+  assert.equal(win.attrs['aria-pressed'], 'true'); assert.deepEqual(a.sent, []);
+  a.click(a.$('.arrow-left'));
+  assert.deepEqual(a.sent.map(m => [m.keysym, m.down]), [[0xffeb, true], [0xff51, true], [0xff51, false], [0xffeb, false]]);
+  assert.equal(win.attrs['aria-pressed'], 'false');
+});
+
+test('replacing the Fn pin keeps the function-key row reachable from the footnote', () => {
+  assert.equal(app().$('#footnote-functions').hidden, true);
+  const a = app({ 'topvnc.mobile.pins.v1': JSON.stringify(['Ctrl+C', 'Ctrl+V', 'Win', 'Ctrl+Z']) });
+  assert.equal(a.$('#footnote-functions').hidden, false);
+  assert.equal(a.$('#footnote-functions').dataset.toggleFunctions, 'true');
+  a.click(a.$('#edit-pins'));
+  const fields = a.$('#sheet-content').querySelectorAll('select'); fields[3].value = 'Fn';
+  a.click(a.$('#sheet-content').querySelectorAll('button').find(node => node.textContent === 'Save pinned keys'));
+  assert.equal(a.$('#footnote-functions').hidden, true); assert.ok(a.$('#show-function-keys'));
+});
+
+test('Escape and Tab reach Customize after focus leaves it, then focus returns to the screen', () => {
+  const a = app(); a.click(a.$('#customize-button'));
+  assert.equal(a.document.activeElement, a.$('#close-sheet'));
+  a.document.activeElement = a.document.body;
+  assert.equal(a.fire(a.document.body, 'keydown', { key: 'Tab' }).defaultPrevented, true);
+  assert.equal(a.document.activeElement, a.$('#close-sheet'));
+  a.document.activeElement = a.document.body;
+  assert.equal(a.fire(a.document.body, 'keydown', { key: 'Escape' }).defaultPrevented, true);
+  assert.equal(a.$('#control-sheet').hidden, true); assert.equal(a.$('#control-deck').inert, false);
+  assert.equal(a.document.activeElement, a.$('#screen'));
+});
+
+test('closing a sheet over Settings keeps the page under Settings inert', () => {
+  const a = app();
+  a.modals.open(a.$('#menu'), { initial: a.$('#close-menu') });
+  a.click(a.$('#customize-button'));
+  assert.equal(a.$('#menu').inert, true); assert.equal(a.$('#control-sheet').hidden, false);
+  a.click(a.$('#close-sheet'));
+  assert.equal(a.$('#menu').hidden, false); assert.equal(a.$('#menu').inert, false);
+  assert.ok(['#screen', '#toolbar', '#control-deck'].every(id => a.$(id).inert === true));
+  assert.equal(a.document.activeElement, a.$('#close-menu'));
+  a.fire(a.document.body, 'keydown', { key: 'Escape' });
+  assert.equal(a.$('#menu').hidden, true);
+  assert.ok(['#screen', '#toolbar', '#control-deck'].every(id => a.$(id).inert === false));
 });

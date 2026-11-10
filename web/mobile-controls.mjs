@@ -12,11 +12,18 @@ export function element(tag, text, className) {
   return node;
 }
 
-export function createMobileControls({ root, keyboard, storage, active, input, button, move, reset, pointerMode }) {
+export function createMobileControls({ root, keyboard, storage, active, input, button, move, reset, modals }) {
   const $ = selector => selector === '#device' ? root : root.querySelector(selector);
   const el = element;
   let mode = 'keys'; let source = 'custom'; let symbols = false; let composing = false;
   let languages = readLanguages(storage);
+  const shortcutChoices = ['Ctrl+C', 'Ctrl+V', 'Ctrl+Z', 'Ctrl+A', 'Win', 'Fn', 'Space', 'Delete', 'Home', 'End', 'Esc'];
+  let pins = ['Ctrl+C', 'Ctrl+V', 'Win', 'Fn'];
+  try {
+    const raw = storage?.getItem('topvnc.mobile.pins.v1');
+    const saved = raw && raw.length <= 256 ? JSON.parse(raw) : undefined;
+    if (Array.isArray(saved) && saved.length === 4 && saved.every(key => shortcutChoices.includes(key))) pins = saved;
+  } catch { /* Invalid or unavailable preferences use the reference defaults. */ }
   const landscape = matchMedia('(orientation: landscape)');
   // A native keyboard may change the viewport aspect ratio without a rotation.
   // On touch devices prefer screen orientation, so opening the IME cannot cause
@@ -24,16 +31,24 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
   const deviceOrientation = matchMedia('(pointer: coarse)').matches ? globalThis.screen?.orientation : undefined;
   const currentOrientation = () => (deviceOrientation?.type ? deviceOrientation.type.startsWith('landscape') : landscape.matches) ? 'landscape' : 'portrait';
   let orientation = currentOrientation();
-  let customization; let switcher; let lastFocus;
+  let customization; let switcher; let toastTimer;
   let eraseTimer; let erasing;
   let track; const pointerButtons = new Map();
   const pad = $('#trackpad'); const draft = $('#compose');
   const userAgent = globalThis.navigator?.userAgent ?? '';
   const os = /iPad|iPhone|iPod/u.test(userAgent) || (/Mac/u.test(userAgent) && globalThis.navigator?.maxTouchPoints > 1) ? 'iOS'
-    : /Android/u.test(userAgent) ? 'Android' : /Windows/u.test(userAgent) ? 'Win' : /Mac/u.test(userAgent) ? 'Mac' : /Linux/u.test(userAgent) ? 'Linux' : 'OS';
+    : /Android/u.test(userAgent) ? 'Android' : /Windows/u.test(userAgent) ? 'Windows' : /Mac/u.test(userAgent) ? 'macOS' : /Linux/u.test(userAgent) ? 'Linux' : 'device';
   $('#native-keyboard').textContent = `Native · ${os}`;
   $('#native-keyboard').setAttribute('aria-label', `Request native ${os} keyboard input`);
-  function feedback(value) { $('#control-status').textContent = value; }
+  function feedback(value) {
+    $('#control-status').textContent = value;
+    // Type and FPS hide the deck heading that shows this status, so the same
+    // text also appears briefly over the remote view (style.css limits it to them).
+    const toast = $('#control-toast');
+    toast.textContent = value; toast.hidden = !value;
+    window.clearTimeout(toastTimer);
+    if (value) toastTimer = window.setTimeout(() => { toast.hidden = true; }, 4000);
+  }
   function canChange() { return !composing; }
   const sender = createMobileInput({ input, button, move, changed: () => renderKeyboard() });
   const fps = createFpsController({ $, el, input: sender, active });
@@ -61,6 +76,7 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
       $(`[data-mode="${name}"]`).setAttribute('aria-pressed', String(name === next));
     }
     root.dataset.controlMode = mode;
+    $('#deck-label').textContent = { keys: 'QUICK KEYS', type: 'MULTILINGUAL TYPING', pointer: 'TRACKPAD' }[mode];
     customization?.apply();
     renderKeyboard();
   }
@@ -101,6 +117,12 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
     $('#keyboard-rows').replaceChildren();
     rows.forEach((keys, index) => {
       const row = el('div', undefined, 'keyboard-row');
+      if (index === 2) {
+        const shift = el('button', '⇧', 'keyboard-shift'); shift.dataset.mod = 'Shift';
+        shift.setAttribute('aria-label', 'Keyboard Shift'); shift.setAttribute('aria-pressed', String(shifted));
+        shift.disabled = source === 'native' && mode === 'type';
+        row.append(shift);
+      }
       keys.forEach((character, column) => {
         const value = shifted && !symbols ? (profile().id === 'th' && !profile().rows ? THAI_SHIFT[index][column] : character.toLocaleUpperCase()) : character;
         const key = el('button', value, 'character-key'); key.dataset.character = value;
@@ -118,7 +140,7 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
       ? 'Native input sends committed text directly. Use your OS globe for languages; your OS controls keyboard visibility.'
       : ['zh', 'ja'].includes(profile().id)
         ? 'Direct character layout. For Chinese/Japanese conversion, use Native input and your device IME.'
-        : 'Compose locally, then Insert. Ctrl/Alt shortcuts send the next key directly.';
+        : 'TopVNC keys · edit the layout to match your habits.';
   }
   function setSource(next) {
     if (!canChange()) { feedback('Finish composing before changing input source.'); return; }
@@ -130,18 +152,13 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
     renderKeyboard();
     if (next === 'native') keyboard.focus(); else keyboard.blur();
   }
-  function closeSheet() {
-    $('#control-sheet').hidden = true;
-    for (const id of ['screen', 'toolbar', 'control-deck', 'menu']) $(`#${id}`).inert = false;
-    lastFocus?.focus();
-  }
+  function closeSheet() { modals.close($('#control-sheet')); }
   function openSheet(title, build) {
     if (!canChange()) { feedback('Finish composing before opening settings.'); return; }
-    lastFocus = document.activeElement; transition(); keyboard.blur();
+    // Focus returns to what had it before input was released, including native input.
+    const opener = document.activeElement; transition(); keyboard.blur();
     $('#sheet-title').textContent = title; build($('#sheet-content'));
-    $('#control-sheet').hidden = false;
-    for (const id of ['screen', 'toolbar', 'control-deck', 'menu']) $(`#${id}`).inert = true;
-    $('#close-sheet').focus();
+    modals.open($('#control-sheet'), { initial: $('#close-sheet'), opener });
   }
   function buildLanguages(content, message = '') {
     content.replaceChildren(el('p', message || 'Favorite up to four profiles. Edit three character rows or add another language.'));
@@ -189,12 +206,49 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
     const back = el('button', 'Back to languages'); back.addEventListener('click', () => buildLanguages(content));
     content.append(field, status, save, back); field.focus();
   }
+  function renderPins() {
+    const expanded = String(!$('#function-keys').hidden);
+    $('#pin-row').replaceChildren();
+    pins.forEach((key, index) => {
+      const node = el('button', key); node.setAttribute('aria-label', `Pinned slot ${index + 1}: ${key}`);
+      if (key === 'Fn') {
+        if (!$('#pin-row').querySelector('[data-toggle-functions]')) node.id = 'show-function-keys';
+        node.dataset.toggleFunctions = 'true'; node.setAttribute('aria-expanded', expanded);
+      } else if (key === 'Win') {
+        // Win latches like Ctrl/Alt/Shift, so Win+arrow and Win+hardware-key chords work.
+        node.dataset.mod = key; node.setAttribute('aria-pressed', String(sender.modifiers.has(key)));
+      } else node.dataset.mobileKey = key;
+      $('#pin-row').append(node);
+    });
+    // Without a pinned Fn, the footnote keeps F1–F12, PgUp and PgDn reachable.
+    $('#footnote-functions').hidden = pins.includes('Fn');
+    $('#footnote-functions').setAttribute('aria-expanded', expanded);
+  }
+  function buildPins(content) {
+    content.replaceChildren(el('p', 'Four fixed positions. Choose the shortcuts you use most.'));
+    const fields = pins.map((value, index) => {
+      const label = el('label', `Slot ${index + 1}`, 'customize-field'); const field = el('select');
+      shortcutChoices.forEach(key => { const option = el('option', key); option.value = key; field.append(option); });
+      field.value = value; label.append(field); content.append(label); return field;
+    });
+    const save = el('button', 'Save pinned keys', 'wide-button');
+    save.addEventListener('click', () => {
+      const next = fields.map(field => field.value);
+      if (!next.every(key => shortcutChoices.includes(key))) return;
+      pins = next;
+      try { if (!storage) throw new Error('Storage unavailable'); storage.setItem('topvnc.mobile.pins.v1', JSON.stringify(pins)); }
+      catch { feedback('Storage unavailable: pinned keys last for this session.'); }
+      $('#function-keys').hidden = true; renderPins(); closeSheet();
+    });
+    content.append(save);
+  }
   customization = createCustomization({
     $, el, storage, orientation: () => orientation, mode: () => mode, canChange,
     key: press, text: value => { if (active() && !composing) { transition(); sender.text(value); } },
     close: closeSheet, feedback, fps: fps.apply,
     enterPreset: () => setMode('pointer'),
   });
+  $('#landscape-controls').addEventListener('change', event => customization.setLandscapePosition(event.target.value));
   switcher = createLanguageSwitcher({
     key: $('#keyboard-languages'), host: root, el,
     profiles: () => languages.profiles, current: () => languages.selected,
@@ -212,6 +266,8 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
   $('#control-deck').addEventListener('pointerdown', event => { if (event.target.closest('button')) event.preventDefault(); });
   $('.dock-enter').addEventListener('click', insert);
   $('#insert-text').addEventListener('click', insert);
+  $('#keyboard-return').addEventListener('click', insert);
+  $('#edit-pins').addEventListener('click', () => openSheet('Your pinned keys', buildPins));
   $('#keyboard-space').addEventListener('click', () => addCharacter(' '));
   function backspace() {
     if (!active() || composing) return;
@@ -233,7 +289,6 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
   });
   eraseKey.addEventListener('click', event => { if (event.detail === 0) backspace(); });
   for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) eraseKey.addEventListener(name, event => { if (erasing === event.pointerId) stopErase(); });
-  $('#clear-draft').addEventListener('click', () => { if (!composing) draft.value = ''; });
   $('#symbol-keyboard').addEventListener('click', () => { symbols = !symbols; renderKeyboard(); });
   $('#custom-keyboard').addEventListener('click', () => setSource('custom'));
   $('#native-keyboard').addEventListener('click', () => setSource('native'));
@@ -241,15 +296,6 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
   $('#customize-button').addEventListener('click', () => openSheet('Customize keys and layout', customization.build));
   $('#keyboard-layout').addEventListener('click', () => openSheet('Keyboard languages', buildLanguages));
   $('#close-sheet').addEventListener('click', closeSheet);
-  $('#control-sheet').addEventListener('keydown', event => {
-    if (event.key === 'Escape') { event.preventDefault(); closeSheet(); }
-    if (event.key === 'Tab') {
-      const nodes = [...$('#control-sheet').querySelectorAll('button, input, textarea, select')].filter(node => !node.disabled && node.getClientRects().length);
-      const first = nodes[0]; const last = nodes.at(-1);
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
-    }
-  });
   keyboard.addEventListener('compositionstart', () => { release(); composing = true; });
   keyboard.addEventListener('compositionend', () => { composing = false; });
   // Standard Pointer deck: a separate relative trackpad and independent buttons.
@@ -276,14 +322,13 @@ export function createMobileControls({ root, keyboard, storage, active, input, b
       if (event.detail === 0 && active()) { button(Number(node.dataset.pointerButton), true); button(Number(node.dataset.pointerButton), false); }
     });
   });
-  $('#pointer-mode-label').textContent = pointerMode();
   function rotate() {
     const next = currentOrientation();
     if (next === orientation) return;
     transition(); orientation = next; customization.apply();
   }
   (deviceOrientation ?? landscape).addEventListener('change', rotate);
-  setMode('keys'); setSource('custom');
+  renderPins(); setMode('keys'); setSource('custom');
   return {
     release, tap: press, clearModifiers: sender.clearModifiers,
     beginPhysical: sender.beginPhysical, endPhysical: sender.endPhysical,

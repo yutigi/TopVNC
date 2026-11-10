@@ -10,6 +10,7 @@ import { TouchGestures } from "./gestures.mjs";
 import { attachTextInput } from "./text-input.mjs";
 import { View } from "./view.mjs";
 import { createMobileControls } from "./mobile-controls.mjs";
+import { createModals } from "./modal.mjs";
 
 const $ = (selector) => document.querySelector(selector);
 const home = $("#home");
@@ -62,7 +63,7 @@ let frame = { width: 0, height: 0 };
 // The host serves more than this browser shows; a size that fits was asked for.
 let oversized = false;
 let relativePointer = false;
-let mode = preference("mode", "trackpad");
+const mode = preference("mode", "trackpad");
 let buttons = 0;
 let pointerPosition = { x: 0, y: 0 };
 // Mouse users see their own cursor; touch input aims a drawn one.
@@ -71,6 +72,12 @@ let mobile;
 const view = new View();
 let lines = [];
 let post;
+// A closed dialog returns focus to its opener; after a mouse click on the
+// header that is the remote screen, so hardware keys reach the host again.
+const modals = createModals({
+  background: [screen, toolbar, $("#control-deck")],
+  fallback: () => (state === "connected" ? screen : undefined),
+});
 
 function preference(name, fallback) {
   try {
@@ -230,6 +237,7 @@ async function onSessionMessage(message) {
       break;
     case "connected":
       state = "connected";
+      $("#session-name").textContent = message.name || "TopVNC";
       passwordForm.hidden = true;
       passwordInput.value = "";
       showViewer(true);
@@ -312,13 +320,20 @@ function showViewer(visible) {
 }
 
 function showMenu(visible) {
-  menu.hidden = !visible;
-  $("#show-menu").setAttribute("aria-expanded", String(visible));
+  if (!visible) {
+    modals.close(menu);
+    return;
+  }
+  $("#show-menu").setAttribute("aria-expanded", "true");
+  modals.open(menu, {
+    initial: $("#close-menu"),
+    closed: () => $("#show-menu").setAttribute("aria-expanded", "false"),
+  });
 }
 
 function showFunctionKeys(visible) {
   functionKeys.hidden = !visible;
-  $("#show-function-keys").setAttribute("aria-expanded", String(visible));
+  viewer.querySelectorAll('[data-toggle-functions]').forEach(button => button.setAttribute("aria-expanded", String(visible)));
 }
 
 function layout() {
@@ -535,7 +550,7 @@ const physicalKeys = new Set();
 const MODIFIER_CODES = /^(Shift|Control|Alt|Meta|OS)(Left|Right)$/;
 
 window.addEventListener("keydown", (event) => {
-  if (state !== "connected" || event.defaultPrevented || event.target.closest?.("#menu, #control-sheet, #control-deck, #toolbar, #function-keys, input, textarea, select, button, .language-popover")) return;
+  if (state !== "connected" || event.defaultPrevented || modals.active() || event.target.closest?.("#menu, #control-sheet, #control-deck, #toolbar, #function-keys, input, textarea, select, button, .language-popover")) return;
   // Hardware keyboards report physical keys; text input methods use the
   // on-screen keyboard field instead.
   if (event.isComposing || !event.code || event.code === "Unidentified") return;
@@ -578,20 +593,13 @@ keyboard.addEventListener("keydown", (event) => {
 viewer.addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button || state !== "connected") return;
-  if (button.id === "show-function-keys") {
+  if (button.dataset.toggleFunctions) {
     showFunctionKeys(functionKeys.hidden);
     layout();
-  } else if (button.id === "toggle-mode") {
-    releaseEverything();
-    mode = mode === "trackpad" ? "direct" : "trackpad";
-    remember("mode", mode);
-    gestures.setMode(mode);
-    button.textContent = mode === "trackpad" ? "Trackpad" : "Direct";
-    $("#pointer-mode-label").textContent = button.textContent;
-    updateCursor();
-  } else if (button.id === "fit") {
+  } else if (button.id === "fit" || button.id === "fit-menu") {
     view.reset();
     layout();
+    if (button.id === "fit-menu") showMenu(false);
   } else if (button.id === "show-menu") {
     releaseEverything();
     showMenu(menu.hidden);
@@ -629,8 +637,16 @@ $("#native-input-panel").append(keyboard);
 mobile = createMobileControls({
   root: viewer, keyboard, storage,
   active: () => state === "connected",
-  input, button: setButton, move: moveBy, reset: releaseEverything,
-  pointerMode: () => mode === "trackpad" ? "Trackpad" : "Direct",
+  input, button: setButton, move: moveBy, reset: releaseEverything, modals,
+});
+// Match style.css: hiding the touch deck must not leave its input held or focus
+// inside an invisible native field. This also covers attaching a mouse/resizing.
+const desktopLayout = matchMedia("(min-width: 900px) and (pointer: fine) and (hover: hover)");
+desktopLayout.addEventListener("change", () => {
+  releaseEverything();
+  if (state === "connected" && !screen.closest("[hidden]") && !modals.active()) {
+    screen.focus({ preventScroll: true });
+  }
 });
 for (const target of [$("#fullscreen"), $("#fullscreen-menu")]) target.addEventListener("click", () => {
   const pending = document.fullscreenElement ? document.exitFullscreen?.() : viewer.requestFullscreen?.();
@@ -758,7 +774,6 @@ new ResizeObserver(layout).observe(screen);
 async function main() {
   await init({ module_or_path: "/topvnc_web_bg.wasm" });
   setQuality(preference("quality", "6"));
-  $("#toggle-mode").textContent = mode === "trackpad" ? "Trackpad" : "Direct";
   readInvite();
   describeIdentity();
 }
