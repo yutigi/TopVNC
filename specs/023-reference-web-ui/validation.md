@@ -156,3 +156,17 @@ the visible Clear control, the Type message, Fn states and the footnote toggle.
 The production WASM build was not rerun here because the `wasm32-unknown-unknown`
 target is not installed in this environment; the WASM and Worker tests were not
 rerun.
+
+### Mobile reset-to-fit follow-up
+
+Added **Settings → Fit to screen** alongside fullscreen, using the toolbar's
+existing view reset. It clears local zoom/pan, closes Settings and returns focus
+to the opener. It remains reachable when phone layouts hide the toolbar Fit.
+The offline Chromium check zooms the canvas, clicks the settings action by
+screen coordinates, and verifies the fitted transform, focus return, and no
+host command beyond the input release on opening Settings. It passed at all
+six touch and five desktop sizes above, including 320×568 and 390×844 phones.
+All 75 web unit tests, `cargo fmt --all -- --check`, `cargo test --workspace`,
+and `cargo clippy --workspace --all-targets` passed. Browser checks used local
+Chromium with GPU and sandbox disabled for the offline fixture. The production
+WASM build remains unverified because its Rust target is not installed.

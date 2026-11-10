@@ -604,9 +604,10 @@ viewer.addEventListener("click", (event) => {
     button.textContent = mode === "trackpad" ? "Trackpad" : "Direct";
     $("#pointer-mode-label").textContent = button.textContent;
     updateCursor();
-  } else if (button.id === "fit") {
+  } else if (button.id === "fit" || button.id === "fit-menu") {
     view.reset();
     layout();
+    if (button.id === "fit-menu") showMenu(false);
   } else if (button.id === "show-menu") {
     releaseEverything();
     showMenu(menu.hidden);

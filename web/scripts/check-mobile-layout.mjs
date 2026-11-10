@@ -98,6 +98,18 @@ try {
     // Focus returns to the remote screen it came from, so hardware keys reach the host again.
     await typeW();
     assert.deepEqual(await evaluate(`sent.filter(m=>m.kind==='code').map(m=>[m.code,m.down])`),[['KeyW',true],['KeyW',false]],label);
+    // Settings keeps reset-to-fit reachable even when the phone toolbar hides Fit.
+    await evaluate(`(()=>{sent.length=0;const r=document.querySelector('#screen').getBoundingClientRect();document.querySelector('#screen').dispatchEvent(new WheelEvent('wheel',{bubbles:true,cancelable:true,ctrlKey:true,deltaY:-100,clientX:r.left+20,clientY:r.top+20}));})()`);
+    assert.notEqual(await evaluate(`document.querySelector('#canvas').style.transform`),'translate(0px, 0px) scale(1)',label);
+    await click('#show-menu');
+    await evaluate(`document.querySelector('#fit-menu').scrollIntoView({block:'center'})`); await frame();
+    const fitButton = await evaluate(`(()=>{const b=document.querySelector('#fit-menu'),r=b.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,reachable:document.elementFromPoint(r.x+r.width/2,r.y+r.height/2)===b};})()`);
+    assert.ok(fitButton.reachable,label);
+    await cdp('Input.dispatchMouseEvent',{type:'mousePressed',x:fitButton.x,y:fitButton.y,button:'left',buttons:1,clickCount:1});
+    await cdp('Input.dispatchMouseEvent',{type:'mouseReleased',x:fitButton.x,y:fitButton.y,button:'left',buttons:0,clickCount:1});
+    assert.equal(await evaluate(`document.querySelector('#canvas').style.transform`),'translate(0px, 0px) scale(1)',label);
+    assert.ok(await evaluate(`document.querySelector('#menu').hidden&&!document.querySelector('#screen').inert&&document.activeElement.id==='screen'`),label);
+    assert.ok(await evaluate(`sent.every(m=>m.kind==='release')`),label);
     await evaluate(`testSessionMessage({type:'capabilities',serveScale:0,displays:[]})`);
   };
   const measure = () => evaluate(`(()=>{const ids=['screen','toolbar','control-deck'];return Object.fromEntries(ids.map(id=>{const r=document.getElementById(id).getBoundingClientRect();return[id,{x:r.x,y:r.y,width:r.width,height:r.height}]}));})()`);
