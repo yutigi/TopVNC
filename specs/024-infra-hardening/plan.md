@@ -1,6 +1,7 @@
 # Infrastructure hardening plan
 
-**Status:** Draft for CTO review, 2026-11-11. Nothing in this plan is implemented yet.
+**Status:** Draft for CTO review, 2026-11-11. Item 0.3 is partly done; nothing
+else in this plan is implemented yet.
 
 This plan fixes the gaps found in the infrastructure review of 2026-11-11.
 The code-level security work (Noise E2E, Access JWT checks in both the Worker
@@ -23,7 +24,7 @@ something is broken.
 | 7 | On Windows, `host.key` and `tunnel-token.txt` are protected only by a manual `icacls`; revocation means hand-editing `browsers.txt` | Medium | 5.4, 5.5 |
 | 8 | No Dependabot, `cargo audit` or `cargo deny`; no `LICENSE` or `SECURITY.md` on a public repository | Medium | 0.2, 0.4, 0.5 |
 | 9 | CI does not run macOS, `test:integration`, Pester, or the design tests | Medium | Phase 6 |
-| 10 | Personal identifiers (live subdomain, host key fingerprint) in tracked files; five ignored `out/` files are tracked | Low | 0.3 |
+| 10 | Personal identifiers: the owner's account name (live `workers.dev` subdomain, wireframe URLs) in files and history, the personal email in commit metadata, and the host key fingerprint; five ignored `out/` files are tracked | Low | 0.3 |
 | 11 | `docs/cloudflare-gateway.md` mixes runbook, status diary and security model in 900 lines | Low | 7.1 |
 | 12 | `src/lib.rs` (6,846 lines) holds server code in the app crate, against the `AGENTS.md` layout | Low | 7.2 |
 
@@ -39,7 +40,7 @@ one objects.
 | Decision | Options | Recommendation | Blocks |
 | --- | --- | --- | --- |
 | License | MIT OR Apache-2.0 (Rust convention); GPL-3.0; proprietary ("all rights reserved") | MIT OR Apache-2.0, unless the code is meant to stay closed. In that case, make the repository private. | 0.2, 0.5 |
-| Rewrite Git history to remove identifiers | Rewrite with `git filter-repo`; leave history and fix forward | Fix forward. These identifiers are not secrets, and a history rewrite breaks every clone and PR. | 0.3 |
+| Rewrite Git history to remove identifiers | Rewrite with `git filter-repo`; leave history and fix forward | **Decided 2026-11-11: rewritten.** The owner chose the rewrite over fixing forward, which also removed the personal email from commit metadata. See 0.3. | — |
 | Where production deploys run | A: stay manual from the owner's machine; B: GitHub Actions with a protected `production` environment and a scoped API token | **B**, after 0.1 is in place. `wrangler login` grants an OAuth session with wide account scope on a laptop. A token limited to one account's Workers, held in an environment that needs manual approval, is narrower and leaves an audit log. This reverses the current "no deployment token in GitHub" choice, so the owner must agree. | 2.3 |
 | Code signing | Windows: Azure Trusted Signing or an OV certificate. macOS: Apple Developer ID with notarization | Sign both. The Windows host service copies `topvnc.exe` into `Program Files` and runs it as SYSTEM, so an unsigned binary there is the biggest gap. Check current prices before buying. | 1.3 |
 | Worker CPU on the Free plan | Stay on Free and accept the cold-start risk; Workers Paid | Stay on Free until the Phase 3 soak shows `exceededCpu`. If it does, the paid plan is the only full fix. | Phase 3 exit |
@@ -77,20 +78,41 @@ failing required check cannot be merged.
 
 ### 0.3 Remove personal identifiers and stray files
 
-- `gateway/cloudflare/worker/test/deploy.test.mjs:12`: replace the live
-  subdomain with `example`.
+Partly done on 2026-11-11.
+
+Done:
+
+- History rewrite. `git filter-repo --sensitive-data-removal` replaced the
+  owner's account name with `example` in every version of every file, which
+  covered the live `workers.dev` address in `deploy.test.mjs` and the wireframe
+  URLs. It also replaced the personal email in commit author and committer
+  fields with the GitHub no-reply address. Every branch and tag was
+  force-pushed. The first changed commit was the repository's first commit, so
+  every commit ID changed.
+- PR #17 points the wireframe links to the source under `design/`, stops
+  tracking `out/`, and ignores it.
+- The owner's checkout commits with the no-reply address.
+
+Still open:
+
+- Ask GitHub Support to dereference the 16 pull-request refs that still point
+  at the old commits, and to garbage-collect them. Until then, the old commits
+  still open by ID on GitHub.
 - `specs/015-cloudflare-web-client/research.md`: replace the full host key
   fingerprint with `xxxx-…`.
-- `design/*/README.md` and `docs/cloudflare-gateway.md:744`: replace the
-  personal wireframe URLs with a neutral name, or move the wireframes to a
-  project-owned host.
-- `git rm --cached -r out/`, since `out/` is already in `.gitignore`.
 - Add a CI step that fails when a tracked file is also ignored
   (`git ls-files -ci --exclude-standard` prints anything).
+- Set the owner's global Git email to the no-reply address and turn on GitHub's
+  email privacy settings, so other repositories stop exposing the personal
+  address.
 
-**Acceptance:** searching tracked files for the owner's name, the live
-`workers.dev` subdomain and the host key fingerprint finds nothing, and
-`git ls-files -ci --exclude-standard` prints nothing.
+Clones made before the rewrite keep the old history, and nothing can change
+that. Item 2.4 is the chance to retire the old subdomain.
+
+**Acceptance:** searching the files and commit metadata of every branch and tag
+for the owner's name and personal email finds nothing, the host key fingerprint
+is not in tracked files, and `git ls-files -ci --exclude-standard` prints
+nothing.
 
 ### 0.4 Dependency updates
 
@@ -226,7 +248,11 @@ the environment's history with the commit SHA.
 
 The live Worker is `topvnc-connection-spike`. Browser pairings live in
 per-origin storage, so **changing the hostname means every browser pairs
-again.** Plan the move as one window:
+again.** Plan the move as one window.
+
+Consider changing the account's `workers.dev` subdomain in the same window.
+Clones made before the 2026-11-11 history rewrite still contain the old one,
+and every browser pairs again anyway.
 
 1. Create an Access application for `topvnc.<subdomain>.workers.dev`.
 2. Deploy the Worker as `topvnc`, change `app_origin` in each host's
