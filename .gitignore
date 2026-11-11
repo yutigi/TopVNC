@@ -23,3 +23,5 @@
 
 /.worktrees/
 /certs.local/
+/out/
+__pycache__/
