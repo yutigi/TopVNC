@@ -25,10 +25,12 @@ python scripts/cloudflare/run-worker.py --dry-run
   This is a redirect smoke check, not proof of the owner policy, authenticated
   WebSocket behavior, or working remote control. It needs network access.
 - `run-worker.py --dry-run` checks the existing build/config without
-  publishing. To publish explicitly, use `run-worker.py --publish`.
-  Neither mode builds assets or runs tests; follow the
+  publishing or rebuilding assets. `run-worker.py --publish` delegates to
+  `npm run deploy`: it requires a clean checkout matching current remote `main`,
+  builds assets, runs tests, filters configuration, and rechecks before upload.
+  It allows up to 30 minutes for that workflow. Follow the
   [build and deployment guide](../../docs/cloudflare-gateway.md#8-build-test-and-deploy)
-  first. The existing npm deployment commands remain the normal workflow.
+  for prerequisites. The existing npm deployment commands remain the normal workflow.
 
 Console output redacts email addresses only. Raw Wrangler logs stay in
 ignored `out/cloudflare/wrangler.log`; they can contain account details.

@@ -65,17 +65,41 @@ class CloudflareTests(unittest.TestCase):
         response.close.assert_called_once()
 
     def test_worker_requires_explicit_mode(self):
-        with patch.object(worker, "run_wrangler") as run:
+        with patch.object(worker, "run_wrangler", return_value=7) as run, \
+             patch.object(worker, "run_deployment", return_value=9) as deploy:
             for arguments in ([], ["--dry-run", "--publish"]):
                 with patch.object(sys, "argv", ["run-worker.py", *arguments]), \
                      contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     worker.main()
             run.assert_not_called()
-            for flag, expected in (("--dry-run", ["deploy", "--dry-run"]),
-                                   ("--publish", ["deploy"])):
-                with patch.object(sys, "argv", ["run-worker.py", flag]):
-                    worker.main()
-                run.assert_called_with(expected, timeout=120)
+            deploy.assert_not_called()
+            with patch.object(sys, "argv", ["run-worker.py", "--dry-run"]):
+                self.assertEqual(worker.main(), 7)
+            run.assert_called_once_with(["deploy", "--dry-run"], timeout=120)
+            deploy.assert_not_called()
+            run.reset_mock()
+            with patch.object(sys, "argv", ["run-worker.py", "--publish"]):
+                self.assertEqual(worker.main(), 9)
+            deploy.assert_called_once_with(timeout=1800)
+            run.assert_not_called()
+
+    def test_publish_uses_guarded_npm_workflow_and_propagates_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "wrangler.local.toml"
+            with patch.object(common, "ROOT", root), patch.object(common, "WORKER", root), \
+                 patch.object(common, "CONFIG", config), \
+                 patch.object(common.subprocess, "run") as run, \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                run.return_value = Mock(returncode=1, stdout="", stderr="owner@example.com: main required")
+                self.assertEqual(common.run_deployment(timeout=1800), 1)
+                self.assertEqual(run.call_args.args[0],
+                                 ["npm.cmd" if common.os.name == "nt" else "npm",
+                                  "run", "deploy", "--", "--config", str(config)])
+                self.assertEqual(run.call_args.kwargs["cwd"], root)
+                self.assertEqual(run.call_args.kwargs["timeout"], 1800)
+                self.assertNotIn("owner@example.com", output.getvalue())
+                self.assertIn("main required", output.getvalue())
 
     def test_account_check_propagates_failure(self):
         with patch.object(account, "run_wrangler", side_effect=[0, 1, 0]) as run, \
