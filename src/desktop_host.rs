@@ -232,6 +232,9 @@ pub struct DisplayPlan {
     pub outputs: Vec<(String, Rect)>,
     /// How many displays were attached.
     pub attached: usize,
+    /// Some connected displays are not capturable in this snapshot. Keep
+    /// the primary live and refresh the listing until the sources agree.
+    pub incomplete: bool,
 }
 
 impl DisplayPlan {
@@ -246,7 +249,34 @@ impl DisplayPlan {
             chosen,
             outputs,
             attached: attached.len(),
+            incomplete: false,
         })
+    }
+
+    /// Resolve a capture snapshot against the current monitor layout.
+    /// Partial lists cannot safely number displays or represent ALL.
+    pub fn for_layout(
+        selection: DisplaySelection,
+        attached: &[DisplayArea],
+        layout: &[DisplayArea],
+    ) -> Result<Self, String> {
+        let complete = layout.iter().all(|area| {
+            attached.iter().any(|output| {
+                output.name.eq_ignore_ascii_case(&area.name) && output.rect == area.rect
+            })
+        });
+        if complete {
+            return Self::new(selection, attached);
+        }
+        if !attached.iter().any(|output| output.primary) {
+            return Err("the current primary display is not yet available for capture".into());
+        }
+        let mut plan = Self::new(DisplaySelection::Primary, attached)?;
+        plan.incomplete = true;
+        if selection != DisplaySelection::Primary {
+            plan.chosen.fallback = Some("the display list is still reconfiguring".into());
+        }
+        Ok(plan)
     }
 
     /// What viewers are told about the served display.
@@ -377,6 +407,14 @@ impl DisplayFollower {
             self.stale_restart = Some(layout);
             return DisplayChange::Restart;
         }
+        if watch.is_current(&layout) && plan.incomplete {
+            // GDI may already be steady while DXGI is still catching up.
+            // A failed refresh must not interrupt a healthy primary.
+            let Ok(snapshot) = attached() else {
+                return DisplayChange::None;
+            };
+            return self.follow(|| Ok(snapshot));
+        }
         if watch.changed(layout) {
             self.stale_restart = None;
             self.follow(attached)
@@ -389,11 +427,12 @@ impl DisplayFollower {
         &mut self,
         attached: impl FnOnce() -> Result<Vec<DisplayArea>, String>,
     ) -> DisplayChange {
-        let Some((plan, _)) = &mut self.serving else {
+        let Some((plan, watch)) = &mut self.serving else {
             return DisplayChange::Restart;
         };
-        let Ok(next) = attached().and_then(|attached| DisplayPlan::new(self.selection, &attached))
-        else {
+        let Ok(next) = attached().and_then(|attached| {
+            DisplayPlan::for_layout(self.selection, &attached, &watch.current)
+        }) else {
             return DisplayChange::Restart;
         };
         if next.outputs != plan.outputs {
@@ -2908,6 +2947,51 @@ mod tests {
             follower.layout_read(replacement.clone(), || Ok(replacement)),
             DisplayChange::None
         );
+    }
+
+    #[test]
+    fn a_partial_snapshot_keeps_the_main_live_and_recovers_without_another_layout_change() {
+        let layout = desktops::one_primary();
+        let partial = desktops::only_one();
+        for selection in [
+            DisplaySelection::Primary,
+            DisplaySelection::Number(2),
+            DisplaySelection::All,
+        ] {
+            let mut follower = DisplayFollower::new(selection);
+            let plan = DisplayPlan::for_layout(selection, &partial, &layout).unwrap();
+            assert!(plan.incomplete);
+            assert_eq!(plan.outputs[0].0, layout[0].name);
+            follower.started(plan, layout.clone());
+            for _ in 0..3 {
+                assert_eq!(
+                    follower.layout_read(layout.clone(), || Ok(partial.clone())),
+                    DisplayChange::None
+                );
+            }
+            assert_eq!(
+                follower.layout_read(layout.clone(), || Err(
+                    "listing temporarily unavailable".into()
+                )),
+                DisplayChange::None
+            );
+            let change = follower.layout_read(layout.clone(), || Ok(layout.clone()));
+            if selection == DisplaySelection::Primary {
+                assert_eq!(change, DisplayChange::Renumbered);
+            } else {
+                assert_eq!(change, DisplayChange::Restart);
+                restart(&mut follower, &layout);
+            }
+            let plan = follower.plan().unwrap();
+            assert!(!plan.incomplete);
+            assert_eq!(*plan, DisplayPlan::new(selection, &layout).unwrap());
+            assert_eq!(
+                follower.layout_read(layout.clone(), || panic!(
+                    "a complete snapshot needs no refresh"
+                )),
+                DisplayChange::None
+            );
+        }
     }
 
     /// Windows can keep an unplugged monitor's display on the desktop for a

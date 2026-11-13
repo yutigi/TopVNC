@@ -1320,7 +1320,7 @@ fn start_capture(
         .map(|output| output.area.clone())
         .collect::<Vec<_>>();
     let (capture, plan) = capture_selected_or_primary(
-        follower.selection(),
+        DisplayPlan::for_layout(follower.selection(), &areas, &layout)?,
         &areas,
         |plan| DesktopCapture::new(plan, &attached),
         |capture| capture.shared.wait_for_first_frames(FIRST_FRAME_TIMEOUT),
@@ -1332,12 +1332,11 @@ fn start_capture(
 /// An unplugged output can remain enumerated while duplication already
 /// fails. Try the current primary before leaving viewers without capture.
 fn capture_selected_or_primary<C>(
-    selection: DisplaySelection,
+    plan: DisplayPlan,
     attached: &[DisplayArea],
     mut capture: impl FnMut(&DisplayPlan) -> Result<C, Box<dyn Error>>,
     mut ready: impl FnMut(&C) -> Result<(), Box<dyn Error>>,
 ) -> Result<(C, DisplayPlan), Box<dyn Error>> {
-    let plan = DisplayPlan::new(selection, attached)?;
     let mut attempt = |plan: &DisplayPlan| {
         let captured = capture(plan)?;
         // Dropping a failed attempt releases its duplication before the
@@ -1355,6 +1354,7 @@ fn capture_selected_or_primary<C>(
         return Err(error);
     }
     let mut primary = DisplayPlan::new(DisplaySelection::Primary, attached)?;
+    primary.incomplete = plan.incomplete;
     if primary.outputs == plan.outputs {
         return Err(error);
     }
@@ -1973,29 +1973,7 @@ fn attached_outputs_in(layout: &[DisplayArea]) -> Result<Vec<AttachedOutput>, Bo
             }
         }
     }
-    validate_output_layout(layout, outputs.iter().map(|output| &output.area))?;
     Ok(outputs)
-}
-
-/// Resolving a partial list could change a numbered selection or keep ALL
-/// on a subset forever: GDI may already be steady while DXGI catches up.
-fn validate_output_layout<'a>(
-    layout: &[DisplayArea],
-    output_areas: impl Iterator<Item = &'a DisplayArea>,
-) -> Result<(), Box<dyn Error>> {
-    let outputs = output_areas.collect::<Vec<_>>();
-    if let Some(missing) = layout.iter().find(|area| {
-        !outputs
-            .iter()
-            .any(|output| output.name.eq_ignore_ascii_case(&area.name) && output.rect == area.rect)
-    }) {
-        return Err(format!(
-            "display {} at {:?} is not yet available in DXGI; waiting for Windows to finish reconfiguring displays",
-            missing.name, missing.rect
-        )
-        .into());
-    }
-    Ok(())
 }
 
 /// GDI can already have the new main display while DXGI still lists the
@@ -2166,7 +2144,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_dxgi_snapshots_are_retried_before_numbering_or_all_selection() {
+    fn partial_dxgi_snapshots_serve_the_main_without_renumbering_the_selection() {
         let mut layout = recovery_displays();
         layout.push(DisplayArea {
             name: "\\\\.\\DISPLAY3".into(),
@@ -2175,16 +2153,30 @@ mod tests {
         });
         // The primary is already current, but another output has not caught
         // up. Accepting this list would move DISPLAY3 into display 2's slot.
-        let partial = [&layout[1], &layout[2]];
-        let error = validate_output_layout(&layout, partial.into_iter()).unwrap_err();
-        assert!(error.to_string().contains(&layout[0].name));
-        // A complete snapshot is accepted without imposing GDI's order on
-        // DXGI numbering. The empty case is classified as NoDisplay later.
-        assert!(validate_output_layout(&layout, layout.iter().rev()).is_ok());
-        assert!(validate_output_layout(&[], [].iter()).is_ok());
+        let partial = [layout[1].clone(), layout[2].clone()];
+        for selection in [
+            DisplaySelection::Primary,
+            DisplaySelection::Number(2),
+            DisplaySelection::All,
+        ] {
+            let plan = DisplayPlan::for_layout(selection, &partial, &layout).unwrap();
+            assert!(plan.incomplete);
+            assert_eq!(plan.outputs, [(layout[1].name.clone(), layout[1].rect)]);
+        }
+        assert!(
+            !DisplayPlan::for_layout(DisplaySelection::All, &layout, &layout)
+                .unwrap()
+                .incomplete
+        );
+        assert!(DisplayPlan::for_layout(DisplaySelection::Primary, &[], &[]).is_err());
+        assert!(DisplayPlan::for_layout(DisplaySelection::Primary, &layout[2..], &layout).is_err());
         let mut stale = layout.clone();
         stale[0].rect = Rect::new(0, 0, 5120, 1440);
-        assert!(validate_output_layout(&layout, stale.iter()).is_err());
+        assert!(
+            DisplayPlan::for_layout(DisplaySelection::All, &stale, &layout)
+                .unwrap()
+                .incomplete
+        );
     }
 
     #[test]
@@ -2215,7 +2207,7 @@ mod tests {
             for fails in [true, false] {
                 let mut attempts = 0;
                 let (shared, plan) = capture_selected_or_primary(
-                    selection,
+                    DisplayPlan::new(selection, &attached).unwrap(),
                     &attached,
                     |plan| {
                         attempts += 1;
@@ -2279,7 +2271,7 @@ mod tests {
 
         let active = AtomicU32::new(0);
         let (capture, plan) = capture_selected_or_primary(
-            DisplaySelection::Number(1),
+            DisplayPlan::new(DisplaySelection::Number(1), &recovery_displays()).unwrap(),
             &recovery_displays(),
             |plan| {
                 assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
@@ -2334,7 +2326,7 @@ mod tests {
         let mut follower = DisplayFollower::new(DisplaySelection::Number(1));
         let mut attempted = Vec::new();
         let (bounds, plan) = capture_selected_or_primary(
-            follower.selection(),
+            DisplayPlan::new(follower.selection(), &attached).unwrap(),
             &attached,
             |plan| {
                 attempted.push(plan.outputs.clone());
@@ -2384,7 +2376,7 @@ mod tests {
         );
         follower.stopped();
         let (_, restored) = capture_selected_or_primary(
-            follower.selection(),
+            DisplayPlan::new(follower.selection(), &returned).unwrap(),
             &returned,
             |plan| Ok(plan.chosen.bounds),
             |_| Ok(()),
@@ -2399,7 +2391,7 @@ mod tests {
         let attached = recovery_displays();
         let mut attempted = Vec::new();
         let (_, plan) = capture_selected_or_primary(
-            DisplaySelection::All,
+            DisplayPlan::new(DisplaySelection::All, &attached).unwrap(),
             &attached,
             |plan| {
                 attempted.push(plan.chosen.indices.clone());
@@ -2427,7 +2419,7 @@ mod tests {
         ] {
             let mut attempts = 0;
             let error = capture_selected_or_primary::<()>(
-                selection,
+                DisplayPlan::new(selection, &attached).unwrap(),
                 &attached,
                 |_| {
                     attempts += 1;
@@ -2441,7 +2433,7 @@ mod tests {
         }
         let mut attempts = 0;
         let error = capture_selected_or_primary::<()>(
-            DisplaySelection::Number(1),
+            DisplayPlan::new(DisplaySelection::Number(1), &attached).unwrap(),
             &attached,
             |_| {
                 attempts += 1;
@@ -2464,7 +2456,7 @@ mod tests {
     fn failed_primary_fallback_preserves_both_errors_and_the_capture_status() {
         let mut attempts = 0;
         let error = capture_selected_or_primary::<()>(
-            DisplaySelection::Number(1),
+            DisplayPlan::new(DisplaySelection::Number(1), &recovery_displays()).unwrap(),
             &recovery_displays(),
             |_| {
                 attempts += 1;
@@ -2497,7 +2489,7 @@ mod tests {
     fn a_successful_capture_does_not_try_another_display() {
         let mut attempts = 0;
         let (_, plan) = capture_selected_or_primary(
-            DisplaySelection::Number(1),
+            DisplayPlan::new(DisplaySelection::Number(1), &recovery_displays()).unwrap(),
             &recovery_displays(),
             |_| {
                 attempts += 1;
@@ -2509,15 +2501,7 @@ mod tests {
         assert_eq!(attempts, 1);
         assert_eq!(plan.chosen.indices, [0]);
         assert_eq!(plan.fallback_notice(), None);
-        assert!(
-            capture_selected_or_primary::<()>(
-                DisplaySelection::Primary,
-                &[],
-                |_| panic!("no display to capture"),
-                |_| panic!("no display to check"),
-            )
-            .is_err()
-        );
+        assert!(DisplayPlan::new(DisplaySelection::Primary, &[]).is_err());
     }
 
     #[test]
