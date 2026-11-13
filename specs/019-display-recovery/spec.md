@@ -23,7 +23,9 @@ The failing component could not be reproduced here, since that needs a cable to 
 - If the steady layout lacks a display that capture is serving, capture restarts once for that layout. If the two sources keep disagreeing, it does not restart again until the layout changes.
 - While capture is stopped, it is retried with the existing backoff (250 ms to 2 s), and resumes on its own when a display returns.
 - Capture candidates must match the current GDI monitor name and desktop area, with the primary flag taken from GDI. A stale DXGI output must not override the current main display during reconfiguration.
+- A capture snapshot must cover every connected GDI display before resolving display numbers or ALL. Retry an incomplete snapshot instead of silently renumbering its surviving outputs or keeping a partial ALL capture after DXGI catches up.
 - If a selected output or ALL cannot start capture while another display is the current primary, try that primary in the same attempt. Keep the requested selection so a later layout change can restore it. Do not retry the same output twice or try other outputs after access to the desktop is denied. Report both failures if the fallback also fails.
+- Capture startup succeeds only once each selected output has copied its first desktop image. An error or a one-second timeout before that counts as a failed capture attempt and follows the same primary fallback path. Cursor-only changes and frames from only some selected outputs do not establish a live capture.
 
 ### Telling viewers
 
@@ -47,9 +49,10 @@ The failing component could not be reproduced here, since that needs a cable to 
 
 ## Follow-up validation (Windows 11, 2026-11-13)
 
-- Capture startup now checks DXGI candidates against the same GDI snapshot used to start layout following. Only matching device names and desktop areas are accepted, and GDI supplies the primary flag. If GDI's current primary has not appeared in DXGI yet, the host retries instead of starting on a secondary indefinitely.
-- A failed selected-output or ALL capture tries the current primary once, keeping the requested selection for later layout changes. Secure-desktop failures retain their status and do not trigger another output attempt. Failure of both attempts preserves both errors.
-- Seven regression tests cover stale names and geometry, a replacement monitor at the same coordinates, fallback to the current primary, the requested monitor returning, ALL fallback, bounded attempts, desktop access denial, and successful capture without fallback.
-- `cargo fmt --all --check`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` pass.
+- Capture startup now checks DXGI candidates against the same GDI snapshot used to start layout following. Only matching device names and desktop areas are accepted, and GDI supplies the primary flag. If any connected GDI display has not appeared in DXGI yet, the host retries the snapshot before resolving display numbers or ALL.
+- A failed selected-output or ALL capture tries the current primary once, keeping the requested selection for later layout changes. Startup includes waiting up to one second for the first desktop image from every selected output, so first-acquisition errors and timeouts trigger fallback too. Failed attempts release their capture resources before the primary is tried. Secure-desktop failures retain their status and do not trigger another output attempt. Failure of both attempts preserves both errors.
+- Twelve regression tests cover stale names and geometry, a replacement monitor at the same coordinates, incomplete snapshots, fallback to the current primary, the requested monitor returning, ALL fallback, bounded attempts, desktop access denial, first-image readiness and errors, resource cleanup before fallback, and successful capture without fallback.
+- Mutation checks: bypassing the readiness check fails `first_frame_failure_and_timeout_follow_the_same_primary_fallback`; accepting a partial snapshot fails `partial_dxgi_snapshots_are_retried_before_numbering_or_all_selection`. Both checks pass with the protections restored.
+- `cargo fmt --all --check`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo build --bin topvnc` pass.
 - Live Windows checks pass: `gdi_and_dxgi_agree_on_attached_displays`, `every_attached_display_has_a_connected_monitor`, `captures_each_and_all_live_displays`, and `viewers_switch_between_live_displays`. Desktop-capture checks ran outside the sandbox, which denies Desktop Duplication access.
 - A physical cable unplug with a browser connected remains unvalidated; use the manual test above. No macOS or Linux hardware testing was performed for this follow-up.
