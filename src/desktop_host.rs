@@ -254,11 +254,13 @@ impl DisplayPlan {
         self.chosen.announcement(self.attached)
     }
 
-    /// Whether every planned display has its area in `layout`.
+    /// Whether every planned display still has its name and area in `layout`.
     pub fn shown_in(&self, layout: &[DisplayArea]) -> bool {
-        self.outputs
-            .iter()
-            .all(|(_, rect)| layout.iter().any(|display| display.rect == *rect))
+        self.outputs.iter().all(|(name, rect)| {
+            layout
+                .iter()
+                .any(|display| display.name.eq_ignore_ascii_case(name) && display.rect == *rect)
+        })
     }
 
     pub fn description(&self) -> String {
@@ -2883,6 +2885,27 @@ mod tests {
         // A later settled change is followed as usual.
         assert_eq!(
             settle(&mut follower, &desktops::one_primary()),
+            DisplayChange::None
+        );
+    }
+
+    #[test]
+    fn a_replacement_monitor_at_the_same_coordinates_is_not_the_captured_output() {
+        let original = desktops::only_one();
+        let mut replacement = original.clone();
+        replacement[0].name = "\\\\.\\DISPLAY2".into();
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        let plan = DisplayPlan::new(follower.selection(), &original).unwrap();
+        assert!(!plan.shown_in(&replacement));
+        follower.started(plan, replacement.clone());
+        assert_eq!(
+            follower.layout_read(replacement.clone(), || Ok(replacement.clone())),
+            DisplayChange::Restart
+        );
+        let plan = restart(&mut follower, &replacement);
+        assert_eq!(served(&plan).0, "\\\\.\\DISPLAY2");
+        assert_eq!(
+            follower.layout_read(replacement.clone(), || Ok(replacement)),
             DisplayChange::None
         );
     }

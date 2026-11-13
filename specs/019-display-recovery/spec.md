@@ -22,6 +22,8 @@ The failing component could not be reproduced here, since that needs a cable to 
 - The served display therefore changes, or capture stops, within about a second of the monitor disconnecting, even while Windows keeps the display on the desktop. A remaining display is served when the primary is disconnected, before Windows moves the primary flag. Input maps to the newly served display.
 - If the steady layout lacks a display that capture is serving, capture restarts once for that layout. If the two sources keep disagreeing, it does not restart again until the layout changes.
 - While capture is stopped, it is retried with the existing backoff (250 ms to 2 s), and resumes on its own when a display returns.
+- Capture candidates must match the current GDI monitor name and desktop area, with the primary flag taken from GDI. A stale DXGI output must not override the current main display during reconfiguration.
+- If a selected output or ALL cannot start capture while another display is the current primary, try that primary in the same attempt. Keep the requested selection so a later layout change can restore it. Do not retry the same output twice or try other outputs after access to the desktop is denied. Report both failures if the fallback also fails.
 
 ### Telling viewers
 
@@ -42,3 +44,12 @@ The failing component could not be reproduced here, since that needs a cable to 
   - `the_page_learns_when_the_host_cannot_capture_its_desktop`: the browser session raises the event only on change.
 - Live, on a two-monitor desktop (`cargo test --bin topvnc -- --ignored gdi_and_dxgi_agree_on_attached_displays every_attached_display_has_a_connected_monitor`): with both monitors connected, every attached DXGI output is reported connected, and GDI and DXGI still agree after filtering.
 - Not yet validated: physically unplugging a monitor. Run `cargo test --bin topvnc -- --ignored follows_display_changes_made_by_hand --nocapture` (spec 013) and unplug the primary display's cable. Then repeat with a browser connected and the only monitor unplugged: the notice should appear within about two seconds and clear after the cable is plugged back in.
+
+## Follow-up validation (Windows 11, 2026-11-13)
+
+- Capture startup now checks DXGI candidates against the same GDI snapshot used to start layout following. Only matching device names and desktop areas are accepted, and GDI supplies the primary flag. If GDI's current primary has not appeared in DXGI yet, the host retries instead of starting on a secondary indefinitely.
+- A failed selected-output or ALL capture tries the current primary once, keeping the requested selection for later layout changes. Secure-desktop failures retain their status and do not trigger another output attempt. Failure of both attempts preserves both errors.
+- Seven regression tests cover stale names and geometry, a replacement monitor at the same coordinates, fallback to the current primary, the requested monitor returning, ALL fallback, bounded attempts, desktop access denial, and successful capture without fallback.
+- `cargo fmt --all --check`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` pass.
+- Live Windows checks pass: `gdi_and_dxgi_agree_on_attached_displays`, `every_attached_display_has_a_connected_monitor`, `captures_each_and_all_live_displays`, and `viewers_switch_between_live_displays`. Desktop-capture checks ran outside the sandbox, which denies Desktop Duplication access.
+- A physical cable unplug with a browser connected remains unvalidated; use the manual test above. No macOS or Linux hardware testing was performed for this follow-up.

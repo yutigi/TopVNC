@@ -3,10 +3,10 @@
 
 use crate::desktop_host::{
     CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureOutage, CaptureSurface, CursorKind, CursorShape,
-    DesktopImage, DisplayArea, DisplayChange, DisplayFollower, DisplayPlan, Downscaler,
-    KeyIdentity, MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner, PointerTransition, Rect,
-    RemoteInputState, Rotation, WHEEL_DELTA, absolute_mouse_coordinate, connected_displays,
-    display_connected, is_secure_attention, latin1_from_unicode, latin1_to_utf16,
+    DesktopImage, DisplayArea, DisplayChange, DisplayFollower, DisplayPlan, DisplaySelection,
+    Downscaler, KeyIdentity, MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner,
+    PointerTransition, Rect, RemoteInputState, Rotation, WHEEL_DELTA, absolute_mouse_coordinate,
+    connected_displays, is_secure_attention, latin1_from_unicode, latin1_to_utf16,
     native_coordinate, served_size, unicode_key_units, validate_capture_dimensions,
     windows_key_identity,
 };
@@ -1265,7 +1265,7 @@ fn start_capture(
 ) -> Result<(DesktopCapture, DisplayPlan), Box<dyn Error>> {
     // Read the layout first: a change while starting is then noticed.
     let layout = monitor_layout();
-    let attached = attached_outputs()?;
+    let attached = attached_outputs_in(&layout)?;
     if attached.is_empty() {
         return Err(Box::new(CaptureUnavailable {
             status: CaptureStatus::NoDisplay,
@@ -1276,10 +1276,46 @@ fn start_capture(
         .iter()
         .map(|output| output.area.clone())
         .collect::<Vec<_>>();
-    let plan = DisplayPlan::new(follower.selection(), &areas)?;
-    let capture = DesktopCapture::new(&plan, &attached)?;
+    let (capture, plan) = capture_selected_or_primary(follower.selection(), &areas, |plan| {
+        DesktopCapture::new(plan, &attached)
+    })?;
     follower.started(plan.clone(), layout);
     Ok((capture, plan))
+}
+
+/// An unplugged output can remain enumerated while duplication already
+/// fails. Try the current primary before leaving viewers without capture.
+fn capture_selected_or_primary<C>(
+    selection: DisplaySelection,
+    attached: &[DisplayArea],
+    mut capture: impl FnMut(&DisplayPlan) -> Result<C, Box<dyn Error>>,
+) -> Result<(C, DisplayPlan), Box<dyn Error>> {
+    let plan = DisplayPlan::new(selection, attached)?;
+    let error = match capture(&plan) {
+        Ok(captured) => return Ok((captured, plan)),
+        Err(error) => error,
+    };
+    // A secure desktop requires the service's privileges; another output
+    // cannot make it accessible.
+    if capture_failure_status(error.as_ref()) == CaptureStatus::SecureDesktop {
+        return Err(error);
+    }
+    let mut primary = DisplayPlan::new(DisplaySelection::Primary, attached)?;
+    if primary.outputs == plan.outputs {
+        return Err(error);
+    }
+    primary.chosen.fallback = Some(format!("could not capture {}: {error}", plan.description()));
+    match capture(&primary) {
+        Ok(captured) => Ok((captured, primary)),
+        Err(fallback_error) => Err(Box::new(CaptureUnavailable {
+            status: capture_failure_status(fallback_error.as_ref()),
+            message: format!(
+                "could not capture {}: {error}; fallback to {} also failed: {fallback_error}",
+                plan.description(),
+                primary.description()
+            ),
+        })),
+    }
 }
 
 /// The attached displays, for the display follower.
@@ -1846,13 +1882,15 @@ pub fn displays() -> Vec<DisplayArea> {
     displays
 }
 
-/// Display outputs attached to the desktop, in DXGI enumeration order. The
-/// primary display is the one at the desktop origin.
+/// Display outputs in the current desktop layout, in DXGI enumeration order.
 fn attached_outputs() -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
-    let connected = connected_sources();
+    attached_outputs_in(&monitor_layout())
+}
+
+fn attached_outputs_in(layout: &[DisplayArea]) -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
     let mut outputs = Vec::new();
-    for adapter_index in 0..16 {
+    'adapters: for adapter_index in 0..16 {
         let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
             Ok(adapter) => adapter,
             Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
@@ -1866,26 +1904,47 @@ fn attached_outputs() -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
             };
             let desc: DXGI_OUTPUT_DESC = unsafe { output.GetDesc()? };
             let name = device_name(&desc.DeviceName);
-            if !desc.AttachedToDesktop.as_bool() || !display_connected(&name, connected.as_ref()) {
+            if !desc.AttachedToDesktop.as_bool() {
                 continue;
             }
-            let area = desc.DesktopCoordinates;
+            let rect = desc.DesktopCoordinates;
+            let Some(area) = current_output_area(
+                &name,
+                Rect::new(rect.left, rect.top, rect.right, rect.bottom),
+                layout,
+            ) else {
+                continue;
+            };
             outputs.push(AttachedOutput {
                 adapter: adapter.clone(),
                 output,
-                area: DisplayArea {
-                    name,
-                    rect: Rect::new(area.left, area.top, area.right, area.bottom),
-                    primary: area.left == 0 && area.top == 0,
-                },
+                area: area.clone(),
                 rotation: desc.Rotation,
             });
             if outputs.len() == MAX_DISPLAYS {
-                return Ok(outputs);
+                break 'adapters;
             }
         }
     }
+    // Otherwise Primary could silently resolve to a secondary output and
+    // remain there after DXGI catches up, with no further GDI layout change.
+    if layout.iter().any(|area| area.primary) && !outputs.iter().any(|output| output.area.primary) {
+        return Err("the current primary display is not yet available in DXGI; waiting for Windows to finish reconfiguring displays".into());
+    }
     Ok(outputs)
+}
+
+/// GDI can already have the new main display while DXGI still lists the
+/// removed output at the origin. Wait for matching geometry, and use GDI's
+/// primary flag rather than inferring it from stale DXGI coordinates.
+fn current_output_area<'a>(
+    name: &str,
+    rect: Rect,
+    layout: &'a [DisplayArea],
+) -> Option<&'a DisplayArea> {
+    layout
+        .iter()
+        .find(|area| area.name.eq_ignore_ascii_case(name) && area.rect == rect)
 }
 
 /// GDI device names, in upper case, of the desktop displays at least one
@@ -2024,8 +2083,210 @@ impl Drop for FrameGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desktop_host::{DisplaySelection, choose_displays};
+    use crate::desktop_host::choose_displays;
     use topvnc::ServedDisplays;
+
+    fn recovery_displays() -> Vec<DisplayArea> {
+        vec![
+            DisplayArea {
+                name: "\\\\.\\DISPLAY5".into(),
+                rect: Rect::new(-5120, 0, 0, 1440),
+                primary: false,
+            },
+            DisplayArea {
+                name: "\\\\.\\DISPLAY1".into(),
+                rect: Rect::new(0, 0, 2560, 1600),
+                primary: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn stale_dxgi_outputs_cannot_replace_the_current_main_display() {
+        let layout = vec![recovery_displays()[1].clone()];
+        // The disconnected external output still has the old main area in
+        // DXGI, including when it has the same size as the replacement.
+        assert!(current_output_area("\\\\.\\DISPLAY5", layout[0].rect, &layout).is_none());
+        // A surviving output's stale position is not used for input mapping.
+        assert!(
+            current_output_area("\\\\.\\DISPLAY1", Rect::new(5120, 0, 7680, 1600), &layout)
+                .is_none()
+        );
+        let main = current_output_area("\\\\.\\display1", layout[0].rect, &layout).unwrap();
+        assert_eq!(main, &layout[0]);
+        assert!(main.primary);
+        assert!(current_output_area(&main.name, main.rect, &[]).is_none());
+        // Mirroring can put a non-primary output at the origin too.
+        let mut mirrored = recovery_displays();
+        mirrored[0].rect = mirrored[1].rect;
+        assert!(
+            !current_output_area(&mirrored[0].name, mirrored[0].rect, &mirrored)
+                .unwrap()
+                .primary
+        );
+    }
+
+    #[test]
+    fn failed_selected_capture_serves_the_current_primary_and_retains_the_selection() {
+        let attached = recovery_displays();
+        let mut follower = DisplayFollower::new(DisplaySelection::Number(1));
+        let mut attempted = Vec::new();
+        let (bounds, plan) = capture_selected_or_primary(follower.selection(), &attached, |plan| {
+            attempted.push(plan.outputs.clone());
+            if plan.chosen.indices == [0] {
+                Err("external output disconnected".into())
+            } else {
+                Ok(plan.chosen.bounds)
+            }
+        })
+        .unwrap();
+        assert_eq!(attempted.len(), 2);
+        assert_eq!(attempted[0][0].0, attached[0].name);
+        assert_eq!(attempted[1][0].0, attached[1].name);
+        assert_eq!(bounds, attached[1].rect);
+        assert_eq!(
+            plan.announcement(),
+            ServedDisplays {
+                served: 2,
+                count: 2
+            }
+        );
+        assert!(
+            plan.fallback_notice()
+                .unwrap()
+                .contains("external output disconnected")
+        );
+        follower.started(plan, attached.clone());
+        assert_eq!(follower.selection(), DisplaySelection::Number(1));
+        for _ in 0..3 {
+            assert_eq!(
+                follower.layout_read(attached.clone(), || Ok(attached.clone())),
+                DisplayChange::None
+            );
+        }
+        // A later topology change retries the requested output.
+        let mut returned = attached.clone();
+        returned[0].rect = Rect::new(2560, 0, 7680, 1440);
+        assert_eq!(
+            follower.layout_read(returned.clone(), || Ok(returned.clone())),
+            DisplayChange::None
+        );
+        assert_eq!(
+            follower.layout_read(returned.clone(), || Ok(returned.clone())),
+            DisplayChange::Restart
+        );
+        follower.stopped();
+        let (_, restored) = capture_selected_or_primary(follower.selection(), &returned, |plan| {
+            Ok(plan.chosen.bounds)
+        })
+        .unwrap();
+        assert_eq!(restored.outputs[0].0, attached[0].name);
+        assert_eq!(restored.fallback_notice(), None);
+    }
+
+    #[test]
+    fn all_display_capture_can_fall_back_to_the_primary() {
+        let attached = recovery_displays();
+        let mut attempted = Vec::new();
+        let (_, plan) = capture_selected_or_primary(DisplaySelection::All, &attached, |plan| {
+            attempted.push(plan.chosen.indices.clone());
+            if plan.outputs.len() > 1 {
+                Err("one output cannot be duplicated".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempted, [vec![0, 1], vec![1]]);
+        assert_eq!(plan.chosen.bounds, attached[1].rect);
+        assert!(plan.fallback_notice().is_some());
+    }
+
+    #[test]
+    fn capture_fallback_never_retries_the_same_output_or_an_inaccessible_desktop() {
+        let attached = recovery_displays();
+        for selection in [
+            DisplaySelection::Primary,
+            DisplaySelection::Number(2),
+            DisplaySelection::Number(9),
+        ] {
+            let mut attempts = 0;
+            let error = capture_selected_or_primary::<()>(selection, &attached, |_| {
+                attempts += 1;
+                Err("main output unavailable".into())
+            })
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert_eq!(error.to_string(), "main output unavailable");
+        }
+        let mut attempts = 0;
+        let error =
+            capture_selected_or_primary::<()>(DisplaySelection::Number(1), &attached, |_| {
+                attempts += 1;
+                Err(Box::new(CaptureUnavailable {
+                    status: CaptureStatus::SecureDesktop,
+                    message: "desktop access denied".into(),
+                }))
+            })
+            .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            capture_failure_status(error.as_ref()),
+            CaptureStatus::SecureDesktop
+        );
+    }
+
+    #[test]
+    fn failed_primary_fallback_preserves_both_errors_and_the_capture_status() {
+        let mut attempts = 0;
+        let error = capture_selected_or_primary::<()>(
+            DisplaySelection::Number(1),
+            &recovery_displays(),
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err("selected output disappeared".into())
+                } else {
+                    Err(Box::new(CaptureUnavailable {
+                        status: CaptureStatus::SecureDesktop,
+                        message: "desktop switched during recovery".into(),
+                    }))
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 2);
+        assert!(error.to_string().contains("selected output disappeared"));
+        assert!(
+            error
+                .to_string()
+                .contains("desktop switched during recovery")
+        );
+        assert_eq!(
+            capture_failure_status(error.as_ref()),
+            CaptureStatus::SecureDesktop
+        );
+    }
+
+    #[test]
+    fn a_successful_capture_does_not_try_another_display() {
+        let mut attempts = 0;
+        let (_, plan) =
+            capture_selected_or_primary(DisplaySelection::Number(1), &recovery_displays(), |_| {
+                attempts += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(attempts, 1);
+        assert_eq!(plan.chosen.indices, [0]);
+        assert_eq!(plan.fallback_notice(), None);
+        assert!(
+            capture_selected_or_primary::<()>(DisplaySelection::Primary, &[], |_| panic!(
+                "no display to capture"
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn input_injection_checks_partial_and_silent_windows_rejections() {
