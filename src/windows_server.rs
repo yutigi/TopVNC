@@ -3,10 +3,10 @@
 
 use crate::desktop_host::{
     CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureOutage, CaptureSurface, CursorKind, CursorShape,
-    DesktopImage, DisplayArea, DisplayChange, DisplayFollower, DisplayPlan, Downscaler,
-    KeyIdentity, MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner, PointerTransition, Rect,
-    RemoteInputState, Rotation, WHEEL_DELTA, absolute_mouse_coordinate, connected_displays,
-    display_connected, is_secure_attention, latin1_from_unicode, latin1_to_utf16,
+    DesktopImage, DisplayArea, DisplayChange, DisplayFollower, DisplayPlan, DisplaySelection,
+    Downscaler, KeyIdentity, MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner,
+    PointerTransition, Rect, RemoteInputState, Rotation, WHEEL_DELTA, absolute_mouse_coordinate,
+    connected_displays, is_secure_attention, latin1_from_unicode, latin1_to_utf16,
     native_coordinate, served_size, unicode_key_units, validate_capture_dimensions,
     windows_key_identity,
 };
@@ -289,10 +289,7 @@ pub fn serve(
     }
     let mut framebuffer = Framebuffer::new(capture.placement.width, capture.placement.height)?;
     let mut damage = Vec::new();
-    let started = Instant::now();
-    while damage.is_empty() && started.elapsed() < FIRST_FRAME_TIMEOUT {
-        capture.next_frame(framebuffer.pixels_mut(), &mut damage)?;
-    }
+    capture.next_frame(framebuffer.pixels_mut(), &mut damage)?;
     let native = (capture.placement.width, capture.placement.height);
     let mut served = ServedImage::new(native, scale)?;
     served.update(
@@ -500,6 +497,7 @@ fn serve_desktop(
             }
             DisplayChange::Restart => {
                 // A display can be duplicated once per process; stop first.
+                outage.stopped(Instant::now());
                 capture = None;
                 follower.stopped();
                 next_retry = Instant::now();
@@ -1225,12 +1223,57 @@ struct CaptureShared {
     changed: Condvar,
 }
 
+impl CaptureShared {
+    fn new(width: u16, height: u16, outputs: usize) -> Self {
+        Self {
+            state: Mutex::new(CaptureState {
+                image: DesktopImage::new(width, height),
+                // The first present covers areas no display fills, too.
+                captured: vec![Rect::new(0, 0, i32::from(width), i32::from(height))],
+                changed: false,
+                first_frames_pending: outputs,
+                pointer: PointerOwner::default(),
+                error: None,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Duplication can start successfully on an output that never delivers
+    /// an image. Establish a complete first image before declaring it live.
+    fn wait_for_first_frames(&self, timeout: Duration) -> Result<(), Box<dyn Error>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "capture state lock poisoned")?;
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.first_frames_pending != 0 && state.error.is_none()
+            })
+            .map_err(|_| "capture state lock poisoned")?;
+        if let Some(error) = state.error.take() {
+            return Err(error.into());
+        }
+        if state.first_frames_pending != 0 {
+            return Err(format!(
+                "{} display(s) did not deliver their first desktop image before the capture timeout",
+                state.first_frames_pending
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
 struct CaptureState {
     image: DesktopImage,
     /// Image regions captured since the serving loop last presented.
     captured: Vec<Rect>,
     /// The image or cursor changed since the serving loop last presented.
     changed: bool,
+    /// Decremented once per output, after its first full image is copied.
+    first_frames_pending: usize,
     pointer: PointerOwner,
     /// Why a display's capture stopped; the whole capture is then recreated.
     error: Option<String>,
@@ -1265,7 +1308,7 @@ fn start_capture(
 ) -> Result<(DesktopCapture, DisplayPlan), Box<dyn Error>> {
     // Read the layout first: a change while starting is then noticed.
     let layout = monitor_layout();
-    let attached = attached_outputs()?;
+    let attached = attached_outputs_in(&layout)?;
     if attached.is_empty() {
         return Err(Box::new(CaptureUnavailable {
             status: CaptureStatus::NoDisplay,
@@ -1276,10 +1319,57 @@ fn start_capture(
         .iter()
         .map(|output| output.area.clone())
         .collect::<Vec<_>>();
-    let plan = DisplayPlan::new(follower.selection(), &areas)?;
-    let capture = DesktopCapture::new(&plan, &attached)?;
+    let (capture, plan) = capture_selected_or_primary(
+        DisplayPlan::for_layout(follower.selection(), &areas, &layout)?,
+        &areas,
+        |plan| DesktopCapture::new(plan, &attached),
+        |capture| capture.shared.wait_for_first_frames(FIRST_FRAME_TIMEOUT),
+    )?;
     follower.started(plan.clone(), layout);
     Ok((capture, plan))
+}
+
+/// An unplugged output can remain enumerated while duplication already
+/// fails. Try the current primary before leaving viewers without capture.
+fn capture_selected_or_primary<C>(
+    plan: DisplayPlan,
+    attached: &[DisplayArea],
+    mut capture: impl FnMut(&DisplayPlan) -> Result<C, Box<dyn Error>>,
+    mut ready: impl FnMut(&C) -> Result<(), Box<dyn Error>>,
+) -> Result<(C, DisplayPlan), Box<dyn Error>> {
+    let mut attempt = |plan: &DisplayPlan| {
+        let captured = capture(plan)?;
+        // Dropping a failed attempt releases its duplication before the
+        // primary is tried, including when its first acquisition failed.
+        ready(&captured)?;
+        Ok::<_, Box<dyn Error>>(captured)
+    };
+    let error = match attempt(&plan) {
+        Ok(captured) => return Ok((captured, plan)),
+        Err(error) => error,
+    };
+    // A secure desktop requires the service's privileges; another output
+    // cannot make it accessible.
+    if capture_failure_status(error.as_ref()) == CaptureStatus::SecureDesktop {
+        return Err(error);
+    }
+    let mut primary = DisplayPlan::new(DisplaySelection::Primary, attached)?;
+    primary.incomplete = plan.incomplete;
+    if primary.outputs == plan.outputs {
+        return Err(error);
+    }
+    primary.chosen.fallback = Some(format!("could not capture {}: {error}", plan.description()));
+    match attempt(&primary) {
+        Ok(captured) => Ok((captured, primary)),
+        Err(fallback_error) => Err(Box::new(CaptureUnavailable {
+            status: capture_failure_status(fallback_error.as_ref()),
+            message: format!(
+                "could not capture {}: {error}; fallback to {} also failed: {fallback_error}",
+                plan.description(),
+                primary.description()
+            ),
+        })),
+    }
 }
 
 /// The attached displays, for the display follower.
@@ -1311,17 +1401,7 @@ impl DesktopCapture {
             captures.push(OutputCapture::new(output, owner, origin)?);
         }
         let mut capture = Self {
-            shared: Arc::new(CaptureShared {
-                state: Mutex::new(CaptureState {
-                    image: DesktopImage::new(width, height),
-                    // The first present covers areas no display fills, too.
-                    captured: vec![Rect::new(0, 0, i32::from(width), i32::from(height))],
-                    changed: false,
-                    pointer: PointerOwner::default(),
-                    error: None,
-                }),
-                changed: Condvar::new(),
-            }),
+            shared: Arc::new(CaptureShared::new(width, height, captures.len())),
             stop: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
             placement: DisplayPlacement {
@@ -1609,6 +1689,9 @@ impl OutputCapture {
                 state.captured.clear();
                 state.captured.push(state.image.bounds());
             }
+            if self.full_frame_pending {
+                state.first_frames_pending -= 1;
+            }
             self.full_frame_pending = false;
         }
         state.changed = true;
@@ -1846,13 +1929,15 @@ pub fn displays() -> Vec<DisplayArea> {
     displays
 }
 
-/// Display outputs attached to the desktop, in DXGI enumeration order. The
-/// primary display is the one at the desktop origin.
+/// Display outputs in the current desktop layout, in DXGI enumeration order.
 fn attached_outputs() -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
-    let connected = connected_sources();
+    attached_outputs_in(&monitor_layout())
+}
+
+fn attached_outputs_in(layout: &[DisplayArea]) -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
     let mut outputs = Vec::new();
-    for adapter_index in 0..16 {
+    'adapters: for adapter_index in 0..16 {
         let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
             Ok(adapter) => adapter,
             Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
@@ -1866,26 +1951,42 @@ fn attached_outputs() -> Result<Vec<AttachedOutput>, Box<dyn Error>> {
             };
             let desc: DXGI_OUTPUT_DESC = unsafe { output.GetDesc()? };
             let name = device_name(&desc.DeviceName);
-            if !desc.AttachedToDesktop.as_bool() || !display_connected(&name, connected.as_ref()) {
+            if !desc.AttachedToDesktop.as_bool() {
                 continue;
             }
-            let area = desc.DesktopCoordinates;
+            let rect = desc.DesktopCoordinates;
+            let Some(area) = current_output_area(
+                &name,
+                Rect::new(rect.left, rect.top, rect.right, rect.bottom),
+                layout,
+            ) else {
+                continue;
+            };
             outputs.push(AttachedOutput {
                 adapter: adapter.clone(),
                 output,
-                area: DisplayArea {
-                    name,
-                    rect: Rect::new(area.left, area.top, area.right, area.bottom),
-                    primary: area.left == 0 && area.top == 0,
-                },
+                area: area.clone(),
                 rotation: desc.Rotation,
             });
             if outputs.len() == MAX_DISPLAYS {
-                return Ok(outputs);
+                break 'adapters;
             }
         }
     }
     Ok(outputs)
+}
+
+/// GDI can already have the new main display while DXGI still lists the
+/// removed output at the origin. Wait for matching geometry, and use GDI's
+/// primary flag rather than inferring it from stale DXGI coordinates.
+fn current_output_area<'a>(
+    name: &str,
+    rect: Rect,
+    layout: &'a [DisplayArea],
+) -> Option<&'a DisplayArea> {
+    layout
+        .iter()
+        .find(|area| area.name.eq_ignore_ascii_case(name) && area.rect == rect)
 }
 
 /// GDI device names, in upper case, of the desktop displays at least one
@@ -2024,8 +2125,384 @@ impl Drop for FrameGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desktop_host::{DisplaySelection, choose_displays};
+    use crate::desktop_host::choose_displays;
     use topvnc::ServedDisplays;
+
+    fn recovery_displays() -> Vec<DisplayArea> {
+        vec![
+            DisplayArea {
+                name: "\\\\.\\DISPLAY5".into(),
+                rect: Rect::new(-5120, 0, 0, 1440),
+                primary: false,
+            },
+            DisplayArea {
+                name: "\\\\.\\DISPLAY1".into(),
+                rect: Rect::new(0, 0, 2560, 1600),
+                primary: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn partial_dxgi_snapshots_serve_the_main_without_renumbering_the_selection() {
+        let mut layout = recovery_displays();
+        layout.push(DisplayArea {
+            name: "\\\\.\\DISPLAY3".into(),
+            rect: Rect::new(2560, 0, 4480, 1080),
+            primary: false,
+        });
+        // The primary is already current, but another output has not caught
+        // up. Accepting this list would move DISPLAY3 into display 2's slot.
+        let partial = [layout[1].clone(), layout[2].clone()];
+        for selection in [
+            DisplaySelection::Primary,
+            DisplaySelection::Number(2),
+            DisplaySelection::All,
+        ] {
+            let plan = DisplayPlan::for_layout(selection, &partial, &layout).unwrap();
+            assert!(plan.incomplete);
+            assert_eq!(plan.outputs, [(layout[1].name.clone(), layout[1].rect)]);
+        }
+        assert!(
+            !DisplayPlan::for_layout(DisplaySelection::All, &layout, &layout)
+                .unwrap()
+                .incomplete
+        );
+        assert!(DisplayPlan::for_layout(DisplaySelection::Primary, &[], &[]).is_err());
+        assert!(DisplayPlan::for_layout(DisplaySelection::Primary, &layout[2..], &layout).is_err());
+        let mut stale = layout.clone();
+        stale[0].rect = Rect::new(0, 0, 5120, 1440);
+        assert!(
+            DisplayPlan::for_layout(DisplaySelection::All, &stale, &layout)
+                .unwrap()
+                .incomplete
+        );
+    }
+
+    #[test]
+    fn startup_requires_a_first_image_from_every_selected_output() {
+        let shared = CaptureShared::new(4, 2, 2);
+        assert!(shared.wait_for_first_frames(Duration::ZERO).is_err());
+        {
+            let mut state = shared.state.lock().unwrap();
+            // A cursor change or an image from only one output cannot make
+            // a combined capture live.
+            state.changed = true;
+            state.first_frames_pending = 1;
+        }
+        assert!(shared.wait_for_first_frames(Duration::ZERO).is_err());
+        shared.state.lock().unwrap().first_frames_pending = 0;
+        shared.wait_for_first_frames(Duration::ZERO).unwrap();
+        // Waiting for readiness must leave the first image pending for the
+        // serving loop, including black gaps between monitors.
+        let state = shared.state.lock().unwrap();
+        assert!(state.changed);
+        assert_eq!(state.captured, [Rect::new(0, 0, 4, 2)]);
+    }
+
+    #[test]
+    fn first_frame_failure_and_timeout_follow_the_same_primary_fallback() {
+        let attached = recovery_displays();
+        for selection in [DisplaySelection::Number(1), DisplaySelection::All] {
+            for fails in [true, false] {
+                let mut attempts = 0;
+                let (shared, plan) = capture_selected_or_primary(
+                    DisplayPlan::new(selection, &attached).unwrap(),
+                    &attached,
+                    |plan| {
+                        attempts += 1;
+                        let shared = CaptureShared::new(4, 2, plan.outputs.len());
+                        {
+                            let mut state = shared.state.lock().unwrap();
+                            if plan.chosen.indices == [1] {
+                                state.first_frames_pending = 0;
+                            } else if fails {
+                                state.error =
+                                    Some("first acquisition lost the selected output".into());
+                            }
+                        }
+                        Ok(shared)
+                    },
+                    |shared| shared.wait_for_first_frames(Duration::ZERO),
+                )
+                .unwrap();
+                assert_eq!(attempts, 2);
+                assert_eq!(plan.outputs[0].0, attached[1].name);
+                assert_eq!(plan.chosen.bounds, attached[1].rect);
+                assert!(plan.fallback_notice().is_some());
+                shared.wait_for_first_frames(Duration::ZERO).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn first_frame_wait_observes_worker_errors_even_after_all_images_arrive() {
+        let shared = CaptureShared::new(4, 2, 1);
+        thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                shared
+                    .wait_for_first_frames(FIRST_FRAME_TIMEOUT)
+                    .map_err(|error| error.to_string())
+            });
+            {
+                let mut state = shared.state.lock().unwrap();
+                state.first_frames_pending = 0;
+                state.error = Some("capture stopped after its first image".into());
+            }
+            shared.changed.notify_all();
+            assert_eq!(
+                waiter.join().unwrap().unwrap_err(),
+                "capture stopped after its first image"
+            );
+        });
+    }
+
+    #[test]
+    fn failed_first_acquisition_releases_capture_before_trying_the_primary() {
+        struct CaptureLease<'a> {
+            active: &'a AtomicU32,
+            primary: bool,
+        }
+        impl Drop for CaptureLease<'_> {
+            fn drop(&mut self) {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let active = AtomicU32::new(0);
+        let (capture, plan) = capture_selected_or_primary(
+            DisplayPlan::new(DisplaySelection::Number(1), &recovery_displays()).unwrap(),
+            &recovery_displays(),
+            |plan| {
+                assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                Ok(CaptureLease {
+                    active: &active,
+                    primary: plan.chosen.indices == [1],
+                })
+            },
+            |capture| {
+                if capture.primary {
+                    Ok(())
+                } else {
+                    Err("first acquisition failed".into())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.chosen.indices, [1]);
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        drop(capture);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stale_dxgi_outputs_cannot_replace_the_current_main_display() {
+        let layout = vec![recovery_displays()[1].clone()];
+        // The disconnected external output still has the old main area in
+        // DXGI, including when it has the same size as the replacement.
+        assert!(current_output_area("\\\\.\\DISPLAY5", layout[0].rect, &layout).is_none());
+        // A surviving output's stale position is not used for input mapping.
+        assert!(
+            current_output_area("\\\\.\\DISPLAY1", Rect::new(5120, 0, 7680, 1600), &layout)
+                .is_none()
+        );
+        let main = current_output_area("\\\\.\\display1", layout[0].rect, &layout).unwrap();
+        assert_eq!(main, &layout[0]);
+        assert!(main.primary);
+        assert!(current_output_area(&main.name, main.rect, &[]).is_none());
+        // Mirroring can put a non-primary output at the origin too.
+        let mut mirrored = recovery_displays();
+        mirrored[0].rect = mirrored[1].rect;
+        assert!(
+            !current_output_area(&mirrored[0].name, mirrored[0].rect, &mirrored)
+                .unwrap()
+                .primary
+        );
+    }
+
+    #[test]
+    fn failed_selected_capture_serves_the_current_primary_and_retains_the_selection() {
+        let attached = recovery_displays();
+        let mut follower = DisplayFollower::new(DisplaySelection::Number(1));
+        let mut attempted = Vec::new();
+        let (bounds, plan) = capture_selected_or_primary(
+            DisplayPlan::new(follower.selection(), &attached).unwrap(),
+            &attached,
+            |plan| {
+                attempted.push(plan.outputs.clone());
+                if plan.chosen.indices == [0] {
+                    Err("external output disconnected".into())
+                } else {
+                    Ok(plan.chosen.bounds)
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(attempted.len(), 2);
+        assert_eq!(attempted[0][0].0, attached[0].name);
+        assert_eq!(attempted[1][0].0, attached[1].name);
+        assert_eq!(bounds, attached[1].rect);
+        assert_eq!(
+            plan.announcement(),
+            ServedDisplays {
+                served: 2,
+                count: 2
+            }
+        );
+        assert!(
+            plan.fallback_notice()
+                .unwrap()
+                .contains("external output disconnected")
+        );
+        follower.started(plan, attached.clone());
+        assert_eq!(follower.selection(), DisplaySelection::Number(1));
+        for _ in 0..3 {
+            assert_eq!(
+                follower.layout_read(attached.clone(), || Ok(attached.clone())),
+                DisplayChange::None
+            );
+        }
+        // A later topology change retries the requested output.
+        let mut returned = attached.clone();
+        returned[0].rect = Rect::new(2560, 0, 7680, 1440);
+        assert_eq!(
+            follower.layout_read(returned.clone(), || Ok(returned.clone())),
+            DisplayChange::None
+        );
+        assert_eq!(
+            follower.layout_read(returned.clone(), || Ok(returned.clone())),
+            DisplayChange::Restart
+        );
+        follower.stopped();
+        let (_, restored) = capture_selected_or_primary(
+            DisplayPlan::new(follower.selection(), &returned).unwrap(),
+            &returned,
+            |plan| Ok(plan.chosen.bounds),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(restored.outputs[0].0, attached[0].name);
+        assert_eq!(restored.fallback_notice(), None);
+    }
+
+    #[test]
+    fn all_display_capture_can_fall_back_to_the_primary() {
+        let attached = recovery_displays();
+        let mut attempted = Vec::new();
+        let (_, plan) = capture_selected_or_primary(
+            DisplayPlan::new(DisplaySelection::All, &attached).unwrap(),
+            &attached,
+            |plan| {
+                attempted.push(plan.chosen.indices.clone());
+                if plan.outputs.len() > 1 {
+                    Err("one output cannot be duplicated".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(attempted, [vec![0, 1], vec![1]]);
+        assert_eq!(plan.chosen.bounds, attached[1].rect);
+        assert!(plan.fallback_notice().is_some());
+    }
+
+    #[test]
+    fn capture_fallback_never_retries_the_same_output_or_an_inaccessible_desktop() {
+        let attached = recovery_displays();
+        for selection in [
+            DisplaySelection::Primary,
+            DisplaySelection::Number(2),
+            DisplaySelection::Number(9),
+        ] {
+            let mut attempts = 0;
+            let error = capture_selected_or_primary::<()>(
+                DisplayPlan::new(selection, &attached).unwrap(),
+                &attached,
+                |_| {
+                    attempts += 1;
+                    Err("main output unavailable".into())
+                },
+                |_| panic!("failed creation cannot be checked for readiness"),
+            )
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert_eq!(error.to_string(), "main output unavailable");
+        }
+        let mut attempts = 0;
+        let error = capture_selected_or_primary::<()>(
+            DisplayPlan::new(DisplaySelection::Number(1), &attached).unwrap(),
+            &attached,
+            |_| {
+                attempts += 1;
+                Err(Box::new(CaptureUnavailable {
+                    status: CaptureStatus::SecureDesktop,
+                    message: "desktop access denied".into(),
+                }))
+            },
+            |_| panic!("an inaccessible desktop cannot be checked for readiness"),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            capture_failure_status(error.as_ref()),
+            CaptureStatus::SecureDesktop
+        );
+    }
+
+    #[test]
+    fn failed_primary_fallback_preserves_both_errors_and_the_capture_status() {
+        let mut attempts = 0;
+        let error = capture_selected_or_primary::<()>(
+            DisplayPlan::new(DisplaySelection::Number(1), &recovery_displays()).unwrap(),
+            &recovery_displays(),
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err("selected output disappeared".into())
+                } else {
+                    Err(Box::new(CaptureUnavailable {
+                        status: CaptureStatus::SecureDesktop,
+                        message: "desktop switched during recovery".into(),
+                    }))
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 2);
+        assert!(error.to_string().contains("selected output disappeared"));
+        assert!(
+            error
+                .to_string()
+                .contains("desktop switched during recovery")
+        );
+        assert_eq!(
+            capture_failure_status(error.as_ref()),
+            CaptureStatus::SecureDesktop
+        );
+    }
+
+    #[test]
+    fn a_successful_capture_does_not_try_another_display() {
+        let mut attempts = 0;
+        let (_, plan) = capture_selected_or_primary(
+            DisplayPlan::new(DisplaySelection::Number(1), &recovery_displays()).unwrap(),
+            &recovery_displays(),
+            |_| {
+                attempts += 1;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(attempts, 1);
+        assert_eq!(plan.chosen.indices, [0]);
+        assert_eq!(plan.fallback_notice(), None);
+        assert!(DisplayPlan::new(DisplaySelection::Primary, &[]).is_err());
+    }
 
     #[test]
     fn input_injection_checks_partial_and_silent_windows_rejections() {
