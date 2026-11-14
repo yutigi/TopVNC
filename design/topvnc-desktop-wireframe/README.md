@@ -1,6 +1,6 @@
 # TopVNC desktop web design
 
-Separate desktop companion to the accepted [mobile reference](https://topvnc-mobile-wireframe-nov26.example.chatgpt.site/).
+Separate desktop companion to the accepted [mobile reference](../topvnc-mobile-wireframe/).
 The original Site and source are preserved unchanged.
 
 This is an interactive design prototype with a simulated remote editor and FPS

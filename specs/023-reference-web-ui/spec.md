@@ -3,7 +3,7 @@
 ## Scope
 
 Replace the browser viewer's navy/teal presentation with the accepted mobile
-reference at https://topvnc-mobile-wireframe-nov26.example.chatgpt.site/.
+reference in `design/topvnc-mobile-wireframe/`.
 Use its paper/olive colors, rounded controls, typography, spacing, pinned-key
 row, modifier/arrow groups, typing keyboard and fixed mode dock. Preserve live
 session behavior, authentication, encryption and input ownership.
