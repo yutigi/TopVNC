@@ -4,6 +4,8 @@ listen = "127.0.0.1:6080"
 # `topvnc --serve` on this host. Loopback only; it must require a password.
 rfb_target = "127.0.0.1:5900"
 app_origin = "https://topvnc.YOUR_SUBDOMAIN.workers.dev"
+# Shared website only: exact HOSTS_JSON ID for THIS machine. Omit for legacy.
+# host_id = "gaming-pc"
 issuer = "https://YOUR_TEAM.cloudflareaccess.com"
 audience = "YOUR_ACCESS_APPLICATION_AUD"
 owner_email = "you@example.com"

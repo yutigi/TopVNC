@@ -4,9 +4,10 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test tests/gestures.test.mjs tests/view.test.mjs tests/pairing-store.test.mjs tests/session-input.test.mjs tests/text-input.test.mjs tests/mobile-input.test.mjs tests/mobile-controls.test.mjs tests/customize.test.mjs tests/languages.test.mjs",
+    "test": "node --test tests/gestures.test.mjs tests/view.test.mjs tests/pairing-store.test.mjs tests/session-input.test.mjs tests/text-input.test.mjs tests/hosts.test.mjs tests/session-slot.test.mjs tests/mobile-input.test.mjs tests/mobile-controls.test.mjs tests/customize.test.mjs tests/languages.test.mjs",
     "test:browser": "node scripts/check-mobile-layout.mjs",
     "test:visual": "node scripts/check-reference-ui.mjs",
+    "test:integration": "node --test tests/browser.test.mjs",
     "test:wasm": "node --test tests/wasm.test.mjs"
   },
   "devDependencies": {

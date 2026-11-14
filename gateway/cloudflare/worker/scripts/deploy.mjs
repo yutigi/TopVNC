@@ -62,7 +62,7 @@ try {
   temporary = resolve(temporaryDir, "wrangler.json");
   writeFileSync(temporary, JSON.stringify(config, null, 2), { mode: 0o600 });
   console.log(`Checking ${config.name} at ${config.vars.APP_ORIGIN}...`);
-  await verifyAccess(config.vars.APP_ORIGIN, config.vars.ACCESS_ISSUER);
+  await verifyAccess(config.vars);
   run("rustup", ["target", "add", "wasm32-unknown-unknown"]);
   const lock = readFileSync(resolve(rootDir, "Cargo.lock"), "utf8");
   const version = lock.match(/name = "wasm-bindgen"\r?\nversion = "([^"]+)"/)?.[1];
@@ -82,11 +82,11 @@ try {
   run(process.execPath, [wrangler, "deploy", "--dry-run", "--config", temporary], workerDir);
   if (checkOnly) console.log("All deployment checks passed. Nothing was published.");
   else {
-    await verifyAccess(config.vars.APP_ORIGIN, config.vars.ACCESS_ISSUER);
+    await verifyAccess(config.vars);
     const head = publishState(checkedHead); // Publish only the commit these checks built.
     console.log(`Publishing main commit ${head}...`);
     run(process.execPath, [wrangler, "deploy", "--config", temporary, "--message", `Manual main ${head}`], workerDir);
-    await verifyAccess(config.vars.APP_ORIGIN, config.vars.ACCESS_ISSUER);
+    await verifyAccess(config.vars);
     console.log(`Deployed ${head} to ${config.vars.APP_ORIGIN}. Verify your paired device session next.`);
   }
 } catch (error) {

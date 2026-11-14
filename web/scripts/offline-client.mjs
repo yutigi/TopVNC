@@ -10,12 +10,20 @@ export async function buildOfflineClient(dir) {
     plugins: [{ name: 'offline-session-fixture', setup(build) {
       build.onResolve({ filter: /build\/pkg\/topvnc_web\.js$/ }, () => ({ path: 'wasm-fixture', namespace: 'fixture' }));
       build.onLoad({ filter: /.*/, namespace: 'fixture' }, () => ({ contents: `export default async function init() {} export const fingerprint=()=> 'test-host', newBrowserKey=()=> 'A'.repeat(43), publicKey=()=> 'B'.repeat(43), parseInvite=()=>({free(){}}); export class Connection {}` }));
-      build.onLoad({ filter: /web[\\/]app\.mjs$/ }, args => ({ contents: readFileSync(args.path, 'utf8') + `\nglobalThis.testConnect=async()=>{pending={browser:'A'.repeat(43),host:'B'.repeat(43)};state='connecting';await startSession();};globalThis.testSessionMessage=onSessionMessage;` }));
+      // The page loads its machine list asynchronously; connect only once it has one.
+      build.onLoad({ filter: /web[\\/]app\.mjs$/ }, args => ({ contents: readFileSync(args.path, 'utf8') + `\nglobalThis.testConnect=async()=>{for(let i=0;!registry&&i<500;i++)await new Promise(r=>setTimeout(r,10));if(!registry)throw new Error('The offline machine list did not load.');pending={browser:'A'.repeat(43),host:'B'.repeat(43)};state='connecting';await startSession();};globalThis.testSessionMessage=onSessionMessage;` }));
     } }],
   });
   // A reload in the placement test retains preferences; other fixture loads reset.
-  const fixture = `try { if (!new URL(location.href).searchParams.has('preserveStorage')) localStorage.clear(); } catch {} globalThis.sent=[]; globalThis.Worker=class {
+  // A file:// page has no Worker API route; serve the single-host registry.
+  const fixture = `try { if (!new URL(location.href).searchParams.has('preserveStorage')) localStorage.clear(); } catch {} globalThis.sent=[];
+  const offlineFetch=globalThis.fetch; globalThis.fetch=(url,options)=>String(url)==='/api/hosts'
+    ? Promise.resolve(new Response(JSON.stringify({legacy:true,legacyHostId:null,hosts:[{id:'default',name:'This machine'}]}),{headers:{'Content-Type':'application/json'}}))
+    : offlineFetch(url,options);
+  globalThis.Worker=class {
+    terminate() {}
     postMessage(message) { if(message.type==='input') sent.push(message);
+      if(message.type==='close') queueMicrotask(()=>this.onmessage({data:{type:'closed',code:1000,reason:'',connected:true}}));
       if(message.type==='connect') queueMicrotask(()=>{
         if(message.canvas) { const c=message.canvas.getContext('2d'); message.canvas.width=1280;message.canvas.height=720;c.fillStyle='#e7e9e0';c.fillRect(0,0,1280,720);c.fillStyle='#fafbf6';c.fillRect(100,110,1080,450);c.strokeStyle='#adb59f';c.strokeRect(100,110,1080,450);c.fillStyle='#f3f5ed';c.fillRect(101,111,1078,50);c.fillStyle='#747e62';c.font='20px monospace';c.fillText('Offline layout fixture — no live host',125,145);c.font='28px monospace';c.fillText('Your remote workspace',145,240);c.font='20px monospace';c.fillText('The session controls below are the actual application.',145,290); }
         this.onmessage({data:{type:'connected',name:'Offline QA fixture'}});

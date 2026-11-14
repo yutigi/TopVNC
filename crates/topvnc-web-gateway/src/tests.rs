@@ -75,6 +75,7 @@ fn config(dir: &Path, rfb_target: SocketAddr, max_session_seconds: u64) -> Confi
         listen: "127.0.0.1:0".parse().unwrap(),
         rfb_target,
         app_origin: fixtures::ORIGIN.into(),
+        host_id: None,
         issuer: policy.issuer,
         audience: policy.audience,
         owner_email: policy.owner_email,
@@ -742,6 +743,41 @@ async fn refuses_public_or_lan_rfb_targets_and_listen_addresses() {
     config.listen = "127.0.0.1:6080".parse().unwrap();
     config.rfb_target = "192.168.1.10:5900".parse().unwrap();
     assert!(Gateway::new(config).is_err());
+}
+
+#[test]
+fn validates_machine_ids_and_builds_scoped_or_legacy_pairing_links() {
+    let dir = TempDir::new();
+    provision(&dir.0);
+    let mut config = config(&dir.0, "127.0.0.1:5900".parse().unwrap(), 7200);
+    let invite = PairingInvite::generate(Keypair::generate().unwrap().public).unwrap();
+    assert_eq!(
+        config.pairing_link(&invite),
+        format!("{}/#pair={}", fixtures::ORIGIN, invite.encode())
+    );
+    config.host_id = Some("gaming-pc".into());
+    assert!(Gateway::new(config.clone()).is_ok());
+    assert_eq!(
+        config.pairing_link(&invite),
+        format!(
+            "{}/?host=gaming-pc#pair={}",
+            fixtures::ORIGIN,
+            invite.encode()
+        )
+    );
+    for id in [
+        "",
+        "UPPER",
+        "-leading",
+        "a/b",
+        "x?host=y",
+        "x#pair=z",
+        "ไทย",
+        &"x".repeat(49),
+    ] {
+        config.host_id = Some(id.into());
+        assert!(Gateway::new(config.clone()).is_err(), "{id}");
+    }
 }
 
 #[test]
