@@ -4,7 +4,7 @@ Interactive design prototype only. No live hosts, passwords, or remote input.
 
 ## Review in Sites
 
-Open the [published wireframe](https://topvnc-mobile-wireframe-nov26.example.chatgpt.site).
+The published wireframe is private to the owner. Its source is in [`dist/`](dist/).
 Select Portrait or Landscape; use **Try full
 viewport** on a phone to try the layout at its actual viewport size.
 

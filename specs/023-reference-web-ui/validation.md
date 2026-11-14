@@ -102,8 +102,8 @@ physical-device settings behavior were not revalidated.
 
 ## Separate desktop publication
 
-Published using Sites at:
-https://topvnc-desktop-wireframe-nov26.example.chatgpt.site
+Published using Sites, private to the owner. The source is
+`design/topvnc-desktop-wireframe/`.
 
 Project: `appgprj_6af1dcf7b3ec819181ff13ee5b7cb32f`.
 Latest source commit (complete settings): `b137395da0bd1f087f8554dac79eaaa8604f7268`.
@@ -252,8 +252,7 @@ layout. All 27 prototype tests and offline browser checks of both sides, modes,
 reload persistence and portrait isolation passed. The accepted reference
 snapshot in `design/topvnc-mobile-wireframe` remains unchanged for goldens.
 
-Published the mobile Site at its existing URL with owner-only access preserved:
-https://topvnc-mobile-wireframe-nov26.example.chatgpt.site/
+Published the mobile Site at its existing URL with owner-only access preserved.
 
 Source commit: `dd7dec62d7cba9c31392f1f3c8ed3897f3e075b9`.
 Deployment: `appgdep_6af36439a67c8191a07b26fa215b12cd` (`succeeded`).

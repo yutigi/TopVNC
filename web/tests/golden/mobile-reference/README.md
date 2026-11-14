@@ -1,8 +1,8 @@
 # Reference-derived mobile goldens
 
 These PNGs are rendered from the unchanged source in
-`design/topvnc-mobile-wireframe/dist`, the source of the accepted
-[mobile wireframe](https://topvnc-mobile-wireframe-nov26.example.chatgpt.site/).
+`design/topvnc-mobile-wireframe/dist`, the source of the accepted mobile
+wireframe.
 They are **not** screenshots approved from the production implementation.
 The original screenshot check only verified bounds and behavior, so it could
 not catch typography, color or spacing drift.
