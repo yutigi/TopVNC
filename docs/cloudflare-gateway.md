@@ -354,8 +354,10 @@ For the existing deployment, keep the Worker name `topvnc-connection-spike`
 and its current workers.dev origin. Do not rename the Worker or change the
 Access/VPC values to resolve a failed check. The script verifies that the input
 describes a workers.dev app with a valid Access policy and one private service;
-the pre-upload check requires the app to redirect anonymous requests to that
-configured Access team. It does not provision an Access application.
+the checks before and after upload require anonymous requests to `/`,
+`/api/hosts`, and every configured WebSocket route (`/ws` for a single host,
+`/ws/<id>` for a registry) to redirect to that configured Access team. A failed
+route stops the workflow. It does not provision an Access application.
 
 If sign-in has expired:
 

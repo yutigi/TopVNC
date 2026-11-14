@@ -128,21 +128,42 @@ test("publishing refuses a different main commit than the one validated", () => 
   assert.doesNotThrow(() => assertPublishable({ ...state, checkedHead: state.head }));
 });
 
-test("Access verification checks both page and WebSocket path without following redirects", async () => {
-  const { APP_ORIGIN: origin, ACCESS_ISSUER: issuer } = fixture().vars;
-  const paths = [];
-  await verifyAccess(origin, issuer, async (url, options) => {
-    paths.push(url.pathname);
-    assert.equal(options.redirect, "manual");
-    assert.equal(options.headers, undefined);
-    return new Response(null, { status: 302, headers: { location: `${issuer}/cdn-cgi/access/login/example.workers.dev` } });
+for (const [mode, makeConfig, expectedPaths] of [
+  ["single-host", fixture, ["/", "/api/hosts", "/ws"]],
+  ["multi-host", multiHostFixture, ["/", "/api/hosts", "/ws/gaming-pc", "/ws/office-pc"]],
+]) {
+  test(`Access verification checks every ${mode} route without following redirects`, async () => {
+    const vars = prepare(makeConfig()).vars;
+    const issuer = vars.ACCESS_ISSUER;
+    const paths = [];
+    await verifyAccess(vars, async (url, options) => {
+      paths.push(url.pathname);
+      assert.equal(options.redirect, "manual");
+      assert.equal(options.headers, undefined);
+      return new Response(null, { status: 302, headers: { location: `${issuer}/cdn-cgi/access/login/example.workers.dev` } });
+    });
+    assert.deepEqual(paths, expectedPaths);
+    for (const [status, location] of [[200, null], [302, null], [302, "https://attacker.example.com/cdn-cgi/access/login/x"], [302, `${issuer}/other`]]) {
+      await assert.rejects(verifyAccess(vars, async () => new Response(null, { status, headers: location ? { location } : {} })));
+    }
   });
-  assert.deepEqual(paths, ["/", "/ws"]);
-  for (const [status, location] of [[200, null], [302, null], [302, "https://attacker.example.com/cdn-cgi/access/login/x"], [302, `${issuer}/other`]]) {
-    await assert.rejects(verifyAccess(origin, issuer, async () => new Response(null, { status, headers: location ? { location } : {} })));
-  }
-  await assert.rejects(verifyAccess(origin, issuer, async (url) => new Response(null, {
-    status: url.pathname === "/" ? 302 : 200,
-    headers: { location: `${issuer}/cdn-cgi/access/login/example.workers.dev` },
-  })));
-});
+
+  test(`Access verification rejects each unprotected ${mode} route`, async () => {
+    const vars = prepare(makeConfig()).vars;
+    for (const failedPath of expectedPaths) {
+      // A missing Access application yields 401 from the Worker; exposed assets
+      // can yield 200. Neither may pass just because the other routes redirect.
+      for (const status of [200, 401]) {
+        const paths = [];
+        await assert.rejects(verifyAccess(vars, async (url) => {
+          paths.push(url.pathname);
+          return new Response(null, {
+            status: url.pathname === failedPath ? status : 302,
+            headers: { location: `${vars.ACCESS_ISSUER}/cdn-cgi/access/login/example.workers.dev` },
+          });
+        }), (error) => error.message === `Access protection check failed for ${failedPath}: expected a 302 to the configured Access login.`);
+        assert.equal(paths.at(-1), failedPath, "stop probing at the first failed route");
+      }
+    }
+  });
+}
