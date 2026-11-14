@@ -201,6 +201,18 @@ the production gateway. Staging needs its own gateway:
   staging `app_origin`, its own host key, and its own tunnel and VPC service.
 - `deploy.mjs` gets a `--target staging|production` option. Staging accepts any
   branch; production keeps the clean-`main` rule.
+- Make `deploymentConfig` upstream validation target-specific. It currently
+  accepts only `http://127.0.0.1:6080/ws`; staging must use
+  `http://127.0.0.1:6081/ws` in `UPSTREAM_URL` (or each `HOSTS_JSON` upstream
+  once multi-host routing is merged), matching the staging gateway and VPC
+  service. Production keeps the exact `6080` URL. Select the expected URL from
+  the target, and retain the loopback and exact-path checks.
+- Add deployment-config tests that accept each target's expected URL and reject
+  the other target's port, non-loopback addresses, and other paths.
+
+**Acceptance:** an authenticated staging session reaches the gateway on `6081`,
+production still reaches `6080`, and neither target accepts the other's upstream
+configuration.
 
 For changes to the page only, the existing local harness
 (`cargo run -p topvnc-web-gateway --features test-fixtures --example local_web`)
@@ -254,11 +266,16 @@ Consider changing the account's `workers.dev` subdomain in the same window.
 Clones made before the 2026-11-11 history rewrite still contain the old one,
 and every browser pairs again anyway.
 
-1. Create an Access application for `topvnc.<subdomain>.workers.dev`.
-2. Deploy the Worker as `topvnc`, change `app_origin` in each host's
-   `gateway.local.toml`, and restart the gateways.
-3. Pair each browser again. Then try a different email at Access and confirm
-   it is refused, which was never tested.
+1. Create an Access application for `topvnc.<subdomain>.workers.dev` and record
+   its new AUD tag.
+2. Deploy the Worker as `topvnc` with the new `APP_ORIGIN` and `ACCESS_AUD`.
+   Change `app_origin` and `audience` in each host's `gateway.local.toml` to
+   that origin and AUD tag, then restart the gateways. Both the Worker and
+   gateway validate the audience, so changing only the origin breaks access.
+3. Run `verifyAccess` against the new origin, then pair each browser again and
+   confirm an authenticated desktop session works on each host. The redirect
+   check alone does not exercise audience validation. Then try a different
+   email at Access and confirm it is refused, which was never tested.
 4. After a week without problems, delete the old Worker and its Access application.
 5. Move any host still using `gateway/cloudflare/spike/host.key` or
    `spike/browsers.txt` to `gateway/cloudflare/`. Then delete the
