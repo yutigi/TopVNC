@@ -87,11 +87,25 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
     return result.result.value;
   };
   const waitFor = async (expression) => {
-    for (let i = 0; i < 200; i++) {
-      if (await evaluate(expression)) return;
+    let failure;
+    for (let i = 0; i < 300; i++) {
+      try {
+        if (await evaluate(expression)) return;
+      } catch (error) {
+        failure = error; // The page may still be loading or replacing its context.
+      }
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    throw new Error(`Timed out: ${expression}`);
+    throw new Error(`Timed out: ${expression}${failure ? ` (last error: ${failure.message})` : ""}`);
+  };
+  // Page.navigate returns before the new page has run main(). Mark the old
+  // document so a check cannot pass on it, then wait until the new page has
+  // loaded its machine list: main() enables the selector in the same
+  // synchronous step that reads invites and describes the pairing.
+  const navigate = async (url) => {
+    await evaluate("window.staleDocument = true");
+    await command("Page.navigate", { url });
+    await waitFor("!window.staleDocument && document.querySelector('#machine')?.disabled === false");
   };
   await command("Page.enable");
   await command("Page.addScriptToEvaluateOnNewDocument", { source: `
@@ -115,8 +129,8 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
       terminate() { this.terminated = true; }
     };
   ` });
-  await command("Page.navigate", { url: origin });
-  await waitFor("!document.querySelector('#connect')?.disabled");
+  await navigate(origin);
+  assert.equal(await evaluate("document.querySelector('#connect').disabled"), false);
   assert.equal(await evaluate("document.querySelector('#machine').value"), "gaming-pc");
   await evaluate("document.querySelector('#connect').click()");
   await waitFor("!document.querySelector('#password-form').hidden");
@@ -171,8 +185,8 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
 
   // `?legacy` stores only a v1 pairing. With no migration target, no machine
   // uses it and Forget pairing cannot reach it, so the page offers to drop it.
-  await command("Page.navigate", { url: `${origin}/?legacy` });
-  await waitFor("!document.querySelector('#legacy-pairing').hidden");
+  await navigate(`${origin}/?legacy`);
+  assert.equal(await evaluate("document.querySelector('#legacy-pairing').hidden"), false);
   assert.equal(await evaluate("document.querySelector('#connect').disabled"), true);
   await evaluate("document.querySelector('#forget-legacy').click()");
   await waitFor("document.querySelector('#legacy-pairing').hidden");
@@ -180,14 +194,14 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
 
   // An explicit target copies it; the v1 original stays for a single-host rollback.
   metadata = { ...metadata, legacyHostId: "gaming-pc" };
-  await command("Page.navigate", { url: `${origin}/?legacy` });
-  await waitFor("!document.querySelector('#connect')?.disabled");
+  await navigate(`${origin}/?legacy`);
+  assert.equal(await evaluate("document.querySelector('#connect').disabled"), false);
   assert.equal(await evaluate(`document.querySelector('#legacy-pairing').hidden
     && localStorage.getItem('topvnc.e2e.pairing.v2.gaming-pc') === localStorage.getItem('topvnc.e2e.pairing.v1')`), true);
 
   metadata = { legacy: true, legacyHostId: null, hosts: [{ id: "default", name: "This machine" }] };
-  await command("Page.navigate", { url: `${origin}/?legacy` });
-  await waitFor("!document.querySelector('#connect')?.disabled");
+  await navigate(`${origin}/?legacy`);
+  assert.equal(await evaluate("document.querySelector('#connect').disabled"), false);
   assert.equal(await evaluate("document.querySelector('#legacy-pairing').hidden"), true, "single-host mode uses v1 itself");
   await evaluate("document.querySelector('#connect').click()");
   await waitFor("!document.querySelector('#password-form').hidden");
