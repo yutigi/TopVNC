@@ -8,7 +8,7 @@ Windows workspace, no deployment or commit.
 | `npm --prefix gateway/cloudflare/worker test` | 22 passed: shared Rust JWT fixtures, two private bindings, owner-protected metadata, rejected destinations/IDs/auth, invalid registry, offline-host isolation, legacy route |
 | `npm --prefix web run build` | Passed with pinned wasm-bindgen and esbuild |
 | `npm --prefix web run test:wasm` | 8 passed against the built WASM and real session module |
-| `npm --prefix web run test:browser` | Passed in headless Chrome 156.0.8078.80 on Windows, actual built page with a controlled session Worker |
+| `npm --prefix web run test:integration` (named `test:browser` until the merge with main, which uses that name for its layout check) | Passed in headless Chrome 156.0.8078.80 on Windows, actual built page with a controlled session Worker |
 | `cargo fmt --all` | Passed |
 | `cargo test --workspace` | Passed, including gateway host-ID/link tests, supervised QR protocol, and native WEB setup validation; existing ignored benchmark retained |
 | `cargo clippy --workspace --all-targets` | Passed |
