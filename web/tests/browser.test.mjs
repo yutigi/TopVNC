@@ -159,9 +159,12 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
   await waitFor("!document.querySelector('#viewer').hidden");
   assert.equal(await evaluate("document.querySelector('#host-status').hidden && document.querySelector('#host-status').textContent === ''"), true, "a healthy machine needs no capture-status event to clear the old warning");
 
-  // End B's session, forget B, and enroll its new invite.
-  await evaluate("document.querySelector('#machine').dispatchEvent(new Event('change'))");
+  // Disconnect B (reported as a disconnect, not a switch), forget B, and enroll its new invite.
+  await evaluate("document.querySelector('#disconnect').click()");
   await waitFor("!document.querySelector('#forget').disabled");
+  assert.equal(await evaluate("document.querySelector('#status').textContent"), "Disconnected.");
+  assert.equal(await evaluate("document.querySelector('#connect').textContent"), "Reconnect");
+  assert.equal(await evaluate("fixture.workers.at(-1).terminated && document.querySelector('#viewer').hidden"), true);
   await evaluate("document.querySelector('#forget').click()");
   const invite = `v1.${keys[2].host}.${newBrowserKey()}`;
   await evaluate(`location.hash = 'pair=${invite}'`);

@@ -231,8 +231,12 @@ function clearViewer() {
   canvas = fresh;
 }
 
-function switchMachine(id) {
+// Releases held input, then closes the session and clears its image and
+// secrets. Disconnect reuses this for the selected machine; the stopped
+// session's own "closed" message is fenced off, so this reports the outcome.
+function switchMachine(id, { disconnect = false } = {}) {
   if (!registry.hosts.some((host) => host.id === id)) return;
+  const name = registry.hosts.find((host) => host.id === id).name;
   releaseEverything();
   const revision = ++selectionRevision;
   const stopped = sessions.stop();
@@ -244,14 +248,14 @@ function switchMachine(id) {
   const url = new URL(location.href);
   if (!registry.legacy) url.searchParams.set("host", id);
   history.replaceState(null, "", url.pathname + url.search);
-  connectButton.textContent = "Connect";
+  connectButton.textContent = disconnect ? "Reconnect" : "Connect";
   describeIdentity();
-  report(`Selected ${registry.hosts.find((host) => host.id === id).name}. Closing the previous session…`);
+  report(disconnect ? "Disconnecting…" : `Selected ${name}. Closing the previous session…`);
   stopped.then(() => {
     if (revision !== selectionRevision) return;
     state = "idle";
     describeIdentity();
-    report(`Ready for ${registry.hosts.find((host) => host.id === id).name}.`);
+    report(disconnect ? "Disconnected." : `Ready for ${name}.`);
   });
 }
 
@@ -681,10 +685,7 @@ for (const bar of [toolbar, functionKeys]) {
   });
 }
 
-$("#disconnect").addEventListener("click", () => {
-  // Releases held input, then closes the session and clears its image.
-  switchMachine(selected);
-});
+$("#disconnect").addEventListener("click", () => switchMachine(selected, { disconnect: true }));
 $("#stats-toggle").addEventListener("change", (event) => {
   statsLine.hidden = !event.target.checked;
 });
