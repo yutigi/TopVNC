@@ -65,6 +65,27 @@ test("switch cancels asynchronous session setup and ignores messages after natur
   assert.deepEqual(seen, ["closed"]);
 });
 
+test("starting over a live session closes and disposes it first", async () => {
+  const events = [];
+  let late;
+  const slot = new SessionSlot((message) => events.push(message.type));
+  await slot.start(async (emit) => {
+    late = emit;
+    return {
+      post(message) {
+        if (message.type !== "close") return;
+        events.push("close-old");
+        queueMicrotask(() => emit({ type: "closed" }));
+      },
+      dispose: () => events.push("dispose-old"),
+    };
+  });
+  // No stop() first: the slot must still release and tear down the old context.
+  assert.equal(await slot.start(async () => { events.push("start-new"); return { post() {}, dispose() {} }; }), true);
+  late({ type: "connected" });
+  assert.deepEqual(events, ["close-old", "dispose-old", "start-new"]);
+});
+
 test("unresponsive worker is disposed before starting another session", async () => {
   const events = [];
   const slot = new SessionSlot(() => {}, 5);

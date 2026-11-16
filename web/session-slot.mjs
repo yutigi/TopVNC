@@ -15,6 +15,9 @@ export class SessionSlot {
   }
 
   async start(factory) {
+    // Never orphan a live context: close it (releasing held input) and wait
+    // for teardown below, even if the caller did not stop it first.
+    if (this.current) this.stop();
     const generation = ++this.generation;
     await this.draining;
     if (generation !== this.generation) return;
