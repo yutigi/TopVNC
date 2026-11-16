@@ -25,8 +25,9 @@ simultaneous viewers, deployment, or native transport changes are included.
   selection cannot copy keys. A changed pinned host key requires forgetting
   that machine's pairing before accepting another invite.
 - Migration copies v1 rather than moving it, so a rollback to a single-host
-  version keeps migrated browsers paired. Forgetting the migrated machine
-  removes both copies. In registry mode, a v1 pairing no machine uses can be
+  version keeps migrated browsers paired. Forgetting the migration target
+  also removes v1, even when the target holds a different pairing, so the next
+  load cannot restore it. In registry mode, a v1 pairing no machine uses can be
   forgotten from the page.
 - Machine-specific QR links select their configured machine. Unknown IDs and
   unscoped invites in explicit registry mode fail closed without altering keys.

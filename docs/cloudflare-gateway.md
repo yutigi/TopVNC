@@ -591,7 +591,8 @@ the old deployment's host identity, set `LEGACY_HOST_ID = "gaming-pc"` in the
 Worker's `[vars]`. On the next load, the browser copies its v1 pairing into
 Gaming PC's slot and keeps the original, so a
 [rollback](#verification-and-rollback) to the single-host Worker still finds
-it. Forgetting Gaming PC's pairing removes both copies. Existing scoped keys
+it. Forgetting Gaming PC's pairing also removes the v1 pairing, even when
+Gaming PC holds a different one, so the next load cannot restore it. Existing scoped keys
 are never overwritten by this migration. Without this setting, legacy keys
 are left untouched and each machine must be paired separately. While a v1
 pairing is unused (no `LEGACY_HOST_ID`, or Gaming PC already holds a

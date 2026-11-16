@@ -794,7 +794,7 @@ passwordForm.addEventListener("submit", (event) => {
 
 forgetButton.addEventListener("click", () => {
   if (state !== "idle") return;
-  forgetPairing(storage, pairingId());
+  forgetPairing(storage, pairingId(), registry.legacyHostId);
   pending = undefined;
   describeIdentity();
   report("Pairing removed from this browser. The host still lists its key until you remove it there.");

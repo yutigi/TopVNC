@@ -58,6 +58,23 @@ test("migration copies the v1 pairing so a single-host rollback still finds it",
   assert.equal(loadPairing(storage, "gaming-pc"), undefined);
 });
 
+test("forgetting the migration target stays forgotten when v1 holds a different pairing", () => {
+  const storage = new MemoryStorage();
+  const old = { host: "E".repeat(43), browser: "F".repeat(43) };
+  savePairing(storage, old);
+  savePairing(storage, { host, browser }, "gaming-pc");
+  assert.equal(strandedLegacyPairing(storage, "gaming-pc"), true);
+  // Another machine is not the migration target: its forget leaves v1 alone.
+  savePairing(storage, { host: "C".repeat(43), browser: "D".repeat(43) }, "office-pc");
+  forgetPairing(storage, "office-pc", "gaming-pc");
+  assert.deepEqual(loadPairing(storage), old);
+  forgetPairing(storage, "gaming-pc", "gaming-pc");
+  migratePairing(storage, "gaming-pc"); // The next load must not restore the old pin.
+  assert.equal(loadPairing(storage, "gaming-pc"), undefined);
+  assert.equal(loadPairing(storage), undefined);
+  assert.equal(strandedLegacyPairing(storage, "gaming-pc"), false);
+});
+
 test("a v1 pairing no machine uses is reported as stranded until forgotten", () => {
   const storage = new MemoryStorage();
   assert.equal(strandedLegacyPairing(storage, null), false);

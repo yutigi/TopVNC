@@ -43,14 +43,15 @@ export function savePairing(storage, pairing, hostId) {
 
 const samePairing = (a, b) => a.host === b.host && a.browser === b.browser;
 
-// Forgetting a machine also forgets the single-host copy it was migrated
-// from; otherwise the next load would migrate that key back into its slot.
-export function forgetPairing(storage, hostId) {
+// Forgetting a machine also forgets the v1 pairing whenever the next load
+// would otherwise bring it back: when this machine is the migration target
+// (even if it holds a different pairing), or when v1 is a copy of its pairing.
+export function forgetPairing(storage, hostId, legacyHostId) {
   try {
     const scoped = hostId === undefined ? undefined : loadPairing(storage, hostId);
     const legacy = scoped && loadPairing(storage);
-    // Copy first: if that fails, the machine still shows as paired, not half-forgotten.
-    if (legacy && samePairing(scoped, legacy)) storage.removeItem(STORAGE_KEY);
+    // Remove v1 first: if that fails, the machine still shows as paired, not half-forgotten.
+    if (legacy && (hostId === legacyHostId || samePairing(scoped, legacy))) storage.removeItem(STORAGE_KEY);
     storage?.removeItem(storageKey(hostId));
   } catch {
     // Nothing persisted, or storage is blocked: either way nothing is paired.
@@ -69,9 +70,9 @@ export function migratePairing(storage, hostId) {
 }
 
 // In registry mode, a v1 pairing that no machine uses: there is no migration
-// target, or that machine already holds a different pairing. Forget pairing
-// cannot reach it, so the page offers to remove it. An empty target slot is
-// not stranded: the next load migrates into it.
+// target, or that machine already holds a different pairing. The page offers
+// to remove it on its own, keeping the target's pairing. An empty target slot
+// is not stranded: the next load migrates into it.
 export function strandedLegacyPairing(storage, legacyHostId) {
   const legacy = loadPairing(storage);
   if (!legacy) return false;
