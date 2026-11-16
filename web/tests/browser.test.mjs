@@ -19,7 +19,7 @@ const executable = process.env.TOPVNC_TEST_BROWSER ?? [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 ].find(existsSync);
 
-test("built page switches machines, isolates pairing, clears secrets and fences late messages", { timeout: 30000 }, async (t) => {
+test("built page switches machines, isolates pairing, clears secrets and fences late messages", { timeout: 120000 }, async (t) => {
   assert.ok(executable, "Set TOPVNC_TEST_BROWSER to a Chromium executable");
   const keys = [0, 1, 2].map(() => ({ host: publicKey(newBrowserKey()), browser: newBrowserKey() }));
   let metadata = { legacy: false, legacyHostId: null, hosts: [{ id: "gaming-pc", name: "Gaming PC" }, { id: "office-pc", name: "Office PC" }] };
@@ -75,17 +75,22 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
     assert.ok(basename(profile).startsWith("topvnc-browser-test-"));
     rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
+  // A cold Chrome on a CI runner can take over 10 s to start. Report how long
+  // it took, and what Chrome printed if it never exposes DevTools.
+  const launched = performance.now();
   endpoint = await new Promise((resolve, reject) => {
     let stderr = "";
-    const timer = setTimeout(() => reject(Error("Browser did not expose DevTools within 10 seconds")), 10000);
+    const fail = (reason) => reject(new Error(`${reason}. Chrome stderr (last 2000 chars):\n${stderr.slice(-2000)}`));
+    const timer = setTimeout(() => fail("Browser did not expose DevTools within 60 seconds"), 60000);
     browser.on("error", reject);
     browser.stderr.on("data", (data) => {
-      stderr += data;
+      if (stderr.length < 65536) stderr += data;
       const match = /DevTools listening on (ws:\/\/[^\s]+)/.exec(stderr);
       if (match) { clearTimeout(timer); resolve(match[1]); }
     });
-    browser.on("exit", () => reject(new Error("Browser exited before exposing DevTools")));
+    browser.on("exit", (code, signal) => { clearTimeout(timer); fail(`Browser exited (${code ?? signal}) before exposing DevTools`); });
   });
+  t.diagnostic(`Chrome exposed DevTools after ${Math.round(performance.now() - launched)} ms`);
   const port = new URL(endpoint).port;
   const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
   const ws = new WebSocket(target.webSocketDebuggerUrl);
