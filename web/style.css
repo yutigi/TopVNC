@@ -46,7 +46,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .choice span { flex: 1; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(var(--cell, 88px), 1fr)); }
 #connect { width: 100%; }
-#forget { margin-top: 8px; background: transparent; }
+#forget, #forget-legacy { margin-top: 8px; background: transparent; }
 input[type="password"] { flex: 1; min-width: 0; min-height: 44px; padding: 8px 12px; border: 1px solid #bfcbb0; border-radius: 6px; background: var(--field); color: var(--ink); font-size: 16px; }
 /* Machine selectors match the password field; 16px keeps iOS from zooming on focus. */
 #machine, #menu-machine { width: 100%; min-width: 0; min-height: 44px; padding: 8px 12px; border: 1px solid #bfcbb0; border-radius: 6px; background: var(--field); color: var(--ink); font-size: 16px; }

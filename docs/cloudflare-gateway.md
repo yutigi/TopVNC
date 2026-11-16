@@ -395,6 +395,12 @@ npx --no-install wrangler rollback VERSION_ID --config wrangler.local.toml
 Then revert the faulty change through a PR and manually deploy the updated main
 commit. See [Cloudflare rollbacks](https://developers.cloudflare.com/workers/configuration/versions-and-deployments/rollbacks/).
 
+Rolling back from a [multi-machine registry](#multiple-machines-on-one-website)
+to a single-host version restores `/ws` and the v1 pairing slot. Browsers
+migrated through `LEGACY_HOST_ID` stay paired, because migration keeps the v1
+original. Pairings made for other machines are kept but unused until you
+roll forward. A browser that forgot its old pairing must pair again.
+
 ## Pair your phone
 
 Pairing introduces one browser to your host, once. The host shows a QR code;
@@ -582,11 +588,16 @@ select that machine, **Forget pairing**, then scan and verify its new invite.
 
 **Keep the old single-host pairing deliberately.** If Gaming PC is exactly
 the old deployment's host identity, set `LEGACY_HOST_ID = "gaming-pc"` in the
-Worker's `[vars]`. The browser moves its v1 pairing into Gaming PC's slot on
-the next load, and removes the old entry only after saving succeeds. Existing
-scoped keys are never overwritten by this migration. Without this setting,
-legacy keys are left untouched and each machine must be paired separately.
-Leave it set while browsers still need migration. To retain the old behavior
+Worker's `[vars]`. On the next load, the browser copies its v1 pairing into
+Gaming PC's slot and keeps the original, so a
+[rollback](#verification-and-rollback) to the single-host Worker still finds
+it. Forgetting Gaming PC's pairing removes both copies. Existing scoped keys
+are never overwritten by this migration. Without this setting, legacy keys
+are left untouched and each machine must be paired separately. While a v1
+pairing is unused (no `LEGACY_HOST_ID`, or Gaming PC already holds a
+different pairing), the page shows **Forget old pairing** so you can remove
+it after pairing again. Keep it if you may return to the single-host Worker.
+Leave `LEGACY_HOST_ID` set while browsers still need migration. To retain the old behavior
 entirely, omit `HOSTS_JSON` and `host_id`, and keep `HOST_NET` / `UPSTREAM_URL`:
 the page uses `/ws` and the original pairing slot.
 

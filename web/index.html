@@ -20,6 +20,10 @@
     <select id="machine" disabled aria-label="Machine"><option>Loading machines…</option></select>
     <h2 class="label">Pairing</h2>
     <p id="identity" class="readout">Loading the encryption module…</p>
+    <div id="legacy-pairing" hidden>
+      <p class="note">This browser still stores a pairing from the single-machine website. No machine listed here uses it. Keep it only if this website may go back to a single machine.</p>
+      <button id="forget-legacy" type="button">Forget old pairing</button>
+    </div>
     <p class="notice">The connection is encrypted from this browser to your host: Cloudflare relays only ciphertext.
       Cloudflare also serves this page's code, so it could replace that code and read a session; the page cannot detect that.
       The VNC password is sent only inside the encrypted channel and is never stored.</p>

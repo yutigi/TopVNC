@@ -250,7 +250,8 @@ Run the commands below from the repository root.
    `app_origin` pointed at the shared website. To preserve an existing browser's
    single-host pairing, set `LEGACY_HOST_ID = "gaming-pc"` in the Worker's `[vars]`
    only if that entry still points to the original host with the same host key.
-   Otherwise, pair each machine again.
+   Otherwise, pair each machine again. The page then offers **Forget old pairing**
+   for the unused single-host key.
 4. **Build, validate, and publish the shared website.** With the
    [build prerequisites](docs/cloudflare-gateway.md#before-you-start) installed:
 

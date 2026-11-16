@@ -5,7 +5,7 @@
 // not to substitute it (see docs/cloudflare-gateway.md).
 
 import init, { fingerprint, newBrowserKey, parseInvite, publicKey } from "./build/pkg/topvnc_web.js";
-import { forgetPairing, inviteFromHash, loadPairing, savePairing, migratePairing } from "./pairing-store.mjs";
+import { forgetPairing, inviteFromHash, loadPairing, savePairing, migratePairing, strandedLegacyPairing } from "./pairing-store.mjs";
 import { fetchHosts, inviteTarget, invitePolicy, socketPath } from "./hosts.mjs";
 import { SessionSlot } from "./session-slot.mjs";
 import { TouchGestures } from "./gestures.mjs";
@@ -20,6 +20,7 @@ const identity = $("#identity");
 const connectForm = $("#connect-form");
 const connectButton = $("#connect");
 const forgetButton = $("#forget");
+const legacyPairing = $("#legacy-pairing");
 const passwordForm = $("#password-form");
 const passwordInput = $("#password");
 const statusLine = $("#status");
@@ -151,6 +152,8 @@ function pairing() {
 }
 
 function describeIdentity() {
+  // A registry never reads the single-host slot; only this control can clear it.
+  legacyPairing.hidden = !registry || registry.legacy || !strandedLegacyPairing(storage, registry.legacyHostId);
   const current = pairing();
   const busy = state !== "idle";
   connectButton.disabled = busy || !current;
@@ -791,6 +794,12 @@ forgetButton.addEventListener("click", () => {
   pending = undefined;
   describeIdentity();
   report("Pairing removed from this browser. The host still lists its key until you remove it there.");
+});
+
+$("#forget-legacy").addEventListener("click", () => {
+  forgetPairing(storage);
+  describeIdentity();
+  report("Old single-machine pairing removed from this browser. That host still lists its key until you remove it there.");
 });
 
 $("#quality").addEventListener("change", (event) => {

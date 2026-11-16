@@ -169,9 +169,26 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
   await evaluate("new Promise(resolve => setTimeout(resolve, 150))");
   assert.equal(await evaluate("document.querySelector('#status').textContent"), "Ready for Gaming PC.");
 
+  // `?legacy` stores only a v1 pairing. With no migration target, no machine
+  // uses it and Forget pairing cannot reach it, so the page offers to drop it.
+  await command("Page.navigate", { url: `${origin}/?legacy` });
+  await waitFor("!document.querySelector('#legacy-pairing').hidden");
+  assert.equal(await evaluate("document.querySelector('#connect').disabled"), true);
+  await evaluate("document.querySelector('#forget-legacy').click()");
+  await waitFor("document.querySelector('#legacy-pairing').hidden");
+  assert.equal(await evaluate("localStorage.getItem('topvnc.e2e.pairing.v1')"), null);
+
+  // An explicit target copies it; the v1 original stays for a single-host rollback.
+  metadata = { ...metadata, legacyHostId: "gaming-pc" };
+  await command("Page.navigate", { url: `${origin}/?legacy` });
+  await waitFor("!document.querySelector('#connect')?.disabled");
+  assert.equal(await evaluate(`document.querySelector('#legacy-pairing').hidden
+    && localStorage.getItem('topvnc.e2e.pairing.v2.gaming-pc') === localStorage.getItem('topvnc.e2e.pairing.v1')`), true);
+
   metadata = { legacy: true, legacyHostId: null, hosts: [{ id: "default", name: "This machine" }] };
   await command("Page.navigate", { url: `${origin}/?legacy` });
   await waitFor("!document.querySelector('#connect')?.disabled");
+  assert.equal(await evaluate("document.querySelector('#legacy-pairing').hidden"), true, "single-host mode uses v1 itself");
   await evaluate("document.querySelector('#connect').click()");
   await waitFor("!document.querySelector('#password-form').hidden");
   assert.equal(await evaluate("fixture.messages.find(m => m.type === 'connect').url.endsWith('/ws')"), true);

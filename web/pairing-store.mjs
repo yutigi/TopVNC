@@ -41,8 +41,16 @@ export function savePairing(storage, pairing, hostId) {
   storage.setItem(storageKey(hostId), JSON.stringify({ version: 1, host: pairing.host, browser: pairing.browser }));
 }
 
+const samePairing = (a, b) => a.host === b.host && a.browser === b.browser;
+
+// Forgetting a machine also forgets the single-host copy it was migrated
+// from; otherwise the next load would migrate that key back into its slot.
 export function forgetPairing(storage, hostId) {
   try {
+    const scoped = hostId === undefined ? undefined : loadPairing(storage, hostId);
+    const legacy = scoped && loadPairing(storage);
+    // Copy first: if that fails, the machine still shows as paired, not half-forgotten.
+    if (legacy && samePairing(scoped, legacy)) storage.removeItem(STORAGE_KEY);
     storage?.removeItem(storageKey(hostId));
   } catch {
     // Nothing persisted, or storage is blocked: either way nothing is paired.
@@ -51,12 +59,23 @@ export function forgetPairing(storage, hostId) {
 
 // The deployment owner must name the old machine explicitly. Never guess from
 // ordering or the currently selected host. Keep existing scoped pins intact.
+// The v1 entry is copied, not moved: a rollback to the single-host website
+// reads only v1, so removing it would unpair every migrated browser.
 export function migratePairing(storage, hostId) {
   if (typeof hostId !== "string" || !HOST_ID_PATTERN.test(hostId)) return;
   const legacy = loadPairing(storage);
-  if (!legacy) return;
-  const current = loadPairing(storage, hostId);
-  if (current && (current.host !== legacy.host || current.browser !== legacy.browser)) return;
-  savePairing(storage, legacy, hostId); // A failed write must leave the old key intact.
-  forgetPairing(storage);
+  if (!legacy || loadPairing(storage, hostId)) return;
+  savePairing(storage, legacy, hostId);
+}
+
+// In registry mode, a v1 pairing that no machine uses: there is no migration
+// target, or that machine already holds a different pairing. Forget pairing
+// cannot reach it, so the page offers to remove it. An empty target slot is
+// not stranded: the next load migrates into it.
+export function strandedLegacyPairing(storage, legacyHostId) {
+  const legacy = loadPairing(storage);
+  if (!legacy) return false;
+  if (typeof legacyHostId !== "string") return true;
+  const scoped = loadPairing(storage, legacyHostId);
+  return scoped !== undefined && !samePairing(scoped, legacy);
 }

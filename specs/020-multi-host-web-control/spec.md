@@ -24,6 +24,10 @@ simultaneous viewers, deployment, or native transport changes are included.
   mode or explicitly migrated to one configured `LEGACY_HOST_ID`. Changing
   selection cannot copy keys. A changed pinned host key requires forgetting
   that machine's pairing before accepting another invite.
+- Migration copies v1 rather than moving it, so a rollback to a single-host
+  version keeps migrated browsers paired. Forgetting the migrated machine
+  removes both copies. In registry mode, a v1 pairing no machine uses can be
+  forgotten from the page.
 - Machine-specific QR links select their configured machine. Unknown IDs and
   unscoped invites in explicit registry mode fail closed without altering keys.
 - Switching releases held input, exits pointer lock, clears passwords, pending
