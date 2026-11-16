@@ -9,7 +9,7 @@ use crate::protocol::{
     FENCE_REQUEST, MAX_RELATIVE_DELTA, MAX_SERVED_DISPLAYS, POINTER_MOTION_CHANGE_ENCODING,
     RELATIVE_POINTER_ORIGIN, SERVE_DISPLAY_FENCE, SERVE_SCALE_FENCE,
 };
-use crate::{CaptureStatus, ServedDisplays};
+use crate::{CaptureStatus, InputStatus, ServedDisplays};
 use std::io;
 
 /// Keys tracked for [`InputState::release_all`]; more held at once are sent
@@ -28,6 +28,7 @@ pub struct InputState {
     serve_scale: Option<u8>,
     serve_display: Option<ServedDisplays>,
     capture_status: CaptureStatus,
+    input_status: InputStatus,
     /// The last absolute position sent.
     position: (u16, u16),
     /// The buttons last sent.
@@ -45,6 +46,7 @@ impl InputState {
             serve_scale: None,
             serve_display: None,
             capture_status: CaptureStatus::Live,
+            input_status: InputStatus::Accepted,
             position: (0, 0),
             buttons: 0,
             held_keys: Vec::new(),
@@ -224,6 +226,16 @@ impl InputState {
 
     pub fn set_capture_status(&mut self, status: CaptureStatus) {
         self.capture_status = status;
+    }
+
+    /// Whether the host accepts the input it injects; accepted until it
+    /// says not.
+    pub fn input_status(&self) -> InputStatus {
+        self.input_status
+    }
+
+    pub fn set_input_status(&mut self, status: InputStatus) {
+        self.input_status = status;
     }
 
     /// Ask the host to serve `display`, numbered from 1, or 0 for all

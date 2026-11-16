@@ -6,10 +6,10 @@ use topvnc_rfb::messages::{
 };
 use topvnc_rfb::protocol::{
     BUTTON_LEFT, CAPTURE_STATUS_ENCODING, CONTINUOUS_UPDATES_MESSAGE, DESKTOP_SIZE_ENCODING,
-    FENCE_REQUEST, SERVE_DISPLAY_ENCODING, SERVE_DISPLAY_FENCE, SERVE_SCALE_ENCODING,
-    SERVE_SCALE_FENCE,
+    FENCE_REQUEST, INPUT_STATUS_ENCODING, SERVE_DISPLAY_ENCODING, SERVE_DISPLAY_FENCE,
+    SERVE_SCALE_ENCODING, SERVE_SCALE_FENCE,
 };
-use topvnc_rfb::{CaptureStatus, Encoding};
+use topvnc_rfb::{CaptureStatus, Encoding, InputStatus};
 
 const CHALLENGE: [u8; 16] = [3; 16];
 
@@ -203,6 +203,33 @@ fn continuous_updates_fences_and_resizes_follow_the_server() {
     expected.extend_from_slice(&update_request(false, 8, 6));
     host.expect(&mut session, &expected);
     assert_eq!(session.frame().unwrap().width(), 8);
+}
+
+#[test]
+fn the_page_learns_when_the_host_rejects_its_input() {
+    let (mut session, mut host) = signed_in(4096);
+    assert_eq!(session.input_status(), InputStatus::Accepted);
+    let status = |code| update(&[rect(code, 0, 0, 0, INPUT_STATUS_ENCODING)]);
+    let events = host.send(&mut session, &status(1), 5, 0.0);
+    assert_eq!(events & EVENT_INPUT_STATUS, EVENT_INPUT_STATUS);
+    assert_eq!(events & EVENT_CAPTURE_STATUS, 0);
+    assert_eq!(session.input_status(), InputStatus::BlockedByElevatedApp);
+    assert_eq!(session.capture_status(), CaptureStatus::Live);
+    // Repeating the same status is not news.
+    let events = host.send(&mut session, &status(1), 64, 0.0);
+    assert_eq!(events & EVENT_INPUT_STATUS, 0);
+    // Codes from newer hosts still mean input is rejected.
+    host.send(&mut session, &status(9), 64, 0.0);
+    assert_eq!(session.input_status(), InputStatus::Rejected);
+    let events = host.send(&mut session, &status(0), 64, 0.0);
+    assert_eq!(events & EVENT_INPUT_STATUS, EVENT_INPUT_STATUS);
+    assert_eq!(session.input_status(), InputStatus::Accepted);
+    // A malformed announcement fails the session.
+    let malformed = host
+        .channel
+        .seal(&update(&[rect(1, 0, 1, 0, INPUT_STATUS_ENCODING)]))
+        .unwrap();
+    assert!(session.receive(&malformed, 0.0).is_err());
 }
 
 #[test]

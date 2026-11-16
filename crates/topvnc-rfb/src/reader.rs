@@ -8,11 +8,13 @@
 
 use crate::protocol::{
     CAPTURE_STATUS_ENCODING, CONTINUOUS_UPDATES_MESSAGE, DESKTOP_SIZE_ENCODING,
-    EXTENDED_MOUSE_BUTTONS_ENCODING, FENCE_MESSAGE, MAX_FENCE_PAYLOAD, MAX_FRAMEBUFFER_PIXELS,
-    MAX_SERVER_CUT_TEXT_BYTES, POINTER_MOTION_CHANGE_ENCODING, RAW_ENCODING,
-    SERVE_DISPLAY_ENCODING, SERVE_SCALE_ENCODING, ZLIB_ENCODING,
+    EXTENDED_MOUSE_BUTTONS_ENCODING, FENCE_MESSAGE, INPUT_STATUS_ENCODING, MAX_FENCE_PAYLOAD,
+    MAX_FRAMEBUFFER_PIXELS, MAX_SERVER_CUT_TEXT_BYTES, POINTER_MOTION_CHANGE_ENCODING,
+    RAW_ENCODING, SERVE_DISPLAY_ENCODING, SERVE_SCALE_ENCODING, ZLIB_ENCODING,
 };
-use crate::{CaptureStatus, Encoding, ServedDisplays, invalid, tight, validate_framebuffer_size};
+use crate::{
+    CaptureStatus, Encoding, InputStatus, ServedDisplays, invalid, tight, validate_framebuffer_size,
+};
 use std::io::{self, Read};
 use std::ops::Range;
 
@@ -54,6 +56,8 @@ pub enum ServerMessage<'a> {
     ServeDisplay(ServedDisplays),
     /// Whether the host can capture its desktop.
     CaptureStatus(CaptureStatus),
+    /// Whether the host's operating system accepts its injected input.
+    InputStatus(InputStatus),
     /// The server asks for relative pointer motion, or absolute positions.
     PointerMode {
         relative: bool,
@@ -83,6 +87,7 @@ enum Parsed {
     ServeScale(u8),
     ServeDisplay(ServedDisplays),
     CaptureStatus(CaptureStatus),
+    InputStatus(InputStatus),
     PointerMode(bool),
     ExtendedMouseButtons,
     Rect {
@@ -282,6 +287,7 @@ impl MessageReader {
                     | Parsed::ServeScale(_)
                     | Parsed::ServeDisplay(_)
                     | Parsed::CaptureStatus(_)
+                    | Parsed::InputStatus(_)
                     | Parsed::PointerMode(_)
                     | Parsed::ExtendedMouseButtons
                     | Parsed::Rect { .. }
@@ -306,6 +312,7 @@ impl MessageReader {
                 Parsed::ServeScale(percent) => ServerMessage::ServeScale(percent),
                 Parsed::ServeDisplay(displays) => ServerMessage::ServeDisplay(displays),
                 Parsed::CaptureStatus(status) => ServerMessage::CaptureStatus(status),
+                Parsed::InputStatus(status) => ServerMessage::InputStatus(status),
                 Parsed::PointerMode(relative) => ServerMessage::PointerMode { relative },
                 Parsed::ExtendedMouseButtons => ServerMessage::ExtendedMouseButtons,
                 Parsed::Rect {
@@ -435,6 +442,12 @@ impl MessageReader {
                     return Err(invalid("invalid capture status"));
                 }
                 return pseudo(Parsed::CaptureStatus(CaptureStatus::from_code(x)));
+            }
+            INPUT_STATUS_ENCODING => {
+                if y != 0 || width != 0 || height != 0 {
+                    return Err(invalid("invalid input status"));
+                }
+                return pseudo(Parsed::InputStatus(InputStatus::from_code(x)));
             }
             POINTER_MOTION_CHANGE_ENCODING => return pseudo(Parsed::PointerMode(x == 0)),
             EXTENDED_MOUSE_BUTTONS_ENCODING => return pseudo(Parsed::ExtendedMouseButtons),

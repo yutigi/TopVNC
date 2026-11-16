@@ -80,6 +80,7 @@ pre { margin: 0; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; 
 #cursor::before { content: ""; position: absolute; left: -1px; top: -1px; border-style: solid; border-width: 0 0 16px 10px; border-color: transparent transparent transparent white; filter: drop-shadow(0 0 1.5px #000); transform: skewY(25deg); }
 #stats { position: absolute; top: 8px; left: 8px; padding: 5px 8px; background: #fbfcf7ee; border: 1px solid #bfcbb0; border-radius: 4px; font: 11px/1.5 var(--mono); pointer-events: none; }
 #host-status { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(32rem, calc(100% - 32px)); padding: 14px; background: #fbfcf7f5; border: 1px solid #a4b48c; border-radius: 8px; font-size: 14px; text-align: center; pointer-events: none; }
+#host-status.input { top: 16px; transform: translateX(-50%); }
 /* Reference: grip, heading, fixed pins, modifiers + inverted-T arrows, dock. */
 #control-deck { grid-row: 3; grid-column: 1; position: relative; min-width: 0; min-height: 0; max-height: 60dvh; display: flex; flex-direction: column; padding: 0 12px; border-top: 1px solid #d7dccb; background: white; overflow: hidden; }
 .deck-grip { flex: none; width: 28px; height: 3px; border-radius: 3px; background: #dce0d3; margin: 8px auto 13px; }

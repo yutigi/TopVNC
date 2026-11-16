@@ -31,7 +31,7 @@ pub use reader::{MessageReader, Rect, ServerMessage};
 
 use protocol::{
     CAPTURE_STATUS_ENCODING, CLIENT_TIGHT_COMPRESS_LEVEL, CONTINUOUS_UPDATES_ENCODING,
-    DESKTOP_SIZE_ENCODING, EXTENDED_MOUSE_BUTTONS_ENCODING, FENCE_ENCODING,
+    DESKTOP_SIZE_ENCODING, EXTENDED_MOUSE_BUTTONS_ENCODING, FENCE_ENCODING, INPUT_STATUS_ENCODING,
     POINTER_MOTION_CHANGE_ENCODING, RAW_ENCODING, SERVE_DISPLAY_ENCODING, SERVE_SCALE_ENCODING,
     ZLIB_ENCODING,
 };
@@ -112,6 +112,45 @@ impl CaptureStatus {
     }
 }
 
+/// Whether a TopVNC host's operating system accepts the input it injects,
+/// as it announces to viewers. While it does not, viewers should say why;
+/// input is still sent, so control returns as soon as the host accepts it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputStatus {
+    /// Input reaches the host's desktop.
+    #[default]
+    Accepted,
+    /// An app with more privileges than the host, such as Task Manager or
+    /// another app running as administrator, is in front. Windows rejects
+    /// all of the host's input, including clicks on other windows, until
+    /// that app closes or another window is brought to the front at the
+    /// host.
+    BlockedByElevatedApp,
+    /// The host rejects input for another or an unknown reason, including
+    /// codes this viewer does not know.
+    Rejected,
+}
+
+impl InputStatus {
+    /// The code sent in the rectangle's `x` field.
+    pub fn code(self) -> u16 {
+        match self {
+            Self::Accepted => 0,
+            Self::BlockedByElevatedApp => 1,
+            Self::Rejected => 2,
+        }
+    }
+
+    /// Unknown codes from newer hosts still mean input is rejected.
+    pub fn from_code(code: u16) -> Self {
+        match code {
+            0 => Self::Accepted,
+            1 => Self::BlockedByElevatedApp,
+            _ => Self::Rejected,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
     Raw,
@@ -146,6 +185,7 @@ impl Encoding {
             SERVE_SCALE_ENCODING,
             SERVE_DISPLAY_ENCODING,
             CAPTURE_STATUS_ENCODING,
+            INPUT_STATUS_ENCODING,
         ]);
         // Relative motion for games that capture the mouse, and the back
         // and forward buttons.

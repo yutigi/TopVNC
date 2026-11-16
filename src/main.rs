@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
     BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, CaptureStatus, Encoding, Framebuffer,
-    InputWriter, ListenerId, ListenerSecurity, PerformanceMode, ServerListeners, Session,
-    StatsSnapshot, encoding_name,
+    InputStatus, InputWriter, ListenerId, ListenerSecurity, PerformanceMode, ServerListeners,
+    Session, StatsSnapshot, encoding_name,
 };
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -2018,11 +2018,16 @@ fn run_session_inner(
     let mut known_serve_scale = None;
     let mut known_serve_display = None;
     let mut capture_status = CaptureStatus::Live;
+    let mut input_status = InputStatus::Accepted;
     loop {
         let mut title_changed = false;
         remote = frames.dimensions();
         if writer.capture_status() != capture_status {
             capture_status = writer.capture_status();
+            title_changed = true;
+        }
+        if writer.input_status() != input_status {
+            input_status = writer.input_status();
             title_changed = true;
         }
         let serve_scale = writer.serve_scale();
@@ -2401,6 +2406,14 @@ fn run_session_inner(
                 CaptureStatus::NoDisplay => status += " · host has no display",
                 CaptureStatus::SecureDesktop => status += " · host screen locked",
                 CaptureStatus::Unavailable => status += " · host capture paused",
+            }
+            // Clicks and keys do nothing; say why.
+            match input_status {
+                InputStatus::Accepted => {}
+                InputStatus::BlockedByElevatedApp => {
+                    status += " · input blocked by an administrator app on the host"
+                }
+                InputStatus::Rejected => status += " · host rejects input",
             }
             if locked {
                 status += " · locked (F8)";

@@ -2,7 +2,7 @@ use super::*;
 use flate2::{Compress, Compression, FlushCompress};
 use protocol::{
     CAPTURE_STATUS_ENCODING, CONTINUOUS_UPDATES_MESSAGE, FENCE_MESSAGE, FENCE_REQUEST,
-    MAX_FENCE_PAYLOAD, MAX_SERVER_CUT_TEXT_BYTES,
+    INPUT_STATUS_ENCODING, MAX_FENCE_PAYLOAD, MAX_SERVER_CUT_TEXT_BYTES,
 };
 
 fn rect_header(x: u16, y: u16, width: u16, height: u16, encoding: i32) -> Vec<u8> {
@@ -99,6 +99,7 @@ fn mixed_stream() -> Vec<u8> {
         zlib_rect(&mut compressor, 0, 0, 8, 8),
         rect_header(1, 2, 0, 0, SERVE_DISPLAY_ENCODING),
         rect_header(1, 0, 0, 0, CAPTURE_STATUS_ENCODING),
+        rect_header(1, 0, 0, 0, INPUT_STATUS_ENCODING),
         rect_header(0, 0, 0, 0, EXTENDED_MOUSE_BUTTONS_ENCODING),
     ]));
     stream.extend_from_slice(&update(&[]));
@@ -162,6 +163,7 @@ fn messages_are_independent_of_chunk_boundaries() {
             "rect 0 0 8x8 6",
             "ServeDisplay(ServedDisplays { served: 1, count: 2 })",
             "CaptureStatus(NoDisplay)",
+            "InputStatus(BlockedByElevatedApp)",
             "ExtendedMouseButtons",
             "UpdateEnd",
             "UpdateStart",
@@ -260,6 +262,14 @@ fn malformed_headers_are_rejected_before_their_bodies_arrive() {
         (
             update(&[rect_header(1, 1, 0, 0, CAPTURE_STATUS_ENCODING)]),
             "invalid capture status",
+        ),
+        (
+            update(&[rect_header(1, 0, 1, 0, INPUT_STATUS_ENCODING)]),
+            "invalid input status",
+        ),
+        (
+            update(&[rect_header(1, 1, 0, 0, INPUT_STATUS_ENCODING)]),
+            "invalid input status",
         ),
         (
             update(&[rect_header(0, 0, 1, 1, tight::TIGHT_ENCODING), vec![0xa0]]),
@@ -381,6 +391,22 @@ fn input_and_control_messages_encode_as_rfb_expects() {
     let response = messages::vnc_auth_response(&[0; 16], "password");
     assert_ne!(response, [0; 16]);
     assert_eq!(response[..8], response[8..]);
+}
+
+#[test]
+fn input_status_codes_round_trip_and_unknown_codes_mean_rejected() {
+    for status in [
+        InputStatus::Accepted,
+        InputStatus::BlockedByElevatedApp,
+        InputStatus::Rejected,
+    ] {
+        assert_eq!(InputStatus::from_code(status.code()), status);
+    }
+    assert_eq!(InputStatus::from_code(9), InputStatus::Rejected);
+    assert_eq!(InputStatus::default(), InputStatus::Accepted);
+    for encoding in [Encoding::Raw, Encoding::Tight { quality: 6 }] {
+        assert!(encoding.advertised().contains(&INPUT_STATUS_ENCODING));
+    }
 }
 
 #[test]

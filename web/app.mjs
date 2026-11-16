@@ -125,10 +125,32 @@ function captureStatusText(status) {
   }
 }
 
-function showCaptureStatus(status) {
-  const text = captureStatusText(status);
+// What the viewer says while the host rejects remote input, by InputStatus
+// code (crates/topvnc-rfb/src/lib.rs); 0 means input is accepted.
+function inputStatusText(status) {
+  switch (status) {
+    case 0:
+      return "";
+    case 1:
+      return "An app running as administrator, such as Task Manager, is in front on the host. Windows blocks all remote input, including clicks on other windows, until someone at the host closes it or switches to another window. To control such apps remotely, install the TopVNC Host service on the host.";
+    default:
+      return "The host is rejecting remote input. Its TopVNC server status says why.";
+  }
+}
+
+// The host's last announced capture and input status codes.
+const hostState = { capture: 0, input: 0 };
+
+function showHostStatus({ capture = hostState.capture, input = hostState.input } = {}) {
+  Object.assign(hostState, { capture, input });
+  // A screen the host cannot share, such as its lock screen, also explains
+  // rejected input, so it takes precedence.
+  const captureText = captureStatusText(capture);
+  const text = captureText || inputStatusText(input);
   hostStatus.textContent = text;
   hostStatus.hidden = !text;
+  // Keep the picture's centre visible while it is still live.
+  hostStatus.classList.toggle("input", !captureText && Boolean(text));
 }
 
 function report(message) {
@@ -267,8 +289,12 @@ async function onSessionMessage(message) {
       showCapabilities(message);
       break;
     case "captureStatus":
-      showCaptureStatus(message.status);
+      showHostStatus({ capture: message.status });
       report(message.status === 0 ? "The host's screen is live again." : captureStatusText(message.status));
+      break;
+    case "inputStatus":
+      showHostStatus({ input: message.status });
+      report(message.status === 0 ? "The host accepts remote input again." : inputStatusText(message.status));
       break;
     case "stats": {
       const rtt = message.rtt >= 0 ? ` · RTT ${message.rtt.toFixed(0)} ms` : "";
@@ -286,7 +312,7 @@ async function onSessionMessage(message) {
       mobile?.closed();
       // The next host may not offer these controls.
       showCapabilities({ serveScale: 0, displays: [] });
-      showCaptureStatus(0);
+      showHostStatus({ capture: 0, input: 0 });
       describeIdentity();
       report(`${wasConnected ? "Disconnected" : "Connection failed"} (${message.code}). ${await closeReason(message)}`);
       connectButton.textContent = wasConnected ? "Reconnect" : "Connect";
