@@ -16,9 +16,11 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# Match verify-access.mjs: the page needs /api/hosts in both modes, and a
+# registry routes only /ws/<id>. LEGACY_HOST_ID affects browser storage only.
 def probe_paths(variables):
     if "HOSTS_JSON" not in variables:
-        return ["/", "/ws"]
+        return ["/", "/api/hosts", "/ws"]
     hosts = json.loads(variables["HOSTS_JSON"])
     if not isinstance(hosts, list) or not 1 <= len(hosts) <= 32:
         raise ValueError("HOSTS_JSON must contain 1 to 32 hosts")
@@ -28,20 +30,30 @@ def probe_paths(variables):
         raise ValueError("HOSTS_JSON contains an invalid host ID")
     if len(ids) != len(set(ids)):
         raise ValueError("HOSTS_JSON contains duplicate host IDs")
-    paths = ["/", "/api/hosts", *[f"/ws/{host_id}" for host_id in ids]]
-    if variables.get("LEGACY_HOST_ID"):
-        paths.append("/ws")
-    return paths
+    return ["/", "/api/hosts", *[f"/ws/{host_id}" for host_id in ids]]
 
 
-def access_redirect(status, location):
+def access_team(issuer):
+    """The ACCESS_ISSUER hostname, or None unless it is an HTTPS Access team URL."""
+    try:
+        parts = urllib.parse.urlsplit(issuer)
+        valid = (parts.scheme == "https" and parts.port in (None, 443) and
+                 parts.username is None and parts.password is None and
+                 (parts.hostname or "").endswith(".cloudflareaccess.com") and
+                 parts.path in ("", "/") and not parts.query and not parts.fragment)
+        return parts.hostname if valid else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def access_redirect(status, location, team):
+    """True only for a 302 to the configured team's Access login, as verify-access.mjs requires."""
     try:
         target = urllib.parse.urlsplit(location)
-        hostname = target.hostname or ""
-        return (status == 302 and target.scheme == "https" and
-                hostname.endswith(".cloudflareaccess.com") and
+        return (status == 302 and team is not None and target.scheme == "https" and
+                target.hostname == team and target.port in (None, 443) and
                 target.username is None and target.password is None and
-                target.port in (None, 443))
+                target.path.startswith("/cdn-cgi/access/login/"))
     except ValueError:
         return False
 
@@ -54,6 +66,9 @@ def main():
     if (parsed.scheme != "https" or not parsed.hostname or parsed.username or
             parsed.password or parsed.path or parsed.query or parsed.fragment):
         sys.exit("APP_ORIGIN must be an exact HTTPS origin")
+    team = access_team(variables.get("ACCESS_ISSUER"))
+    if team is None:
+        sys.exit("ACCESS_ISSUER must be your https://<team>.cloudflareaccess.com URL")
     paths = probe_paths(variables)
     opener = urllib.request.build_opener(NoRedirect)
     for path in paths:
@@ -62,7 +77,7 @@ def main():
             response = opener.open(request, timeout=20)
         except urllib.error.HTTPError as response_error:
             response = response_error
-        protected = access_redirect(response.code, response.headers.get("Location", ""))
+        protected = access_redirect(response.code, response.headers.get("Location", ""), team)
         print(json.dumps({"path": path, "status": response.code,
                           "redirects_to_access": protected}), flush=True)
         response.close()

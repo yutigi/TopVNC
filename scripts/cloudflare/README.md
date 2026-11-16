@@ -18,10 +18,11 @@ python scripts/cloudflare/run-worker.py --dry-run
 - `check-cloudflare.py` lists identity, VPC services, and tunnels without
   changing the account. Any failed command or timeout makes it exit nonzero.
 - `validate-cloudflare.py` makes unauthenticated HTTP requests without
-  following redirects. It checks `/` and `/ws` for single-host configs, or
-  `/`, `/api/hosts`, and every configured `/ws/<id>` for multi-host configs
-  (plus `/ws` when legacy migration is enabled). Each must return an HTTPS
-  redirect to Cloudflare Access before the Wrangler dry run proceeds.
+  following redirects. It checks the same routes as `npm run deploy`: `/`,
+  `/api/hosts`, and `/ws` for single-host configs, or `/`, `/api/hosts`, and
+  every configured `/ws/<id>` for multi-host configs. Each must return a 302
+  to the Access login of the configured `ACCESS_ISSUER` team before the
+  Wrangler dry run proceeds.
   This is a redirect smoke check, not proof of the owner policy, authenticated
   WebSocket behavior, or working remote control. It needs network access.
 - `run-worker.py --dry-run` checks the existing build/config without
@@ -31,6 +32,10 @@ python scripts/cloudflare/run-worker.py --dry-run
   It allows up to 30 minutes for that workflow. Follow the
   [build and deployment guide](../../docs/cloudflare-gateway.md#8-build-test-and-deploy)
   for prerequisites. The existing npm deployment commands remain the normal workflow.
+
+Output streams as each command runs. A command that exceeds its time limit is
+stopped together with every process it started, so a timed-out publish cannot
+keep uploading in the background.
 
 Console output redacts email addresses only. Raw Wrangler logs stay in
 ignored `out/cloudflare/wrangler.log`; they can contain account details.

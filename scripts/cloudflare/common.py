@@ -2,12 +2,15 @@
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
+import threading
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "gateway/cloudflare/worker"
 CONFIG = WORKER / "wrangler.local.toml"
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 def run_wrangler(arguments, timeout):
@@ -31,14 +34,61 @@ def _run(command, timeout, label):
     log = ROOT / "out/cloudflare/wrangler.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, WRANGLER_SEND_METRICS="false", WRANGLER_LOG_PATH=str(log))
+    # npm and Wrangler start their own child processes. On POSIX a new session
+    # lets a timeout signal the whole group; on Windows taskkill walks the tree.
+    group = {} if os.name == "nt" else {"start_new_session": True}
     try:
-        result = subprocess.run(command, cwd=WORKER, env=env, capture_output=True,
-                                text=True, encoding="utf-8", errors="replace", timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
-        # Exceptions may carry captured output; don't print their raw contents.
-        print(f"{label} could not start or timed out.")
+        # These workflows never prompt; a prompt hidden behind the pipe would hang.
+        process = subprocess.Popen(command, cwd=WORKER, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="replace", **group)
+    except OSError:
+        print(f"{label} could not start.")
         return 1
-    safe = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-                  "[email redacted]", result.stdout + "\n" + result.stderr)
-    print(safe[-9000:])
-    return result.returncode
+    # Show progress as it happens: a build, tests and upload take minutes.
+    reader = threading.Thread(target=_forward, args=(process.stdout,), daemon=True)
+    reader.start()
+    try:
+        code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _stop_tree(process)
+        _finish(reader, process.stdout)
+        print(f"{label} timed out after {timeout} seconds; it and its child processes were stopped.")
+        return 1
+    except KeyboardInterrupt:
+        _stop_tree(process)
+        raise
+    _finish(reader, process.stdout)
+    return code
+
+
+def _forward(stream):
+    for line in stream:
+        print(EMAIL.sub("[email redacted]", line), end="", flush=True)
+
+
+def _finish(reader, stream):
+    # A leftover descendant could hold the pipe open; never wait on it forever.
+    reader.join(timeout=5)
+    if not reader.is_alive():
+        stream.close()
+
+
+def _stop_tree(process):
+    # Killing only the direct child (npm) would leave node and Wrangler
+    # running, still able to publish after the helper reports a timeout.
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    if process.poll() is None:
+        process.kill()
+    process.wait()
