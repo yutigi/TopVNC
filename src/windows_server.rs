@@ -17,6 +17,7 @@ use crate::desktop_host::{
 use std::collections::HashSet;
 use std::error::Error;
 use std::mem::size_of;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -24,7 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use topvnc::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, CaptureStatus,
-    ClientEvent, DamageRect, Framebuffer, ServerConfig, VncServer,
+    ClientEvent, DamageRect, Framebuffer, InputStatus, ServerConfig, VncServer,
 };
 use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::{
@@ -57,9 +58,14 @@ use windows_sys::Win32::Devices::Display::{
     QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL, GetLastError, GlobalFree, SetLastError,
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL, GetLastError,
+    GlobalFree, HANDLE, SetLastError,
 };
 use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod};
+use windows_sys::Win32::Security::{
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
+    TOKEN_QUERY, TokenIntegrityLevel,
+};
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
     SetConsoleCtrlHandler,
@@ -77,10 +83,11 @@ use windows_sys::Win32::System::StationsAndDesktops::{
     SetThreadDesktop, UOI_NAME,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThreadId, GetPriorityClass, HIGH_PRIORITY_CLASS,
-    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-    ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
+    GetCurrentProcess, GetCurrentThreadId, GetPriorityClass, HIGH_PRIORITY_CLASS, OpenProcess,
+    OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION, ProcessPowerThrottling,
+    QueryFullProcessImageNameW, SetPriorityClass, SetProcessInformation,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -95,8 +102,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSOR_SUPPRESSED, CURSORINFO, CreateWindowExW, DestroyWindow, GetCursorInfo,
-    GetSystemMetrics, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetProcessDPIAware, XBUTTON1, XBUTTON2,
+    GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, MONITORINFOF_PRIMARY,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetProcessDPIAware, XBUTTON1, XBUTTON2,
 };
 
 static SERVER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -717,17 +725,33 @@ fn run_input(
     report: &(dyn Fn(ServerNotice) + Sync),
 ) {
     let mut input = InputReleaseGuard(RemoteInputState::default());
-    let mut injection_failed = false;
+    let mut rejection = InputRejection::default();
+    // When the app in front was last checked; throttles the checks made
+    // while input is rejected, such as on every rejected mouse movement.
+    let mut foreground_checked: Option<Instant> = None;
     let mut desktop_checked: Option<Instant> = None;
     while !shutdown.load(Ordering::Acquire) {
         let event = match server.recv_event_timeout(INPUT_POLL_INTERVAL) {
             Ok(event) => event,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                // Viewers told that an elevated app blocks input learn when
+                // it is no longer in front, without first trying input.
+                if rejection.blocked_by_elevated_app()
+                    && foreground_checked
+                        .is_none_or(|at| at.elapsed() >= INPUT_DESKTOP_CHECK_INTERVAL)
+                {
+                    foreground_checked = Some(Instant::now());
+                    if let Some(status) = rejection.foreground_changed(foreground_app().as_ref()) {
+                        server.set_input_status(status);
+                    }
+                }
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         };
         // Input goes to this thread's desktop; follow the lock screen. A
         // failure is retried at the next check and shows as rejected input.
-        if injection_failed
+        if rejection.rejected()
             || desktop_checked.is_none_or(|at| at.elapsed() >= INPUT_DESKTOP_CHECK_INTERVAL)
         {
             desktop_checked = Some(Instant::now());
@@ -793,27 +817,237 @@ fn run_input(
                 }
             }
         }
-        // Report the first failure without flooding the UI on mouse motion.
-        // A rejected batch must remain visible until an actual injection succeeds.
+        // Report each new cause without flooding the UI on mouse motion. A
+        // rejection must remain visible until an actual injection succeeds.
         match injection {
-            Err(error) if !injection_failed => {
-                injection_failed = true;
-                report(ServerNotice::Message(format!(
-                    "Windows rejected remote input: {error}. Check whether the foreground app \
-                     is elevated or the desktop is locked; reconnecting the viewer does not \
-                     change Windows input permissions."
-                )));
+            Err(error) => {
+                // Viewers that think input works are told at once.
+                if rejection.announced_accepted()
+                    || foreground_checked
+                        .is_none_or(|at| at.elapsed() >= INPUT_DESKTOP_CHECK_INTERVAL)
+                {
+                    foreground_checked = Some(Instant::now());
+                    let app = foreground_app();
+                    let (status, new_cause) = rejection.failed(app.as_ref());
+                    if let Some(status) = status {
+                        server.set_input_status(status);
+                    }
+                    if new_cause {
+                        report(ServerNotice::Message(rejection_message(
+                            &error,
+                            app.as_ref(),
+                        )));
+                    }
+                }
             }
-            Err(_) => {}
-            Ok(true) if injection_failed => {
-                injection_failed = false;
-                report(ServerNotice::Message(
-                    "Remote input injection resumed.".into(),
-                ));
+            Ok(true) => {
+                let (status, resumed) = rejection.succeeded();
+                if let Some(status) = status {
+                    server.set_input_status(status);
+                }
+                if resumed {
+                    report(ServerNotice::Message(
+                        "Remote input injection resumed.".into(),
+                    ));
+                }
             }
-            Ok(_) => {}
+            Ok(false) => {}
         }
     }
+}
+
+/// The app that owns the window in front, as far as this process can tell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ForegroundApp {
+    /// Its executable's file name, such as `Taskmgr.exe`.
+    name: Option<String>,
+    /// It runs at a higher integrity level than this process, as apps
+    /// started as administrator do. Windows then rejects all of this
+    /// process's input, including clicks on other windows, while it is in
+    /// front (User Interface Privilege Isolation).
+    elevated: bool,
+}
+
+/// What viewers and the host have been told about rejected input.
+#[derive(Debug, Default)]
+struct InputRejection {
+    /// The status viewers were last told.
+    announced: InputStatus,
+    /// While input is rejected: the cause last reported to the host.
+    reported: Option<(InputStatus, Option<String>)>,
+}
+
+impl InputRejection {
+    fn rejected(&self) -> bool {
+        self.reported.is_some()
+    }
+
+    fn blocked_by_elevated_app(&self) -> bool {
+        self.announced == InputStatus::BlockedByElevatedApp
+    }
+
+    fn announced_accepted(&self) -> bool {
+        self.announced == InputStatus::Accepted
+    }
+
+    /// Windows rejected input while `app` was in front. Returns the status
+    /// to tell viewers if it changed, and whether the cause is new to the
+    /// host.
+    fn failed(&mut self, app: Option<&ForegroundApp>) -> (Option<InputStatus>, bool) {
+        let status = rejection_status(app);
+        let cause = Some((status, app.and_then(|app| app.name.clone())));
+        let new_cause = self.reported != cause;
+        self.reported = cause;
+        (self.announce(status), new_cause)
+    }
+
+    /// Windows accepted input. Returns the status to tell viewers if it
+    /// changed, and whether input had been rejected.
+    fn succeeded(&mut self) -> (Option<InputStatus>, bool) {
+        let resumed = self.reported.take().is_some();
+        (self.announce(InputStatus::Accepted), resumed)
+    }
+
+    /// While viewers are told an elevated app blocks input, `app` is in
+    /// front. Once that is no longer an elevated app, viewers are told
+    /// input works again; the host is told when input actually succeeds.
+    fn foreground_changed(&mut self, app: Option<&ForegroundApp>) -> Option<InputStatus> {
+        if !self.blocked_by_elevated_app() || app.is_some_and(|app| app.elevated) {
+            return None;
+        }
+        // A different cause, such as the lock screen, is learned from the
+        // next rejected input.
+        self.announce(InputStatus::Accepted)
+    }
+
+    fn announce(&mut self, status: InputStatus) -> Option<InputStatus> {
+        (self.announced != status).then(|| {
+            self.announced = status;
+            status
+        })
+    }
+}
+
+fn rejection_status(app: Option<&ForegroundApp>) -> InputStatus {
+    if app.is_some_and(|app| app.elevated) {
+        InputStatus::BlockedByElevatedApp
+    } else {
+        InputStatus::Rejected
+    }
+}
+
+/// What the host is told when Windows rejects input while `app` is in front.
+fn rejection_message(error: &std::io::Error, app: Option<&ForegroundApp>) -> String {
+    match app {
+        Some(app) if app.elevated => {
+            let name = app.name.as_deref().map_or_else(
+                || "An app with more privileges than this server".to_owned(),
+                |name| format!("{name}, which has more privileges than this server,"),
+            );
+            format!(
+                "Windows rejected remote input: {name} is in front, for example because it runs \
+                 as administrator, as Task Manager does. Windows blocks all remote input, \
+                 including clicks on other windows, until that app closes or someone at this \
+                 computer brings another window to the front. To control such apps remotely, \
+                 install the TopVNC Host service. ({error})"
+            )
+        }
+        _ => format!(
+            "Windows rejected remote input: {error}. Check whether the foreground app is \
+             elevated or the desktop is locked; reconnecting the viewer does not change \
+             Windows input permissions."
+        ),
+    }
+}
+
+/// The app that owns the window in front, or `None` when no window is in
+/// front, such as while the secure desktop is shown.
+fn foreground_app() -> Option<ForegroundApp> {
+    let window = unsafe { GetForegroundWindow() };
+    if window.is_null() {
+        return None;
+    }
+    let mut process_id = 0;
+    if unsafe { GetWindowThreadProcessId(window, &mut process_id) } == 0 || process_id == 0 {
+        return None;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        // Even this limited access is refused only for processes more
+        // privileged than this one, such as protected processes.
+        let denied = unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        return Some(ForegroundApp {
+            name: None,
+            elevated: denied,
+        });
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    Some(ForegroundApp {
+        name: process_file_name(process.as_raw_handle()),
+        elevated: runs_above(
+            integrity_level(unsafe { GetCurrentProcess() }),
+            integrity_level(process.as_raw_handle()),
+        ),
+    })
+}
+
+/// Whether a process at `other` integrity runs above one at `own`. A
+/// process whose token this one may not read is treated as more privileged.
+fn runs_above(own: Result<u32, u32>, other: Result<u32, u32>) -> bool {
+    match (own, other) {
+        (Ok(own), Ok(other)) => other > own,
+        (_, Err(error)) => error == ERROR_ACCESS_DENIED,
+        (Err(_), Ok(_)) => false,
+    }
+}
+
+/// The mandatory integrity level of `process`'s token, such as
+/// `0x2000` (medium) or `0x3000` (high, as administrator), or the Windows
+/// error.
+fn integrity_level(process: HANDLE) -> Result<u32, u32> {
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(unsafe { GetLastError() });
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    // A label and a SID of at most 68 bytes; `u64` keeps the pointer aligned.
+    let mut buffer = [0u64; 16];
+    let mut needed = 0;
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenIntegrityLevel,
+            buffer.as_mut_ptr().cast(),
+            size_of_val(&buffer) as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(unsafe { GetLastError() });
+    }
+    let label = unsafe { &*buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
+    let count = unsafe { *GetSidSubAuthorityCount(label.Label.Sid) };
+    if count == 0 {
+        return Err(0);
+    }
+    Ok(unsafe { *GetSidSubAuthority(label.Label.Sid, u32::from(count) - 1) })
+}
+
+/// The executable file name of `process`, such as `Taskmgr.exe`.
+fn process_file_name(process: HANDLE) -> Option<String> {
+    let mut path = [0u16; 1024];
+    let mut length = path.len() as u32;
+    if unsafe {
+        QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, path.as_mut_ptr(), &mut length)
+    } == 0
+    {
+        return None;
+    }
+    let path = String::from_utf16_lossy(path.get(..length as usize)?);
+    path.rsplit('\\')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
 }
 
 /// Releases every remotely held key and button when the input thread exits.
@@ -2516,6 +2750,108 @@ mod tests {
                 .to_string()
                 .contains("Windows error 5")
         );
+    }
+
+    fn app(name: &str, elevated: bool) -> ForegroundApp {
+        ForegroundApp {
+            name: Some(name.into()),
+            elevated,
+        }
+    }
+
+    #[test]
+    fn an_elevated_app_in_front_is_told_apart_from_other_rejections() {
+        const MEDIUM: u32 = 0x2000;
+        const HIGH: u32 = 0x3000;
+        const SYSTEM: u32 = 0x4000;
+        assert!(runs_above(Ok(MEDIUM), Ok(HIGH)));
+        assert!(!runs_above(Ok(HIGH), Ok(HIGH)));
+        assert!(!runs_above(Ok(SYSTEM), Ok(HIGH)));
+        assert!(!runs_above(Ok(HIGH), Ok(MEDIUM)));
+        // A token this process may not read belongs to a more privileged one.
+        assert!(runs_above(Ok(MEDIUM), Err(ERROR_ACCESS_DENIED)));
+        assert!(!runs_above(Ok(MEDIUM), Err(6)));
+        assert!(!runs_above(Err(5), Ok(HIGH)));
+
+        let task_manager = app("Taskmgr.exe", true);
+        assert_eq!(
+            rejection_status(Some(&task_manager)),
+            InputStatus::BlockedByElevatedApp
+        );
+        assert_eq!(
+            rejection_status(Some(&app("notepad.exe", false))),
+            InputStatus::Rejected
+        );
+        // No window in front, as on the secure desktop.
+        assert_eq!(rejection_status(None), InputStatus::Rejected);
+
+        let error = std::io::Error::other("SendInput accepted 0/1 events");
+        let message = rejection_message(&error, Some(&task_manager));
+        assert!(message.contains("Taskmgr.exe"), "{message}");
+        assert!(message.contains("TopVNC Host service"), "{message}");
+        assert!(message.contains("SendInput accepted 0/1"), "{message}");
+        let unnamed = ForegroundApp {
+            name: None,
+            elevated: true,
+        };
+        assert!(rejection_message(&error, Some(&unnamed)).starts_with(
+            "Windows rejected remote input: An app with more privileges than this server is in front"
+        ));
+        assert!(rejection_message(&error, None).contains("desktop is locked"));
+    }
+
+    #[test]
+    fn this_process_reads_its_own_integrity_level() {
+        let own = integrity_level(unsafe { GetCurrentProcess() });
+        assert!(own.is_ok_and(|level| level >= 0x1000), "{own:?}");
+        assert!(!runs_above(own, own));
+    }
+
+    #[test]
+    fn viewers_and_the_host_learn_each_rejection_cause_once_and_when_input_resumes() {
+        let task_manager = app("Taskmgr.exe", true);
+        let mut rejection = InputRejection::default();
+        assert!(!rejection.rejected());
+        // Accepted input announces nothing new.
+        assert_eq!(rejection.succeeded(), (None, false));
+
+        assert_eq!(
+            rejection.failed(Some(&task_manager)),
+            (Some(InputStatus::BlockedByElevatedApp), true)
+        );
+        assert!(rejection.rejected() && rejection.blocked_by_elevated_app());
+        // Repeated rejections, such as on mouse motion, are not news.
+        assert_eq!(rejection.failed(Some(&task_manager)), (None, false));
+        // Another elevated app is news to the host, not to viewers.
+        assert_eq!(
+            rejection.failed(Some(&app("regedit.exe", true))),
+            (None, true)
+        );
+        // Still elevated: nothing changes while idle.
+        assert_eq!(rejection.foreground_changed(Some(&task_manager)), None);
+        // The elevated app left the front: viewers are told before input is
+        // tried, the host only once input actually succeeds.
+        assert_eq!(
+            rejection.foreground_changed(Some(&app("explorer.exe", false))),
+            Some(InputStatus::Accepted)
+        );
+        assert!(rejection.rejected() && !rejection.blocked_by_elevated_app());
+        // A rejection now must be checked at once, as viewers think input
+        // works.
+        assert!(rejection.announced_accepted());
+        assert_eq!(rejection.foreground_changed(None), None);
+        assert_eq!(rejection.succeeded(), (None, true));
+        assert!(!rejection.rejected());
+
+        // Rejected with no elevated app in front, as on the lock screen.
+        assert_eq!(rejection.failed(None), (Some(InputStatus::Rejected), true));
+        // That cause is not cleared by the foreground check.
+        assert_eq!(rejection.foreground_changed(None), None);
+        assert_eq!(
+            rejection.failed(Some(&task_manager)),
+            (Some(InputStatus::BlockedByElevatedApp), true)
+        );
+        assert_eq!(rejection.succeeded(), (Some(InputStatus::Accepted), true));
     }
 
     #[test]
