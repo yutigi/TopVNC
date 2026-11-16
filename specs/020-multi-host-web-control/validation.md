@@ -31,6 +31,31 @@ The browser test required execution outside the restricted process sandbox
 so Chromium subprocesses and DevTools could communicate. It used a temporary
 profile and a loopback-only server, removed afterward.
 
+## Review follow-up — 2026-11-17
+
+Session worker start-up per Connect, headless Chrome 157.0.8103.51 on
+Windows, built `topvnc_web_bg.wasm` (412,352 bytes). The server mimicked
+Workers assets: ETag with `must-revalidate`, so a worker's WASM fetch is a
+304 revalidation. Each value is a median of 15–20 interleaved starts after
+warm-up, from `new Worker` to the worker reporting WASM ready.
+
+| Link | Worker only | Worker fetches and compiles WASM (before) | Worker instantiates the page's module (after) |
+| --- | --- | --- | --- |
+| Loopback | 4.5–6.0 ms | 6.3–8.2 ms | 4.6–6.3 ms |
+| Simulated 40 ms RTT | 92.4–92.8 ms | 139.6–139.9 ms | 92.5–93.1 ms |
+
+Passing the compiled module removes one round trip per Connect on a real
+link and about 2 ms of compilation locally. A separate check loaded the
+built `session-worker.js` under the production CSP and posted it the
+module: it initialized and opened its WebSocket without fetching the WASM
+again. Not measured: iOS Safari or a live Cloudflare link.
+
+The first CI run of `test:integration` failed on Linux: navigation waits
+such as `!document.querySelector('#connect')?.disabled` passed while the new
+page was still loading. Under 6x CPU throttling the old test failed 3 of 3
+runs with the same error; the corrected waits passed 3 of 3, and unthrottled
+5 of 5.
+
 ## Remaining live verification
 
 - Deploy only when requested, with the shared Access policy covering the

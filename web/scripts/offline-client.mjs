@@ -15,10 +15,13 @@ export async function buildOfflineClient(dir) {
     } }],
   });
   // A reload in the placement test retains preferences; other fixture loads reset.
-  // A file:// page has no Worker API route; serve the single-host registry.
+  // A file:// page has no Worker API route; serve the single-host registry,
+  // and an empty WASM module for the page to compile (the glue is stubbed).
   const fixture = `try { if (!new URL(location.href).searchParams.has('preserveStorage')) localStorage.clear(); } catch {} globalThis.sent=[];
   const offlineFetch=globalThis.fetch; globalThis.fetch=(url,options)=>String(url)==='/api/hosts'
     ? Promise.resolve(new Response(JSON.stringify({legacy:true,legacyHostId:null,hosts:[{id:'default',name:'This machine'}]}),{headers:{'Content-Type':'application/json'}}))
+    : String(url)==='/topvnc_web_bg.wasm'
+    ? Promise.resolve(new Response(new Uint8Array([0,97,115,109,1,0,0,0]),{headers:{'Content-Type':'application/wasm'}}))
     : offlineFetch(url,options);
   globalThis.Worker=class {
     terminate() {}

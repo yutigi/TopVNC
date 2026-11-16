@@ -75,6 +75,8 @@ let mobile;
 const view = new View();
 let lines = [];
 let registry;
+// Compiled once; every session worker instantiates it (see compileWasm).
+let wasmModule;
 let queuedInvite;
 let selected;
 let selectionRevision = 0;
@@ -733,6 +735,7 @@ async function startSession() {
     host: keys.host,
     secret: pending?.secret,
     quality: Number(chosen("quality")),
+    wasm: wasmModule,
   };
   await sessions.stop();
   if (revision !== selectionRevision) return;
@@ -850,8 +853,20 @@ window.visualViewport?.addEventListener("resize", () => {
 });
 new ResizeObserver(layout).observe(screen);
 
+// Each connect starts a fresh session worker. Handing it this module instead
+// of the URL saves a revalidation round trip and a compile per connect
+// (see specs/020-multi-host-web-control/validation.md for the measurement).
+async function compileWasm(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error("The encryption module is unavailable");
+  return response.headers.get("Content-Type") === "application/wasm"
+    ? WebAssembly.compileStreaming(response)
+    : WebAssembly.compile(await response.arrayBuffer());
+}
+
 async function main() {
-  await init({ module_or_path: "/topvnc_web_bg.wasm" });
+  wasmModule = await compileWasm("/topvnc_web_bg.wasm");
+  await init({ module_or_path: wasmModule });
   // Only the legacy local harness can lack this endpoint. HTTP errors on the
   // protected production website must never silently select a legacy host.
   const local = location.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);

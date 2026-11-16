@@ -155,6 +155,8 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
   await evaluate(`fixture.workers[0].emit({ type: 'connected' }); fixture.workers[0].emit({ type: 'verified' }); fixture.workers[0].emit({ type: 'resized', width: 999, height: 999 }); fixture.workers[0].emit({ type: 'captureStatus', status: 1 });`);
   assert.equal(await evaluate("document.querySelector('#viewer').hidden && !document.querySelector('#password-form').hidden && document.querySelector('#canvas').width === 1"), true);
   assert.equal(await evaluate("fixture.messages.filter(m => m.type === 'connect')[1].url.endsWith('/ws/office-pc')"), true);
+  assert.equal(await evaluate("fixture.messages.filter(m => m.type === 'connect').every(m => m.wasm instanceof WebAssembly.Module)"), true,
+    "each new session worker gets the page's compiled module instead of refetching it");
   await evaluate("document.querySelector('#password').value = 'office-password'; document.querySelector('#password-form').requestSubmit()");
   await waitFor("!document.querySelector('#viewer').hidden");
   assert.equal(await evaluate("document.querySelector('#host-status').hidden && document.querySelector('#host-status').textContent === ''"), true, "a healthy machine needs no capture-status event to clear the old warning");
