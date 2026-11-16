@@ -43,16 +43,39 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
   t.after(() => { server.closeAllConnections(); server.close(); });
   const origin = `http://127.0.0.1:${server.address().port}`;
   const profile = realpathSync(mkdtempSync(join(tmpdir(), "topvnc-browser-test-")));
+  // No background downloads or crash reports: both write into the profile.
+  const posix = process.platform !== "win32";
   const browser = spawn(executable, ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-    "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+    "--disable-background-networking", "--disable-component-update", "--disable-breakpad", "--disable-sync",
+    "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"],
+  // Its own process group on POSIX, so cleanup can stop every helper process.
+  { stdio: ["ignore", "ignore", "pipe"], detached: posix });
+  let endpoint;
   t.after(async () => {
-    browser.kill();
-    await once(browser, "exit").catch(() => {});
+    // SIGTERM ends only Chrome's main process on Linux; its helpers can keep
+    // writing to the profile while it is removed (ENOTEMPTY in CI). Close it
+    // through DevTools so it flushes and stops its helpers, then make sure.
+    if (browser.exitCode === null && browser.signalCode === null) {
+      const exited = once(browser, "exit");
+      const timer = setTimeout(() => browser.kill("SIGKILL"), 5000); // Never hang cleanup.
+      try {
+        const control = new WebSocket(endpoint);
+        await new Promise((resolve, reject) => { control.onopen = resolve; control.onerror = reject; });
+        control.send(JSON.stringify({ id: 1, method: "Browser.close" }));
+      } catch {
+        browser.kill();
+      }
+      await exited;
+      clearTimeout(timer);
+    }
+    if (posix) {
+      try { process.kill(-browser.pid, "SIGKILL"); } catch { /* The whole group has exited. */ }
+    }
     assert.equal(dirname(profile), realpathSync(tmpdir()));
     assert.ok(basename(profile).startsWith("topvnc-browser-test-"));
     rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
-  const endpoint = await new Promise((resolve, reject) => {
+  endpoint = await new Promise((resolve, reject) => {
     let stderr = "";
     const timer = setTimeout(() => reject(Error("Browser did not expose DevTools within 10 seconds")), 10000);
     browser.on("error", reject);
