@@ -225,8 +225,7 @@ fn decode(payload: &[u8]) -> Result<Handoff, String> {
     let mut action = None;
     let mut form = ServeForm::default();
     let mut viewer = Vec::new();
-    for pair in strings.chunks_exact(2) {
-        let (key, value) = (pair[0], pair[1]);
+    for &[key, value] in strings.as_chunks::<2>().0 {
         let on = || match value {
             "1" => Ok(true),
             "0" => Ok(false),
