@@ -14,8 +14,11 @@ use crate::desktop_host::{
     MAX_CLIPBOARD_CHARS, ServeOptions, ServerNotice, VirtualKey, parse_serve_arguments,
     report_serving,
 };
+use crate::elevation::{self, NO_ELEVATE_FLAG};
+use crate::service_pipe::{UI_PIPE_FLAG, WindowPipe};
 use std::collections::HashSet;
 use std::error::Error;
+use std::io::Write;
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -83,11 +86,12 @@ use windows_sys::Win32::System::StationsAndDesktops::{
     SetThreadDesktop, UOI_NAME,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThreadId, GetPriorityClass, HIGH_PRIORITY_CLASS, OpenProcess,
-    OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    GetCurrentProcess, GetCurrentThreadId, GetPriorityClass, HIGH_PRIORITY_CLASS, INFINITE,
+    OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
     PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
-    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION, ProcessPowerThrottling,
-    QueryFullProcessImageNameW, SetPriorityClass, SetProcessInformation,
+    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    ProcessPowerThrottling, QueryFullProcessImageNameW, SetPriorityClass, SetProcessInformation,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -217,9 +221,22 @@ impl ServedImage {
     }
 }
 
-/// Run `topvnc --serve` until the console asks the server to stop.
+/// Run `topvnc --serve` until the console asks the server to stop. Without
+/// administrator rights, the server runs in TopVNC started as administrator
+/// after approval, and this console shows its messages.
 pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let options = parse_serve_arguments(arguments)?;
+    if let [flag, name, options @ ..] = arguments
+        && flag == UI_PIPE_FLAG
+    {
+        return serve_for_console(name, options);
+    }
+    let no_elevate = arguments.iter().any(|argument| argument == NO_ELEVATE_FLAG);
+    let arguments = arguments
+        .iter()
+        .filter(|argument| *argument != NO_ELEVATE_FLAG)
+        .cloned()
+        .collect::<Vec<_>>();
+    let options = parse_serve_arguments(&arguments)?;
     options.tls.server()?;
     // Capture sizes, cursor positions, and injected pointer coordinates must
     // all be physical pixels, even on scaled displays.
@@ -234,6 +251,22 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
         Some(password)
     };
+    if !no_elevate && !elevation::is_elevated() {
+        eprintln!(
+            "Asking Windows for administrator approval, so remote input also reaches apps that \
+             run as administrator, such as Task Manager."
+        );
+        match elevation::serve_elevated(&arguments, password.as_deref()) {
+            Ok(0) => return Ok(()),
+            Ok(code) => {
+                return Err(format!(
+                    "the server started as administrator stopped (exit code {code})"
+                )
+                .into());
+            }
+            Err(error) => eprintln!("{error} Serving without administrator rights."),
+        }
+    }
     SERVER_SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     if unsafe { SetConsoleCtrlHandler(Some(console_control_handler), 1) } == 0 {
         return Err("could not register the server shutdown handler".into());
@@ -246,6 +279,63 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             // The CLI has no status view; connection counts would only be noise.
             ServerNotice::Connections(_) => {}
             notice => eprintln!("{notice}"),
+        },
+    )
+}
+
+/// `--serve --ui-pipe NAME OPTIONS`: the server a console without
+/// administrator rights started as administrator. It reads the password
+/// from the pipe, writes its messages there, and stops when that console's
+/// TopVNC ends, such as on Ctrl+C there.
+fn serve_for_console(name: &str, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let pipe = Mutex::new(WindowPipe::connect(name)?);
+    let result = serve_for_console_with(&pipe, arguments);
+    if let Err(error) = &result
+        && let Ok(mut pipe) = pipe.lock()
+    {
+        let _ = writeln!(pipe, "{error}");
+    }
+    result
+}
+
+fn serve_for_console_with(
+    pipe: &Mutex<WindowPipe>,
+    arguments: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let options = parse_serve_arguments(arguments)?;
+    enable_dpi_awareness();
+    let (password, owner) = {
+        let mut pipe = pipe.lock().map_err(|_| "the console pipe is unusable")?;
+        let password = if options.allow_insecure {
+            None
+        } else {
+            Some(pipe.read_password()?)
+        };
+        (password, pipe.owner_process_id())
+    };
+    let owner = owner
+        .map(|id| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, id) })
+        .filter(|process| !process.is_null())
+        .map(|process| unsafe { OwnedHandle::from_raw_handle(process) })
+        .ok_or("could not find the console that started this server")?;
+    SERVER_SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+    thread::Builder::new()
+        .name("topvnc-console-watch".into())
+        .spawn(move || {
+            unsafe { WaitForSingleObject(owner.as_raw_handle(), INFINITE) };
+            SERVER_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+        })?;
+    serve(
+        options,
+        password,
+        &SERVER_SHUTDOWN_REQUESTED,
+        &|notice| match notice {
+            ServerNotice::Connections(_) => {}
+            notice => {
+                if let Ok(mut pipe) = pipe.lock() {
+                    let _ = writeln!(pipe, "{notice}");
+                }
+            }
         },
     )
 }
@@ -264,6 +354,9 @@ pub fn serve(
     } else {
         "WARNING: explicit unencrypted TCP transport.".into()
     }));
+    if !elevation::is_elevated() {
+        report(ServerNotice::Message(elevation::NOT_ELEVATED.into()));
+    }
     let ServeOptions {
         tls: _,
         address,
@@ -944,12 +1037,20 @@ fn rejection_message(error: &std::io::Error, app: Option<&ForegroundApp>) -> Str
                 || "An app with more privileges than this server".to_owned(),
                 |name| format!("{name}, which has more privileges than this server,"),
             );
+            // A server running as administrator is blocked only by apps
+            // above that, such as ones running as SYSTEM.
+            let remedy = if elevation::is_elevated() {
+                "install the TopVNC Host service"
+            } else {
+                "start the server again and approve the administrator prompt, or install the \
+                 TopVNC Host service"
+            };
             format!(
                 "Windows rejected remote input: {name} is in front, for example because it runs \
                  as administrator, as Task Manager does. Windows blocks all remote input, \
                  including clicks on other windows, until that app closes or someone at this \
                  computer brings another window to the front. To control such apps remotely, \
-                 install the TopVNC Host service. ({error})"
+                 {remedy}. ({error})"
             )
         }
         _ => format!(

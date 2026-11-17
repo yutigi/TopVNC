@@ -18,6 +18,8 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes};
 // Each host backend uses part of the shared logic; tests cover all of it.
 #[allow(dead_code)]
 mod desktop_host;
+#[cfg(windows)]
+mod elevation;
 #[cfg(target_os = "macos")]
 mod macos_server;
 #[cfg(windows)]
@@ -581,10 +583,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("--host-agent") => return windows_service::run_agent(&arguments[1..]),
         _ => {}
     }
+    // TopVNC reopened as administrator takes over a window's server start.
+    #[cfg(windows)]
+    let (arguments, mut start, handed_form) = reopened(arguments)?;
+    #[cfg(not(windows))]
+    let (mut start, handed_form) = (None, None);
+    let _ = VIEWER_ARGUMENTS.set(arguments.clone());
     let mut config = Config::default();
     settings::load(&mut config);
     let input_debug = apply_viewer_arguments(&mut config, arguments)?;
     config.tls.client(&config.host)?;
+    if let Some(form) = handed_form {
+        config.serve = form;
+    }
 
     #[cfg(windows)]
     let _timer = TimerResolution::new();
@@ -605,6 +616,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &mut server,
             &mut web,
             &mut service,
+            start.take(),
         )?
         else {
             return Ok(());
@@ -618,6 +630,109 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("Session ended: {error}");
         }
     }
+}
+
+/// A start the landing window performs as if its button was clicked: one
+/// handed over from a window that reopened TopVNC as administrator, or one
+/// performed here after that did not happen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum StartAction {
+    /// START SERVER in the Server tab.
+    Server,
+    /// START BROWSER ACCESS in the WEB tab.
+    Web,
+    /// PAIR in the WEB tab, which starts browser access first.
+    WebPair,
+}
+
+/// This window's command line, handed on when it reopens as administrator.
+static VIEWER_ARGUMENTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+/// Set in TopVNC reopened as administrator, which never reopens again.
+#[cfg(windows)]
+static REOPENED: AtomicBool = AtomicBool::new(false);
+
+/// Shown while a server start waits for Windows administrator approval.
+const WAITING_FOR_APPROVAL: &str = "Waiting for Windows administrator approval. TopVNC reopens \
+     as administrator to serve, so remote input also reaches apps that run as administrator, \
+     such as Task Manager.";
+
+/// The command line to use, the start to perform, and the Server tab's form.
+#[cfg(windows)]
+type Reopened = (Vec<String>, Option<StartAction>, Option<ui::ServeForm>);
+
+/// With `--elevated-window` first: take over the window's start.
+#[cfg(windows)]
+fn reopened(arguments: Vec<String>) -> Result<Reopened, Box<dyn Error>> {
+    if arguments.first().map(String::as_str) != Some(elevation::WINDOW_FLAG) {
+        return Ok((arguments, None, None));
+    }
+    let handoff = elevation::receive(&arguments[1..])?;
+    REOPENED.store(true, Ordering::Release);
+    Ok((handoff.viewer, Some(handoff.action), Some(handoff.form)))
+}
+
+/// Whether a server start should first reopen TopVNC as administrator: on
+/// Windows, when this process does not run as administrator, and when
+/// closing this window stops nothing that runs.
+fn should_elevate(
+    server: &HostedServer,
+    web: &WebRuntime,
+    helpers: &helpers::HelperRuntime,
+    service: &host_service::ServiceRuntime,
+) -> bool {
+    #[cfg(windows)]
+    {
+        !REOPENED.load(Ordering::Acquire)
+            && server.running.is_none()
+            && server.web_service.is_none()
+            && web.is_idle()
+            && !helpers.busy()
+            && service.view.busy.is_none()
+            && !elevation::is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (server, web, helpers, service);
+        false
+    }
+}
+
+/// Reopen TopVNC as administrator for `action` with this window's settings,
+/// off the UI thread. The receiver gets `Ok` once it took over.
+#[cfg(windows)]
+fn reopen_as_administrator(
+    action: StartAction,
+    config: &Config,
+) -> mpsc::Receiver<Result<(), String>> {
+    let (sender, receiver) = mpsc::channel();
+    let handoff = elevation::Handoff {
+        action,
+        form: config.serve.clone(),
+        viewer: VIEWER_ARGUMENTS.get().cloned().unwrap_or_default(),
+    };
+    let worker = sender.clone();
+    let spawned = thread::Builder::new()
+        .name("topvnc-elevation".into())
+        .spawn(move || {
+            let _ = worker.send(elevation::hand_off(&handoff).map_err(|error| error.to_string()));
+        });
+    if let Err(error) = spawned {
+        let _ = sender.send(Err(format!(
+            "Could not ask Windows for administrator approval: {error}"
+        )));
+    }
+    receiver
+}
+
+#[cfg(not(windows))]
+fn reopen_as_administrator(
+    _action: StartAction,
+    _config: &Config,
+) -> mpsc::Receiver<Result<(), String>> {
+    let (sender, receiver) = mpsc::channel();
+    let _ = sender.send(Err("Only Windows reopens TopVNC as administrator.".into()));
+    receiver
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -1188,6 +1303,7 @@ fn show_landing(
     server: &mut HostedServer,
     web: &mut WebRuntime,
     service: &mut host_service::ServiceRuntime,
+    mut pending_start: Option<StartAction>,
 ) -> Result<Option<(Config, Session)>, Box<dyn Error>> {
     const WIDTH: usize = 800;
     const HEIGHT: usize = 640;
@@ -1214,7 +1330,37 @@ fn show_landing(
     let mut dragging_serve_scale = false;
     // The pointer position in form pixels while it is over the window.
     let mut cursor: Option<(usize, usize)> = None;
+    // A start waiting for TopVNC to reopen as administrator.
+    let mut elevating: Option<(StartAction, mpsc::Receiver<Result<(), String>>)> = None;
+    // The pending start runs here, without administrator rights, as
+    // TopVNC did not reopen as administrator.
+    let mut skip_elevation = false;
     loop {
+        if let Some((action, receiver)) = &elevating {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "Reopening TopVNC as administrator stopped unexpectedly.".into(),
+                )),
+            };
+            if let Some(result) = result {
+                let action = *action;
+                elevating = None;
+                state.notice = None;
+                server.view.message = None;
+                match result {
+                    // TopVNC as administrator serves now; this window closes.
+                    Ok(()) => return Ok(None),
+                    // The server then says what it cannot do.
+                    Err(reason) => {
+                        eprintln!("{reason} Serving without administrator rights.");
+                        skip_elevation = true;
+                        pending_start = Some(action);
+                    }
+                }
+            }
+        }
         helpers.poll();
         service.poll(state.tab == Tab::Service || server.web_service.is_some());
         server.poll_web_service(service);
@@ -1603,6 +1749,31 @@ fn show_landing(
                 _ => {}
             }
         }
+        if elevating.is_some() {
+            // This window closes once TopVNC reopens as administrator, so
+            // nothing new starts here meanwhile.
+            (connect_clicked, server_clicked, web_clicked, pair_clicked) =
+                (false, false, false, false);
+            helper_action = None;
+            service_action = None;
+        }
+        if let Some(action) = pending_start.take() {
+            match action {
+                StartAction::Server => {
+                    state.switch_tab(Tab::Server);
+                    server_clicked = server.view.phase == ServerPhase::Stopped;
+                }
+                StartAction::Web | StartAction::WebPair => {
+                    state.switch_tab(Tab::Web);
+                    web_clicked = action == StartAction::Web && web.is_idle();
+                    pair_clicked = action == StartAction::WebPair && web.is_idle();
+                }
+            }
+        }
+        // A viewer connection in progress would end with this window.
+        let may_elevate = !std::mem::take(&mut skip_elevation)
+            && !connecting
+            && should_elevate(server, web, &helpers, service);
         if let Some(action) = helper_action
             && let Some(helper) = state.tab.helper()
             && !helpers.busy()
@@ -1652,7 +1823,14 @@ fn show_landing(
                         } else {
                             state.error = None;
                             state.focus = None;
-                            if let Err(error) = server.start(Owner::ServerTab, request) {
+                            // TLS files that do not load are reported here.
+                            if may_elevate && request.tls.server().is_ok() {
+                                server.view.message = Some(WAITING_FOR_APPROVAL.into());
+                                elevating = Some((
+                                    StartAction::Server,
+                                    reopen_as_administrator(StartAction::Server, &config),
+                                ));
+                            } else if let Err(error) = server.start(Owner::ServerTab, request) {
                                 state.error = Some(error);
                             }
                         }
@@ -1672,6 +1850,23 @@ fn show_landing(
                 }
                 Err(error) => state.error = Some(format!("Could not copy the app URL: {error}")),
             }
+        }
+        // Browser access starting here; its own problems are reported here.
+        if may_elevate
+            && (web_clicked || (pair_clicked && !web.pairing_active()))
+            && !config.serve.password.is_empty()
+            && web_access::config::prepare().is_ok()
+        {
+            let action = if web_clicked {
+                StartAction::Web
+            } else {
+                StartAction::WebPair
+            };
+            state.error = None;
+            state.focus = None;
+            state.notice = Some(WAITING_FOR_APPROVAL.into());
+            elevating = Some((action, reopen_as_administrator(action, &config)));
+            (web_clicked, pair_clicked) = (false, false);
         }
         if web_clicked || pair_clicked {
             state.notice = None;
