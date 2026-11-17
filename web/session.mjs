@@ -41,8 +41,10 @@ export function createSession(post) {
   // The OffscreenCanvas arrives once and is reused by later connections.
   let canvas;
 
-  async function ready() {
-    wasm ??= await init({ module_or_path: "/topvnc_web_bg.wasm" });
+  // The page compiles the module once and sends it with each connect, so a new
+  // session worker skips refetching (a revalidation round trip) and compiling.
+  async function ready(module) {
+    wasm ??= await init({ module_or_path: module instanceof WebAssembly.Module ? module : "/topvnc_web_bg.wasm" });
   }
 
   // Ends the session, or a connection still setting up. Either way the page
@@ -186,7 +188,7 @@ export function createSession(post) {
     sendAll(current);
   }
 
-  async function connect({ url, browser, host, secret, quality, canvas: transferred }) {
+  async function connect({ url, browser, host, secret, quality, canvas: transferred, wasm: module }) {
     stop(4000, "Replaced by a new connection.");
     const attempt = (starting = {});
     canvas = transferred ?? canvas;
@@ -194,7 +196,7 @@ export function createSession(post) {
     let socket;
     let current;
     try {
-      await ready();
+      await ready(module);
       if (starting !== attempt) return;
       connection = new Connection(browser, host, secret ?? undefined, quality);
       socket = new WebSocket(url, ["binary"]);

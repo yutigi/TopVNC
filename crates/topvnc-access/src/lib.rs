@@ -14,6 +14,22 @@ pub const KEY_REFRESH_SECONDS: u64 = 10;
 
 pub type PolicyResult<T> = Result<T, &'static str>;
 
+/// Stable, URL-safe ID shared by gateway pairing links and the WEB tab.
+pub fn validate_host_id(id: &str) -> PolicyResult<()> {
+    if id.is_empty()
+        || id.len() > 48
+        || !(id.as_bytes()[0].is_ascii_lowercase() || id.as_bytes()[0].is_ascii_digit())
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    {
+        return Err(
+            "host_id must be 1-48 lowercase letters, digits or hyphens, starting with a letter or digit",
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct AccessPolicy {
     pub issuer: String,

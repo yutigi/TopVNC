@@ -1,5 +1,9 @@
-export async function verifyAccess(origin, issuer, request = fetch) {
-  for (const path of ["/", "/ws"]) {
+// Use the validated deployment variables so every configured route is checked.
+export async function verifyAccess({ APP_ORIGIN: origin, ACCESS_ISSUER: issuer, HOSTS_JSON: hosts }, request = fetch) {
+  const paths = ["/", "/api/hosts", ...(hosts === undefined
+    ? ["/ws"]
+    : JSON.parse(hosts).map(({ id }) => `/ws/${id}`))];
+  for (const path of paths) {
     const response = await request(new URL(path, origin), { redirect: "manual", signal: AbortSignal.timeout(15000) });
     const location = response.headers.get("location");
     let login;

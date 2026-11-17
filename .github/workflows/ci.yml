@@ -138,7 +138,20 @@ jobs:
       - name: Test WebAssembly bindings
         working-directory: web
         run: npm run test:wasm
+      # The built page in headless Chrome with a controlled session Worker:
+      # machine switching, late-message fencing, scoped enrollment and legacy
+      # pairing handling. Needs the build above; no network or credentials.
+      - name: Test multi-host switching in Chrome
+        working-directory: web
+        env:
+          TOPVNC_TEST_BROWSER: /usr/bin/google-chrome
+        run: npm run test:integration
       # Plain JavaScript with node:test; it needs no npm install.
       - name: Test Cloudflare Worker
         working-directory: gateway/cloudflare/worker
         run: npm test
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+      - name: Test Cloudflare setup helpers (offline)
+        run: python -m unittest discover -s scripts/tests -p test_cloudflare.py

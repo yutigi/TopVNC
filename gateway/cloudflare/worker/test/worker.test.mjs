@@ -11,6 +11,7 @@ import worker, {
   tokenKeyId,
   validateUpgrade,
   validateUpstream,
+  hostRegistry,
 } from "../src/index.mjs";
 
 // Signed by crates/topvnc-access's fixtures; its test keeps this file current.
@@ -264,5 +265,76 @@ describe("fetch handler", () => {
     assert.equal((await worker.fetch(upgrade(token), env(undefined))).status, 503);
     assert.equal((await worker.fetch(upgrade(token), { ...env({ fetch: async () => ({ status: 101 }) }), UPSTREAM_URL: "http://8.8.8.8:6080/ws" })).status, 503);
     assert.equal((await worker.fetch(upgrade(token), { ...env({ fetch: async () => ({ status: 101 }) }), ACCESS_ISSUER: "https://evil.example" })).status, 503);
+  });
+
+  const hosts = [
+    { id: "gaming-pc", name: "Gaming PC", binding: "GAMING_NET", upstream: "http://127.0.0.1:6080/ws" },
+    { id: "office-pc", name: "Office PC", binding: "OFFICE_NET", upstream: "http://127.0.0.1:7080/ws" },
+  ];
+  const multi = (fetch) => ({ ...env(undefined), HOSTS_JSON: JSON.stringify(hosts),
+    GAMING_NET: { fetch: (req) => fetch("gaming", req) }, OFFICE_NET: { fetch: (req) => fetch("office", req) } });
+  const machineRequest = (path, token = vectors.accepted.array_audience, extra = {}) => new Request(`${vectors.origin}${path}`, {
+    headers: { Origin: vectors.origin, Upgrade: "websocket", "Sec-WebSocket-Protocol": "binary",
+      ...(token === undefined ? {} : { "Cf-Access-Jwt-Assertion": token }), ...extra },
+  });
+
+  it("routes two machines to separate configured bindings and rewrites only the private path", async () => {
+    const sent = [];
+    const config = multi(async (host, req) => { sent.push([host, req.url, req.headers.get("Origin")]); return { status: 101 }; });
+    for (const id of ["office-pc", "gaming-pc"]) assert.equal((await worker.fetch(machineRequest(`/ws/${id}`), config)).status, 101);
+    assert.deepEqual(sent, [["office", hosts[1].upstream, vectors.origin], ["gaming", hosts[0].upstream, vectors.origin]]);
+  });
+
+  it("protects metadata with owner JWT and exposes only labels, IDs, and migration policy", async () => {
+    let contacted = false;
+    const config = { ...multi(async () => { contacted = true; }), LEGACY_HOST_ID: "gaming-pc" };
+    for (const token of [null, "bad", vectors.rejected.wrong_email, vectors.rejected.forged_payload]) {
+      const headers = token === null ? {} : { "Cf-Access-Jwt-Assertion": token };
+      assert.equal((await worker.fetch(new Request(`${vectors.origin}/api/hosts`, { headers }), config)).status, 401);
+    }
+    const response = await worker.fetch(machineRequest("/api/hosts"), config);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Cache-Control"), "no-store");
+    assert.deepEqual(await response.json(), { legacy: false, legacyHostId: "gaming-pc", hosts: hosts.map(({ id, name }) => ({ id, name })) });
+    assert.equal(contacted, false);
+    const legacy = await worker.fetch(machineRequest("/api/hosts"), env({ fetch() {} }));
+    assert.deepEqual(await legacy.json(), { legacy: true, legacyHostId: null, hosts: [{ id: "default", name: "This machine" }] });
+  });
+
+  it("never reaches a machine on unknown IDs, implicit defaults, bad origins, queries, or rejected auth", async () => {
+    let contacted = false;
+    const config = multi(async () => { contacted = true; return { status: 101 }; });
+    for (const [request, status] of [
+      [machineRequest("/ws/missing"), 404], [machineRequest("/ws"), 404],
+      [machineRequest("/ws/UPPER"), 404], [machineRequest("/ws/a%2fb"), 404],
+      [machineRequest("/ws/office-pc?url=http://evil.example"), 403],
+      [machineRequest("/ws/office-pc", "invalid"), 401],
+      [machineRequest("/ws/office-pc", vectors.rejected.wrong_email), 401],
+      [machineRequest("/ws/office-pc", vectors.accepted.array_audience, { Origin: "https://evil.example" }), 403],
+      [machineRequest("/ws/office-pc", vectors.accepted.array_audience, { "Sec-WebSocket-Protocol": "text" }), 403],
+      [machineRequest("/api/hosts?x"), 403],
+      [machineRequest("/api/hosts", vectors.accepted.array_audience, { Origin: "https://evil.example" }), 403],
+      [new Request(`${vectors.origin}/api/hosts`, { method: "POST" }), 403],
+    ]) assert.equal((await worker.fetch(request, config)).status, status, request.url);
+    assert.equal(contacted, false);
+  });
+
+  it("fails closed for invalid registries, migration targets and private endpoints", () => {
+    const config = multi(async () => ({ status: 101 }));
+    for (const value of ["bad", "[]", "null", "x".repeat(16385),
+      JSON.stringify(Array(33).fill(hosts[0])), JSON.stringify([hosts[0], hosts[0]]),
+      JSON.stringify([{ ...hosts[0], id: "../ws" }]), JSON.stringify([{ ...hosts[0], name: "" }]),
+      JSON.stringify([{ ...hosts[0], binding: "toString" }]),
+      JSON.stringify([{ ...hosts[0], upstream: "http://8.8.8.8:6080/ws" }])]) {
+      assert.throws(() => hostRegistry({ ...config, HOSTS_JSON: value }));
+    }
+    assert.throws(() => hostRegistry({ ...config, LEGACY_HOST_ID: "missing" }));
+    assert.throws(() => hostRegistry({ ...config, OFFICE_NET: undefined }));
+  });
+
+  it("reports an offline machine while leaving the other route usable", async () => {
+    const config = multi(async (host) => { if (host === "office") throw Error("offline"); return { status: 101 }; });
+    assert.equal((await worker.fetch(machineRequest("/ws/office-pc"), config)).status, 503);
+    assert.equal((await worker.fetch(machineRequest("/ws/gaming-pc"), config)).status, 101);
   });
 });

@@ -1,8 +1,8 @@
 // Cloudflare Worker for TopVNC's browser client. Static assets (web/dist) are
-// served before this code runs; it handles only `/ws`: it verifies the
+// served before this code runs; it handles host metadata and upgrades: verifies the
 // Cloudflare Access JWT, then forwards the WebSocket upgrade unchanged to the
-// one private gateway behind the Workers VPC binding. It never accepts the
-// socket, reads messages, or chooses a destination from the request.
+// selected allowlisted private gateway behind a Workers VPC binding. It never
+// accepts the socket, reads messages, or accepts browser-supplied destinations.
 //
 // This is plain JavaScript with WebCrypto rather than Rust compiled to
 // WebAssembly. A cold isolate spent most of its CPU instantiating and
@@ -374,17 +374,48 @@ async function signingKeys(policy, kid) {
 
 const text = (body, status) => new Response(body, { status });
 
+export function hostRegistry(env) {
+  if (env.HOSTS_JSON === undefined) {
+    validateUpstream(String(env.UPSTREAM_URL));
+    return { legacy: true, legacyHostId: null, hosts: [
+      { id: "default", name: "This machine", binding: "HOST_NET", upstream: String(env.UPSTREAM_URL) },
+    ] };
+  }
+  if (typeof env.HOSTS_JSON !== "string" || env.HOSTS_JSON.length > 16 * 1024) reject("invalid host registry");
+  const hosts = JSON.parse(env.HOSTS_JSON);
+  if (!Array.isArray(hosts) || hosts.length < 1 || hosts.length > 32) reject("invalid host count");
+  const ids = new Set();
+  for (const host of hosts) {
+    if (!isObject(host) || typeof host.id !== "string" || !/^[a-z0-9][a-z0-9-]{0,47}$/.test(host.id)
+      || ids.has(host.id) || typeof host.name !== "string" || !host.name.trim() || host.name.length > 80
+      || /[\u0000-\u001f\u007f]/.test(host.name)
+      || typeof host.binding !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(host.binding)
+      || typeof env[host.binding]?.fetch !== "function" || typeof host.upstream !== "string") reject("invalid host entry");
+    validateUpstream(host.upstream);
+    ids.add(host.id);
+  }
+  const legacyHostId = env.LEGACY_HOST_ID ?? null;
+  if (legacyHostId !== null && !ids.has(legacyHostId)) reject("invalid legacy host ID");
+  return { legacy: false, legacyHostId, hosts };
+}
+
 async function handle(request, env) {
   const url = new URL(request.url);
-  if (url.pathname !== "/ws") return text("Not found", 404);
+  const metadata = url.pathname === "/api/hosts";
+  const route = /^\/ws\/([a-z0-9][a-z0-9-]{0,47})$/.exec(url.pathname);
+  if (!metadata && url.pathname !== "/ws" && !route) return text("Not found", 404);
   const appOrigin = String(env.APP_ORIGIN);
   const headers = request.headers;
   try {
+    validateOrigin(appOrigin);
     if (url.origin !== appOrigin) reject("wrong host");
-    validateUpgrade(
+    if (metadata) {
+      if (request.method !== "GET" || request.url.includes("?")
+        || (headers.has("Origin") && headers.get("Origin") !== appOrigin)) reject("invalid metadata request");
+    } else validateUpgrade(
       {
         method: request.method,
-        path: url.pathname,
+        path: "/ws",
         hasQuery: url.search !== "" || request.url.includes("?"),
         origin: headers.get("Origin") ?? undefined,
         protocols: headers.get("Sec-WebSocket-Protocol") ?? undefined,
@@ -411,10 +442,19 @@ async function handle(request, env) {
   } catch {
     return text("Access authentication failed", 401);
   }
-  const upstream = String(env.UPSTREAM_URL);
-  validateUpstream(upstream);
-  const binding = env.HOST_NET;
-  if (typeof binding?.fetch !== "function") throw new Error("HOST_NET has no fetch API");
+  const registry = hostRegistry(env);
+  if (metadata) return new Response(JSON.stringify({
+    legacy: registry.legacy,
+    legacyHostId: registry.legacyHostId,
+    hosts: registry.hosts.map(({ id, name }) => ({ id, name })),
+  }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
+  const host = registry.legacy
+    ? (url.pathname === "/ws" ? registry.hosts[0] : undefined)
+    : registry.hosts.find((host) => host.id === route?.[1]);
+  if (!host) return text("Unknown machine", 404);
+  const upstream = host.upstream;
+  const binding = env[host.binding];
+  if (typeof binding?.fetch !== "function") throw new Error("Missing private service binding");
   // Abort only a pending handshake; the timer is cleared once the gateway answers.
   const controller = new AbortController();
   const outbound = new Request(upstream, {
