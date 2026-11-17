@@ -226,7 +226,7 @@ update the website: publish the Worker and browser client too. Publishing runs
 only from `main` (see [Manual Cloudflare deployment](#manual-cloudflare-deployment)).
 Run the commands below from the repository root.
 
-1. **Prepare each machine.** Check out this branch on both hosts and complete
+1. **Prepare each machine.** Check out `main` on both hosts and complete
    [setup steps 1–7](docs/cloudflare-gateway.md#one-time-setup). Use the same app
    origin, Access issuer, audience, and owner email on both. Create a separate
    private tunnel and VPC service for each machine; keep ports `5900` and `6080`
@@ -263,7 +263,7 @@ Run the commands below from the repository root.
    npm --prefix web run test:wasm
    npm --prefix web run test:integration # requires Chrome/Edge/Chromium
    npm --prefix gateway/cloudflare/worker run deploy:check
-   # After merging, from a clean main checkout that matches origin/main:
+   # From a clean main checkout that matches origin/main:
    npm --prefix gateway/cloudflare/worker run deploy # publishes the website
    ```
 
