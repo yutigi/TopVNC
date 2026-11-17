@@ -1,0 +1,34 @@
+# Copy to wrangler.local.toml and fill in your account and service IDs.
+name = "topvnc"
+main = "src/index.mjs"
+compatibility_date = "2026-10-29"
+workers_dev = true
+preview_urls = false
+account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+
+[assets]
+directory = "../../../web/dist"
+run_worker_first = ["/ws", "/ws/*", "/api/hosts"]
+
+[vars]
+APP_ORIGIN = "https://topvnc.YOUR_SUBDOMAIN.workers.dev"
+ACCESS_ISSUER = "https://YOUR_TEAM.cloudflareaccess.com"
+ACCESS_AUD = "YOUR_ACCESS_APPLICATION_AUD"
+OWNER_EMAIL = "you@example.com"
+HOSTS_JSON = '''[
+  {"id":"gaming-pc","name":"Gaming PC","binding":"GAMING_NET","upstream":"http://127.0.0.1:6080/ws"},
+  {"id":"office-pc","name":"Office PC","binding":"OFFICE_NET","upstream":"http://127.0.0.1:6080/ws"}
+]'''
+# Optional: only if gaming-pc is the old single-host deployment's SAME identity.
+# LEGACY_HOST_ID = "gaming-pc"
+
+# Each service ID must point to its own machine's private tunnel.
+[[vpc_services]]
+binding = "GAMING_NET"
+service_id = "YOUR_GAMING_VPC_SERVICE_ID"
+remote = true
+
+[[vpc_services]]
+binding = "OFFICE_NET"
+service_id = "YOUR_OFFICE_VPC_SERVICE_ID"
+remote = true
