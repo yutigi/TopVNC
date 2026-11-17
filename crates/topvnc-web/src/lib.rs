@@ -210,6 +210,14 @@ impl Connection {
         self.inner.capture_status().code()
     }
 
+    /// Whether the host accepts the input it injects: 0 accepted, 1 blocked
+    /// by an app with more privileges in front, such as Task Manager, 2
+    /// rejected for another reason. See [`topvnc_rfb::InputStatus`].
+    #[wasm_bindgen(js_name = inputStatus)]
+    pub fn input_status(&self) -> u16 {
+        self.inner.input_status().code()
+    }
+
     #[wasm_bindgen(js_name = relativePointer)]
     pub fn relative_pointer(&self) -> bool {
         self.inner.relative_pointer()

@@ -7,6 +7,10 @@
 //! signed-in user may open, starts `topvnc --install-service --ui-pipe NAME`
 //! elevated, checks that the client is that process, and only then sends the
 //! password. The installer writes its summary or error back on the same pipe.
+//!
+//! The same pipe hands a server start to TopVNC reopened as administrator
+//! (`--elevated-window`, and `--serve` from a terminal), so remote input
+//! also reaches apps that run as administrator; see `elevation`.
 
 use std::error::Error;
 use std::fs::File;
@@ -35,8 +39,8 @@ use windows_sys::Win32::System::Com::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, GetExitCodeProcess, GetProcessId, OpenProcessToken,
@@ -46,7 +50,7 @@ use windows_sys::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     ShellExecuteExW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 
 /// Put first after `--install-service` or `--uninstall-service` by the
 /// window, followed by the pipe's name.
@@ -81,7 +85,7 @@ fn pipe_path(name: &str) -> Vec<u16> {
 }
 
 /// The password as the window sends it: a little-endian length, then UTF-8.
-fn password_frame(password: &str) -> Result<Vec<u8>, String> {
+pub fn password_frame(password: &str) -> Result<Vec<u8>, String> {
     let bytes = password.as_bytes();
     if bytes.is_empty() {
         return Err("The service needs a VNC password.".into());
@@ -121,7 +125,7 @@ fn read_password_frame(reader: &mut impl Read) -> Result<String, String> {
 pub struct WindowPipe(File);
 
 impl WindowPipe {
-    fn connect(name: &str) -> Result<Self, String> {
+    pub fn connect(name: &str) -> Result<Self, String> {
         if !valid_pipe_name(name) {
             return Err(format!("{name} is not a TopVNC window pipe"));
         }
@@ -151,6 +155,32 @@ impl WindowPipe {
     pub fn read_password(&mut self) -> Result<String, String> {
         read_password_frame(&mut self.0)
     }
+
+    /// One frame of 1 to `max` bytes: a little-endian length, then the bytes.
+    pub fn read_frame(&mut self, max: usize) -> Result<Vec<u8>, String> {
+        read_frame(&mut self.0, max)
+    }
+
+    /// The process that created the pipe: the TopVNC that started this one.
+    pub fn owner_process_id(&self) -> Option<u32> {
+        let mut process_id = 0;
+        (unsafe { GetNamedPipeServerProcessId(self.0.as_raw_handle(), &mut process_id) } != 0
+            && process_id != 0)
+            .then_some(process_id)
+    }
+}
+
+fn read_frame(reader: &mut impl Read, max: usize) -> Result<Vec<u8>, String> {
+    let failed = |error: std::io::Error| format!("could not read from the TopVNC window: {error}");
+    let mut length = [0; 4];
+    reader.read_exact(&mut length).map_err(failed)?;
+    let length = u32::from_le_bytes(length) as usize;
+    if length == 0 || length > max {
+        return Err("the TopVNC window sent a frame of an invalid length".into());
+    }
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes).map_err(failed)?;
+    Ok(bytes)
 }
 
 impl Write for WindowPipe {
@@ -196,6 +226,8 @@ struct ControlPipe {
     name: String,
     pipe: OwnedHandle,
     event: OwnedHandle,
+    /// What the started process is called in errors, such as "installer".
+    peer: &'static str,
 }
 
 /// The signed-in user's SID, as text for a security descriptor.
@@ -248,7 +280,7 @@ fn current_user_sid() -> Result<String, String> {
 }
 
 impl ControlPipe {
-    fn create() -> Result<Self, String> {
+    fn create(peer: &'static str) -> Result<Self, String> {
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)
             .map_err(|error| format!("Could not name the pipe: {error}"))?;
@@ -314,7 +346,12 @@ impl ControlPipe {
             ));
         }
         let event = unsafe { OwnedHandle::from_raw_handle(event) };
-        Ok(Self { name, pipe, event })
+        Ok(Self {
+            name,
+            pipe,
+            event,
+            peer,
+        })
     }
 
     fn overlapped(&self) -> OVERLAPPED {
@@ -345,26 +382,29 @@ impl ControlPipe {
                             CancelIoEx(pipe, &overlapped);
                             GetOverlappedResult(pipe, &overlapped, &mut transferred, 1);
                         }
+                        let peer = self.peer;
                         return Err(match waited {
                             _ if waited == WAIT_OBJECT_0 + 1 => {
-                                "The installer ended before it reached the TopVNC window.".into()
+                                format!("The {peer} ended before it reached the TopVNC window.")
                             }
                             WAIT_TIMEOUT => {
-                                "The installer did not reach the TopVNC window in time.".into()
+                                format!("The {peer} did not reach the TopVNC window in time.")
                             }
-                            _ => format!("Could not wait for the installer: {wait_error}"),
+                            _ => format!("Could not wait for the {peer}: {wait_error}"),
                         });
                     }
                     if unsafe { GetOverlappedResult(pipe, &overlapped, &mut transferred, 0) } == 0 {
                         return Err(format!(
-                            "The installer could not connect: {}",
+                            "The {} could not connect: {}",
+                            self.peer,
                             std::io::Error::last_os_error()
                         ));
                     }
                 }
                 error => {
                     return Err(format!(
-                        "Could not wait for the installer: {}",
+                        "Could not wait for the {}: {}",
+                        self.peer,
                         std::io::Error::from_raw_os_error(error as i32)
                     ));
                 }
@@ -375,9 +415,10 @@ impl ControlPipe {
         if unsafe { GetNamedPipeClientProcessId(pipe, &mut connected) } == 0
             || connected != unsafe { GetProcessId(client) }
         {
-            return Err(
-                "Another process connected to the installer's pipe, so nothing was sent.".into(),
-            );
+            return Err(format!(
+                "Another process connected to the {}'s pipe, so nothing was sent.",
+                self.peer
+            ));
         }
         Ok(())
     }
@@ -434,6 +475,16 @@ impl ControlPipe {
     /// [`MAX_REPORT_BYTES`].
     fn read_report(&self) -> String {
         let mut report = Vec::new();
+        self.relay(|chunk| {
+            let keep = chunk.len().min(MAX_REPORT_BYTES - report.len());
+            report.extend_from_slice(&chunk[..keep]);
+        });
+        String::from_utf8_lossy(&report).trim().to_owned()
+    }
+
+    /// Hand `output` what the started process writes, as it arrives, until
+    /// it closes the pipe.
+    fn relay(&self, mut output: impl FnMut(&[u8])) {
         let mut chunk = [0u8; 4096];
         loop {
             let read = self.transfer(|pipe, overlapped, transferred| unsafe {
@@ -447,29 +498,116 @@ impl ControlPipe {
             });
             match read {
                 Ok(0) | Err(_) => break,
-                Ok(count) => {
-                    let keep = count.min(MAX_REPORT_BYTES - report.len());
-                    report.extend_from_slice(&chunk[..keep]);
-                }
+                Ok(count) => output(&chunk[..count]),
             }
         }
-        String::from_utf8_lossy(&report).trim().to_owned()
     }
 }
 
+/// Why a process that needs administrator approval did not start.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LaunchError {
+    /// Nobody approved the prompt.
+    Cancelled,
+    Failed(String),
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("Windows administrator approval was cancelled."),
+            Self::Failed(error) => formatter.write_str(error),
+        }
+    }
+}
+
+/// TopVNC started again with administrator approval and connected to a
+/// pipe that only it may use: `topvnc COMMAND --ui-pipe NAME OPTIONS`.
+pub struct ElevatedProcess {
+    pipe: ControlPipe,
+    process: OwnedHandle,
+}
+
+impl ElevatedProcess {
+    /// Ask for approval, start the process `shown` or hidden, and wait for
+    /// it to connect. Blocks through the approval prompt. Tests never call
+    /// it: it asks for administrator approval.
+    pub fn start(
+        command: &str,
+        options: &[String],
+        shown: bool,
+        peer: &'static str,
+    ) -> Result<Self, LaunchError> {
+        let pipe = ControlPipe::create(peer).map_err(LaunchError::Failed)?;
+        let mut arguments = vec![
+            command.to_owned(),
+            UI_PIPE_FLAG.to_owned(),
+            pipe.name.clone(),
+        ];
+        arguments.extend(options.iter().cloned());
+        let program = std::env::current_exe().map_err(|error| {
+            LaunchError::Failed(format!("Could not find the TopVNC program: {error}"))
+        })?;
+        let show = if shown { SW_SHOWNORMAL } else { SW_HIDE };
+        let process = launch_elevated(&program, &arguments, show)?;
+        pipe.accept(process.as_raw_handle(), CONNECT_TIMEOUT)
+            .map_err(LaunchError::Failed)?;
+        Ok(Self { pipe, process })
+    }
+
+    pub fn send(&self, bytes: &[u8]) -> Result<(), String> {
+        self.pipe
+            .write_all(bytes)
+            .map_err(|error| format!("Could not reach the {}: {error}", self.pipe.peer))
+    }
+
+    /// Everything it writes until it closes the pipe.
+    pub fn read_report(&self) -> String {
+        self.pipe.read_report()
+    }
+
+    /// Hand `output` what it writes, as it arrives, until it closes the pipe.
+    pub fn relay(&self, output: impl FnMut(&[u8])) {
+        self.pipe.relay(output)
+    }
+
+    /// Its exit code, once it ends within `timeout`.
+    pub fn exit_code(&self, timeout: Duration) -> Option<u32> {
+        let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        unsafe { WaitForSingleObject(self.process.as_raw_handle(), milliseconds) };
+        let mut code = 0;
+        (unsafe { GetExitCodeProcess(self.process.as_raw_handle(), &mut code) } != 0
+            && code != STILL_ACTIVE)
+            .then_some(code)
+    }
+}
+
+/// What `GetExitCodeProcess` reports while the process runs.
+const STILL_ACTIVE: u32 = 259;
+
 /// Start `program` with `arguments` after Windows administrator approval,
-/// with no window.
-fn launch_elevated(program: &Path, arguments: &[String]) -> Result<OwnedHandle, String> {
+/// in this process's folder, with its window shown as `show` says.
+fn launch_elevated(
+    program: &Path,
+    arguments: &[String],
+    show: i32,
+) -> Result<OwnedHandle, LaunchError> {
     let file = wide(&program.to_string_lossy());
     let parameters = wide(&crate::windows_service::argument_line(arguments));
     let verb = wide("runas");
+    let folder = std::env::current_dir()
+        .ok()
+        .map(|folder| wide(&folder.to_string_lossy()));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
         lpVerb: verb.as_ptr(),
         lpFile: file.as_ptr(),
         lpParameters: parameters.as_ptr(),
-        nShow: SW_HIDE,
+        lpDirectory: folder
+            .as_ref()
+            .map_or(std::ptr::null(), |folder| folder.as_ptr()),
+        nShow: show,
         ..Default::default()
     };
     // The shell may hand the request to COM components.
@@ -486,13 +624,17 @@ fn launch_elevated(program: &Path, arguments: &[String]) -> Result<OwnedHandle, 
     }
     if launched == 0 {
         return Err(if error.raw_os_error() == Some(ERROR_CANCELLED as i32) {
-            "Windows administrator approval was cancelled. Nothing was changed.".into()
+            LaunchError::Cancelled
         } else {
-            format!("Could not ask Windows for administrator approval: {error}")
+            LaunchError::Failed(format!(
+                "Could not ask Windows for administrator approval: {error}"
+            ))
         });
     }
     if info.hProcess.is_null() {
-        return Err("Windows did not report the installer process.".into());
+        return Err(LaunchError::Failed(
+            "Windows did not report the started process.".into(),
+        ));
     }
     Ok(unsafe { OwnedHandle::from_raw_handle(info.hProcess) })
 }
@@ -505,7 +647,7 @@ pub fn run_elevated(request: Request) -> Result<String, String> {
         Request::Install { password, .. } => Some(password_frame(password)?),
         Request::Remove => None,
     };
-    let pipe = ControlPipe::create()?;
+    let pipe = ControlPipe::create("installer")?;
     let mut arguments = vec![
         match request {
             Request::Install { .. } => "--install-service",
@@ -520,7 +662,13 @@ pub fn run_elevated(request: Request) -> Result<String, String> {
     }
     let program = std::env::current_exe()
         .map_err(|error| format!("Could not find the TopVNC program: {error}"))?;
-    let installer = launch_elevated(&program, &arguments)?;
+    let installer =
+        launch_elevated(&program, &arguments, SW_HIDE).map_err(|error| match error {
+            LaunchError::Cancelled => {
+                "Windows administrator approval was cancelled. Nothing was changed.".to_owned()
+            }
+            LaunchError::Failed(error) => error,
+        })?;
     let accepted = pipe.accept(installer.as_raw_handle(), CONNECT_TIMEOUT);
     if accepted.is_ok()
         && let Some(frame) = &frame
@@ -603,7 +751,7 @@ mod tests {
     /// which stands in for the elevated one. Nothing is elevated.
     #[test]
     fn the_window_sends_the_password_to_its_installer_and_reads_the_report() {
-        let pipe = ControlPipe::create().unwrap();
+        let pipe = ControlPipe::create("installer").unwrap();
         // The name exists only once.
         assert!(
             unsafe {
@@ -660,7 +808,7 @@ mod tests {
 
         // A client that is not the started installer gets nothing: this
         // process connects first.
-        let pipe = ControlPipe::create().unwrap();
+        let pipe = ControlPipe::create("installer").unwrap();
         let _other = WindowPipe::connect(&pipe.name).unwrap();
         let error = pipe
             .accept(started.as_raw_handle(), Duration::from_secs(10))
@@ -668,10 +816,57 @@ mod tests {
         assert!(error.contains("Another process"), "{error}");
 
         // An installer that ends without connecting is reported.
-        let pipe = ControlPipe::create().unwrap();
+        let pipe = ControlPipe::create("installer").unwrap();
         let error = pipe
             .accept(started.as_raw_handle(), Duration::from_secs(10))
             .unwrap_err();
         assert!(error.contains("ended before"), "{error}");
+    }
+
+    /// TopVNC reopened as administrator, played by a thread of this
+    /// process: it reads the window's frame, finds the window's process,
+    /// and answers. Nothing is elevated.
+    #[test]
+    fn a_reopened_window_reads_its_frame_and_answers_the_window() {
+        let pipe = ControlPipe::create("administrator window").unwrap();
+        let name = pipe.name.clone();
+        let reopened = std::thread::spawn(move || {
+            let mut window = WindowPipe::connect(&name).unwrap();
+            let owner = window.owner_process_id();
+            let frame = window.read_frame(16);
+            window.write_all(b"ready").unwrap();
+            (owner, frame)
+        });
+        let this = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                GetCurrentProcessId(),
+            )
+        };
+        assert!(!this.is_null());
+        let this = unsafe { OwnedHandle::from_raw_handle(this) };
+        pipe.accept(this.as_raw_handle(), Duration::from_secs(10))
+            .unwrap();
+        pipe.write_all(&[3, 0, 0, 0, b'a', b'b', b'c']).unwrap();
+        let mut relayed = Vec::new();
+        pipe.relay(|chunk| relayed.extend_from_slice(chunk));
+        assert_eq!(relayed, b"ready");
+        let (owner, frame) = reopened.join().unwrap();
+        assert_eq!(owner, Some(unsafe { GetCurrentProcessId() }));
+        assert_eq!(frame.unwrap(), b"abc");
+    }
+
+    #[test]
+    fn frames_of_invalid_lengths_are_refused() {
+        assert_eq!(read_frame(&mut &[2, 0, 0, 0, 7, 8][..], 2).unwrap(), [7, 8]);
+        for frame in [
+            &[0, 0, 0, 0][..],
+            &[3, 0, 0, 0, 1, 2, 3],
+            &[2, 0, 0, 0, 1],
+            &[1, 0],
+        ] {
+            assert!(read_frame(&mut &frame[..], 2).is_err(), "{frame:?}");
+        }
     }
 }

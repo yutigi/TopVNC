@@ -11,8 +11,8 @@ use topvnc_e2e::{Channel, Initiator, Key, MAX_PLAINTEXT_BYTES};
 use topvnc_rfb::messages::{continuous_updates_message, fence_message, update_request};
 use topvnc_rfb::protocol::{FENCE_REQUEST, FENCE_SUPPORTED_FLAGS};
 use topvnc_rfb::{
-    CaptureStatus, ClientHandshake, Encoding, HandshakeStatus, InputState, MessageReader,
-    RectDecoder, ServerInfo, ServerMessage,
+    CaptureStatus, ClientHandshake, Encoding, HandshakeStatus, InputState, InputStatus,
+    MessageReader, RectDecoder, ServerInfo, ServerMessage,
 };
 
 /// The host proved the pinned key: the encrypted channel is up.
@@ -39,6 +39,9 @@ pub const EVENT_OVERSIZE: u32 = 1 << 9;
 /// The host can or can no longer capture its desktop; see
 /// [`ClientSession::capture_status`].
 pub const EVENT_CAPTURE_STATUS: u32 = 1 << 10;
+/// The host does or no longer rejects the input it injects; see
+/// [`ClientSession::input_status`].
+pub const EVENT_INPUT_STATUS: u32 = 1 << 11;
 
 /// The largest framebuffer the browser shows: two 4K displays side by side,
 /// 64 MiB as RGBA, and the canvas area iOS Safari allows. A host serving more
@@ -346,6 +349,12 @@ impl ClientSession {
                         events |= EVENT_CAPTURE_STATUS;
                     }
                 }
+                ServerMessage::InputStatus(status) => {
+                    if running.input.input_status() != status {
+                        running.input.set_input_status(status);
+                        events |= EVENT_INPUT_STATUS;
+                    }
+                }
                 ServerMessage::PointerMode { relative } => {
                     running.input.server_pointer_mode(relative);
                     events |= EVENT_POINTER_MODE;
@@ -607,6 +616,15 @@ impl ClientSession {
         match &self.phase {
             Phase::Running(running) => running.input.capture_status(),
             _ => CaptureStatus::Live,
+        }
+    }
+
+    /// Whether the host accepts the input it injects; accepted unless it
+    /// said not.
+    pub fn input_status(&self) -> InputStatus {
+        match &self.phase {
+            Phase::Running(running) => running.input.input_status(),
+            _ => InputStatus::Accepted,
         }
     }
 

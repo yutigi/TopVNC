@@ -17,8 +17,9 @@ use topvnc_rfb::protocol::*;
 pub use topvnc_rfb::{
     BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_WHEEL_DOWN,
     BUTTON_WHEEL_LEFT, BUTTON_WHEEL_RIGHT, BUTTON_WHEEL_UP, CaptureStatus, DamageRect, Encoding,
-    Framebuffer, MAX_FRAMEBUFFER_DIMENSION, MAX_FRAMEBUFFER_PIXELS, MAX_SERVED_DISPLAYS, Security,
-    ServedDisplays, ServerInfo, encoding_name, negotiate, negotiate_with_encoding,
+    Framebuffer, InputStatus, MAX_FRAMEBUFFER_DIMENSION, MAX_FRAMEBUFFER_PIXELS,
+    MAX_SERVED_DISPLAYS, Security, ServedDisplays, ServerInfo, encoding_name, negotiate,
+    negotiate_with_encoding,
 };
 use topvnc_rfb::{Decoded, InputState, MessageReader, RectDecoder, ServerMessage};
 
@@ -603,6 +604,8 @@ pub struct VncServer {
     requested_display: Arc<std::sync::atomic::AtomicU16>,
     /// The [`CaptureStatus`] code viewers are told.
     capture_status: Arc<std::sync::atomic::AtomicU16>,
+    /// The [`InputStatus`] code viewers are told.
+    input_status: Arc<std::sync::atomic::AtomicU16>,
     events: std::sync::mpsc::SyncSender<ClientEvent>,
     event_receiver: Mutex<std::sync::mpsc::Receiver<ClientEvent>>,
     config: ServerConfig,
@@ -893,6 +896,9 @@ impl VncServer {
             capture_status: Arc::new(std::sync::atomic::AtomicU16::new(
                 CaptureStatus::Live.code(),
             )),
+            input_status: Arc::new(std::sync::atomic::AtomicU16::new(
+                InputStatus::Accepted.code(),
+            )),
             events,
             event_receiver: Mutex::new(event_receiver),
             config,
@@ -977,6 +983,15 @@ impl VncServer {
     /// capability are told promptly; the others see a still picture.
     pub fn set_capture_status(&self, status: CaptureStatus) {
         if self.capture_status.swap(status.code(), Ordering::AcqRel) != status.code() {
+            self.wake_sessions();
+        }
+    }
+
+    /// Tell viewers whether the host's operating system accepts the input it
+    /// injects, so a viewer whose clicks do nothing can say why. Viewers
+    /// that advertised the capability are told promptly.
+    pub fn set_input_status(&self, status: InputStatus) {
+        if self.input_status.swap(status.code(), Ordering::AcqRel) != status.code() {
             self.wake_sessions();
         }
     }
@@ -1115,6 +1130,7 @@ impl VncServer {
             serve_display: Arc::clone(&self.serve_display),
             requested_display: Arc::clone(&self.requested_display),
             capture_status: Arc::clone(&self.capture_status),
+            input_status: Arc::clone(&self.input_status),
             clipboard: Arc::clone(&self.clipboard),
             thread_setup: self.config.thread_setup,
             priority: self.config.priority,
@@ -1289,6 +1305,8 @@ struct SessionShared {
     requested_display: Arc<std::sync::atomic::AtomicU16>,
     /// The [`CaptureStatus`] code viewers are told.
     capture_status: Arc<std::sync::atomic::AtomicU16>,
+    /// The [`InputStatus`] code viewers are told.
+    input_status: Arc<std::sync::atomic::AtomicU16>,
     clipboard: Arc<Mutex<ServerClipboard>>,
     /// See [`ServerConfig::thread_setup`].
     thread_setup: Option<fn()>,
@@ -1665,6 +1683,7 @@ struct ClientEncodings {
     serve_scale: bool,
     serve_display: bool,
     capture_status: bool,
+    input_status: bool,
     fence: bool,
     continuous_updates: bool,
     /// QEMU Pointer Motion Change: the client sends relative motion on request.
@@ -1690,6 +1709,7 @@ impl ClientEncodings {
                 SERVE_SCALE_ENCODING => result.serve_scale = true,
                 SERVE_DISPLAY_ENCODING => result.serve_display = true,
                 CAPTURE_STATUS_ENCODING => result.capture_status = true,
+                INPUT_STATUS_ENCODING => result.input_status = true,
                 FENCE_ENCODING => result.fence = true,
                 CONTINUOUS_UPDATES_ENCODING => result.continuous_updates = true,
                 POINTER_MOTION_CHANGE_ENCODING => result.pointer_motion_change = true,
@@ -1929,6 +1949,8 @@ fn write_client_updates(
     let mut announced_displays = 0;
     // Viewers assume a live picture until told otherwise.
     let mut announced_status = CaptureStatus::Live.code();
+    // And that the host accepts their input.
+    let mut announced_input = InputStatus::Accepted.code();
     let mut encoder = SessionEncoder {
         priority: session.priority,
         performance: session.performance,
@@ -1983,6 +2005,18 @@ fn write_client_updates(
                 height: 0,
             });
             announced_status = status;
+        }
+        let input_status = session.input_status.load(Ordering::Acquire);
+        if encodings.input_status && input_status != announced_input {
+            pseudo.retain(|rect| rect.encoding != INPUT_STATUS_ENCODING);
+            pseudo.push(PseudoRect {
+                encoding: INPUT_STATUS_ENCODING,
+                x: input_status,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+            announced_input = input_status;
         }
         if encodings.pointer_motion_change {
             let relative = session.relative_pointer.load(Ordering::Acquire);
@@ -3088,6 +3122,7 @@ enum ServerControl<'a> {
     ServeScale(u8),
     ServeDisplay(ServedDisplays),
     CaptureStatus(CaptureStatus),
+    InputStatus(InputStatus),
     /// The server supports continuous updates, or stopped sending them.
     EndOfContinuousUpdates,
     Fence {
@@ -3156,6 +3191,7 @@ fn read_update_inner(
                 control(ServerControl::ServeDisplay(displays))?
             }
             ServerMessage::CaptureStatus(status) => control(ServerControl::CaptureStatus(status))?,
+            ServerMessage::InputStatus(status) => control(ServerControl::InputStatus(status))?,
             ServerMessage::PointerMode { relative } => {
                 control(ServerControl::PointerMode { relative })?
             }
@@ -3288,6 +3324,14 @@ impl InputWriter {
     pub fn capture_status(&self) -> CaptureStatus {
         self.state()
             .map(|state| state.input.capture_status())
+            .unwrap_or_default()
+    }
+
+    /// Whether the host accepts the input it injects; accepted unless it
+    /// said not.
+    pub fn input_status(&self) -> InputStatus {
+        self.state()
+            .map(|state| state.input.input_status())
             .unwrap_or_default()
     }
 
@@ -3600,6 +3644,10 @@ impl Session {
                     writer.state()?.input.set_capture_status(status);
                     Ok(())
                 }
+                ServerControl::InputStatus(status) => {
+                    writer.state()?.input.set_input_status(status);
+                    Ok(())
+                }
                 ServerControl::EndOfContinuousUpdates => {
                     if continuous.get() {
                         // The server stopped pushing; go back to requests.
@@ -3742,6 +3790,7 @@ mod tests {
             serve_display: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             requested_display: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             capture_status: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            input_status: Arc::new(std::sync::atomic::AtomicU16::new(0)),
             clipboard: Arc::new(Mutex::new(ServerClipboard::default())),
             thread_setup: None,
             priority: UpdatePriority::Whole,
@@ -4634,6 +4683,47 @@ mod tests {
                     assert!(Instant::now() < deadline, "{status:?} was not announced");
                     read(&mut session);
                 }
+            }
+            writer.shutdown().unwrap();
+            server.stop();
+        }
+    }
+
+    #[test]
+    fn viewers_are_told_when_the_host_rejects_their_input_and_when_it_accepts_it_again() {
+        fn read(session: &mut Session) {
+            session
+                .read_update_pipelined(&mut Vec::new(), |_, _, _, _, _| Ok(()))
+                .unwrap()
+        }
+        for push in [false, true] {
+            let (server, address) = start_insecure_server(Framebuffer::new(4, 2).unwrap());
+            let mut session = Session::connect_with_encoding(
+                &address.to_string(),
+                true,
+                Encoding::Raw,
+                || unreachable!(),
+            )
+            .unwrap();
+            session.set_continuous_updates(push);
+            let writer = session.writer();
+            writer.request_update(false, 4, 2).unwrap();
+            read(&mut session);
+            assert_eq!(writer.input_status(), InputStatus::Accepted);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            for status in [
+                InputStatus::BlockedByElevatedApp,
+                InputStatus::Rejected,
+                InputStatus::Accepted,
+            ] {
+                // Nothing else changes: the announcement alone must arrive.
+                server.set_input_status(status);
+                while writer.input_status() != status {
+                    assert!(Instant::now() < deadline, "{status:?} was not announced");
+                    read(&mut session);
+                }
+                // Input status is separate from the picture's status.
+                assert_eq!(writer.capture_status(), CaptureStatus::Live);
             }
             writer.shutdown().unwrap();
             server.stop();
@@ -6294,6 +6384,7 @@ mod tests {
                 SERVE_SCALE_ENCODING,
                 SERVE_DISPLAY_ENCODING,
                 CAPTURE_STATUS_ENCODING,
+                INPUT_STATUS_ENCODING,
                 POINTER_MOTION_CHANGE_ENCODING,
                 EXTENDED_MOUSE_BUTTONS_ENCODING,
             ],
