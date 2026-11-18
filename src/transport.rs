@@ -53,6 +53,65 @@ pub fn server_config(cert: &Path, key: &Path) -> io::Result<Arc<rustls::ServerCo
     Ok(Arc::new(config))
 }
 
+/// Folder, relative to the working directory, searched for host PEM files
+/// when neither `--tls-cert` nor `--tls-key` is given. Ignored by git.
+pub const LOCAL_CERT_DIR: &str = "certs.local";
+
+/// Largest file inspected while detecting PEM files.
+const MAX_DETECTED_PEM_BYTES: u64 = 1024 * 1024;
+
+/// Finds one host certificate and private key among the `.pem` files in
+/// `dir` by their PEM labels, not their names. Returns `None` when there is no
+/// private key, more than one, no certificate, or several different
+/// certificates with none named after the key (`server-key.pem` ->
+/// `server.pem`). Nothing is generated or trusted; the files are validated
+/// when the host starts, exactly as if they were passed on the command line.
+pub fn detect_host_credentials(dir: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let mut entries = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pem"))
+                && std::fs::metadata(path)
+                    .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_DETECTED_PEM_BYTES)
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    let mut keys = Vec::new();
+    let mut certs = Vec::new();
+    for path in entries {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
+            keys.push(path);
+        } else if text.contains("-----BEGIN CERTIFICATE-----") {
+            certs.push((path, text));
+        }
+    }
+    let [key] = keys.as_slice() else {
+        return None;
+    };
+    let stem = key.file_stem()?.to_str()?;
+    let base = ["-key", "_key", ".key", "-privkey", "_privkey"]
+        .iter()
+        .find_map(|suffix| stem.strip_suffix(suffix))
+        .unwrap_or(stem);
+    if let Some((cert, _)) = certs.iter().find(|(path, _)| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s != stem && s.eq_ignore_ascii_case(base))
+    }) {
+        return Some((cert.clone(), key.clone()));
+    }
+    let (first, text) = certs.first()?;
+    certs
+        .iter()
+        .all(|(_, other)| other == text)
+        .then(|| (first.clone(), key.clone()))
+}
+
 /// Explicit native viewer transport. The executable defaults to TLS; legacy
 /// library connection APIs retain TCP for gateways and third-party integrations.
 #[derive(Clone)]
@@ -103,6 +162,22 @@ impl TlsOptions {
         })
     }
 
+    /// Fills host credentials from [`detect_host_credentials`] when the
+    /// command line gave neither and did not ask for plain TCP. Returns the
+    /// detected paths so the caller can report them.
+    pub fn detect_host_credentials_in(
+        &mut self,
+        dir: &Path,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        if self.unencrypted || self.cert.is_some() || self.key.is_some() {
+            return None;
+        }
+        let (cert, key) = detect_host_credentials(dir)?;
+        self.cert = Some(cert.clone());
+        self.key = Some(key.clone());
+        Some((cert, key))
+    }
+
     pub fn server(&self) -> io::Result<Option<Arc<rustls::ServerConfig>>> {
         if self.unencrypted {
             if self.cert.is_some() || self.key.is_some() {
@@ -115,7 +190,7 @@ impl TlsOptions {
         match (&self.cert, &self.key) {
             (Some(cert), Some(key)) => server_config(cert, key).map(Some),
             _ => Err(invalid(
-                "TLS hosting needs --tls-cert and --tls-key, or tick PLAIN TCP (NO TLS) on a trusted network.",
+                "TLS hosting needs --tls-cert and --tls-key or PEMs in certs.local, or PLAIN TCP (NO TLS) on a trusted network.",
             )),
         }
     }

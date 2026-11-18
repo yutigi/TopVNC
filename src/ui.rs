@@ -1593,6 +1593,24 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
     );
 }
 
+/// The Server tab line under the transport checkbox: which certificate TLS
+/// hosting will use, or how to provide one.
+fn tls_credentials_hint(tls: &topvnc::transport::TlsOptions) -> String {
+    if tls.unencrypted {
+        return "UNENCRYPTED. ONLY 8 PASSWORD CHARACTERS ARE USED.".into();
+    }
+    match (&tls.cert, &tls.key) {
+        (Some(cert), Some(_)) => {
+            let name = cert
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            format!("TLS CERT: {name}")
+        }
+        _ => "TLS NEEDS --tls-cert/--tls-key OR PEMS IN certs.local".into(),
+    }
+}
+
 fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server: &ServerView) {
     canvas.text(42, 76, "SHARE THIS DESKTOP OVER VNC", MUTED, 2);
     ultra_button(canvas, ULTRA_MODE, form.performance);
@@ -1652,14 +1670,11 @@ fn server_tab(canvas: &mut Canvas<'_>, form: &ServeForm, state: &UiState, server
         canvas.button(area, name, form.mouse == mode);
     }
     transport_checkbox(canvas, SERVE_UNENCRYPTED_TRANSPORT, form.tls.unencrypted);
+    let tls_hint = tls_credentials_hint(&form.tls);
     canvas.text(
         400,
         331,
-        if form.tls.unencrypted {
-            "UNENCRYPTED. ONLY 8 PASSWORD CHARACTERS ARE USED."
-        } else {
-            "TLS REQUIRES --tls-cert AND --tls-key PEM FILES."
-        },
+        &tls_hint,
         if form.tls.unencrypted { ERROR } else { MUTED },
         1,
     );

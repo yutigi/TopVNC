@@ -28,7 +28,7 @@ Enter the VNC password and click Connect. For another computer, copy **only `ser
 
 Without `--tls-ca`, the viewer uses bundled public WebPKI roots. A supplied CA file replaces those roots for this launch; it does not disable any verification. System-installed private CAs must also be supplied explicitly. No skip-verification option exists.
 
-For GUI hosting, launch with `--tls-cert CERT.pem --tls-key KEY.pem`, then use the Server tab. Certificate paths are configured at launch, not edited in the form. Missing or invalid credentials are reported before desktop capture starts. On Windows the work-server launcher reads `TOPVNC_TLS_CERT` and `TOPVNC_TLS_KEY` from its environment; its `/check` checks the executable, not certificate validity.
+For GUI hosting, launch with `--tls-cert CERT.pem --tls-key KEY.pem`, then use the Server tab. Without those options (and without `--unencrypted`), the GUI looks in `certs.local` under the working directory: if it holds exactly one private key `.pem` and one certificate `.pem` (or several identical copies, or one named after the key, such as `server.pem` for `server-key.pem`), those are used, printed to the terminal, and named on the Server tab. Files are recognized by their PEM labels; nothing is generated or trusted. Any other layout detects nothing. `--serve` still needs explicit paths. Certificate paths are configured at launch, not edited in the form. Missing or invalid credentials are reported before desktop capture starts. On Windows the work-server launcher reads `TOPVNC_TLS_CERT` and `TOPVNC_TLS_KEY` from its environment; its `/check` checks the executable, not certificate validity.
 
 ## Explicit legacy TCP
 

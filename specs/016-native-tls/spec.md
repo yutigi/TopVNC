@@ -4,7 +4,7 @@
 
 Use direct TLS 1.3 before RFB for the native viewer and Windows/macOS desktop host. Use rustls with certificate chain and DNS/IP name validation. Keep RFB and browser crates independent of native transport. Native UI and CLI default to TLS; plaintext requires `--unencrypted` on each endpoint. TLS failures never retry plaintext. Existing library TCP APIs remain available for explicit legacy integrations and the loopback browser gateway.
 
-Configure host PEM credentials with `--tls-cert` and `--tls-key`, and optional viewer trust with `--tls-ca` and `--tls-server-name`. These options also prefill the GUI server transport. Without host credentials, starting a TLS host fails with actionable instructions. Do not generate or trust certificates silently. VNC authentication remains separate and None still requires explicit consent. Do not persist transport overrides or credential paths in saved settings.
+Configure host PEM credentials with `--tls-cert` and `--tls-key`, and optional viewer trust with `--tls-ca` and `--tls-server-name`. These options also prefill the GUI server transport. Without host credentials, starting a TLS host fails with actionable instructions. When neither credential option nor `--unencrypted` is given, the GUI may use an unambiguous certificate and private key found in the git-ignored `certs.local` folder, reporting the paths it chose. Do not generate or trust certificates silently. VNC authentication remains separate and None still requires explicit consent. Do not persist transport overrides or credential paths in saved settings.
 
 ## Acceptance criteria
 
