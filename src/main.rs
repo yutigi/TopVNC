@@ -592,6 +592,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut config = Config::default();
     settings::load(&mut config);
     let input_debug = apply_viewer_arguments(&mut config, arguments)?;
+    if let Some((cert, key)) = config
+        .serve
+        .tls
+        .detect_host_credentials_in(std::path::Path::new(topvnc::transport::LOCAL_CERT_DIR))
+    {
+        eprintln!(
+            "TopVNC: using host TLS credentials found in {}: --tls-cert {} --tls-key {}",
+            topvnc::transport::LOCAL_CERT_DIR,
+            cert.display(),
+            key.display()
+        );
+    }
     config.tls.client(&config.host)?;
     if let Some(form) = handed_form {
         config.serve = form;

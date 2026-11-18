@@ -270,3 +270,101 @@ fn native_tls_defaults_and_overrides_are_explicit() {
     plain.cert = Some("cert.pem".into());
     assert!(plain.server().is_err());
 }
+
+/// A fresh, empty folder for one detection test.
+fn pem_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("topvnc-pem-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+const CERT_A: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+const CERT_B: &str = "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
+const KEY: &str = "-----BEGIN PRIVATE KEY-----\nKKKK\n-----END PRIVATE KEY-----\n";
+
+fn write(dir: &Path, name: &str, text: &str) {
+    std::fs::write(dir.join(name), text).unwrap();
+}
+
+#[test]
+fn detects_certificate_and_key_by_pem_label() {
+    let dir = pem_dir("label");
+    write(&dir, "a.pem", KEY);
+    write(&dir, "b.pem", CERT_A);
+    write(&dir, "notes.txt", CERT_B);
+    assert_eq!(
+        detect_host_credentials(&dir),
+        Some((dir.join("b.pem"), dir.join("a.pem")))
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn identical_certificate_copies_are_not_ambiguous() {
+    let dir = pem_dir("copies");
+    write(&dir, "office-pc.pem", CERT_A);
+    write(&dir, "server.pem", CERT_A);
+    write(&dir, "server-key.pem", KEY);
+    let (cert, key) = detect_host_credentials(&dir).unwrap();
+    assert_eq!(key, dir.join("server-key.pem"));
+    assert_eq!(cert, dir.join("server.pem"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn certificate_named_after_the_key_wins() {
+    let dir = pem_dir("named");
+    write(&dir, "ca.pem", CERT_B);
+    write(&dir, "host.pem", CERT_A);
+    write(&dir, "host_key.pem", KEY);
+    assert_eq!(
+        detect_host_credentials(&dir),
+        Some((dir.join("host.pem"), dir.join("host_key.pem")))
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn ambiguous_or_incomplete_folders_detect_nothing() {
+    let dir = pem_dir("ambiguous");
+    assert_eq!(detect_host_credentials(&dir.join("missing")), None);
+    assert_eq!(detect_host_credentials(&dir), None);
+    write(&dir, "key.pem", KEY);
+    assert_eq!(detect_host_credentials(&dir), None, "no certificate");
+    write(&dir, "one.pem", CERT_A);
+    write(&dir, "two.pem", CERT_B);
+    assert_eq!(
+        detect_host_credentials(&dir),
+        None,
+        "two different certificates"
+    );
+    std::fs::remove_file(dir.join("two.pem")).unwrap();
+    write(&dir, "key2.pem", KEY);
+    assert_eq!(detect_host_credentials(&dir), None, "two private keys");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn explicit_options_are_never_replaced_by_detection() {
+    let dir = pem_dir("explicit");
+    write(&dir, "server.pem", CERT_A);
+    write(&dir, "server-key.pem", KEY);
+    let mut plain = TlsOptions {
+        unencrypted: true,
+        ..TlsOptions::default()
+    };
+    assert_eq!(plain.detect_host_credentials_in(&dir), None);
+    assert_eq!(plain.cert, None);
+    let mut given = TlsOptions {
+        cert: Some("mine.pem".into()),
+        ..TlsOptions::default()
+    };
+    assert_eq!(given.detect_host_credentials_in(&dir), None);
+    assert_eq!(given.key, None);
+    let mut empty = TlsOptions::default();
+    assert!(empty.detect_host_credentials_in(&dir).is_some());
+    assert_eq!(empty.cert, Some(dir.join("server.pem")));
+    assert_eq!(empty.key, Some(dir.join("server-key.pem")));
+    std::fs::remove_dir_all(dir).unwrap();
+}
