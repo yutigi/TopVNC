@@ -344,27 +344,3 @@ fn ambiguous_or_incomplete_folders_detect_nothing() {
     assert_eq!(detect_host_credentials(&dir), None, "two private keys");
     std::fs::remove_dir_all(dir).unwrap();
 }
-
-#[test]
-fn explicit_options_are_never_replaced_by_detection() {
-    let dir = pem_dir("explicit");
-    write(&dir, "server.pem", CERT_A);
-    write(&dir, "server-key.pem", KEY);
-    let mut plain = TlsOptions {
-        unencrypted: true,
-        ..TlsOptions::default()
-    };
-    assert_eq!(plain.detect_host_credentials_in(&dir), None);
-    assert_eq!(plain.cert, None);
-    let mut given = TlsOptions {
-        cert: Some("mine.pem".into()),
-        ..TlsOptions::default()
-    };
-    assert_eq!(given.detect_host_credentials_in(&dir), None);
-    assert_eq!(given.key, None);
-    let mut empty = TlsOptions::default();
-    assert!(empty.detect_host_credentials_in(&dir).is_some());
-    assert_eq!(empty.cert, Some(dir.join("server.pem")));
-    assert_eq!(empty.key, Some(dir.join("server-key.pem")));
-    std::fs::remove_dir_all(dir).unwrap();
-}

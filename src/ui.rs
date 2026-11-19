@@ -132,6 +132,10 @@ pub struct ServeForm {
     /// When viewers are asked for relative pointer motion.
     pub mouse: MouseMode,
     pub priority: UpdatePriority,
+    /// Certificate and private key found in `certs.local` at launch. PLAIN
+    /// TCP drops them from `tls` and unticking it puts them back, so the
+    /// checkbox chooses whether the detected certificate is used.
+    pub detected_tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 impl Default for ServeForm {
@@ -147,6 +151,7 @@ impl Default for ServeForm {
             scale: 1.0,
             mouse: MouseMode::Auto,
             priority: UpdatePriority::Whole,
+            detected_tls: None,
         }
     }
 }
@@ -168,6 +173,42 @@ pub struct ServeRequest {
 }
 
 impl ServeForm {
+    /// Looks in `dir` for host credentials when the command line named
+    /// neither `--tls-cert` nor `--tls-key`, and uses them unless PLAIN TCP
+    /// was asked for. Returns what it found, for the caller to report.
+    pub fn detect_tls(
+        &mut self,
+        dir: &std::path::Path,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        if self.tls.cert.is_some() || self.tls.key.is_some() {
+            return None;
+        }
+        let found = topvnc::transport::detect_host_credentials(dir)?;
+        self.detected_tls = Some(found.clone());
+        if !self.tls.unencrypted {
+            (self.tls.cert, self.tls.key) = (Some(found.0.clone()), Some(found.1.clone()));
+        }
+        Some(found)
+    }
+
+    /// Ticks or unticks PLAIN TCP (NO TLS). Detected credentials leave with
+    /// TLS and come back with it; `--tls-cert` and `--tls-key` given on the
+    /// command line stay and still conflict with plain TCP.
+    pub fn toggle_unencrypted(&mut self) {
+        self.tls.unencrypted = !self.tls.unencrypted;
+        let Some((cert, key)) = &self.detected_tls else {
+            return;
+        };
+        let tls = &mut self.tls;
+        if tls.unencrypted {
+            if tls.cert.as_ref() == Some(cert) && tls.key.as_ref() == Some(key) {
+                (tls.cert, tls.key) = (None, None);
+            }
+        } else if tls.cert.is_none() && tls.key.is_none() {
+            (tls.cert, tls.key) = (Some(cert.clone()), Some(key.clone()));
+        }
+    }
+
     pub fn request(&self) -> Result<ServeRequest, String> {
         let address = socket_address(&self.host, &self.port, "Enter a valid listen address.")?;
         // A typed password always enables authentication; the checkbox only
@@ -3285,6 +3326,82 @@ mod tests {
         assert!(levels.contains(&DEFAULT_JPEG_QUALITY));
         assert!(levels.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(levels.iter().all(|level| *level <= 9));
+    }
+
+    /// A folder holding one certificate and key, as `certs.local` would.
+    fn cert_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("topvnc-ui-pem-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("server.pem"),
+            "-----BEGIN CERTIFICATE-----
+AAAA
+-----END CERTIFICATE-----
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("server-key.pem"),
+            "-----BEGIN PRIVATE KEY-----
+KKKK
+-----END PRIVATE KEY-----
+",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn plain_tcp_toggles_whether_detected_certificates_are_used() {
+        let dir = cert_dir("toggle");
+        let (cert, key) = (
+            Some(dir.join("server.pem")),
+            Some(dir.join("server-key.pem")),
+        );
+        let mut form = ServeForm {
+            allow_insecure: true,
+            ..ServeForm::default()
+        };
+        assert!(form.detect_tls(&dir).is_some());
+        assert_eq!((&form.tls.cert, &form.tls.key), (&cert, &key));
+        form.toggle_unencrypted();
+        assert!(form.tls.unencrypted);
+        assert_eq!((&form.tls.cert, &form.tls.key), (&None, &None));
+        assert!(form.request().unwrap().tls.server().unwrap().is_none());
+        form.toggle_unencrypted();
+        assert!(!form.tls.unencrypted);
+        assert_eq!((&form.tls.cert, &form.tls.key), (&cert, &key));
+
+        // Launched with --unencrypted: found, not used until unticked.
+        let mut plain = ServeForm::default();
+        plain.tls.unencrypted = true;
+        assert!(plain.detect_tls(&dir).is_some());
+        assert_eq!((&plain.tls.cert, &plain.tls.key), (&None, &None));
+        plain.toggle_unencrypted();
+        assert_eq!((&plain.tls.cert, &plain.tls.key), (&cert, &key));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_certificates_are_never_replaced_or_dropped() {
+        let dir = cert_dir("explicit");
+        let mut given = ServeForm::default();
+        given.tls.cert = Some("mine.pem".into());
+        assert_eq!(given.detect_tls(&dir), None);
+        assert_eq!((given.tls.key, given.detected_tls), (None, None));
+        let mut given = ServeForm::default();
+        given.tls.cert = Some("mine.pem".into());
+        given.tls.key = Some("mine-key.pem".into());
+        // Detected elsewhere, but these were typed: plain TCP keeps the conflict.
+        given.detected_tls = Some((dir.join("server.pem"), dir.join("server-key.pem")));
+        given.toggle_unencrypted();
+        assert_eq!(
+            given.tls.cert.as_deref(),
+            Some(std::path::Path::new("mine.pem"))
+        );
+        assert!(given.tls.server().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
