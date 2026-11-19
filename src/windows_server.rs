@@ -2,13 +2,13 @@
 //! Duplication capture, `SendInput` injection, and clipboard sync.
 
 use crate::desktop_host::{
-    CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureOutage, CaptureSurface, CursorKind, CursorShape,
-    DesktopImage, DisplayArea, DisplayChange, DisplayFollower, DisplayPlan, DisplaySelection,
-    DisplayWake, Downscaler, KeyIdentity, MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner,
-    PointerTransition, Rect, RemoteInputState, Rotation, WHEEL_DELTA, absolute_mouse_coordinate,
-    connected_displays, is_secure_attention, latin1_from_unicode, latin1_to_utf16,
-    native_coordinate, served_size, unicode_key_units, validate_capture_dimensions,
-    windows_key_identity,
+    CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureOutage, CaptureSurface, CaptureWatchdog,
+    CursorKind, CursorShape, DesktopImage, DisplayArea, DisplayChange, DisplayFollower,
+    DisplayPlan, DisplaySelection, Downscaler, KeyIdentity, MAX_DISPLAYS, MouseMode,
+    PointerModeHint, PointerOwner, PointerTransition, Rect, RemoteInputState, Rotation,
+    WHEEL_DELTA, absolute_mouse_coordinate, connected_displays, is_secure_attention,
+    latin1_from_unicode, latin1_to_utf16, native_coordinate, served_size, unicode_key_units,
+    validate_capture_dimensions, windows_key_identity,
 };
 use crate::desktop_host::{
     MAX_CLIPBOARD_CHARS, ServeOptions, ServerNotice, VirtualKey, parse_serve_arguments,
@@ -126,9 +126,6 @@ const INPUT_DESKTOP_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const FRAME_TIMEOUT_MS: u32 = 50;
 const FRAME_TIMEOUT: Duration = Duration::from_millis(FRAME_TIMEOUT_MS as u64);
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
-/// How long capture may receive no frame, not even a pointer move, before
-/// it is restarted to check that its displays still show the desktop.
-const CAPTURE_SILENCE_CHECK: Duration = Duration::from_secs(3);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How often the monitor layout is compared, to follow displays that are
 /// plugged in, unplugged, or made primary without interrupting capture.
@@ -520,9 +517,7 @@ fn serve_desktop(
     let mut connections = 0;
     let mut pointer_mode = PointerModeHint::default();
     let mut outage = CaptureOutage::default();
-    let mut wake = DisplayWake::default();
-    // What a liveness check restarted; it is not announced again.
-    let mut probed: Option<DisplayPlan> = None;
+    let mut watchdog = CaptureWatchdog::<DisplayPlan>::default();
     while !shutdown.load(Ordering::Acquire) {
         if capture.is_none() {
             outage.stopped(Instant::now());
@@ -593,20 +588,18 @@ fn serve_desktop(
                 renumbered => renumbered,
             };
         }
-        // An unplugged monitor can stay on the desktop, listed and reported
-        // available, while Desktop Duplication just stops delivering frames,
-        // as when a laptop's lid is closed and Windows has no other display
-        // to move to. A desktop at rest is silent too, so while viewers
-        // watch, restart a silent capture: a new duplication delivers its
-        // first image at once unless its display is gone. Viewers receive
-        // only tiles that changed, so this costs them nothing.
+        // An unplugged monitor can stay on the desktop while Desktop
+        // Duplication just stops delivering frames; see CaptureWatchdog.
+        // Viewers receive only tiles that changed, so a restart of a healthy
+        // desktop at rest costs them nothing.
         if change == DisplayChange::None
-            && connections > 0
-            && capture
-                .as_ref()
-                .is_some_and(|active| active.silent_for() >= CAPTURE_SILENCE_CHECK)
+            && let Some(active) = &capture
+            && watchdog.check_silence(
+                connections,
+                active.shared.silent_for(Instant::now()),
+                follower.plan(),
+            )
         {
-            probed = follower.plan().cloned();
             change = DisplayChange::Restart;
         }
         match change {
@@ -660,13 +653,12 @@ fn serve_desktop(
                         ..recreated.placement
                     };
                     server.set_serve_display(plan.announcement());
-                    if probed.take().as_ref() != Some(&plan) {
+                    if watchdog.started(&plan) {
                         report(ServerNotice::Message(
                             plan.fallback_notice()
                                 .unwrap_or_else(|| format!("Serving {}.", plan.description())),
                         ));
                     }
-                    wake.capture_live();
                     capture = Some(recreated);
                     outage.resumed();
                     server.set_capture_status(CaptureStatus::Live);
@@ -675,7 +667,6 @@ fn serve_desktop(
                     last_layout_check = Instant::now();
                 }
                 Err(error) => {
-                    probed = None;
                     let status = capture_failure_status(error.as_ref());
                     outage.failed(status, Instant::now());
                     let message = error.to_string();
@@ -687,7 +678,7 @@ fn serve_desktop(
                     }
                     next_retry = Instant::now() + retry_delay;
                     retry_delay = (retry_delay * 2).min(CAPTURE_RETRY_MAX);
-                    if wake.capture_failed(status, connections) {
+                    if watchdog.failed(status, connections) {
                         wake_display();
                     }
                 }
@@ -1631,6 +1622,19 @@ impl CaptureShared {
         }
         Ok(())
     }
+
+    /// A captured display delivered a frame at `now`, even one where only
+    /// the pointer moved.
+    fn frame_delivered(state: &mut CaptureState, now: Instant) {
+        state.last_frame = state.last_frame.max(now);
+    }
+
+    /// How long, at `now`, no captured display has delivered a frame.
+    fn silent_for(&self, now: Instant) -> Duration {
+        self.state.lock().map_or(Duration::ZERO, |state| {
+            now.saturating_duration_since(state.last_frame)
+        })
+    }
 }
 
 struct CaptureState {
@@ -1823,14 +1827,6 @@ impl DesktopCapture {
             state.changed = false;
         }
         Ok(())
-    }
-
-    /// How long no captured display has delivered a frame.
-    fn silent_for(&self) -> Duration {
-        self.shared
-            .state
-            .lock()
-            .map_or(Duration::ZERO, |state| state.last_frame.elapsed())
     }
 }
 
@@ -2034,7 +2030,7 @@ impl OutputCapture {
             .lock()
             .map_err(|_| "capture state lock poisoned")?;
         let state = &mut *state;
-        state.last_frame = Instant::now();
+        CaptureShared::frame_delivered(state, Instant::now());
         if frame_info.LastMouseUpdateTime != 0 {
             let position = frame_info.PointerPosition.Position;
             let visible = frame_info.PointerPosition.Visible.as_bool();
@@ -2509,7 +2505,7 @@ impl Drop for FrameGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desktop_host::choose_displays;
+    use crate::desktop_host::{CAPTURE_SILENCE_CHECK, CAPTURE_STATUS_GRACE, choose_displays};
     use topvnc::ServedDisplays;
 
     fn recovery_displays() -> Vec<DisplayArea> {
@@ -2886,6 +2882,107 @@ mod tests {
         assert_eq!(plan.chosen.indices, [0]);
         assert_eq!(plan.fallback_notice(), None);
         assert!(DisplayPlan::new(DisplaySelection::Primary, &[]).is_err());
+    }
+
+    /// What a capture thread does when Desktop Duplication hands it a frame.
+    fn deliver_frame(shared: &CaptureShared, at: Instant) {
+        let mut state = shared.state.lock().unwrap();
+        CaptureShared::frame_delivered(&mut state, at);
+        state.first_frames_pending = state.first_frames_pending.saturating_sub(1);
+        state.changed = true;
+        drop(state);
+        shared.changed.notify_all();
+    }
+
+    /// Headless: no monitor or Desktop Duplication, so it runs in CI. As
+    /// measured on a laptop with its lid closed, an unplugged monitor stays
+    /// on the desktop, unchanged in every display listing, while capture of
+    /// it receives no frame and raises no error. The host must notice, tell
+    /// viewers, and recover when the monitor returns, without disturbing a
+    /// healthy desktop at rest.
+    #[test]
+    fn a_display_that_silently_stops_is_noticed_reported_and_recovered() {
+        let attached = recovery_displays();
+        let plan = DisplayPlan::new(DisplaySelection::Primary, &attached).unwrap();
+        // Starts capture as the host does; a plugged-in display delivers its
+        // first image at once, an unplugged one never does.
+        let start = |plugged: bool| {
+            capture_selected_or_primary(
+                plan.clone(),
+                &attached,
+                |_| {
+                    let shared = CaptureShared::new(4, 4, 1);
+                    if plugged {
+                        deliver_frame(&shared, Instant::now());
+                    }
+                    Ok(shared)
+                },
+                |shared| shared.wait_for_first_frames(Duration::from_millis(20)),
+            )
+        };
+        let mut watchdog = CaptureWatchdog::<DisplayPlan>::default();
+        let mut outage = CaptureOutage::default();
+        let viewers = 1;
+
+        let (shared, served) = start(true).unwrap();
+        assert!(watchdog.started(&served), "the first start is announced");
+        let t0 = Instant::now();
+
+        // Activity, even a pointer move, keeps capture running.
+        deliver_frame(&shared, t0 + Duration::from_secs(2));
+        let now = t0 + Duration::from_secs(4);
+        assert!(!watchdog.check_silence(viewers, shared.silent_for(now), Some(&served)));
+
+        // A desktop at rest is checked, and restarts on the same display
+        // without a message or a viewer notice.
+        let now = t0 + Duration::from_secs(2) + CAPTURE_SILENCE_CHECK;
+        assert!(watchdog.check_silence(viewers, shared.silent_for(now), Some(&served)));
+        outage.stopped(now);
+        let (shared, served) = start(true).unwrap();
+        assert!(!watchdog.started(&served), "a healthy check stays quiet");
+        outage.resumed();
+        assert_eq!(outage.status(now), CaptureStatus::Live);
+
+        // Unplugged: the running capture falls silent, and its restart
+        // receives no first image.
+        let unplugged = Instant::now();
+        let now = unplugged + CAPTURE_SILENCE_CHECK;
+        assert!(watchdog.check_silence(viewers, shared.silent_for(now), Some(&served)));
+        outage.stopped(now);
+        let Err(error) = start(false) else {
+            panic!("an unplugged display started capture")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("did not deliver their first desktop image"),
+            "{error}"
+        );
+        let status = capture_failure_status(error.as_ref());
+        assert_eq!(status, CaptureStatus::Unavailable);
+        outage.failed(status, now);
+        assert!(watchdog.failed(status, viewers), "displays are woken once");
+        // Retries keep failing while the monitor is gone, without waking
+        // again, and viewers are told once the grace period passes.
+        let Err(error) = start(false) else {
+            panic!("an unplugged display started capture")
+        };
+        let retry = now + CAPTURE_STATUS_GRACE;
+        outage.failed(capture_failure_status(error.as_ref()), retry);
+        assert!(!watchdog.failed(capture_failure_status(error.as_ref()), viewers));
+        assert_eq!(outage.status(retry), CaptureStatus::Unavailable);
+
+        // Plugged back in: capture resumes, viewers see it live again, and
+        // the recovery is announced although the display is the same.
+        let (shared, served) = start(true).unwrap();
+        assert_eq!(served, plan);
+        assert!(watchdog.started(&served));
+        outage.resumed();
+        assert_eq!(outage.status(retry), CaptureStatus::Live);
+
+        // Without viewers, silence is never checked.
+        let now = Instant::now() + CAPTURE_SILENCE_CHECK * 10;
+        assert!(!watchdog.check_silence(0, shared.silent_for(now), Some(&served)));
     }
 
     #[test]

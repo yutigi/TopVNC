@@ -505,29 +505,74 @@ impl CaptureOutage {
     }
 }
 
-/// Decides when a host asks for its displays to be turned on. A display
-/// that went to sleep delivers no images, like an unplugged one, so while
-/// viewers are watching, a capture that fails to start asks once per outage.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DisplayWake {
-    asked: bool,
+/// How long capture may receive no frame, not even a pointer move, before
+/// it is restarted to check that its displays still show the desktop.
+pub const CAPTURE_SILENCE_CHECK: Duration = Duration::from_secs(3);
+
+/// Notices displays that stopped delivering images without an error.
+///
+/// Windows can keep an unplugged monitor on the desktop, listed and
+/// reported available, as when a laptop's lid is closed and no other
+/// display is left; capture then simply receives nothing. A desktop at rest
+/// is silent too, so while viewers watch, a silent capture is restarted: a
+/// new capture delivers its first image at once unless its display is gone.
+/// Restarts that serve the same displays again are not announced. A display
+/// that went to sleep delivers nothing either, so the first failed start of
+/// an outage asks for the displays to be turned on.
+///
+/// `P` is what a capture serves, compared to tell a quiet check from a
+/// change worth announcing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureWatchdog<P> {
+    /// What a silence check restarted.
+    probed: Option<P>,
+    woke: bool,
 }
 
-impl DisplayWake {
+impl<P> Default for CaptureWatchdog<P> {
+    fn default() -> Self {
+        Self {
+            probed: None,
+            woke: false,
+        }
+    }
+}
+
+impl<P: PartialEq + Clone> CaptureWatchdog<P> {
+    /// The running capture serving `serving` has received nothing for
+    /// `silent_for`, with `viewers` connected. Returns whether to restart it.
+    pub fn check_silence(
+        &mut self,
+        viewers: usize,
+        silent_for: Duration,
+        serving: Option<&P>,
+    ) -> bool {
+        // Without viewers nobody sees a frozen picture; check once one joins.
+        if viewers == 0 || silent_for < CAPTURE_SILENCE_CHECK {
+            return false;
+        }
+        self.probed = serving.cloned();
+        true
+    }
+
+    /// Capture started serving `plan`. Returns whether to announce it: not
+    /// after a silence check that serves the same displays again.
+    pub fn started(&mut self, plan: &P) -> bool {
+        self.woke = false;
+        self.probed.take().as_ref() != Some(plan)
+    }
+
     /// Starting capture failed for `status`, with `viewers` connected.
     /// Returns whether to turn the displays on now.
-    pub fn capture_failed(&mut self, status: topvnc::CaptureStatus, viewers: usize) -> bool {
+    pub fn failed(&mut self, status: topvnc::CaptureStatus, viewers: usize) -> bool {
+        // The next start is a recovery, which is announced.
+        self.probed = None;
         // Nobody needs the picture, and a locked or secure desktop cannot be
         // captured however the displays are powered.
         if viewers == 0 || status == topvnc::CaptureStatus::SecureDesktop {
             return false;
         }
-        !std::mem::replace(&mut self.asked, true)
-    }
-
-    /// Capture is running again; a later outage asks again.
-    pub fn capture_live(&mut self) {
-        self.asked = false;
+        !std::mem::replace(&mut self.woke, true)
     }
 }
 
@@ -3046,17 +3091,37 @@ mod tests {
     }
 
     #[test]
+    fn silent_captures_are_checked_only_while_viewers_watch() {
+        let mut watchdog = CaptureWatchdog::<&str>::default();
+        let due = CAPTURE_SILENCE_CHECK;
+        assert!(!watchdog.check_silence(0, due * 10, Some(&"main")));
+        assert!(!watchdog.check_silence(1, due - Duration::from_millis(1), Some(&"main")));
+        assert!(watchdog.check_silence(1, due, Some(&"main")));
+        // A healthy desktop at rest restarts quietly.
+        assert!(!watchdog.started(&"main"));
+        // Starting on other displays is always announced, as is a start
+        // without a check.
+        assert!(watchdog.check_silence(2, due, Some(&"main")));
+        assert!(watchdog.started(&"other"));
+        assert!(watchdog.started(&"other"));
+    }
+
+    #[test]
     fn displays_are_asked_to_turn_on_once_per_outage_while_viewers_watch() {
         use topvnc::CaptureStatus;
-        let mut wake = DisplayWake::default();
+        let mut watchdog = CaptureWatchdog::<&str>::default();
         // Nobody watching, or a desktop that display power cannot help with.
-        assert!(!wake.capture_failed(CaptureStatus::Unavailable, 0));
-        assert!(!wake.capture_failed(CaptureStatus::SecureDesktop, 1));
-        assert!(wake.capture_failed(CaptureStatus::Unavailable, 1));
+        assert!(!watchdog.failed(CaptureStatus::Unavailable, 0));
+        assert!(!watchdog.failed(CaptureStatus::SecureDesktop, 1));
+        assert!(watchdog.failed(CaptureStatus::Unavailable, 1));
         // Not on every retry of the same outage.
-        assert!(!wake.capture_failed(CaptureStatus::NoDisplay, 2));
-        wake.capture_live();
-        assert!(wake.capture_failed(CaptureStatus::NoDisplay, 1));
+        assert!(!watchdog.failed(CaptureStatus::NoDisplay, 2));
+        // Recovering from a failed check is announced even on the same
+        // displays, and a later outage asks again.
+        assert!(watchdog.check_silence(1, CAPTURE_SILENCE_CHECK, Some(&"main")));
+        assert!(!watchdog.failed(CaptureStatus::Unavailable, 1));
+        assert!(watchdog.started(&"main"));
+        assert!(watchdog.failed(CaptureStatus::NoDisplay, 1));
     }
 
     #[test]
