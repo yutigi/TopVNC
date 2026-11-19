@@ -4,7 +4,7 @@
 use crate::desktop_host::{
     CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureOutage, CaptureSurface, CaptureWatchdog,
     CursorKind, CursorShape, DesktopImage, DisplayArea, DisplayChange, DisplayFollower,
-    DisplayPlan, DisplaySelection, Downscaler, KeyIdentity, MAX_DISPLAYS, MouseMode,
+    DisplayPlan, DisplaySelection, Downscaler, DrawnCursor, KeyIdentity, MAX_DISPLAYS, MouseMode,
     PointerModeHint, PointerOwner, PointerTransition, Rect, RemoteInputState, Rotation,
     WHEEL_DELTA, absolute_mouse_coordinate, connected_displays, is_secure_attention,
     latin1_from_unicode, latin1_to_utf16, native_coordinate, served_size, unicode_key_units,
@@ -518,6 +518,8 @@ fn serve_desktop(
     let mut pointer_mode = PointerModeHint::default();
     let mut outage = CaptureOutage::default();
     let mut watchdog = CaptureWatchdog::<DisplayPlan>::default();
+    // The cursor a restarted capture drew, and the desktop area it covered.
+    let mut previous_cursor: Option<(Rect, DrawnCursor)> = None;
     while !shutdown.load(Ordering::Acquire) {
         if capture.is_none() {
             outage.stopped(Instant::now());
@@ -615,7 +617,7 @@ fn serve_desktop(
             DisplayChange::Restart => {
                 // A display can be duplicated once per process; stop first.
                 outage.stopped(Instant::now());
-                capture = None;
+                previous_cursor = capture.take().and_then(|active| active.drawn_cursor());
                 follower.stopped();
                 next_retry = Instant::now();
                 retry_delay = CAPTURE_RETRY_MIN;
@@ -652,6 +654,9 @@ fn serve_desktop(
                         served_height,
                         ..recreated.placement
                     };
+                    if let Some(previous) = previous_cursor.take() {
+                        recreated.restore_cursor(previous);
+                    }
                     server.set_serve_display(plan.announcement());
                     if watchdog.started(&plan) {
                         report(ServerNotice::Message(
@@ -667,6 +672,8 @@ fn serve_desktop(
                     last_layout_check = Instant::now();
                 }
                 Err(error) => {
+                    // The cursor may move before capture recovers.
+                    previous_cursor = None;
                     let status = capture_failure_status(error.as_ref());
                     outage.failed(status, Instant::now());
                     let message = error.to_string();
@@ -1827,6 +1834,33 @@ impl DesktopCapture {
             state.changed = false;
         }
         Ok(())
+    }
+
+    /// The desktop area this capture covers.
+    fn area(&self) -> Rect {
+        let placement = &self.placement;
+        Rect::new(
+            placement.left,
+            placement.top,
+            placement.left + i32::from(placement.width),
+            placement.top + i32::from(placement.height),
+        )
+    }
+
+    /// The cursor drawn into the captured image, and the area it is in.
+    fn drawn_cursor(&self) -> Option<(Rect, DrawnCursor)> {
+        let state = self.shared.state.lock().ok()?;
+        Some((self.area(), state.image.cursor()))
+    }
+
+    /// Keep drawing the cursor a capture of the same area drew; see
+    /// [`DesktopImage::restore_cursor`].
+    fn restore_cursor(&self, (area, cursor): (Rect, DrawnCursor)) {
+        if area == self.area()
+            && let Ok(mut state) = self.shared.state.lock()
+        {
+            state.image.restore_cursor(cursor);
+        }
     }
 }
 

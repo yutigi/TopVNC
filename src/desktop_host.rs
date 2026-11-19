@@ -2030,6 +2030,16 @@ pub struct DesktopImage {
     cursor_visible: bool,
     drawn_cursor: Option<Rect>,
     cursor_changed: bool,
+    /// The capture reported the cursor's shape or position.
+    cursor_reported: bool,
+}
+
+/// The cursor a [`DesktopImage`] draws, carried over when capture restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawnCursor {
+    shape: Option<CursorShape>,
+    position: (i32, i32),
+    visible: bool,
 }
 
 impl DesktopImage {
@@ -2044,6 +2054,7 @@ impl DesktopImage {
             cursor_visible: false,
             drawn_cursor: None,
             cursor_changed: false,
+            cursor_reported: false,
         }
     }
 
@@ -2080,6 +2091,7 @@ impl DesktopImage {
     }
 
     pub fn set_cursor_position(&mut self, x: i32, y: i32, visible: bool) {
+        self.cursor_reported = true;
         if (x, y) != self.cursor_position || visible != self.cursor_visible {
             self.cursor_position = (x, y);
             self.cursor_visible = visible;
@@ -2088,10 +2100,34 @@ impl DesktopImage {
     }
 
     pub fn set_cursor_shape(&mut self, shape: Option<CursorShape>) {
+        self.cursor_reported = true;
         if shape != self.cursor {
             self.cursor = shape;
             self.cursor_changed = true;
         }
+    }
+
+    /// The cursor this image draws.
+    pub fn cursor(&self) -> DrawnCursor {
+        DrawnCursor {
+            shape: self.cursor.clone(),
+            position: self.cursor_position,
+            visible: self.cursor_visible,
+        }
+    }
+
+    /// A restarted capture can take a while to report a cursor that does
+    /// not move. Draw `previous`, the cursor the last capture of the same
+    /// area drew, until this capture reports the cursor itself, so the
+    /// cursor does not vanish from viewers' picture meanwhile.
+    pub fn restore_cursor(&mut self, previous: DrawnCursor) {
+        if self.cursor_reported {
+            return;
+        }
+        self.cursor = previous.shape;
+        self.cursor_position = previous.position;
+        self.cursor_visible = previous.visible;
+        self.cursor_changed = true;
     }
 
     /// Compose `captured` regions and any cursor change into `output`, which
@@ -3664,6 +3700,34 @@ mod tests {
         assert!(CursorShape::new(CursorKind::Color, 1, 2, 4, vec![0; 4]).is_err());
         assert!(CursorShape::new(CursorKind::MaskedColor, 1, 1, 4, vec![0, 0, 0, 7]).is_err());
         assert!(CursorShape::new(CursorKind::Color, 0, 1, 4, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_restarted_capture_keeps_drawing_the_cursor_until_it_reports_one() {
+        let shape = CursorShape::new(CursorKind::Color, 1, 1, 4, [0xff; 4].to_vec()).unwrap();
+        let mut old = DesktopImage::new(4, 1);
+        old.set_cursor_shape(Some(shape.clone()));
+        old.set_cursor_position(2, 0, true);
+
+        // The restarted image's first picture already has the cursor, so
+        // viewers see no change at all.
+        let mut image = DesktopImage::new(4, 1);
+        image.restore_cursor(old.cursor());
+        let (mut output, mut damage) = (vec![0; 4], Vec::new());
+        image.present(&[image.bounds()], &mut output, &mut damage);
+        assert_eq!(output, [0, 0, 0x00ff_ffff, 0]);
+
+        // What the new capture reports wins, and is not undone by a late
+        // restore.
+        image.set_cursor_position(0, 0, false);
+        image.restore_cursor(old.cursor());
+        damage.clear();
+        image.present(&[], &mut output, &mut damage);
+        assert_eq!(output, [0; 4]);
+        let mut reported = DesktopImage::new(4, 1);
+        reported.set_cursor_shape(None);
+        reported.restore_cursor(old.cursor());
+        assert_eq!(reported.cursor().shape, None);
     }
 
     #[test]
