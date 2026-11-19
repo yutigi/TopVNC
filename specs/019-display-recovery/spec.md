@@ -56,3 +56,27 @@ The failing component could not be reproduced here, since that needs a cable to 
 - `cargo fmt --all --check`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo build --bin topvnc` pass.
 - Live Windows checks pass: `gdi_and_dxgi_agree_on_attached_displays`, `every_attached_display_has_a_connected_monitor`, `captures_each_and_all_live_displays`, and `viewers_switch_between_live_displays`. Desktop-capture checks ran outside the sandbox, which denies Desktop Duplication access.
 - A physical cable unplug with a browser connected remains unvalidated; use the manual test above. No macOS or Linux hardware testing was performed for this follow-up.
+
+## Follow-up: monitor unplugged with the laptop lid closed (Windows 11, 2026-11-19)
+
+Reported: on a laptop used with its lid closed and one external monitor, unplugging that monitor left viewers on a frozen picture instead of falling back to the laptop's display.
+
+### Findings (hardware: RTX 4090 laptop, Samsung LS49AG95 over HDMI, lid closed)
+
+A logger recording GDI, `QueryDisplayConfig`, DXGI, and a fresh Desktop Duplication every 200 ms during a physical unplug showed:
+
+- Windows changed nothing. The external display stayed active on the desktop, its target still reported available, and GDI and DXGI still listed it. The built-in panel stayed unavailable (lid closed), so Windows had nowhere to move the desktop. No earlier check in this spec can notice that.
+- Desktop Duplication raised no error. It just delivered no frames; a freshly started duplication delivered no first image either. With the monitor plugged in, a fresh duplication always delivers its first image at once.
+- Asking Windows for the built-in display (`SetDisplayConfig` with `SDC_TOPOLOGY_INTERNAL`) is accepted with the lid closed, both to validate and to apply, but does not light the panel. Windows set the unplugged output's desktop to 1024x768 instead, and capture still received nothing. That step was therefore not adopted. With the lid closed there is no physical display to fall back to; serving one would need a virtual display.
+
+### Acceptance criteria
+
+- While viewers are connected, a capture that has received no frame from any display, not even a pointer move, for 3 seconds is restarted. A healthy desktop at rest restarts quietly: no host message, no viewer notice (within the one-second grace), and viewers receive only tiles that changed. A display that no longer shows the desktop fails the first-image check, so capture stops, viewers are told it is unavailable, and it is retried with the existing backoff until the monitor returns.
+- Without viewers, capture is not restarted for silence, and displays are never woken.
+- The first failed start of an outage, while viewers are connected and the desktop is not the secure desktop, asks Windows to turn the displays on (`ES_DISPLAY_REQUIRED`), so a monitor that only went to sleep recovers instead of staying in an outage.
+
+### Validation
+
+- `displays_are_asked_to_turn_on_once_per_outage_while_viewers_watch` covers the wake decision.
+- Live, physical unplug with a viewer connected (`follows_display_changes_made_by_hand`, lid closed): the host reported `1 display(s) did not deliver their first desktop image before the capture timeout` within seconds of the unplug, kept retrying, and on replug reported `Serving display 1 of 1 (\.\DISPLAY5)` with capture live again. That run also included the rejected built-in-display switch; the test's own pass condition (the viewer following a new main display) cannot be met with the lid closed and failed as expected. The shipped code (silence check and wake only) passed formatting, Clippy, `cargo test --workspace`, and the live `captures_each_and_all_live_displays`, `gdi_and_dxgi_agree_on_attached_displays`, and `every_attached_display_has_a_connected_monitor` checks; the physical unplug was not repeated with it.
+- Not validated: a monitor going to sleep with a viewer connected, and multiple displays where only one goes silent (captures that span several displays restart only when all are silent).

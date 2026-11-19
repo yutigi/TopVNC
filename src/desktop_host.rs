@@ -505,6 +505,32 @@ impl CaptureOutage {
     }
 }
 
+/// Decides when a host asks for its displays to be turned on. A display
+/// that went to sleep delivers no images, like an unplugged one, so while
+/// viewers are watching, a capture that fails to start asks once per outage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DisplayWake {
+    asked: bool,
+}
+
+impl DisplayWake {
+    /// Starting capture failed for `status`, with `viewers` connected.
+    /// Returns whether to turn the displays on now.
+    pub fn capture_failed(&mut self, status: topvnc::CaptureStatus, viewers: usize) -> bool {
+        // Nobody needs the picture, and a locked or secure desktop cannot be
+        // captured however the displays are powered.
+        if viewers == 0 || status == topvnc::CaptureStatus::SecureDesktop {
+            return false;
+        }
+        !std::mem::replace(&mut self.asked, true)
+    }
+
+    /// Capture is running again; a later outage asks again.
+    pub fn capture_live(&mut self) {
+        self.asked = false;
+    }
+}
+
 /// Decides which output's pointer reports move the cursor when several
 /// outputs are captured at once. Each output reports the pointer only while
 /// it is on that output, so a report from another output hides it only
@@ -3017,6 +3043,20 @@ mod tests {
         let mut follower = DisplayFollower::new(DisplaySelection::Primary);
         start(&mut follower, &desktops::one_primary());
         assert_eq!(settle(&mut follower, &remaining), DisplayChange::Restart);
+    }
+
+    #[test]
+    fn displays_are_asked_to_turn_on_once_per_outage_while_viewers_watch() {
+        use topvnc::CaptureStatus;
+        let mut wake = DisplayWake::default();
+        // Nobody watching, or a desktop that display power cannot help with.
+        assert!(!wake.capture_failed(CaptureStatus::Unavailable, 0));
+        assert!(!wake.capture_failed(CaptureStatus::SecureDesktop, 1));
+        assert!(wake.capture_failed(CaptureStatus::Unavailable, 1));
+        // Not on every retry of the same outage.
+        assert!(!wake.capture_failed(CaptureStatus::NoDisplay, 2));
+        wake.capture_live();
+        assert!(wake.capture_failed(CaptureStatus::NoDisplay, 1));
     }
 
     #[test]

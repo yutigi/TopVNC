@@ -4,7 +4,7 @@
 use crate::desktop_host::{
     CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureOutage, CaptureSurface, CursorKind, CursorShape,
     DesktopImage, DisplayArea, DisplayChange, DisplayFollower, DisplayPlan, DisplaySelection,
-    Downscaler, KeyIdentity, MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner,
+    DisplayWake, Downscaler, KeyIdentity, MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner,
     PointerTransition, Rect, RemoteInputState, Rotation, WHEEL_DELTA, absolute_mouse_coordinate,
     connected_displays, is_secure_attention, latin1_from_unicode, latin1_to_utf16,
     native_coordinate, served_size, unicode_key_units, validate_capture_dimensions,
@@ -81,6 +81,7 @@ use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, SetThreadExecutionState};
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, HDESK, OpenInputDesktop,
     SetThreadDesktop, UOI_NAME,
@@ -125,6 +126,9 @@ const INPUT_DESKTOP_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const FRAME_TIMEOUT_MS: u32 = 50;
 const FRAME_TIMEOUT: Duration = Duration::from_millis(FRAME_TIMEOUT_MS as u64);
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long capture may receive no frame, not even a pointer move, before
+/// it is restarted to check that its displays still show the desktop.
+const CAPTURE_SILENCE_CHECK: Duration = Duration::from_secs(3);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How often the monitor layout is compared, to follow displays that are
 /// plugged in, unplugged, or made primary without interrupting capture.
@@ -516,6 +520,9 @@ fn serve_desktop(
     let mut connections = 0;
     let mut pointer_mode = PointerModeHint::default();
     let mut outage = CaptureOutage::default();
+    let mut wake = DisplayWake::default();
+    // What a liveness check restarted; it is not announced again.
+    let mut probed: Option<DisplayPlan> = None;
     while !shutdown.load(Ordering::Acquire) {
         if capture.is_none() {
             outage.stopped(Instant::now());
@@ -586,6 +593,22 @@ fn serve_desktop(
                 renumbered => renumbered,
             };
         }
+        // An unplugged monitor can stay on the desktop, listed and reported
+        // available, while Desktop Duplication just stops delivering frames,
+        // as when a laptop's lid is closed and Windows has no other display
+        // to move to. A desktop at rest is silent too, so while viewers
+        // watch, restart a silent capture: a new duplication delivers its
+        // first image at once unless its display is gone. Viewers receive
+        // only tiles that changed, so this costs them nothing.
+        if change == DisplayChange::None
+            && connections > 0
+            && capture
+                .as_ref()
+                .is_some_and(|active| active.silent_for() >= CAPTURE_SILENCE_CHECK)
+        {
+            probed = follower.plan().cloned();
+            change = DisplayChange::Restart;
+        }
         match change {
             DisplayChange::None => {}
             DisplayChange::Renumbered => {
@@ -637,10 +660,13 @@ fn serve_desktop(
                         ..recreated.placement
                     };
                     server.set_serve_display(plan.announcement());
-                    report(ServerNotice::Message(
-                        plan.fallback_notice()
-                            .unwrap_or_else(|| format!("Serving {}.", plan.description())),
-                    ));
+                    if probed.take().as_ref() != Some(&plan) {
+                        report(ServerNotice::Message(
+                            plan.fallback_notice()
+                                .unwrap_or_else(|| format!("Serving {}.", plan.description())),
+                        ));
+                    }
+                    wake.capture_live();
                     capture = Some(recreated);
                     outage.resumed();
                     server.set_capture_status(CaptureStatus::Live);
@@ -649,7 +675,9 @@ fn serve_desktop(
                     last_layout_check = Instant::now();
                 }
                 Err(error) => {
-                    outage.failed(capture_failure_status(error.as_ref()), Instant::now());
+                    probed = None;
+                    let status = capture_failure_status(error.as_ref());
+                    outage.failed(status, Instant::now());
                     let message = error.to_string();
                     if message != last_capture_error {
                         report(ServerNotice::Message(format!(
@@ -659,6 +687,9 @@ fn serve_desktop(
                     }
                     next_retry = Instant::now() + retry_delay;
                     retry_delay = (retry_delay * 2).min(CAPTURE_RETRY_MAX);
+                    if wake.capture_failed(status, connections) {
+                        wake_display();
+                    }
                 }
             }
             continue;
@@ -1567,6 +1598,7 @@ impl CaptureShared {
                 captured: vec![Rect::new(0, 0, i32::from(width), i32::from(height))],
                 changed: false,
                 first_frames_pending: outputs,
+                last_frame: Instant::now(),
                 pointer: PointerOwner::default(),
                 error: None,
             }),
@@ -1609,6 +1641,9 @@ struct CaptureState {
     changed: bool,
     /// Decremented once per output, after its first full image is copied.
     first_frames_pending: usize,
+    /// When any captured display last delivered a frame, even one where
+    /// only the pointer moved.
+    last_frame: Instant,
     pointer: PointerOwner,
     /// Why a display's capture stopped; the whole capture is then recreated.
     error: Option<String>,
@@ -1788,6 +1823,14 @@ impl DesktopCapture {
             state.changed = false;
         }
         Ok(())
+    }
+
+    /// How long no captured display has delivered a frame.
+    fn silent_for(&self) -> Duration {
+        self.shared
+            .state
+            .lock()
+            .map_or(Duration::ZERO, |state| state.last_frame.elapsed())
     }
 }
 
@@ -1991,6 +2034,7 @@ impl OutputCapture {
             .lock()
             .map_err(|_| "capture state lock poisoned")?;
         let state = &mut *state;
+        state.last_frame = Instant::now();
         if frame_info.LastMouseUpdateTime != 0 {
             let position = frame_info.PointerPosition.Position;
             let visible = frame_info.PointerPosition.Visible.as_bool();
@@ -2379,6 +2423,11 @@ fn connected_sources() -> Option<HashSet<String>> {
         connected.insert(device_name(&source.viewGdiDeviceName).to_ascii_uppercase());
     }
     Some(connected)
+}
+
+/// Turn the displays on if they went to sleep, as user input would.
+fn wake_display() {
+    unsafe { SetThreadExecutionState(ES_DISPLAY_REQUIRED) };
 }
 
 /// The monitors on the desktop as GDI reports them, without displays no
