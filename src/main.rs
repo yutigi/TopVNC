@@ -592,17 +592,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut config = Config::default();
     settings::load(&mut config);
     let input_debug = apply_viewer_arguments(&mut config, arguments)?;
-    if let Some((cert, key)) = config
-        .serve
-        .tls
-        .detect_host_credentials_in(std::path::Path::new(topvnc::transport::LOCAL_CERT_DIR))
-    {
-        eprintln!(
-            "TopVNC: using host TLS credentials found in {}: --tls-cert {} --tls-key {}",
-            topvnc::transport::LOCAL_CERT_DIR,
-            cert.display(),
-            key.display()
-        );
+    let cert_dir = topvnc::transport::LOCAL_CERT_DIR;
+    if let Some((cert, key)) = config.serve.detect_tls(std::path::Path::new(cert_dir)) {
+        let (cert, key) = (cert.display(), key.display());
+        if config.serve.tls.unencrypted {
+            eprintln!(
+                "TopVNC: found host TLS credentials in {cert_dir} (--tls-cert {cert} --tls-key {key}); untick PLAIN TCP (NO TLS) on the Server tab to use them"
+            );
+        } else {
+            eprintln!(
+                "TopVNC: using host TLS credentials found in {cert_dir}: --tls-cert {cert} --tls-key {key}; tick PLAIN TCP (NO TLS) on the Server tab to serve without them"
+            );
+        }
     }
     config.tls.client(&config.host)?;
     if let Some(form) = handed_form {
@@ -1625,7 +1626,7 @@ fn show_landing(
                             serve.allow_insecure = !serve.allow_insecure;
                         }
                         if editable && ui::SERVE_UNENCRYPTED_TRANSPORT.contains(x, y) {
-                            serve.tls.unencrypted = !serve.tls.unencrypted;
+                            serve.toggle_unencrypted();
                         }
                         if editable && ui::LOCAL_ONLY.contains(x, y) {
                             serve.host = ui::LOCAL_ONLY_HOST.into();

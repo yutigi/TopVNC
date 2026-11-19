@@ -162,22 +162,6 @@ impl TlsOptions {
         })
     }
 
-    /// Fills host credentials from [`detect_host_credentials`] when the
-    /// command line gave neither and did not ask for plain TCP. Returns the
-    /// detected paths so the caller can report them.
-    pub fn detect_host_credentials_in(
-        &mut self,
-        dir: &Path,
-    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        if self.unencrypted || self.cert.is_some() || self.key.is_some() {
-            return None;
-        }
-        let (cert, key) = detect_host_credentials(dir)?;
-        self.cert = Some(cert.clone());
-        self.key = Some(key.clone());
-        Some((cert, key))
-    }
-
     pub fn server(&self) -> io::Result<Option<Arc<rustls::ServerConfig>>> {
         if self.unencrypted {
             if self.cert.is_some() || self.key.is_some() {
