@@ -933,6 +933,12 @@ impl VncServer {
         self.active_clients
             .load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// Sessions that completed security negotiation and desktop initialization.
+    pub fn active_viewers(&self) -> usize {
+        self.sessions.lock().map_or(0, |sessions| sessions.wakers.len())
+    }
+
     pub fn try_event(&self) -> Result<ClientEvent, std::sync::mpsc::TryRecvError> {
         match self.event_receiver.lock() {
             Ok(receiver) => receiver.try_recv(),

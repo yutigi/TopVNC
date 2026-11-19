@@ -83,8 +83,8 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, SetThreadExecutionState};
 use windows_sys::Win32::System::StationsAndDesktops::{
-    CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, HDESK, OpenInputDesktop,
-    SetThreadDesktop, UOI_NAME,
+    CloseDesktop, DESKTOP_READOBJECTS, GetThreadDesktop, GetUserObjectInformationW, HDESK,
+    OpenInputDesktop, SetThreadDesktop, UOI_NAME,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThreadId, GetPriorityClass, HIGH_PRIORITY_CLASS, INFINITE,
@@ -597,7 +597,7 @@ fn serve_desktop(
         if change == DisplayChange::None
             && let Some(active) = &capture
             && watchdog.check_silence(
-                connections,
+                server.active_viewers(),
                 active.shared.silent_for(Instant::now()),
                 follower.plan(),
             )
@@ -685,7 +685,7 @@ fn serve_desktop(
                     }
                     next_retry = Instant::now() + retry_delay;
                     retry_delay = (retry_delay * 2).min(CAPTURE_RETRY_MAX);
-                    if watchdog.failed(status, connections) {
+                    if watchdog.failed(status, server.active_viewers(), input_desktop_allows_wake) {
                         wake_display();
                     }
                 }
@@ -2455,6 +2455,18 @@ fn connected_sources() -> Option<HashSet<String>> {
     Some(connected)
 }
 
+/// In the SYSTEM agent even a secure desktop may be accessible to capture.
+/// Inspect the input desktop so a first-frame timeout there cannot wake it.
+fn input_desktop_allows_wake() -> bool {
+    let desktop = unsafe { OpenInputDesktop(0, 0, DESKTOP_READOBJECTS) };
+    if desktop.is_null() {
+        return false;
+    }
+    let name = desktop_name(desktop);
+    unsafe { CloseDesktop(desktop) };
+    name.is_some_and(|name| name.eq_ignore_ascii_case("Default"))
+}
+
 /// Turn the displays on if they went to sleep, as user input would.
 fn wake_display() {
     unsafe { SetThreadExecutionState(ES_DISPLAY_REQUIRED) };
@@ -2995,7 +3007,7 @@ mod tests {
         let status = capture_failure_status(error.as_ref());
         assert_eq!(status, CaptureStatus::Unavailable);
         outage.failed(status, now);
-        assert!(watchdog.failed(status, viewers), "displays are woken once");
+        assert!(watchdog.failed(status, viewers, || true), "displays are woken once");
         // Retries keep failing while the monitor is gone, without waking
         // again, and viewers are told once the grace period passes.
         let Err(error) = start(false) else {
@@ -3003,7 +3015,7 @@ mod tests {
         };
         let retry = now + CAPTURE_STATUS_GRACE;
         outage.failed(capture_failure_status(error.as_ref()), retry);
-        assert!(!watchdog.failed(capture_failure_status(error.as_ref()), viewers));
+        assert!(!watchdog.failed(capture_failure_status(error.as_ref()), viewers, || true));
         assert_eq!(outage.status(retry), CaptureStatus::Unavailable);
 
         // Plugged back in: capture resumes, viewers see it live again, and

@@ -564,15 +564,25 @@ impl<P: PartialEq + Clone> CaptureWatchdog<P> {
 
     /// Starting capture failed for `status`, with `viewers` connected.
     /// Returns whether to turn the displays on now.
-    pub fn failed(&mut self, status: topvnc::CaptureStatus, viewers: usize) -> bool {
+    pub fn failed(
+        &mut self,
+        status: topvnc::CaptureStatus,
+        viewers: usize,
+        input_desktop_allows_wake: impl FnOnce() -> bool,
+    ) -> bool {
         // The next start is a recovery, which is announced.
         self.probed = None;
         // Nobody needs the picture, and a locked or secure desktop cannot be
         // captured however the displays are powered.
-        if viewers == 0 || status == topvnc::CaptureStatus::SecureDesktop {
+        if viewers == 0
+            || self.woke
+            || status == topvnc::CaptureStatus::SecureDesktop
+            || !input_desktop_allows_wake()
+        {
             return false;
         }
-        !std::mem::replace(&mut self.woke, true)
+        self.woke = true;
+        true
     }
 }
 
@@ -2030,8 +2040,8 @@ pub struct DesktopImage {
     cursor_visible: bool,
     drawn_cursor: Option<Rect>,
     cursor_changed: bool,
-    /// The capture reported the cursor's shape or position.
-    cursor_reported: bool,
+    cursor_shape_reported: bool,
+    cursor_position_reported: bool,
 }
 
 /// The cursor a [`DesktopImage`] draws, carried over when capture restarts.
@@ -2054,7 +2064,8 @@ impl DesktopImage {
             cursor_visible: false,
             drawn_cursor: None,
             cursor_changed: false,
-            cursor_reported: false,
+            cursor_shape_reported: false,
+            cursor_position_reported: false,
         }
     }
 
@@ -2091,7 +2102,7 @@ impl DesktopImage {
     }
 
     pub fn set_cursor_position(&mut self, x: i32, y: i32, visible: bool) {
-        self.cursor_reported = true;
+        self.cursor_position_reported = true;
         if (x, y) != self.cursor_position || visible != self.cursor_visible {
             self.cursor_position = (x, y);
             self.cursor_visible = visible;
@@ -2100,7 +2111,7 @@ impl DesktopImage {
     }
 
     pub fn set_cursor_shape(&mut self, shape: Option<CursorShape>) {
-        self.cursor_reported = true;
+        self.cursor_shape_reported = true;
         if shape != self.cursor {
             self.cursor = shape;
             self.cursor_changed = true;
@@ -2121,13 +2132,17 @@ impl DesktopImage {
     /// area drew, until this capture reports the cursor itself, so the
     /// cursor does not vanish from viewers' picture meanwhile.
     pub fn restore_cursor(&mut self, previous: DrawnCursor) {
-        if self.cursor_reported {
-            return;
+        if !self.cursor_shape_reported && self.cursor != previous.shape {
+            self.cursor = previous.shape;
+            self.cursor_changed = true;
         }
-        self.cursor = previous.shape;
-        self.cursor_position = previous.position;
-        self.cursor_visible = previous.visible;
-        self.cursor_changed = true;
+        if !self.cursor_position_reported
+            && (self.cursor_position != previous.position || self.cursor_visible != previous.visible)
+        {
+            self.cursor_position = previous.position;
+            self.cursor_visible = previous.visible;
+            self.cursor_changed = true;
+        }
     }
 
     /// Compose `captured` regions and any cursor change into `output`, which
@@ -3147,17 +3162,18 @@ mod tests {
         use topvnc::CaptureStatus;
         let mut watchdog = CaptureWatchdog::<&str>::default();
         // Nobody watching, or a desktop that display power cannot help with.
-        assert!(!watchdog.failed(CaptureStatus::Unavailable, 0));
-        assert!(!watchdog.failed(CaptureStatus::SecureDesktop, 1));
-        assert!(watchdog.failed(CaptureStatus::Unavailable, 1));
+        assert!(!watchdog.failed(CaptureStatus::Unavailable, 0, || true));
+        assert!(!watchdog.failed(CaptureStatus::SecureDesktop, 1, || true));
+        assert!(!watchdog.failed(CaptureStatus::Unavailable, 1, || false));
+        assert!(watchdog.failed(CaptureStatus::Unavailable, 1, || true));
         // Not on every retry of the same outage.
-        assert!(!watchdog.failed(CaptureStatus::NoDisplay, 2));
+        assert!(!watchdog.failed(CaptureStatus::NoDisplay, 2, || true));
         // Recovering from a failed check is announced even on the same
         // displays, and a later outage asks again.
         assert!(watchdog.check_silence(1, CAPTURE_SILENCE_CHECK, Some(&"main")));
-        assert!(!watchdog.failed(CaptureStatus::Unavailable, 1));
+        assert!(!watchdog.failed(CaptureStatus::Unavailable, 1, || true));
         assert!(watchdog.started(&"main"));
-        assert!(watchdog.failed(CaptureStatus::NoDisplay, 1));
+        assert!(watchdog.failed(CaptureStatus::NoDisplay, 1, || true));
     }
 
     #[test]
@@ -3728,6 +3744,22 @@ mod tests {
         reported.set_cursor_shape(None);
         reported.restore_cursor(old.cursor());
         assert_eq!(reported.cursor().shape, None);
+
+        let mut position_only = DesktopImage::new(4, 1);
+        position_only.set_cursor_position(1, 0, true);
+        position_only.restore_cursor(old.cursor());
+        damage.clear();
+        position_only.present(&[position_only.bounds()], &mut output, &mut damage);
+        assert_eq!(output, [0, 0x00ff_ffff, 0, 0]);
+
+        let mut shape_only = DesktopImage::new(4, 1);
+        let replacement =
+            CursorShape::new(CursorKind::Color, 1, 1, 4, vec![0xff, 0, 0, 0xff]).unwrap();
+        shape_only.set_cursor_shape(Some(replacement));
+        shape_only.restore_cursor(old.cursor());
+        damage.clear();
+        shape_only.present(&[shape_only.bounds()], &mut output, &mut damage);
+        assert_eq!(output, [0, 0, 0x0000_00ff, 0]);
     }
 
     #[test]
