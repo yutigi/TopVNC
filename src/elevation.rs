@@ -175,6 +175,11 @@ fn encode(handoff: &Handoff) -> Result<Vec<u8>, String> {
     if let Some(name) = &tls.server_name {
         fields.push(("tls-server-name", name.clone()));
     }
+    // Kept so PLAIN TCP can still drop and restore them over there.
+    if let Some((cert, key)) = &form.detected_tls {
+        fields.push(("detected-cert", absolute(cert)));
+        fields.push(("detected-key", absolute(key)));
+    }
     fields.extend(
         handoff
             .viewer
@@ -225,6 +230,7 @@ fn decode(payload: &[u8]) -> Result<Handoff, String> {
     let mut action = None;
     let mut form = ServeForm::default();
     let mut viewer = Vec::new();
+    let (mut detected_cert, mut detected_key) = (None::<PathBuf>, None::<PathBuf>);
     for &[key, value] in strings.as_chunks::<2>().0 {
         let on = || match value {
             "1" => Ok(true),
@@ -276,10 +282,17 @@ fn decode(payload: &[u8]) -> Result<Handoff, String> {
             "tls-key" => form.tls.key = Some(value.into()),
             "tls-ca" => form.tls.ca = Some(value.into()),
             "tls-server-name" => form.tls.server_name = Some(value.into()),
+            "detected-cert" => detected_cert = Some(value.into()),
+            "detected-key" => detected_key = Some(value.into()),
             "viewer" => viewer.push(value.to_owned()),
             _ => return Err(invalid("setting")),
         }
     }
+    form.detected_tls = match (detected_cert, detected_key) {
+        (Some(cert), Some(key)) => Some((cert, key)),
+        (None, None) => None,
+        _ => return Err(invalid("detected TLS credentials")),
+    };
     Ok(Handoff {
         action: action.ok_or_else(|| invalid("handoff"))?,
         form,
@@ -411,6 +424,7 @@ mod tests {
             scale: 0.5,
             mouse: MouseMode::Relative,
             priority: UpdatePriority::Changes,
+            detected_tls: None,
         }
     }
 
@@ -449,7 +463,37 @@ mod tests {
             assert!(cert.is_absolute() && cert.ends_with("cert.pem"), "{cert:?}");
             assert_eq!(form.tls.key.as_deref(), Some(Path::new(r"C:\keys\key.pem")));
             assert_eq!(form.tls.ca, None);
+            assert_eq!(form.detected_tls, None);
         }
+    }
+
+    #[test]
+    fn a_handoff_keeps_detected_credentials_while_plain_tcp_is_ticked() {
+        let mut sent = form();
+        sent.tls = Default::default();
+        sent.tls.unencrypted = true;
+        sent.detected_tls = Some(("certs.local/a.pem".into(), "certs.local/a-key.pem".into()));
+        let handoff = Handoff {
+            action: StartAction::Server,
+            form: sent,
+            viewer: Vec::new(),
+        };
+        let mut form = decode(payload(&encode(&handoff).unwrap())).unwrap().form;
+        assert_eq!((&form.tls.cert, &form.tls.key), (&None, &None));
+        let (cert, key) = form.detected_tls.clone().unwrap();
+        assert!(
+            cert.is_absolute() && cert.ends_with("certs.local/a.pem"),
+            "{cert:?}"
+        );
+        assert!(
+            key.is_absolute() && key.ends_with("certs.local/a-key.pem"),
+            "{key:?}"
+        );
+        form.toggle_unencrypted();
+        assert_eq!((form.tls.cert, form.tls.key), (Some(cert), Some(key)));
+        // Half a pair is refused.
+        let frame = strings(&["action", "server", "detected-cert", "a.pem"]);
+        assert!(decode(&frame).is_err());
     }
 
     #[test]

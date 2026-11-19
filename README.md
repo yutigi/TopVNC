@@ -73,7 +73,7 @@ cargo run --release -- 127.0.0.1:5900 --window 1280x720
 | `--window WIDTHxHEIGHT` | Set a custom initial window size, such as `1280x720`. |
 | `--tls-ca CA.pem` | Trust the PEM certificates in this file instead of public roots; verification remains enabled. |
 | `--tls-server-name NAME` | Verify this DNS/IP certificate identity while connecting to the entered host address. |
-| `--tls-cert CERT.pem --tls-key KEY.pem` | Configure TLS credentials for the GUI Server tab; also required by `--serve`. Without them, the GUI uses the certificate and private key `.pem` it finds in `./certs.local`. |
+| `--tls-cert CERT.pem --tls-key KEY.pem` | Configure TLS credentials for the GUI Server tab; also required by `--serve`. Without them, the GUI uses the certificate and private key `.pem` it finds in `./certs.local`; the Server tab's PLAIN TCP checkbox turns those off and on. |
 | `--unencrypted` | Explicit legacy TCP for this launch, on viewer and GUI server; never selected automatically. |
 | `--allow-insecure` | Explicitly allow a server offering unauthenticated `None` security. |
 | `--quality LEVEL` | JPEG quality level for Tight, from 0 (smallest) to 9 (best); default 6. Lower it on a slow link. The form shows the level and offers 3, 6, and 9 as presets. |
