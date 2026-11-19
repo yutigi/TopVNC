@@ -57,10 +57,27 @@ fn encoding(config: &Config) -> Encoding {
 }
 
 fn connect_native(config: &Config) -> std::io::Result<Session> {
+    connect_native_in(
+        config,
+        std::path::Path::new(topvnc::transport::LOCAL_CERT_DIR),
+    )
+}
+
+fn connect_native_in(config: &Config, cert_dir: &std::path::Path) -> std::io::Result<Session> {
     let address = config.address().map_err(std::io::Error::other)?;
+    let tls = config.tls.with_local_ca(&config.host, cert_dir)?;
+    if config.tls.ca.is_none()
+        && let Some(ca) = &tls.ca
+    {
+        eprintln!(
+            "TopVNC: using viewer TLS trust from {} for {}",
+            ca.display(),
+            config.host
+        );
+    }
     Session::connect_with_transport(
         &address,
-        config.tls.client(&config.host)?,
+        tls.client(&config.host)?,
         config.allow_insecure,
         encoding(config),
         || Ok(config.password.clone()),
@@ -2087,8 +2104,9 @@ fn run_session_inner(
 ) -> Result<Option<String>, Box<dyn Error>> {
     let info = session.info.clone();
     eprintln!(
-        "Connected using {:?} security. RFB traffic is not encrypted.",
-        info.security
+        "Connected using {:?} authentication. {}.",
+        info.security,
+        config.tls.label()
     );
     let writer = session.writer();
     if !config.relative_mouse {

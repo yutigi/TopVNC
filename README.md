@@ -54,7 +54,7 @@ cargo run --release
 3. Choose the compression, the initial window size, presentation rate, and scaling mode. For games and video, pick a **Tight JPEG** quality: **Low** (level 3) for Wi-Fi or slow links, **Med** (level 6, the default), or **High** (level 9) for a fast wired link. **Raw** and **Zlib** are lossless but far larger.
 4. Click **Connect**. Press **F8** during the session to adjust display settings or disconnect.
 
-> **Transport security:** Native connections use TLS 1.3 with certificate and hostname verification before VNC authentication. Supply `--tls-ca CA.pem` for a private/self-signed host. Plain VNC requires an explicit `--unencrypted` option and is labeled in the UI; TLS failures never fall back. See [Native TLS setup](docs/native-tls.md).
+> **Transport security:** Native connections use TLS 1.3 with certificate and hostname verification before VNC authentication. Place a trusted private/self-signed host certificate in `certs.local`; Connect automatically selects it by its DNS/IP identity. Use `--tls-ca CA.pem` to choose a trust file explicitly. Plain VNC requires an explicit `--unencrypted` option and is labeled in the UI; TLS failures never fall back. See [Native TLS setup](docs/native-tls.md).
 
 ### Command-line options
 
@@ -71,7 +71,7 @@ cargo run --release -- 127.0.0.1:5900 --window 1280x720
 | `--fit` | Fit the remote image to the viewer window. |
 | `--native-size` | Show native pixels; center and crop if the image is larger than the window. |
 | `--window WIDTHxHEIGHT` | Set a custom initial window size, such as `1280x720`. |
-| `--tls-ca CA.pem` | Trust the PEM certificates in this file instead of public roots; verification remains enabled. |
+| `--tls-ca CA.pem` | Explicit trust file; overrides automatic target certificate lookup in `./certs.local` and public roots. Verification remains enabled. |
 | `--tls-server-name NAME` | Verify this DNS/IP certificate identity while connecting to the entered host address. |
 | `--tls-cert CERT.pem --tls-key KEY.pem` | Configure TLS credentials for the GUI Server tab; also required by `--serve`. Without them, the GUI uses the certificate and private key `.pem` it finds in `./certs.local`; the Server tab's PLAIN TCP checkbox turns those off and on. |
 | `--unencrypted` | Explicit legacy TCP for this launch, on viewer and GUI server; never selected automatically. |
