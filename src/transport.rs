@@ -3,7 +3,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObjec
 use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore, ServerConnection};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,12 +53,89 @@ pub fn server_config(cert: &Path, key: &Path) -> io::Result<Arc<rustls::ServerCo
     Ok(Arc::new(config))
 }
 
-/// Folder, relative to the working directory, searched for host PEM files
-/// when neither `--tls-cert` nor `--tls-key` is given. Ignored by git.
+/// User-managed PEM directory relative to the working directory. Used for
+/// host credentials and target-specific viewer trust. Ignored by git.
 pub const LOCAL_CERT_DIR: &str = "certs.local";
 
 /// Largest file inspected while detecting PEM files.
 const MAX_DETECTED_PEM_BYTES: u64 = 1024 * 1024;
+const MAX_VIEWER_CERT_ENTRIES: usize = 128;
+
+/// Select a locally distributed host certificate by its DNS/IP identity.
+/// Selection is not verification: the live TLS handshake must still validate
+/// the chain, validity period, name, and proof of possession of the private key.
+fn detect_client_ca(dir: &Path, name: &str) -> io::Result<Option<PathBuf>> {
+    let name = ServerName::try_from(name).map_err(invalid)?;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // Bound even a directory containing many unrelated files, and fail instead
+    // of choosing from an arbitrary subset of its certificates.
+    let mut paths = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_VIEWER_CERT_ENTRIES {
+            return Err(invalid(
+                "Too many entries in certs.local; use --tls-ca FILE",
+            ));
+        }
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pem"))
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    let mut selected = None;
+    for path in paths {
+        let file = std::fs::File::open(&path)?;
+        if file.metadata()?.len() > MAX_DETECTED_PEM_BYTES {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_DETECTED_PEM_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_DETECTED_PEM_BYTES {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        // Never use a combined certificate/key file as viewer trust.
+        if text.contains("PRIVATE KEY-----") {
+            continue;
+        }
+        let Ok(chain) = CertificateDer::pem_slice_iter(&bytes).collect::<Result<Vec<_>, _>>()
+        else {
+            continue;
+        };
+        let Some(leaf) = chain.first() else {
+            continue;
+        };
+        let Ok(parsed) = rustls::server::ParsedCertificate::try_from(leaf) else {
+            continue;
+        };
+        if rustls::client::verify_server_name(&parsed, &name).is_err() {
+            continue;
+        }
+        if let Some((_, previous)) = &selected {
+            if previous != &chain {
+                return Err(invalid(format!(
+                    "Multiple certificates in certs.local match {}; use --tls-ca FILE to choose one",
+                    name.to_str()
+                )));
+            }
+        } else {
+            selected = Some((path, chain));
+        }
+    }
+    Ok(selected.map(|(path, _)| path))
+}
 
 /// Finds one host certificate and private key among the `.pem` files in
 /// `dir` by their PEM labels, not their names. Returns `None` when there is no
@@ -134,6 +211,25 @@ pub struct TlsOptions {
 }
 
 impl TlsOptions {
+    /// Resolve fresh trust for this target, leaving launch settings unchanged.
+    /// Explicit trust and plaintext choices always take precedence.
+    pub fn with_local_ca(&self, host: &str, dir: &Path) -> io::Result<Self> {
+        let mut resolved = self.clone();
+        if !self.unencrypted && self.ca.is_none() {
+            resolved.ca = detect_client_ca(dir, &self.client_server_name(host))?;
+        }
+        Ok(resolved)
+    }
+
+    fn client_server_name(&self, host: &str) -> String {
+        self.server_name.clone().unwrap_or_else(|| {
+            host.trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_owned()
+        })
+    }
+
     pub fn label(&self) -> &'static str {
         if self.unencrypted {
             "TCP / UNENCRYPTED (EXPLICIT)"
@@ -153,12 +249,7 @@ impl TlsOptions {
         }
         Ok(ClientTransport::Tls {
             config: client_config(self.ca.as_deref())?,
-            server_name: self.server_name.clone().unwrap_or_else(|| {
-                host.trim()
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_owned()
-            }),
+            server_name: self.client_server_name(host),
         })
     }
 

@@ -21,12 +21,18 @@ cargo run --release -- --serve 127.0.0.1:5900 --tls-cert certs.local/server.pem 
 In another terminal:
 
 ```sh
-cargo run --release -- 127.0.0.1:5900 --tls-ca certs.local/server.pem
+cargo run --release -- 127.0.0.1:5900
 ```
 
 Enter the VNC password and click Connect. For another computer, copy **only `server.pem`** through a trusted channel and dial the host's reachable address. With the example certificate above, add `--tls-server-name topvnc-host` to verify its DNS identity while dialing that address. Prefer issuing a certificate with the actual host DNS/IP SANs. Wrong names, expired certificates, and untrusted issuers are rejected.
 
-Without `--tls-ca`, the viewer uses bundled public WebPKI roots. A supplied CA file replaces those roots for this launch; it does not disable any verification. System-installed private CAs must also be supplied explicitly. No skip-verification option exists.
+Without `--tls-ca`, each Connect attempt looks for a matching public host certificate in `certs.local` under the working directory. For example, put your trusted office host certificate in `certs.local/office-pc.pem`, launch `cargo run --release`, enter its address and password, and click Connect. The filename is arbitrary: the certificate's DNS/IP subject alternative names must match the entered host (or `--tls-server-name`). Editing the target triggers a fresh lookup. The Connect tab names this automatic trust source, and the terminal reports the selected file.
+
+This directory is a **local trust source**: only place certificates obtained through a trusted channel there. TopVNC never downloads a certificate to trust it automatically. Discovery inspects at most 128 directory entries and certificate-only `.pem` files up to 1 MiB; it ignores private keys, combined certificate/key files, malformed certificates, subdirectories, symlinks, and unrelated certificates. Identical certificate-chain copies are accepted. Multiple different matching chains fail with guidance to choose one using `--tls-ca FILE`. Expired certificates are still rejected by the handshake.
+
+With no match (or no directory), the viewer uses bundled public WebPKI roots. An explicit `--tls-ca CA.pem` takes precedence over discovery and replaces public roots for this launch; it does not disable any verification. Use it for a CA-only trust file, ambiguous matches, or a certificate outside `certs.local`. System-installed private CAs must also be supplied explicitly. No skip-verification option exists. Explicit plain TCP skips discovery. Neither discovered trust nor plaintext consent is saved to last-session settings.
+
+The connection message reports VNC authentication separately from transport: `VncPassword` can run inside verified TLS. Earlier builds always printed "RFB traffic is not encrypted" even on TLS connections; that message was incorrect.
 
 For GUI hosting, launch with `--tls-cert CERT.pem --tls-key KEY.pem`, then use the Server tab. Without those options (and without `--unencrypted`), the GUI looks in `certs.local` under the working directory: if it holds exactly one private key `.pem` and one certificate `.pem` (or several identical copies, or one named after the key, such as `server.pem` for `server-key.pem`), those are used, printed to the terminal, and named on the Server tab. Files are recognized by their PEM labels; nothing is generated or trusted. Any other layout detects nothing. Ticking **PLAIN TCP (NO TLS)** on the Server tab serves without the detected certificate, and unticking it uses the certificate again; launched with `--unencrypted`, the GUI still finds them and uses them once the box is unticked. Certificates given with `--tls-cert` and `--tls-key` are never dropped this way, so plain TCP with them still fails. `--serve` still needs explicit paths. Certificate paths are configured at launch, not edited in the form. Missing or invalid credentials are reported before desktop capture starts. On Windows the work-server launcher reads `TOPVNC_TLS_CERT` and `TOPVNC_TLS_KEY` from its environment; its `/check` checks the executable, not certificate validity.
 

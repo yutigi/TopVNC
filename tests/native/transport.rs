@@ -8,6 +8,183 @@ use std::sync::mpsc;
 use std::thread;
 use support::Identity;
 
+struct PemDirectory(PathBuf);
+
+impl PemDirectory {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "topvnc-viewer-certs-{}-{}",
+            std::process::id(),
+            getrandom::u64().unwrap()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn write(&self, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn resolve(&self, host: &str) -> io::Result<Option<PathBuf>> {
+        Ok(TlsOptions::default().with_local_ca(host, &self.0)?.ca)
+    }
+}
+
+impl Drop for PemDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn viewer_trust_matches_certificate_dns_and_ip_and_is_resolved_per_target() {
+    let directory = PemDirectory::new();
+    let office = directory.write("office-pc.pem", Identity::new().cert.pem());
+    let other = rcgen::generate_simple_self_signed(vec!["other-pc".into(), "::1".into()]).unwrap();
+    let other = directory.write("unrelated-filename.PEM", other.cert.pem());
+    assert_eq!(
+        directory.resolve("LOCALHOST").unwrap(),
+        Some(office.clone())
+    );
+    assert_eq!(directory.resolve("127.0.0.1").unwrap(), Some(office));
+    assert_eq!(directory.resolve("other-pc").unwrap(), Some(other.clone()));
+    assert_eq!(directory.resolve("[::1]").unwrap(), Some(other));
+    assert_eq!(directory.resolve("unknown.invalid").unwrap(), None);
+    // The effective TLS identity can differ from the dialed address.
+    let options = TlsOptions {
+        server_name: Some("other-pc".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        options
+            .with_local_ca("192.0.2.10", &directory.0)
+            .unwrap()
+            .ca,
+        directory.resolve("other-pc").unwrap()
+    );
+    assert!(
+        options.ca.is_none(),
+        "do not retain trust for another target"
+    );
+}
+
+#[test]
+fn duplicate_certificates_are_ok_but_distinct_matches_need_an_explicit_choice() {
+    let directory = PemDirectory::new();
+    let identity = Identity::new();
+    let first = directory.write("a.pem", identity.cert.pem());
+    directory.write("b.pem", identity.cert.pem().replace('\n', "\r\n"));
+    assert_eq!(directory.resolve("localhost").unwrap(), Some(first));
+    directory.write("c.pem", Identity::new().cert.pem());
+    let error = directory.resolve("localhost").unwrap_err().to_string();
+    assert!(error.contains("Multiple certificates"));
+    assert!(error.contains("--tls-ca"));
+}
+
+#[test]
+fn viewer_discovery_ignores_keys_malformed_oversized_and_unrelated_files() {
+    let directory = PemDirectory::new();
+    let identity = Identity::new();
+    directory.write("key.pem", identity.key.serialize_pem());
+    directory.write(
+        "combined.pem",
+        format!("{}{}", identity.cert.pem(), identity.key.serialize_pem()),
+    );
+    directory.write(
+        "malformed.pem",
+        "-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----",
+    );
+    directory.write(
+        "invalid-der.pem",
+        "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----",
+    );
+    directory.write("empty.pem", "");
+    directory.write("binary.pem", [0xff, 0xfe]);
+    directory.write("wrong-extension.txt", identity.cert.pem());
+    directory.write(
+        "oversized.pem",
+        format!(
+            "{}{}",
+            " ".repeat(MAX_DETECTED_PEM_BYTES as usize),
+            identity.cert.pem()
+        ),
+    );
+    std::fs::create_dir(directory.0.join("folder.pem")).unwrap();
+    // A matching filename must never substitute for a matching SAN.
+    let wrong = rcgen::generate_simple_self_signed(vec!["wrong.invalid".into()]).unwrap();
+    directory.write("localhost.pem", wrong.cert.pem());
+    assert_eq!(directory.resolve("localhost").unwrap(), None);
+}
+
+#[test]
+fn explicit_ca_and_plaintext_bypass_discovery_without_masking_conflicts() {
+    let directory = PemDirectory::new();
+    directory.write("a.pem", Identity::new().cert.pem());
+    directory.write("b.pem", Identity::new().cert.pem());
+    let explicit = TlsOptions {
+        ca: Some("chosen.pem".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        explicit.with_local_ca("localhost", &directory.0).unwrap(),
+        explicit
+    );
+    let plain = TlsOptions {
+        unencrypted: true,
+        ..Default::default()
+    };
+    assert!(matches!(
+        plain
+            .with_local_ca("localhost", &directory.0)
+            .unwrap()
+            .client("localhost")
+            .unwrap(),
+        ClientTransport::Unencrypted
+    ));
+    let conflict = TlsOptions {
+        unencrypted: true,
+        ..explicit
+    };
+    assert!(
+        conflict
+            .with_local_ca("localhost", &directory.0)
+            .unwrap()
+            .client("localhost")
+            .is_err()
+    );
+}
+
+#[test]
+fn absent_directory_uses_public_roots_and_directory_inspection_is_bounded() {
+    let directory = PemDirectory::new();
+    assert!(
+        TlsOptions::default()
+            .with_local_ca("localhost", &directory.0.join("missing"))
+            .unwrap()
+            .ca
+            .is_none()
+    );
+    // A path that is not a directory is an error, not an absent trust source.
+    let file = directory.write("not-a-directory", "");
+    assert!(
+        TlsOptions::default()
+            .with_local_ca("localhost", &file)
+            .is_err()
+    );
+    for index in 0..MAX_VIEWER_CERT_ENTRIES {
+        directory.write(&format!("{index}.txt"), "");
+    }
+    assert!(
+        directory
+            .resolve("localhost")
+            .unwrap_err()
+            .to_string()
+            .contains("--tls-ca")
+    );
+}
+
 fn socket_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();

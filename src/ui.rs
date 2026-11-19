@@ -1582,6 +1582,13 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
         if config.tls.unencrypted { ERROR } else { MUTED },
         1,
     );
+    if !config.tls.unencrypted {
+        let trust = match &config.tls.ca {
+            Some(path) => format!("TRUST: {}", path.display()),
+            None => "TRUST: AUTO certs.local / PUBLIC ROOTS".into(),
+        };
+        canvas.text(400, 345, &trust, MUTED, 1);
+    }
     canvas.label(40, 362, "WINDOW SIZE");
     canvas.button(FIT, "FIT", config.window_mode == WindowMode::Fit);
     canvas.button(NATIVE, "NATIVE", config.window_mode == WindowMode::Native);
