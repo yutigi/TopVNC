@@ -2,13 +2,13 @@
 //! Duplication capture, `SendInput` injection, and clipboard sync.
 
 use crate::desktop_host::{
-    CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureOutage, CaptureSurface, CursorKind, CursorShape,
-    DesktopImage, DisplayArea, DisplayChange, DisplayFollower, DisplayPlan, DisplaySelection,
-    Downscaler, KeyIdentity, MAX_DISPLAYS, MouseMode, PointerModeHint, PointerOwner,
-    PointerTransition, Rect, RemoteInputState, Rotation, WHEEL_DELTA, absolute_mouse_coordinate,
-    connected_displays, is_secure_attention, latin1_from_unicode, latin1_to_utf16,
-    native_coordinate, served_size, unicode_key_units, validate_capture_dimensions,
-    windows_key_identity,
+    CAPTURE_RETRY_MAX, CAPTURE_RETRY_MIN, CaptureOutage, CaptureSurface, CaptureWatchdog,
+    CursorKind, CursorShape, DesktopImage, DisplayArea, DisplayChange, DisplayFollower,
+    DisplayPlan, DisplaySelection, Downscaler, DrawnCursor, KeyIdentity, MAX_DISPLAYS, MouseMode,
+    PointerModeHint, PointerOwner, PointerTransition, Rect, RemoteInputState, Rotation,
+    WHEEL_DELTA, absolute_mouse_coordinate, connected_displays, is_secure_attention,
+    latin1_from_unicode, latin1_to_utf16, native_coordinate, served_size, unicode_key_units,
+    validate_capture_dimensions, windows_key_identity,
 };
 use crate::desktop_host::{
     MAX_CLIPBOARD_CHARS, ServeOptions, ServerNotice, VirtualKey, parse_serve_arguments,
@@ -81,9 +81,10 @@ use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, SetThreadExecutionState};
 use windows_sys::Win32::System::StationsAndDesktops::{
-    CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, HDESK, OpenInputDesktop,
-    SetThreadDesktop, UOI_NAME,
+    CloseDesktop, DESKTOP_READOBJECTS, GetThreadDesktop, GetUserObjectInformationW, HDESK,
+    OpenInputDesktop, SetThreadDesktop, UOI_NAME,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThreadId, GetPriorityClass, HIGH_PRIORITY_CLASS, INFINITE,
@@ -376,7 +377,7 @@ pub fn serve(
         report(ServerNotice::Message(error));
     }
     let mut follower = DisplayFollower::new(display);
-    let (capture, plan) = start_capture(&mut follower).map_err(|error| {
+    let (capture, plan) = start_capture(&mut follower, None).map_err(|error| {
         format!(
             "{error}. Run the server in an interactive, unlocked desktop session; \
              services, disconnected Remote Desktop sessions, and the secure desktop cannot be captured"
@@ -508,6 +509,7 @@ fn serve_desktop(
             "Could not read the initial system clipboard: {error}"
         ))),
     }
+    let mut fallback_retry = capture.retry_selection.then(FallbackRetry::new);
     let mut capture = Some(capture);
     let mut retry_delay = CAPTURE_RETRY_MIN;
     let mut next_retry = Instant::now();
@@ -516,6 +518,9 @@ fn serve_desktop(
     let mut connections = 0;
     let mut pointer_mode = PointerModeHint::default();
     let mut outage = CaptureOutage::default();
+    let mut watchdog = CaptureWatchdog::<DisplayPlan>::default();
+    // The cursor a restarted capture drew, and the desktop area it covered.
+    let mut previous_cursor: Option<(Rect, DrawnCursor)> = None;
     while !shutdown.load(Ordering::Acquire) {
         if capture.is_none() {
             outage.stopped(Instant::now());
@@ -586,9 +591,40 @@ fn serve_desktop(
                 renumbered => renumbered,
             };
         }
+        let viewers = server.active_viewers();
+        if change == DisplayChange::None
+            && viewers != 0
+            && let (Some(retry), Some(serving)) = (&mut fallback_retry, follower.plan())
+            && retry.selection_ready(follower.selection(), serving)
+        {
+            change = DisplayChange::Restart;
+        }
+
+        // Check the display that viewers are actually watching. Failed
+        // outputs are tested separately, while the fallback keeps serving.
+        // Finish the probe first so a fresh topology cannot make its output
+        // part of the restart while the probe still holds the duplication.
+        let mut restart_fallback = None;
+        if change == DisplayChange::None
+            && fallback_retry
+                .as_ref()
+                .is_none_or(|retry| retry.probe.is_none())
+            && let Some(active) = &capture
+            && watchdog.check_silence(
+                viewers,
+                active.shared.silent_for(Instant::now()),
+                follower.plan(),
+            )
+        {
+            if fallback_retry.is_some() {
+                restart_fallback = follower.plan().cloned();
+            }
+            change = DisplayChange::Restart;
+        }
         match change {
             DisplayChange::None => {}
             DisplayChange::Renumbered => {
+                fallback_retry = None;
                 if let Some(plan) = follower.plan() {
                     server.set_serve_display(plan.announcement());
                     if let Some(notice) = plan.fallback_notice() {
@@ -598,8 +634,11 @@ fn serve_desktop(
             }
             DisplayChange::Restart => {
                 // A display can be duplicated once per process; stop first.
+                if restart_fallback.is_none() {
+                    fallback_retry = None;
+                }
                 outage.stopped(Instant::now());
-                capture = None;
+                previous_cursor = capture.take().and_then(|active| active.drawn_cursor());
                 follower.stopped();
                 next_retry = Instant::now();
                 retry_delay = CAPTURE_RETRY_MIN;
@@ -619,7 +658,7 @@ fn serve_desktop(
                 report(ServerNotice::Message(error.clone()));
                 last_capture_error = error;
             }
-            match start_capture(&mut follower) {
+            match start_capture(&mut follower, restart_fallback.as_ref()) {
                 Ok((recreated, plan)) => {
                     let size = (recreated.placement.width, recreated.placement.height);
                     if size != (framebuffer.width() as u16, framebuffer.height() as u16) {
@@ -636,11 +675,21 @@ fn serve_desktop(
                         served_height,
                         ..recreated.placement
                     };
+                    if let Some(previous) = previous_cursor.take() {
+                        recreated.restore_cursor(previous);
+                    }
                     server.set_serve_display(plan.announcement());
-                    report(ServerNotice::Message(
-                        plan.fallback_notice()
-                            .unwrap_or_else(|| format!("Serving {}.", plan.description())),
-                    ));
+                    if watchdog.started(&plan) {
+                        report(ServerNotice::Message(
+                            plan.fallback_notice()
+                                .unwrap_or_else(|| format!("Serving {}.", plan.description())),
+                        ));
+                    }
+                    if recreated.retry_selection {
+                        fallback_retry.get_or_insert_with(FallbackRetry::new);
+                    } else {
+                        fallback_retry = None;
+                    }
                     capture = Some(recreated);
                     outage.resumed();
                     server.set_capture_status(CaptureStatus::Live);
@@ -649,7 +698,11 @@ fn serve_desktop(
                     last_layout_check = Instant::now();
                 }
                 Err(error) => {
-                    outage.failed(capture_failure_status(error.as_ref()), Instant::now());
+                    // The cursor may move before capture recovers.
+                    previous_cursor = None;
+                    fallback_retry = None;
+                    let status = capture_failure_status(error.as_ref());
+                    outage.failed(status, Instant::now());
                     let message = error.to_string();
                     if message != last_capture_error {
                         report(ServerNotice::Message(format!(
@@ -659,6 +712,9 @@ fn serve_desktop(
                     }
                     next_retry = Instant::now() + retry_delay;
                     retry_delay = (retry_delay * 2).min(CAPTURE_RETRY_MAX);
+                    if watchdog.failed(status, server.active_viewers(), input_desktop_allows_wake) {
+                        wake_display();
+                    }
                 }
             }
             continue;
@@ -672,6 +728,7 @@ fn serve_desktop(
                 "Desktop capture paused: {error}"
             )));
             last_capture_error = error.to_string();
+            fallback_retry = None;
             capture = None;
             follower.stopped();
             next_retry = Instant::now() + retry_delay;
@@ -1550,6 +1607,8 @@ struct DesktopCapture {
     /// Windows raised every capture device's GPU thread priority, so copies
     /// do not queue behind a game's rendering.
     gpu_priority_raised: bool,
+    /// The requested capture failed and a working primary is being served.
+    retry_selection: bool,
 }
 
 /// What capture threads hand to the serving loop.
@@ -1567,6 +1626,7 @@ impl CaptureShared {
                 captured: vec![Rect::new(0, 0, i32::from(width), i32::from(height))],
                 changed: false,
                 first_frames_pending: outputs,
+                last_frame: Instant::now(),
                 pointer: PointerOwner::default(),
                 error: None,
             }),
@@ -1599,6 +1659,19 @@ impl CaptureShared {
         }
         Ok(())
     }
+
+    /// A captured display delivered a frame at `now`, even one where only
+    /// the pointer moved.
+    fn frame_delivered(state: &mut CaptureState, now: Instant) {
+        state.last_frame = state.last_frame.max(now);
+    }
+
+    /// How long, at `now`, no captured display has delivered a frame.
+    fn silent_for(&self, now: Instant) -> Duration {
+        self.state.lock().map_or(Duration::ZERO, |state| {
+            now.saturating_duration_since(state.last_frame)
+        })
+    }
 }
 
 struct CaptureState {
@@ -1609,6 +1682,9 @@ struct CaptureState {
     changed: bool,
     /// Decremented once per output, after its first full image is copied.
     first_frames_pending: usize,
+    /// When any captured display last delivered a frame, even one where
+    /// only the pointer moved.
+    last_frame: Instant,
     pointer: PointerOwner,
     /// Why a display's capture stopped; the whole capture is then recreated.
     error: Option<String>,
@@ -1640,6 +1716,7 @@ fn capture_failure_status(error: &(dyn Error + 'static)) -> CaptureStatus {
 /// now, and tell it what is served.
 fn start_capture(
     follower: &mut DisplayFollower,
+    restart_fallback: Option<&DisplayPlan>,
 ) -> Result<(DesktopCapture, DisplayPlan), Box<dyn Error>> {
     // Read the layout first: a change while starting is then noticed.
     let layout = monitor_layout();
@@ -1654,14 +1731,133 @@ fn start_capture(
         .iter()
         .map(|output| output.area.clone())
         .collect::<Vec<_>>();
-    let (capture, plan) = capture_selected_or_primary(
-        DisplayPlan::for_layout(follower.selection(), &areas, &layout)?,
+    let requested = DisplayPlan::for_layout(follower.selection(), &areas, &layout)?;
+    let initial = primary_for_silence_check(restart_fallback, &requested, &areas);
+    let (mut capture, plan) = capture_selected_or_primary(
+        initial,
         &areas,
         |plan| DesktopCapture::new(plan, &attached),
         |capture| capture.shared.wait_for_first_frames(FIRST_FRAME_TIMEOUT),
     )?;
+    capture.retry_selection = plan.outputs != requested.outputs;
     follower.started(plan.clone(), layout);
     Ok((capture, plan))
+}
+
+/// Recheck the working primary without waiting on the unavailable selection.
+/// If the layout has changed, resolve the request against the fresh snapshot.
+fn primary_for_silence_check(
+    serving_fallback: Option<&DisplayPlan>,
+    requested: &DisplayPlan,
+    areas: &[DisplayArea],
+) -> DisplayPlan {
+    if let Some(serving) = serving_fallback
+        && let Ok(mut primary) = DisplayPlan::new(DisplaySelection::Primary, areas)
+        && primary.outputs == serving.outputs
+        && primary.outputs != requested.outputs
+    {
+        primary.chosen.fallback.clone_from(&serving.chosen.fallback);
+        return primary;
+    }
+    requested.clone()
+}
+
+/// Check the missing outputs in a worker so first-frame timeouts do not
+/// interrupt the live fallback or block its serving loop.
+struct FallbackRetry {
+    next_probe: Instant,
+    delay: Duration,
+    probe: Option<thread::JoinHandle<bool>>,
+}
+
+impl FallbackRetry {
+    fn new() -> Self {
+        Self {
+            next_probe: Instant::now() + CAPTURE_RETRY_MIN,
+            delay: CAPTURE_RETRY_MIN,
+            probe: None,
+        }
+    }
+
+    fn selection_ready(&mut self, selection: DisplaySelection, serving: &DisplayPlan) -> bool {
+        if let Some(probe) = &self.probe {
+            if !probe.is_finished() {
+                return false;
+            }
+            let ready = self
+                .probe
+                .take()
+                .is_some_and(|probe| probe.join().unwrap_or(false));
+            self.schedule_retry();
+            return ready;
+        }
+        if Instant::now() >= self.next_probe {
+            let served_names: Vec<_> = serving
+                .outputs
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            match thread::Builder::new()
+                .name("topvnc-display-probe".into())
+                .spawn(move || probe_missing_outputs(selection, &served_names).is_ok())
+            {
+                Ok(probe) => self.probe = Some(probe),
+                Err(_) => self.schedule_retry(),
+            }
+        }
+        false
+    }
+
+    fn schedule_retry(&mut self) {
+        self.next_probe = Instant::now() + self.delay;
+        self.delay = (self.delay * 2).min(CAPTURE_RETRY_MAX);
+    }
+}
+
+impl Drop for FallbackRetry {
+    fn drop(&mut self) {
+        // Release any duplications before a new display selection tries them.
+        if let Some(probe) = self.probe.take() {
+            let _ = probe.join();
+        }
+    }
+}
+
+fn probe_missing_outputs(
+    selection: DisplaySelection,
+    served_names: &[String],
+) -> Result<(), Box<dyn Error>> {
+    enable_thread_dpi_awareness();
+    follow_input_desktop()?;
+    let layout = monitor_layout();
+    let attached = attached_outputs_in(&layout)?;
+    let areas: Vec<_> = attached.iter().map(|output| output.area.clone()).collect();
+    let requested = DisplayPlan::for_layout(selection, &areas, &layout)?;
+    let missing_indices = missing_output_indices(&requested, served_names);
+    let missing: Vec<_> = attached
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, output)| missing_indices.contains(&index).then_some(output))
+        .collect();
+    let areas: Vec<_> = missing.iter().map(|output| output.area.clone()).collect();
+    let plan = DisplayPlan::new(DisplaySelection::All, &areas)?;
+    let capture = DesktopCapture::new(&plan, &missing)?;
+    capture.shared.wait_for_first_frames(FIRST_FRAME_TIMEOUT)
+}
+
+fn missing_output_indices(requested: &DisplayPlan, served_names: &[String]) -> Vec<usize> {
+    requested
+        .chosen
+        .indices
+        .iter()
+        .zip(&requested.outputs)
+        .filter_map(|(&index, (name, _))| {
+            (!served_names
+                .iter()
+                .any(|served| served.eq_ignore_ascii_case(name)))
+            .then_some(index)
+        })
+        .collect()
 }
 
 /// An unplugged output can remain enumerated while duplication already
@@ -1748,6 +1944,7 @@ impl DesktopCapture {
                 served_height: height,
             },
             gpu_priority_raised: captures.iter().all(|output| output.gpu_priority_raised),
+            retry_selection: false,
         };
         for output in captures {
             let shared = Arc::clone(&capture.shared);
@@ -1788,6 +1985,33 @@ impl DesktopCapture {
             state.changed = false;
         }
         Ok(())
+    }
+
+    /// The desktop area this capture covers.
+    fn area(&self) -> Rect {
+        let placement = &self.placement;
+        Rect::new(
+            placement.left,
+            placement.top,
+            placement.left + i32::from(placement.width),
+            placement.top + i32::from(placement.height),
+        )
+    }
+
+    /// The cursor drawn into the captured image, and the area it is in.
+    fn drawn_cursor(&self) -> Option<(Rect, DrawnCursor)> {
+        let state = self.shared.state.lock().ok()?;
+        Some((self.area(), state.image.cursor()))
+    }
+
+    /// Keep drawing the cursor a capture of the same area drew; see
+    /// [`DesktopImage::restore_cursor`].
+    fn restore_cursor(&self, (area, cursor): (Rect, DrawnCursor)) {
+        if area == self.area()
+            && let Ok(mut state) = self.shared.state.lock()
+        {
+            state.image.restore_cursor(cursor);
+        }
     }
 }
 
@@ -1991,6 +2215,7 @@ impl OutputCapture {
             .lock()
             .map_err(|_| "capture state lock poisoned")?;
         let state = &mut *state;
+        CaptureShared::frame_delivered(state, Instant::now());
         if frame_info.LastMouseUpdateTime != 0 {
             let position = frame_info.PointerPosition.Position;
             let visible = frame_info.PointerPosition.Visible.as_bool();
@@ -2381,6 +2606,23 @@ fn connected_sources() -> Option<HashSet<String>> {
     Some(connected)
 }
 
+/// In the SYSTEM agent even a secure desktop may be accessible to capture.
+/// Inspect the input desktop so a first-frame timeout there cannot wake it.
+fn input_desktop_allows_wake() -> bool {
+    let desktop = unsafe { OpenInputDesktop(0, 0, DESKTOP_READOBJECTS) };
+    if desktop.is_null() {
+        return false;
+    }
+    let name = desktop_name(desktop);
+    unsafe { CloseDesktop(desktop) };
+    name.is_some_and(|name| name.eq_ignore_ascii_case("Default"))
+}
+
+/// Turn the displays on if they went to sleep, as user input would.
+fn wake_display() {
+    unsafe { SetThreadExecutionState(ES_DISPLAY_REQUIRED) };
+}
+
 /// The monitors on the desktop as GDI reports them, without displays no
 /// connected monitor shows. Cheap enough to compare twice a second, unlike
 /// enumerating DXGI outputs.
@@ -2460,7 +2702,7 @@ impl Drop for FrameGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desktop_host::choose_displays;
+    use crate::desktop_host::{CAPTURE_SILENCE_CHECK, CAPTURE_STATUS_GRACE, choose_displays};
     use topvnc::ServedDisplays;
 
     fn recovery_displays() -> Vec<DisplayArea> {
@@ -2656,6 +2898,41 @@ mod tests {
     }
 
     #[test]
+    fn silence_checks_reopen_only_the_live_fallback_and_probes_exclude_it() {
+        let attached = recovery_displays();
+        for selection in [DisplaySelection::Number(1), DisplaySelection::All] {
+            let requested = DisplayPlan::new(selection, &attached).unwrap();
+            let (_, fallback) = capture_selected_or_primary(
+                requested.clone(),
+                &attached,
+                |plan| {
+                    if plan.chosen.indices.contains(&0) {
+                        Err("display did not deliver its first image".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            let initial = primary_for_silence_check(Some(&fallback), &requested, &attached);
+            let (_, reopened) = capture_selected_or_primary(
+                initial,
+                &attached,
+                |plan| {
+                    assert_eq!(plan.outputs, fallback.outputs);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(reopened, fallback);
+            let served = [attached[1].name.to_ascii_lowercase()];
+            assert_eq!(missing_output_indices(&requested, &served), [0]);
+        }
+    }
+
+    #[test]
     fn failed_selected_capture_serves_the_current_primary_and_retains_the_selection() {
         let attached = recovery_displays();
         let mut follower = DisplayFollower::new(DisplaySelection::Number(1));
@@ -2837,6 +3114,110 @@ mod tests {
         assert_eq!(plan.chosen.indices, [0]);
         assert_eq!(plan.fallback_notice(), None);
         assert!(DisplayPlan::new(DisplaySelection::Primary, &[]).is_err());
+    }
+
+    /// What a capture thread does when Desktop Duplication hands it a frame.
+    fn deliver_frame(shared: &CaptureShared, at: Instant) {
+        let mut state = shared.state.lock().unwrap();
+        CaptureShared::frame_delivered(&mut state, at);
+        state.first_frames_pending = state.first_frames_pending.saturating_sub(1);
+        state.changed = true;
+        drop(state);
+        shared.changed.notify_all();
+    }
+
+    /// Headless: no monitor or Desktop Duplication, so it runs in CI. As
+    /// measured on a laptop with its lid closed, an unplugged monitor stays
+    /// on the desktop, unchanged in every display listing, while capture of
+    /// it receives no frame and raises no error. The host must notice, tell
+    /// viewers, and recover when the monitor returns, without disturbing a
+    /// healthy desktop at rest.
+    #[test]
+    fn a_display_that_silently_stops_is_noticed_reported_and_recovered() {
+        let attached = recovery_displays();
+        let plan = DisplayPlan::new(DisplaySelection::Primary, &attached).unwrap();
+        // Starts capture as the host does; a plugged-in display delivers its
+        // first image at once, an unplugged one never does.
+        let start = |plugged: bool| {
+            capture_selected_or_primary(
+                plan.clone(),
+                &attached,
+                |_| {
+                    let shared = CaptureShared::new(4, 4, 1);
+                    if plugged {
+                        deliver_frame(&shared, Instant::now());
+                    }
+                    Ok(shared)
+                },
+                |shared| shared.wait_for_first_frames(Duration::from_millis(20)),
+            )
+        };
+        let mut watchdog = CaptureWatchdog::<DisplayPlan>::default();
+        let mut outage = CaptureOutage::default();
+        let viewers = 1;
+
+        let (shared, served) = start(true).unwrap();
+        assert!(watchdog.started(&served), "the first start is announced");
+        let t0 = Instant::now();
+
+        // Activity, even a pointer move, keeps capture running.
+        deliver_frame(&shared, t0 + Duration::from_secs(2));
+        let now = t0 + Duration::from_secs(4);
+        assert!(!watchdog.check_silence(viewers, shared.silent_for(now), Some(&served)));
+
+        // A desktop at rest is checked, and restarts on the same display
+        // without a message or a viewer notice.
+        let now = t0 + Duration::from_secs(2) + CAPTURE_SILENCE_CHECK;
+        assert!(watchdog.check_silence(viewers, shared.silent_for(now), Some(&served)));
+        outage.stopped(now);
+        let (shared, served) = start(true).unwrap();
+        assert!(!watchdog.started(&served), "a healthy check stays quiet");
+        outage.resumed();
+        assert_eq!(outage.status(now), CaptureStatus::Live);
+
+        // Unplugged: the running capture falls silent, and its restart
+        // receives no first image.
+        let unplugged = Instant::now();
+        let now = unplugged + CAPTURE_SILENCE_CHECK;
+        assert!(watchdog.check_silence(viewers, shared.silent_for(now), Some(&served)));
+        outage.stopped(now);
+        let Err(error) = start(false) else {
+            panic!("an unplugged display started capture")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("did not deliver their first desktop image"),
+            "{error}"
+        );
+        let status = capture_failure_status(error.as_ref());
+        assert_eq!(status, CaptureStatus::Unavailable);
+        outage.failed(status, now);
+        assert!(
+            watchdog.failed(status, viewers, || true),
+            "displays are woken once"
+        );
+        // Retries keep failing while the monitor is gone, without waking
+        // again, and viewers are told once the grace period passes.
+        let Err(error) = start(false) else {
+            panic!("an unplugged display started capture")
+        };
+        let retry = now + CAPTURE_STATUS_GRACE;
+        outage.failed(capture_failure_status(error.as_ref()), retry);
+        assert!(!watchdog.failed(capture_failure_status(error.as_ref()), viewers, || true));
+        assert_eq!(outage.status(retry), CaptureStatus::Unavailable);
+
+        // Plugged back in: capture resumes, viewers see it live again, and
+        // the recovery is announced although the display is the same.
+        let (shared, served) = start(true).unwrap();
+        assert_eq!(served, plan);
+        assert!(watchdog.started(&served));
+        outage.resumed();
+        assert_eq!(outage.status(retry), CaptureStatus::Live);
+
+        // Without viewers, silence is never checked.
+        let now = Instant::now() + CAPTURE_SILENCE_CHECK * 10;
+        assert!(!watchdog.check_silence(0, shared.silent_for(now), Some(&served)));
     }
 
     #[test]
@@ -3097,7 +3478,8 @@ mod tests {
         let mut selections = vec![DisplaySelection::Primary, DisplaySelection::All];
         selections.extend((1..=displays.len()).map(DisplaySelection::Number));
         for selection in selections {
-            let (capture, plan) = start_capture(&mut DisplayFollower::new(selection)).unwrap();
+            let (capture, plan) =
+                start_capture(&mut DisplayFollower::new(selection), None).unwrap();
             let chosen = choose_displays(selection, &displays).unwrap();
             assert_eq!(plan.chosen, chosen);
             assert_eq!(
@@ -3142,7 +3524,7 @@ mod tests {
         // differently keeps the capture; another display needs a new one.
         let primary = displays.iter().position(|display| display.primary).unwrap();
         let mut follower = DisplayFollower::new(DisplaySelection::Primary);
-        let (_capture, _) = start_capture(&mut follower).unwrap();
+        let (_capture, _) = start_capture(&mut follower, None).unwrap();
         assert_eq!(
             follower.request(primary as u8 + 1, attached_areas),
             DisplayChange::None

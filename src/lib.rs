@@ -933,6 +933,14 @@ impl VncServer {
         self.active_clients
             .load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// Sessions that completed security negotiation and desktop initialization.
+    pub fn active_viewers(&self) -> usize {
+        self.sessions
+            .lock()
+            .map_or(0, |sessions| sessions.wakers.len())
+    }
+
     pub fn try_event(&self) -> Result<ClientEvent, std::sync::mpsc::TryRecvError> {
         match self.event_receiver.lock() {
             Ok(receiver) => receiver.try_recv(),
@@ -4215,6 +4223,42 @@ mod tests {
         assert_eq!(second.focus.load(Ordering::Relaxed), u32::MAX);
         assert!(reader.pointer(0, 0, 64, 9).is_err());
         assert_eq!(first.focus.load(Ordering::Relaxed), (7 << 16) | 9);
+    }
+
+    #[test]
+    fn active_viewers_counts_only_initialized_sessions() {
+        let server = VncServer::bind(
+            "127.0.0.1:0",
+            Framebuffer::new(1, 1).unwrap(),
+            ServerConfig {
+                password: Some("test-password".into()),
+                ..ServerConfig::default()
+            },
+        )
+        .unwrap();
+        let (stream, _peer) = tcp_pair();
+        server
+            .sessions
+            .lock()
+            .unwrap()
+            .register(1, ListenerId::TEST, stream)
+            .unwrap();
+        server.active_clients.store(1, Ordering::Release);
+        assert_eq!(server.active_connections(), 1);
+        assert_eq!(server.active_viewers(), 0);
+
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        server.sessions.lock().unwrap().watch(
+            1,
+            SessionWaker {
+                sender,
+                queued: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        assert_eq!(server.active_viewers(), 1);
+
+        server.sessions.lock().unwrap().remove(1);
+        assert_eq!(server.active_viewers(), 0);
     }
 
     #[test]
