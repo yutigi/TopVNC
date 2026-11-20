@@ -2137,7 +2137,8 @@ impl DesktopImage {
             self.cursor_changed = true;
         }
         if !self.cursor_position_reported
-            && (self.cursor_position != previous.position || self.cursor_visible != previous.visible)
+            && (self.cursor_position != previous.position
+                || self.cursor_visible != previous.visible)
         {
             self.cursor_position = previous.position;
             self.cursor_visible = previous.visible;
