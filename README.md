@@ -308,7 +308,8 @@ remain pending.
 | F8 → Display | Choose which host display to see, numbered as on the host, or **ALL** displays side by side. The highlighted button is what the host serves; the choice is shared by every viewer. Shows *Not offered by this host* for Mac hosts, older TopVNC hosts, and other servers. |
 | F8 → Served size | Drag from **25% to 100%** in 1% steps; release to request the size from an updated TopVNC host. |
 | Fit / 1:1 pixels | Scale the remote image to the window while preserving its aspect ratio, or show native pixels, centered and cropped when necessary. |
-| Zoom | **Ctrl + mouse wheel** or a trackpad pinch zooms around the pointer, up to **800×** on top of Fit or 1:1 pixels. While zoomed, **Ctrl + left drag** pans, and the title shows the zoom. From 2 window pixels per remote pixel up, pixels are drawn sharp. Ctrl+wheel and Ctrl+drag stay local while zooming (the Ctrl key itself still reaches the host). **F8 → Fit** or **1:1 pixels** resets the zoom. Zoom changes only this window's view, not what the host sends. |
+| Zoom | **Ctrl + mouse wheel** or a trackpad pinch zooms around the pointer, up to **800×** on top of Fit or 1:1 pixels. While zoomed, **Ctrl + left drag** pans, and the title shows the zoom. From 2 window pixels per remote pixel up, pixels are drawn sharp. **F8 → Fit** or **1:1 pixels** resets the zoom. |
+| F8 → Zoom shortcuts | Switch **Off** to send **Ctrl + wheel** and **Ctrl + drag** to the remote app. TopVNC saves this preference. Trackpad pinch remains available. |
 | Full screen | Switch the viewer to full screen and back. |
 | 60 FPS / 120 FPS / No limit | Cap local presentation. **No limit**, the default, adds no application FPS cap; Smooth motion still synchronizes to the display. This does not set the server's frame rate. |
 | Ultra | Publish complete images without an additional local FPS cap; click again to restore the prior settings. |

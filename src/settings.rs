@@ -8,14 +8,14 @@ use std::process::{Command, Stdio};
 
 use crate::ui::Config;
 
-fn path() -> Option<PathBuf> {
+fn directory() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(not(target_os = "windows"))]
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    base.map(|base| base.join("TopVNC").join("last-session"))
+    base.map(|base| base.join("TopVNC"))
 }
 
 #[cfg(target_os = "windows")]
@@ -68,8 +68,13 @@ fn saved_password(host: &str, port: &str, password: Option<&str>) -> io::Result<
 }
 
 pub fn load(config: &mut Config) {
-    let Some(path) = path() else { return };
-    let Ok(contents) = fs::read_to_string(path) else {
+    let Some(dir) = directory() else { return };
+    if let Ok(saved) = fs::read_to_string(dir.join("zoom-shortcuts"))
+        && let Ok(enabled) = saved.trim().parse()
+    {
+        config.zoom_shortcuts = enabled;
+    }
+    let Ok(contents) = fs::read_to_string(dir.join("last-session")) else {
         return;
     };
     let mut lines = contents.lines();
@@ -120,8 +125,8 @@ mod tests {
 }
 
 pub fn save(config: &Config) -> io::Result<()> {
-    let path = path().ok_or_else(|| io::Error::other("settings directory unavailable"))?;
-    fs::create_dir_all(path.parent().unwrap())?;
+    let dir = directory().ok_or_else(|| io::Error::other("settings directory unavailable"))?;
+    fs::create_dir_all(&dir)?;
     #[cfg(target_os = "windows")]
     let password_result = protected_password(&config.password, true);
     #[cfg(target_os = "linux")]
@@ -134,7 +139,7 @@ pub fn save(config: &Config) -> io::Result<()> {
         ""
     };
     fs::write(
-        path,
+        dir.join("last-session"),
         format!(
             "topvnc-session-1\n{}\n{}\n{}\n",
             config.host.trim(),
@@ -143,4 +148,13 @@ pub fn save(config: &Config) -> io::Result<()> {
         ),
     )?;
     password_result.map(|_| ())
+}
+
+pub fn save_zoom_shortcuts(enabled: bool) -> io::Result<()> {
+    let dir = directory().ok_or_else(|| io::Error::other("settings directory unavailable"))?;
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join("zoom-shortcuts"),
+        if enabled { "true" } else { "false" },
+    )
 }

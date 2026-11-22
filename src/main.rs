@@ -2160,7 +2160,7 @@ fn run_session_inner(
     let renderer = RenderWorker::start(
         presenter,
         Arc::clone(&frames),
-        RenderOptions::new(config, &window),
+        RenderOptions::new(config, window.inner_size(), window.scale_factor()),
         remote,
         error_tx.clone(),
         ui.waker(),
@@ -2528,6 +2528,15 @@ fn run_session_inner(
                                     } else if ui::LIVE_MOUSE_OFF.contains(x, y) {
                                         config.relative_mouse = false;
                                         writer.set_relative_pointer_allowed(false)?;
+                                    } else if ui::LIVE_ZOOM_SHORTCUTS.contains(x, y) {
+                                        config.zoom_shortcuts = !config.zoom_shortcuts;
+                                        if let Err(error) =
+                                            settings::save_zoom_shortcuts(config.zoom_shortcuts)
+                                        {
+                                            eprintln!(
+                                                "Could not remember the zoom shortcuts setting: {error}"
+                                            );
+                                        }
                                     } else if ui::LIVE_WHOLE_UPDATE.contains(x, y) {
                                         config.progressive = false;
                                         config.performance = PerformanceMode::Standard;
@@ -2573,7 +2582,8 @@ fn run_session_inner(
                                 }
                                 // Ctrl+drag pans a zoomed view; the click
                                 // stays local.
-                                if ctrl_held
+                                if config.zoom_shortcuts
+                                    && ctrl_held
                                     && zoom.is_zoomed()
                                     && let Some(point) = cursor
                                 {
@@ -2610,7 +2620,7 @@ fn run_session_inner(
                             if settings_open {
                                 continue;
                             }
-                            if ctrl_held && !locked {
+                            if config.zoom_shortcuts && ctrl_held && !locked {
                                 let size = logical_size(&window);
                                 let at =
                                     cursor.unwrap_or((size.0 as f64 / 2.0, size.1 as f64 / 2.0));
@@ -2727,7 +2737,7 @@ fn run_session_inner(
             }
             window.set_title(&status);
         }
-        let mut options = RenderOptions::new(config, &window);
+        let mut options = RenderOptions::new(config, window.inner_size(), window.scale_factor());
         options.open = settings_open;
         options.locked = locked;
         options.occluded = occluded;
@@ -2795,7 +2805,7 @@ mod tests {
         let renderer = RenderWorker::start(
             presenter,
             Arc::clone(&frames),
-            RenderOptions::new(&config, &window),
+            RenderOptions::new(&config, window.inner_size(), window.scale_factor()),
             (1920, 1080),
             errors,
             ui.waker(),

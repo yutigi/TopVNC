@@ -35,6 +35,7 @@ const toolbar = $("#toolbar");
 const functionKeys = $("#function-keys");
 const menu = $("#menu");
 const keyboard = $("#keyboard");
+const zoomShortcuts = $("#zoom-shortcuts");
 
 const BUTTON = { left: 1, middle: 2, right: 4, wheelUp: 8, wheelDown: 16, wheelLeft: 32, wheelRight: 64, back: 128, forward: 256 };
 // KeyboardEvent.buttons bits, in order: left, right, middle, back, forward.
@@ -59,6 +60,7 @@ try {
 } catch {
   storage = undefined;
 }
+zoomShortcuts.checked = preference("zoomShortcuts", "true") === "true";
 
 let pending; // A scanned invite and a new browser key, kept in memory until verified.
 let state = "idle"; // idle | connecting | password | connected
@@ -586,7 +588,7 @@ screen.addEventListener("pointerdown", (event) => {
   }
   screen.setPointerCapture(event.pointerId);
   // Ctrl-drag pans a zoomed view; the click stays local.
-  if (event.ctrlKey && view.zoom > 1 && !document.pointerLockElement) {
+  if (zoomShortcuts.checked && event.ctrlKey && view.zoom > 1 && !document.pointerLockElement) {
     panning = { id: event.pointerId, ...screenPoint(event) };
     return;
   }
@@ -646,7 +648,7 @@ let wheelY = 0;
 screen.addEventListener("wheel", (event) => {
   if (state !== "connected") return;
   event.preventDefault();
-  if (event.ctrlKey) {
+  if (zoomShortcuts.checked && event.ctrlKey) {
     // Trackpad pinch and Ctrl+wheel on desktop browsers zoom the local view.
     view.zoomAt(Math.exp(-event.deltaY / 100), ...Object.values(screenPoint(event)));
     layout();
@@ -743,6 +745,7 @@ for (const bar of [toolbar, functionKeys]) {
 }
 
 $("#disconnect").addEventListener("click", () => switchMachine(selected, { disconnect: true }));
+zoomShortcuts.addEventListener("change", () => remember("zoomShortcuts", zoomShortcuts.checked));
 $("#stats-toggle").addEventListener("change", (event) => {
   statsLine.hidden = !event.target.checked;
 });

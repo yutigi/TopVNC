@@ -53,6 +53,7 @@ pub struct Config {
     pub allow_insecure: bool,
     pub window_mode: WindowMode,
     pub window_size: String,
+    pub zoom_shortcuts: bool,
     /// Presentation limit in frames per second; 0 presents every frame as
     /// it arrives.
     pub fps: usize,
@@ -84,6 +85,7 @@ impl Default for Config {
             allow_insecure: false,
             window_mode: WindowMode::Fit,
             window_size: "1280x720".into(),
+            zoom_shortcuts: true,
             fps: 0,
             quality: Quality::Smooth,
             compression: Compression::Tight,
@@ -2521,10 +2523,16 @@ pub const LIVE_SHARP: Box2 = Box2 {
 pub const LIVE_MOUSE_AUTO: Box2 = Box2 {
     x: 24,
     y: 410,
-    w: 190,
+    w: 120,
     h: 38,
 };
 pub const LIVE_MOUSE_OFF: Box2 = Box2 {
+    x: 152,
+    y: 410,
+    w: 62,
+    h: 38,
+};
+pub const LIVE_ZOOM_SHORTCUTS: Box2 = Box2 {
     x: 226,
     y: 410,
     w: 190,
@@ -2724,6 +2732,12 @@ pub fn overlay(
     canvas.text(24, 386, "GAME MOUSE", ACCENT, 2);
     canvas.button(LIVE_MOUSE_AUTO, "AUTO LOCK", config.relative_mouse);
     canvas.button(LIVE_MOUSE_OFF, "OFF", !config.relative_mouse);
+    canvas.text(LIVE_ZOOM_SHORTCUTS.x, 386, "ZOOM SHORTCUTS", ACCENT, 2);
+    canvas.button(
+        LIVE_ZOOM_SHORTCUTS,
+        if config.zoom_shortcuts { "ON" } else { "OFF" },
+        config.zoom_shortcuts,
+    );
     canvas.text(24, 456, "PRESENT UPDATES", ACCENT, 2);
     canvas.button(LIVE_WHOLE_UPDATE, "WHOLE", config.upload_policy() == 0);
     canvas.button(LIVE_PROGRESSIVE, "PROGRESSIVE", config.upload_policy() == 1);
