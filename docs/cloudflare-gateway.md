@@ -752,7 +752,11 @@ background. Afterwards, read the `/ws` CPU times in Workers analytics.
   shows where touch input aims.
 - **Direct mode**: the pointer goes where you touch. Tap to click there, drag
   to hold the left button, and long-press to right-click.
-- **Zoom**: pinch with two fingers in either mode. **Fit** in the toolbar or
+- **Zoom**: pinch with two fingers in either mode, or on desktop browsers
+  pinch the trackpad or use **Ctrl + mouse wheel**, up to **800×**. While
+  zoomed, drag with two fingers, or **Ctrl + drag** with a mouse, to pan;
+  pixels turn sharp from 2 screen pixels per remote pixel. The toolbar's
+  **Fit** shows the zoom (for example *Fit · 12×*); it or
   **Settings → Fit to screen** resets the view.
   Zoom changes only this device's view, not what the host sends.
 - **Appearance** follows the accepted [mobile reference](../design/topvnc-mobile-wireframe/): paper surfaces, olive accents, rounded controls and locally bundled DM Sans / IBM Plex Mono fonts. At widths of at least 900 CSS pixels with a fine primary pointer and hover, desktop browsers use a full-width remote view below the header, with physical keyboard/mouse input, Fit, Fullscreen and settings. The entire touch deck, dock and FPS overlay are hidden regardless of saved layout. Coarse-pointer devices retain mobile controls, including landscape phones and wide touch tablets. The [separate desktop design](../design/topvnc-desktop-wireframe/) is a simulated prototype.

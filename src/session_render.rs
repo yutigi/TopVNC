@@ -1,5 +1,6 @@
 //! Session GPU work is isolated from the window/input event thread.
 use crate::ui::{self, Canvas, Config, Quality, WindowMode};
+use crate::view_zoom::ViewZoom;
 use crate::window::{Draw, Presenter, Waker};
 use crate::{Overlay, RETRY_INTERVAL, clip, placement};
 use std::error::Error;
@@ -30,6 +31,7 @@ pub struct RenderOptions {
     pub serve_display: Option<ServedDisplays>,
     pub viewport: (u32, u32),
     pub scale: f64,
+    pub zoom: ViewZoom,
 }
 
 impl RenderOptions {
@@ -53,6 +55,7 @@ impl RenderOptions {
             serve_display: None,
             viewport: (size.width, size.height),
             scale: window.scale_factor(),
+            zoom: ViewZoom::default(),
         }
     }
 
@@ -331,7 +334,17 @@ fn render_loop(
             ]
         };
         let mut draws = Vec::with_capacity(2);
-        if let Some((target, source)) = placement(options.window_mode, remote, logical) {
+        if let Some((target, source)) = options.zoom.draw(options.window_mode, remote, logical) {
+            let [x, y, width, height] = target;
+            draws.push(Draw {
+                layer: &image,
+                target: [x * scale, y * scale, width * scale, height * scale],
+                source,
+                // Deep zoom shows remote pixels as sharp squares.
+                smooth: options.quality == Quality::Smooth
+                    && !options.zoom.pixelated(options.window_mode, remote, logical),
+            });
+        } else if let Some((target, source)) = placement(options.window_mode, remote, logical) {
             draws.push(Draw {
                 layer: &image,
                 target: physical(target.x0, target.y0, target.width(), target.height()),

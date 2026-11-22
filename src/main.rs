@@ -43,8 +43,10 @@ use ui::{
 use web_access::runtime::{HostServer, ServerRequest, WebRuntime};
 use window::{Draw, Layer, Presenter, Ui, UiEvent};
 mod session_render;
+mod view_zoom;
 use session_render::{RenderOptions, RenderWorker};
 use topvnc::presentation::{FrameMailbox, MotionPresentation};
+use view_zoom::ViewZoom;
 
 fn encoding(config: &Config) -> Encoding {
     match config.compression {
@@ -284,6 +286,40 @@ fn pointer_for_mode(
     let ry = (y.floor() as isize - target.y0 as isize + source.y0 as isize)
         .clamp(0, remote.1 as isize - 1) as u16;
     Some((rx, ry))
+}
+
+/// The remote pixel under a logical window point, through the local zoom
+/// when it is zoomed in.
+fn pointer_at(
+    point: (f64, f64),
+    window: (usize, usize),
+    remote: (usize, usize),
+    mode: WindowMode,
+    zoom: &ViewZoom,
+) -> Option<(u16, u16)> {
+    if zoom.is_zoomed() {
+        return zoom.remote_pointer(point, mode, remote, window);
+    }
+    pointer_for_mode(point.0, point.1, window, remote, mode)
+}
+
+/// How much one wheel event zooms: a notch is 25%, and trackpad pixels
+/// scale smoothly. Scrolling up zooms in.
+fn wheel_zoom_factor(delta: MouseScrollDelta, scale_factor: f64) -> f64 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => 1.25f64.powf(f64::from(y)),
+        MouseScrollDelta::PixelDelta(position) => (position.y / scale_factor / 100.0).exp(),
+    }
+}
+
+/// A zoom factor for the title: one decimal below 10x, whole numbers above.
+fn zoom_label(factor: f64) -> String {
+    if factor < 10.0 {
+        let label = format!("{factor:.1}");
+        format!("{}×", label.trim_end_matches(".0"))
+    } else {
+        format!("{factor:.0}×")
+    }
 }
 
 /// The keysym a physical key sends, as on a US keyboard with Shift held or
@@ -2227,6 +2263,11 @@ fn run_session_inner(
     let mut known_serve_display = None;
     let mut capture_status = CaptureStatus::Live;
     let mut input_status = InputStatus::Accepted;
+    // Local zoom: Ctrl+wheel or a trackpad pinch zooms, Ctrl+drag pans.
+    let mut zoom = ViewZoom::default();
+    let mut ctrl_held = false;
+    // The last logical point of a Ctrl+drag that pans the zoomed view.
+    let mut panning: Option<(f64, f64)> = None;
     loop {
         let mut title_changed = false;
         remote = frames.dimensions();
@@ -2289,6 +2330,22 @@ fn run_session_inner(
                                 ui_captured_mouse = false;
                                 dragging_ui_scale = false;
                                 dragging_serve_scale = None;
+                                panning = None;
+                                ctrl_held = false;
+                            }
+                        }
+                        WindowEvent::ModifiersChanged(modifiers) => {
+                            ctrl_held = modifiers.state().control_key();
+                        }
+                        WindowEvent::PinchGesture { delta, .. } => {
+                            if settings_open || locked {
+                                continue;
+                            }
+                            let size = logical_size(&window);
+                            let at = cursor.unwrap_or((size.0 as f64 / 2.0, size.1 as f64 / 2.0));
+                            if zoom.zoom_at(delta.exp(), at, config.window_mode, remote, size) {
+                                redraw = true;
+                                title_changed = true;
                             }
                         }
                         WindowEvent::KeyboardInput {
@@ -2346,6 +2403,18 @@ fn run_session_inner(
                                 overlay_changed = true;
                                 redraw = true;
                             }
+                            if let Some(last) = panning {
+                                if zoom.pan(
+                                    (point.0 - last.0, point.1 - last.1),
+                                    config.window_mode,
+                                    remote,
+                                    logical_size(&window),
+                                ) {
+                                    redraw = true;
+                                }
+                                panning = Some(point);
+                                continue;
+                            }
                             let over_button = ui::open_settings_box(config.ui_scale)
                                 .contains(point.0.max(0.0) as usize, point.1.max(0.0) as usize);
                             if locked || settings_open || ui_captured_mouse {
@@ -2360,12 +2429,12 @@ fn run_session_inner(
                                 }
                                 continue;
                             }
-                            if let Some(at) = pointer_for_mode(
-                                point.0,
-                                point.1,
+                            if let Some(at) = pointer_at(
+                                point,
                                 logical_size(&window),
                                 remote,
                                 config.window_mode,
+                                &zoom,
                             ) && last_pointer != Some(at)
                             {
                                 if input_debug {
@@ -2382,6 +2451,9 @@ fn run_session_inner(
                         WindowEvent::MouseInput { state, button, .. } => {
                             let pressed = state == ElementState::Pressed;
                             let left = button == MouseButton::Left;
+                            if left && !pressed && panning.take().is_some() {
+                                continue;
+                            }
                             if left && !pressed && ui_captured_mouse {
                                 if let Some(percent) = dragging_serve_scale.take() {
                                     if Some(percent) != writer.serve_scale() {
@@ -2410,8 +2482,12 @@ fn run_session_inner(
                                         settings_open = false;
                                     } else if ui::LIVE_FIT.contains(x, y) {
                                         config.window_mode = WindowMode::Fit;
+                                        zoom.reset();
+                                        title_changed = true;
                                     } else if ui::LIVE_NATIVE.contains(x, y) {
                                         config.window_mode = WindowMode::Native;
+                                        zoom.reset();
+                                        title_changed = true;
                                     } else if ui::LIVE_FULLSCREEN.contains(x, y) {
                                         window.set_fullscreen(match window.fullscreen() {
                                             Some(_) => None,
@@ -2495,6 +2571,15 @@ fn run_session_inner(
                                     send_buttons(&writer, 0, false, last_pointer)?;
                                     continue;
                                 }
+                                // Ctrl+drag pans a zoomed view; the click
+                                // stays local.
+                                if ctrl_held
+                                    && zoom.is_zoomed()
+                                    && let Some(point) = cursor
+                                {
+                                    panning = Some(point);
+                                    continue;
+                                }
                             }
                             if settings_open {
                                 continue;
@@ -2509,13 +2594,13 @@ fn run_session_inner(
                             };
                             // A click lands where the pointer is, even before
                             // it has moved over the window.
-                            if !locked && let Some((x, y)) = cursor {
-                                last_pointer = pointer_for_mode(
-                                    x,
-                                    y,
+                            if !locked && let Some(point) = cursor {
+                                last_pointer = pointer_at(
+                                    point,
                                     logical_size(&window),
                                     remote,
                                     config.window_mode,
+                                    &zoom,
                                 )
                                 .or(last_pointer);
                             }
@@ -2525,6 +2610,17 @@ fn run_session_inner(
                             if settings_open {
                                 continue;
                             }
+                            if ctrl_held && !locked {
+                                let size = logical_size(&window);
+                                let at =
+                                    cursor.unwrap_or((size.0 as f64 / 2.0, size.1 as f64 / 2.0));
+                                let by = wheel_zoom_factor(delta, window.scale_factor());
+                                if zoom.zoom_at(by, at, config.window_mode, remote, size) {
+                                    redraw = true;
+                                    title_changed = true;
+                                }
+                                continue;
+                            }
                             let notches = wheel.notches(delta, window.scale_factor());
                             if locked {
                                 send_wheel(&writer, buttons, notches, None)?;
@@ -2532,13 +2628,13 @@ fn run_session_inner(
                             }
                             // Scrolling lands where the pointer is, even
                             // before it has moved over the window.
-                            if let Some((x, y)) = cursor {
-                                last_pointer = pointer_for_mode(
-                                    x,
-                                    y,
+                            if let Some(point) = cursor {
+                                last_pointer = pointer_at(
+                                    point,
                                     logical_size(&window),
                                     remote,
                                     config.window_mode,
+                                    &zoom,
                                 )
                                 .or(last_pointer);
                             }
@@ -2623,6 +2719,9 @@ fn run_session_inner(
                 }
                 InputStatus::Rejected => status += " · host rejects input",
             }
+            if zoom.is_zoomed() {
+                status += &format!(" · zoom {}", zoom_label(zoom.factor()));
+            }
             if locked {
                 status += " · locked (F8)";
             }
@@ -2634,6 +2733,7 @@ fn run_session_inner(
         options.occluded = occluded;
         options.serve_scale = dragging_serve_scale.or(serve_scale);
         options.serve_display = serve_display;
+        options.zoom = zoom;
         renderer.update(options, overlay_changed || redraw)?;
         overlay_changed = false;
         redraw = false;

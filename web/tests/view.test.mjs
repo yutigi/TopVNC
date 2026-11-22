@@ -27,7 +27,7 @@ test("zooms around the pinch point and keeps the image covering the viewer", () 
   assert.deepEqual([view.x, view.y], [0, 0]);
   view.pan(-10_000, -10_000);
   assert.deepEqual([view.x, view.y], [-400, -225]);
-  view.zoomAt(100, 0, 0);
+  view.zoomAt(MAX_ZOOM * 2, 0, 0);
   assert.equal(view.zoom, MAX_ZOOM);
   view.zoomAt(0.001, 0, 0);
   assert.deepEqual([view.zoom, view.x, view.y], [1, 0, 0]);
@@ -55,4 +55,24 @@ test("zoom keeps the pinched remote point fixed on a letterboxed image", () => {
   view.zoomAt(2, 0, 87.5);
   assert.deepEqual([view.x, view.y], [0, -87.5]);
   assert.deepEqual(view.toFrame(0, 0, 1920, 1080), { x: 0, y: 0 });
+});
+
+test("zooms up to 800x, keeps the anchor at deep zoom, and pixelates", () => {
+  assert.equal(MAX_ZOOM, 800);
+  const view = new View();
+  view.layout(400, 225, 1920, 1080);
+  assert.equal(view.style().imageRendering, "auto");
+  const before = view.toFrame(123, 77, 1920, 1080);
+  for (let step = 0; step < 40; step++) view.zoomAt(1.25, 123, 77);
+  assert.equal(view.zoom, MAX_ZOOM);
+  assert.deepEqual(view.toFrame(123, 77, 1920, 1080), before);
+  // 400 / 1920 * 800 screen pixels per remote pixel.
+  assert.ok(Math.abs(view.pixelScale() - (400 / 1920) * 800) < 1e-9);
+  assert.equal(view.style().imageRendering, "pixelated");
+  // The far corner is still reachable by panning.
+  view.pan(-1e9, -1e9);
+  assert.deepEqual(view.toFrame(399, 224, 1920, 1080), { x: 1919, y: 1079 });
+  view.reset();
+  view.clamp();
+  assert.equal(view.style().imageRendering, "auto");
 });

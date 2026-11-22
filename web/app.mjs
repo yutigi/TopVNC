@@ -69,6 +69,8 @@ let relativePointer = false;
 const mode = preference("mode", "trackpad");
 let buttons = 0;
 let pointerPosition = { x: 0, y: 0 };
+// A Ctrl-drag panning the zoomed view: its pointer and last screen point.
+let panning = null;
 // Mouse users see their own cursor; touch input aims a drawn one.
 let touchInput = matchMedia("(pointer: coarse)").matches;
 let mobile;
@@ -236,6 +238,7 @@ function clearViewer() {
   frame = { width: 0, height: 0 };
   oversized = relativePointer = false;
   wheelX = wheelY = 0;
+  panning = null;
   view.reset();
   passwordInput.value = "";
   passwordForm.hidden = true;
@@ -439,7 +442,17 @@ function layout() {
   const box = screen.getBoundingClientRect();
   view.layout(box.width, box.height, frame.width, frame.height);
   Object.assign(canvas.style, view.style());
+  showZoom();
   updateCursor();
+}
+
+// The Fit button says how far the local view is zoomed in.
+function showZoom() {
+  const fitButton = $("#fit");
+  const zoomed = view.zoom > 1;
+  const factor = view.zoom < 10 ? view.zoom.toFixed(1).replace(/\.0$/, "") : String(Math.round(view.zoom));
+  fitButton.textContent = zoomed ? `Fit · ${factor}×` : "Fit";
+  fitButton.title = zoomed ? `Zoomed ${factor}× — click to fit the whole screen` : "Fit the whole screen";
 }
 
 function updateCursor() {
@@ -572,6 +585,11 @@ screen.addEventListener("pointerdown", (event) => {
     return;
   }
   screen.setPointerCapture(event.pointerId);
+  // Ctrl-drag pans a zoomed view; the click stays local.
+  if (event.ctrlKey && view.zoom > 1 && !document.pointerLockElement) {
+    panning = { id: event.pointerId, ...screenPoint(event) };
+    return;
+  }
   if (relativePointer && !document.pointerLockElement) {
     canvas.requestPointerLock?.();
     return;
@@ -585,6 +603,13 @@ screen.addEventListener("pointermove", (event) => {
   if (event.pointerType === "touch") {
     const point = screenPoint(event);
     gestures.move(event.pointerId, point.x, point.y, event.timeStamp);
+    return;
+  }
+  if (panning?.id === event.pointerId) {
+    const point = screenPoint(event);
+    view.pan(point.x - panning.x, point.y - panning.y);
+    panning = { id: event.pointerId, ...point };
+    layout();
     return;
   }
   if (document.pointerLockElement === canvas) {
@@ -604,6 +629,10 @@ for (const type of ["pointerup", "pointercancel"]) {
       else gestures.up(event.pointerId, point.x, point.y, event.timeStamp);
       return;
     }
+    if (panning?.id === event.pointerId) {
+      panning = null;
+      return;
+    }
     domButtons(type === "pointercancel" ? 0 : event.buttons);
   });
 }
@@ -618,7 +647,7 @@ screen.addEventListener("wheel", (event) => {
   if (state !== "connected") return;
   event.preventDefault();
   if (event.ctrlKey) {
-    // Trackpad pinch on desktop browsers zooms the local view.
+    // Trackpad pinch and Ctrl+wheel on desktop browsers zoom the local view.
     view.zoomAt(Math.exp(-event.deltaY / 100), ...Object.values(screenPoint(event)));
     layout();
     return;
