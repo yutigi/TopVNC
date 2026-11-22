@@ -515,9 +515,13 @@ function sendPointer(motion) {
   else input({ kind: "pointer", buttons, x: pointerPosition.x, y: pointerPosition.y, motion });
 }
 
-function moveTo(point) {
+function aimAt(point) {
   pointerPosition = view.toFrame(point.x, point.y, frame.width, frame.height);
   updateCursor();
+}
+
+function moveTo(point) {
+  aimAt(point);
   sendPointer(true);
 }
 
@@ -587,8 +591,8 @@ screen.addEventListener("pointerdown", (event) => {
     return;
   }
   screen.setPointerCapture(event.pointerId);
-  // Ctrl-drag pans a zoomed view; the click stays local.
-  if (zoomShortcuts.checked && event.ctrlKey && view.zoom > 1 && !document.pointerLockElement) {
+  // Ctrl-left-drag pans a zoomed view; the click stays local.
+  if (zoomShortcuts.checked && event.ctrlKey && event.button === 0 && view.zoom > 1 && !document.pointerLockElement) {
     panning = { id: event.pointerId, ...screenPoint(event) };
     return;
   }
@@ -661,6 +665,7 @@ screen.addEventListener("wheel", (event) => {
   const stepsY = Math.trunc(wheelY);
   wheelX -= stepsX;
   wheelY -= stepsY;
+  if (!relativePointer && (stepsX !== 0 || stepsY !== 0)) aimAt(screenPoint(event));
   wheel(stepsX, stepsY);
 }, { passive: false });
 
