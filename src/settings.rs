@@ -8,14 +8,24 @@ use std::process::{Command, Stdio};
 
 use crate::ui::Config;
 
-fn path() -> Option<PathBuf> {
+fn config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(not(target_os = "windows"))]
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    base.map(|base| base.join("TopVNC").join("last-session"))
+    base.filter(|path| path.is_absolute())
+        .map(|base| base.join("TopVNC"))
+}
+
+fn path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("last-session"))
+}
+
+pub fn viewer_cert_dir() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join(topvnc::transport::LOCAL_CERT_DIR))
 }
 
 #[cfg(target_os = "windows")]

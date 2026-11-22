@@ -17,18 +17,29 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 
 /// TLS 1.3 only. An explicit CA file replaces the public trust roots.
 pub fn client_config(ca_file: Option<&Path>) -> io::Result<Arc<ClientConfig>> {
-    let mut roots = RootCertStore::empty();
     if let Some(path) = ca_file {
         let certs = CertificateDer::pem_file_iter(path).map_err(invalid)?;
-        for cert in certs {
-            roots.add(cert.map_err(invalid)?).map_err(invalid)?;
-        }
-        if roots.is_empty() {
-            return Err(invalid("TLS CA file contains no certificates"));
-        }
-    } else {
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        return custom_client_config(certs.map(|cert| cert.map_err(invalid)));
     }
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    client_config_with_roots(roots)
+}
+
+fn custom_client_config(
+    certs: impl IntoIterator<Item = io::Result<CertificateDer<'static>>>,
+) -> io::Result<Arc<ClientConfig>> {
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert?).map_err(invalid)?;
+    }
+    if roots.is_empty() {
+        return Err(invalid("TLS CA file contains no certificates"));
+    }
+    client_config_with_roots(roots)
+}
+
+fn client_config_with_roots(roots: RootCertStore) -> io::Result<Arc<ClientConfig>> {
     let config = ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(invalid)?
@@ -53,56 +64,102 @@ pub fn server_config(cert: &Path, key: &Path) -> io::Result<Arc<rustls::ServerCo
     Ok(Arc::new(config))
 }
 
-/// User-managed PEM directory relative to the working directory. Used for
-/// host credentials and target-specific viewer trust. Ignored by git.
+/// PEM directory name. Host credentials use the working directory, while
+/// viewer trust uses the per-user configuration directory.
 pub const LOCAL_CERT_DIR: &str = "certs.local";
 
 /// Largest file inspected while detecting PEM files.
 const MAX_DETECTED_PEM_BYTES: u64 = 1024 * 1024;
-const MAX_VIEWER_CERT_ENTRIES: usize = 128;
+const MAX_VIEWER_PEM_FILES: usize = 128;
+
+struct DiscoveredCa {
+    path: PathBuf,
+    chain: Vec<CertificateDer<'static>>,
+}
+
+impl DiscoveredCa {
+    fn into_client(self, server_name: String) -> io::Result<(ClientTransport, PathBuf)> {
+        let config = custom_client_config(self.chain.into_iter().map(Ok))
+            .map_err(|error| discovery_error(&self.path, "load certificates from", error))?;
+        Ok((
+            ClientTransport::Tls {
+                config,
+                server_name,
+            },
+            self.path,
+        ))
+    }
+}
+
+fn discovery_error(path: &Path, action: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "Viewer TLS trust: cannot {action} {}: {error}. Fix access or use --tls-ca FILE",
+            path.display()
+        ),
+    )
+}
+
+fn read_viewer_pem(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(discovery_error(path, "open", error)),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| discovery_error(path, "inspect", error))?;
+    if !metadata.is_file() || metadata.len() > MAX_DETECTED_PEM_BYTES {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_DETECTED_PEM_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| discovery_error(path, "read", error))?;
+    Ok((bytes.len() as u64 <= MAX_DETECTED_PEM_BYTES).then_some(bytes))
+}
 
 /// Select a locally distributed host certificate by its DNS/IP identity.
 /// Selection is not verification: the live TLS handshake must still validate
 /// the chain, validity period, name, and proof of possession of the private key.
-fn detect_client_ca(dir: &Path, name: &str) -> io::Result<Option<PathBuf>> {
+fn detect_client_ca(dir: &Path, name: &str) -> io::Result<Option<DiscoveredCa>> {
     let name = ServerName::try_from(name).map_err(invalid)?;
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => return Err(discovery_error(dir, "list", error)),
     };
-    // Bound even a directory containing many unrelated files, and fail instead
-    // of choosing from an arbitrary subset of its certificates.
     let mut paths = Vec::new();
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_VIEWER_CERT_ENTRIES {
-            return Err(invalid(
-                "Too many entries in certs.local; use --tls-ca FILE",
-            ));
-        }
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("pem"))
+    for entry in entries {
+        let entry = entry.map_err(|error| discovery_error(dir, "list", error))?;
+        let path = entry.path();
+        if !path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pem"))
         {
-            paths.push(entry.path());
+            continue;
         }
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(discovery_error(&path, "inspect", error)),
+        }
+        if paths.len() == MAX_VIEWER_PEM_FILES {
+            return Err(invalid(format!(
+                "Too many .pem files in {} (limit {MAX_VIEWER_PEM_FILES}). Remove some or use --tls-ca FILE",
+                dir.display()
+            )));
+        }
+        paths.push(path);
     }
     paths.sort();
-    let mut selected = None;
+    let mut selected: Option<DiscoveredCa> = None;
     for path in paths {
-        let file = std::fs::File::open(&path)?;
-        if file.metadata()?.len() > MAX_DETECTED_PEM_BYTES {
+        let Some(bytes) = read_viewer_pem(&path)? else {
             continue;
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_DETECTED_PEM_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_DETECTED_PEM_BYTES {
-            continue;
-        }
+        };
         let Ok(text) = std::str::from_utf8(&bytes) else {
             continue;
         };
@@ -123,18 +180,19 @@ fn detect_client_ca(dir: &Path, name: &str) -> io::Result<Option<PathBuf>> {
         if rustls::client::verify_server_name(&parsed, &name).is_err() {
             continue;
         }
-        if let Some((_, previous)) = &selected {
-            if previous != &chain {
+        if let Some(previous) = &selected {
+            if previous.chain != chain {
                 return Err(invalid(format!(
-                    "Multiple certificates in certs.local match {}; use --tls-ca FILE to choose one",
+                    "Multiple certificates in {} match {}. Use --tls-ca FILE to choose one",
+                    dir.display(),
                     name.to_str()
                 )));
             }
         } else {
-            selected = Some((path, chain));
+            selected = Some(DiscoveredCa { path, chain });
         }
     }
-    Ok(selected.map(|(path, _)| path))
+    Ok(selected)
 }
 
 /// Finds one host certificate and private key among the `.pem` files in
@@ -211,14 +269,24 @@ pub struct TlsOptions {
 }
 
 impl TlsOptions {
-    /// Resolve fresh trust for this target, leaving launch settings unchanged.
-    /// Explicit trust and plaintext choices always take precedence.
-    pub fn with_local_ca(&self, host: &str, dir: &Path) -> io::Result<Self> {
-        let mut resolved = self.clone();
-        if !self.unencrypted && self.ca.is_none() {
-            resolved.ca = detect_client_ca(dir, &self.client_server_name(host))?;
+    /// Prepare the transport for one connection and report the discovered PEM,
+    /// if any. Explicit trust and plaintext choices bypass discovery.
+    pub fn client_with_local_ca(
+        &self,
+        host: &str,
+        dir: Option<&Path>,
+    ) -> io::Result<(ClientTransport, Option<PathBuf>)> {
+        if let Some(dir) = dir
+            && !self.unencrypted
+            && self.ca.is_none()
+        {
+            let server_name = self.client_server_name(host);
+            if let Some(ca) = detect_client_ca(dir, &server_name)? {
+                let (transport, path) = ca.into_client(server_name)?;
+                return Ok((transport, Some(path)));
+            }
         }
-        Ok(resolved)
+        Ok((self.client(host)?, None))
     }
 
     fn client_server_name(&self, host: &str) -> String {

@@ -3,35 +3,41 @@
 ## Scope
 
 The Connect form should use a public host certificate already placed in
-`certs.local` without requiring `--tls-ca` on every launch. Resolve trust for
-the current target on each connection attempt, including after editing the
-address. Keep host credential discovery separate from viewer trust.
+`certs.local` in the per-user TopVNC configuration directory without requiring
+`--tls-ca` on every launch. Resolve trust for the current target on each
+connection attempt, including after editing the address. Keep host credential
+discovery separate from viewer trust.
 
 ## Acceptance criteria
 
 - An explicit `--tls-ca` takes precedence. Explicit plain TCP never discovers
   or loads certificates and still rejects conflicting explicit trust options.
-- Otherwise, inspect certificate-only `.pem` files in `./certs.local`, matching
-  the certificate's DNS/IP subject alternative names to the target (or explicit
-  `--tls-server-name`). Filenames do not establish identity. Do not fetch or
-  automatically trust certificates from a server.
+- Otherwise, inspect certificate-only `.pem` files in the per-user TopVNC
+  configuration directory's `certs.local` folder. Match the leaf certificate's
+  DNS/IP subject alternative names to the target or `--tls-server-name`.
+  Filenames do not establish identity. Do not fetch or automatically trust
+  certificates from a server.
 - Select one matching certificate chain, accepting identical copies. Multiple
   different matches fail with guidance to use `--tls-ca`. With no match, retain
   public roots. CA-only trust files still need `--tls-ca`.
-- Bound directory inspection and file reads; ignore private keys, malformed
-  files, oversized files, and unrelated certificates. Report directory access
-  errors other than a missing directory.
+- Count only regular `.pem` files toward the 128-candidate limit and cap each
+  candidate's size at 1 MiB. Ignore private keys, malformed files, oversized
+  files, and unrelated certificates. Skip a missing directory or a candidate
+  that disappears. Report other I/O errors with the affected path.
+- Build the trust store directly from the inspected certificate chain.
 - TLS still verifies the presented chain, expiry, hostname, and handshake
   signature. Failed verification never retries plaintext.
-- The Connect tab explains automatic local trust, the terminal reports the
-  selected file, and successful connections report their actual transport
-  choice instead of always claiming unencrypted RFB.
+- The Connect tab names automatic per-user trust, the terminal reports the
+  selected absolute discovery path, and F8 shows the active transport and
+  trust source for the connection.
 - Cover target changes, DNS/IP identities, duplicates, ambiguity, explicit
   overrides, malformed/key files, and real TLS connections with focused tests.
 
-The local directory is a user-managed trust source: only certificates obtained
-through a trusted channel should be placed there. No trust decision or plaintext
-consent is saved in last-session settings.
+The viewer trust directory is configured per user and must be writable only by
+that user. A file placed there can replace public trust for a matching target.
+Automatic lookup in the working directory is limited to GUI host credentials.
+Only place certificates obtained through a trusted channel in the viewer trust
+directory. Last-session settings omit trust decisions and plaintext consent.
 
 ## Validation
 

@@ -28,7 +28,9 @@ impl PemDirectory {
     }
 
     fn resolve(&self, host: &str) -> io::Result<Option<PathBuf>> {
-        Ok(TlsOptions::default().with_local_ca(host, &self.0)?.ca)
+        Ok(TlsOptions::default()
+            .client_with_local_ca(host, Some(&self.0))?
+            .1)
     }
 }
 
@@ -59,9 +61,9 @@ fn viewer_trust_matches_certificate_dns_and_ip_and_is_resolved_per_target() {
     };
     assert_eq!(
         options
-            .with_local_ca("192.0.2.10", &directory.0)
+            .client_with_local_ca("192.0.2.10", Some(&directory.0))
             .unwrap()
-            .ca,
+            .1,
         directory.resolve("other-pc").unwrap()
     );
     assert!(
@@ -123,25 +125,25 @@ fn explicit_ca_and_plaintext_bypass_discovery_without_masking_conflicts() {
     let directory = PemDirectory::new();
     directory.write("a.pem", Identity::new().cert.pem());
     directory.write("b.pem", Identity::new().cert.pem());
+    let ca = directory.write("chosen.txt", Identity::new().cert.pem());
     let explicit = TlsOptions {
-        ca: Some("chosen.pem".into()),
+        ca: Some(ca),
         ..Default::default()
     };
-    assert_eq!(
-        explicit.with_local_ca("localhost", &directory.0).unwrap(),
-        explicit
-    );
+    let (transport, discovered) = explicit
+        .client_with_local_ca("localhost", Some(&directory.0))
+        .unwrap();
+    assert!(matches!(transport, ClientTransport::Tls { .. }));
+    assert!(discovered.is_none());
     let plain = TlsOptions {
         unencrypted: true,
         ..Default::default()
     };
     assert!(matches!(
         plain
-            .with_local_ca("localhost", &directory.0)
-            .unwrap()
-            .client("localhost")
+            .client_with_local_ca("localhost", Some(&directory.0))
             .unwrap(),
-        ClientTransport::Unencrypted
+        (ClientTransport::Unencrypted, None)
     ));
     let conflict = TlsOptions {
         unencrypted: true,
@@ -149,40 +151,92 @@ fn explicit_ca_and_plaintext_bypass_discovery_without_masking_conflicts() {
     };
     assert!(
         conflict
-            .with_local_ca("localhost", &directory.0)
-            .unwrap()
-            .client("localhost")
+            .client_with_local_ca("localhost", Some(&directory.0))
             .is_err()
     );
 }
 
 #[test]
-fn absent_directory_uses_public_roots_and_directory_inspection_is_bounded() {
+fn absent_directory_uses_public_roots_and_directory_errors_include_the_path() {
     let directory = PemDirectory::new();
-    assert!(
-        TlsOptions::default()
-            .with_local_ca("localhost", &directory.0.join("missing"))
-            .unwrap()
-            .ca
-            .is_none()
-    );
-    // A path that is not a directory is an error, not an absent trust source.
+    let missing = directory.0.join("missing");
+    let (transport, discovered) = TlsOptions::default()
+        .client_with_local_ca("localhost", Some(&missing))
+        .unwrap();
+    assert!(matches!(transport, ClientTransport::Tls { .. }));
+    assert!(discovered.is_none());
     let file = directory.write("not-a-directory", "");
+    let error = detect_client_ca(&file, "localhost").err().unwrap();
     assert!(
-        TlsOptions::default()
-            .with_local_ca("localhost", &file)
-            .is_err()
+        error.to_string().contains(&*file.to_string_lossy()),
+        "{error}"
     );
-    for index in 0..MAX_VIEWER_CERT_ENTRIES {
-        directory.write(&format!("{index}.txt"), "");
+}
+
+#[test]
+fn viewer_discovery_limits_only_regular_pem_files() {
+    let directory = PemDirectory::new();
+    let matching = directory.write("host.pem", Identity::new().cert.pem());
+    for index in 1..MAX_VIEWER_PEM_FILES {
+        directory.write(&format!("{index}.pem"), "");
     }
+    directory.write("notes.txt", "");
+    std::fs::create_dir(directory.0.join("backup.pem")).unwrap();
+    assert_eq!(directory.resolve("localhost").unwrap(), Some(matching));
+    directory.write("extra.PEM", "");
+    let error = directory.resolve("localhost").unwrap_err().to_string();
+    assert!(error.contains("Too many .pem files"), "{error}");
     assert!(
-        directory
-            .resolve("localhost")
-            .unwrap_err()
-            .to_string()
-            .contains("--tls-ca")
+        error.contains(&format!("limit {MAX_VIEWER_PEM_FILES}")),
+        "{error}"
     );
+    assert!(error.contains("--tls-ca"), "{error}");
+}
+
+#[test]
+fn viewer_discovery_skips_a_disappearing_candidate() {
+    let directory = PemDirectory::new();
+    let path = directory.write("vanished.pem", Identity::new().cert.pem());
+    std::fs::remove_file(&path).unwrap();
+    assert!(read_viewer_pem(&path).unwrap().is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn viewer_discovery_reports_a_locked_candidate_by_path() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let directory = PemDirectory::new();
+    let path = directory.write("locked.pem", Identity::new().cert.pem());
+    let _lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+    let error = directory.resolve("localhost").unwrap_err().to_string();
+    assert!(error.contains(&*path.to_string_lossy()), "{error}");
+    assert!(error.contains("--tls-ca FILE"), "{error}");
+}
+
+#[test]
+fn viewer_tls_uses_the_inspected_certificates_after_file_replacement() {
+    let directory = PemDirectory::new();
+    let identity = Identity::new();
+    let path = directory.write("host.pem", identity.cert.pem());
+    let discovered = detect_client_ca(&directory.0, "localhost")
+        .unwrap()
+        .unwrap();
+    directory.write("host.pem", Identity::new().cert.pem());
+    let (transport, reported_path) = discovered.into_client("localhost".into()).unwrap();
+    assert_eq!(reported_path, path);
+
+    let config = identity.server_config();
+    let (client, server) = socket_pair();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let host = thread::spawn(move || NativeStream::server(server, Some(config), deadline));
+    let client = NativeStream::client(client, transport, deadline);
+    assert!(client.is_ok(), "{:?}", client.err());
+    assert!(host.join().unwrap().is_ok());
 }
 
 fn socket_pair() -> (TcpStream, TcpStream) {
