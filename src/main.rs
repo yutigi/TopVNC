@@ -2251,7 +2251,12 @@ fn run_session_inner(
     // Windows acts on shortcuts such as Win+Space before the window sees
     // them; while the viewer has focus, take them for the remote computer.
     #[cfg(windows)]
-    let system_keys = system_keys::SystemKeyCapture::start(&window, ui.key_sender())
+    let system_keys = system_keys::SystemKeyCapture::start(&window, ui.key_sender(), input_debug)
+        .inspect(|_| {
+            if input_debug {
+                eprintln!("system keys: hook installed");
+            }
+        })
         .inspect_err(|error| {
             eprintln!("Windows-key shortcuts will act on this computer: {error}");
         })
@@ -2309,7 +2314,14 @@ fn run_session_inner(
         }
         #[cfg(windows)]
         if let Some(capture) = &system_keys {
-            capture.set_active(config.windows_key && focused && !settings_open);
+            let active = config.windows_key && focused && !settings_open;
+            if capture.set_active(active) && input_debug {
+                eprintln!(
+                    "system keys: capture {} (WIN KEY {}, focused {focused}, F8 open {settings_open})",
+                    if active { "on" } else { "off" },
+                    if config.windows_key { "on" } else { "off" },
+                );
+            }
         }
         // Presentation waits never run on the input event thread.
         let timeout = (last_stats.0 + STATS_INTERVAL).saturating_duration_since(Instant::now());

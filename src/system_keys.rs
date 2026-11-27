@@ -99,6 +99,8 @@ struct HookState {
     active: Arc<AtomicBool>,
     router: Router,
     keys: KeySink,
+    /// Print why a Windows-key press was left to this computer.
+    debug: bool,
 }
 
 fn foreground_window() -> isize {
@@ -113,17 +115,30 @@ impl HookState {
             WM_KEYUP | WM_SYSKEYUP => false,
             _ => return false,
         };
-        // Keys that programs inject pass through. A TopVNC server on this
-        // computer injects the keys its viewers send, and taking them here
-        // would loop them back to it.
-        if event.flags & LLKHF_INJECTED != 0 {
-            return false;
-        }
         let Ok(vk) = u8::try_from(event.vkCode) else {
             return false;
         };
-        let capturing = self.active.load(Ordering::Relaxed) && (self.foreground)() == self.window;
-        if !self.router.take(vk, down, capturing) {
+        // Keys that programs inject pass through. A TopVNC server on this
+        // computer injects the keys its viewers send, and taking them here
+        // would loop them back to it.
+        let injected = event.flags & LLKHF_INJECTED != 0;
+        let active = self.active.load(Ordering::Relaxed);
+        let foreground = (self.foreground)();
+        let capturing = active && foreground == self.window;
+        if injected || !self.router.take(vk, down, capturing) {
+            if self.debug && down && (vk == VK_LWIN || vk == VK_RWIN) {
+                let reason = if injected {
+                    "another program injected it".to_string()
+                } else if !active {
+                    "capture is off (WIN KEY off, window unfocused, or F8 open)".to_string()
+                } else {
+                    format!(
+                        "the viewer window {:#x} is not in front ({foreground:#x} is)",
+                        self.window
+                    )
+                };
+                eprintln!("system keys: Windows key {vk:#x} left to this computer: {reason}");
+            }
             return false;
         }
         // A key the viewer cannot name is still taken, so Windows never sees
@@ -169,16 +184,21 @@ pub struct SystemKeyCapture {
 
 impl SystemKeyCapture {
     /// Install the hook for `window`. It takes nothing until
-    /// [`SystemKeyCapture::set_active`] turns it on.
-    pub fn start(window: &Window, keys: KeySender) -> io::Result<Self> {
+    /// [`SystemKeyCapture::set_active`] turns it on. With `debug`, it prints
+    /// why a Windows-key press was left to this computer.
+    pub fn start(window: &Window, keys: KeySender, debug: bool) -> io::Result<Self> {
         let window = match window.window_handle().map_err(io::Error::other)?.as_raw() {
             RawWindowHandle::Win32(handle) => handle.hwnd.get(),
             _ => return Err(io::Error::other("the viewer window is not a Win32 window")),
         };
-        Self::spawn(window, Box::new(move |code, down| keys.send(code, down)))
+        Self::spawn(
+            window,
+            Box::new(move |code, down| keys.send(code, down)),
+            debug,
+        )
     }
 
-    fn spawn(window: isize, keys: KeySink) -> io::Result<Self> {
+    fn spawn(window: isize, keys: KeySink, debug: bool) -> io::Result<Self> {
         let active = Arc::new(AtomicBool::new(false));
         let state = HookState {
             window,
@@ -186,6 +206,7 @@ impl SystemKeyCapture {
             active: Arc::clone(&active),
             router: Router::default(),
             keys,
+            debug,
         };
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         // The hook gets its own thread. Windows waits for the hook on every
@@ -212,9 +233,9 @@ impl SystemKeyCapture {
 
     /// Whether new presses may be taken: the session wants Windows-key
     /// shortcuts and the viewer has focus. Keys already taken are released
-    /// through the viewer either way.
-    pub fn set_active(&self, active: bool) {
-        self.active.store(active, Ordering::Relaxed);
+    /// through the viewer either way. Returns whether this changed it.
+    pub fn set_active(&self, active: bool) -> bool {
+        self.active.swap(active, Ordering::Relaxed) != active
     }
 }
 
@@ -372,6 +393,7 @@ mod tests {
             active: Arc::clone(&active),
             router: Router::default(),
             keys: Box::new(move |code, down| record.lock().unwrap().push((code, down))),
+            debug: false,
         };
         (state, active, sent)
     }
@@ -422,8 +444,8 @@ mod tests {
     #[ignore = "installs a system-wide keyboard hook; needs an interactive desktop"]
     fn the_hook_installs_and_stops_with_its_capture() {
         let started = std::time::Instant::now();
-        let capture = SystemKeyCapture::spawn(0, Box::new(|_, _| {})).unwrap();
-        capture.set_active(false);
+        let capture = SystemKeyCapture::spawn(0, Box::new(|_, _| {}), false).unwrap();
+        assert!(!capture.set_active(false), "starts inactive");
         drop(capture);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
