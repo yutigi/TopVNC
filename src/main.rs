@@ -2847,6 +2847,29 @@ mod tests {
     #[ignore = "requires an interactive GPU desktop"]
     fn render_worker_smoke_on_interactive_desktop() {
         let mut ui = Ui::new().unwrap();
+        // The Windows-key hook needs raw keyboard input disabled. Relative
+        // mouse motion still needs its separate registration.
+        use windows_sys::Win32::UI::Input::{GetRegisteredRawInputDevices, RAWINPUTDEVICE};
+        let mut devices = [RAWINPUTDEVICE::default(); 8];
+        let mut count = devices.len() as u32;
+        let registered = unsafe {
+            GetRegisteredRawInputDevices(
+                devices.as_mut_ptr(),
+                &mut count,
+                size_of::<RAWINPUTDEVICE>() as u32,
+            )
+        };
+        assert_ne!(registered, u32::MAX, "{}", std::io::Error::last_os_error());
+        let desktop_usages = devices[..registered as usize]
+            .iter()
+            .filter(|device| device.usUsagePage == 0x01)
+            .map(|device| device.usUsage)
+            .collect::<Vec<_>>();
+        assert!(desktop_usages.contains(&0x02), "raw mouse is missing");
+        assert!(
+            !desktop_usages.contains(&0x06),
+            "raw keyboard is registered"
+        );
         let window = ui
             .create_window(
                 WindowAttributes::default()

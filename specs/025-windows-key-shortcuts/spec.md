@@ -51,7 +51,7 @@ Read from the code, not reproduced live:
 - [x] Injected keys pass through the hook.
 - [x] The F8 switch and the web setting are saved and default to on.
 - [x] In Chromium fullscreen with the setting on, the web client locks only `MetaLeft` and `MetaRight`. Otherwise it unlocks them.
-- [ ] Validated live on Windows 11 (below). Win+Space worked, but not reliably in the first minutes of a session.
+- [x] Validate that Win+Space switches the host's language after refocusing the viewer on Windows 11.
 
 ## Validation (Windows 11, 2026-11-27)
 
@@ -62,7 +62,9 @@ Read from the code, not reproduced live:
   - `the_hook_installs_and_stops_with_its_capture` (ignored; run with `--include-ignored` on a desktop): the real hook installs, and dropping the capture removes it and stops its thread. Passed here.
   - `session_overlay_reflects_windows_key_changes`: the F8 panel redraws when the switch changes.
 - Web unit tests (`npm test` in `web/`): `tests/system-keys.test.mjs` covers locking, unlocking, browsers without the API, and refused locks.
-- Live, 2026-11-27, Windows 11 25H2 viewer to a Windows 11 TopVNC host (English and Thai): Win+Space reached the host whole, as `system key` events in order. But in the first minute or two of fresh sessions, Windows did not call the hook at all while the viewer was in front, so the shortcut acted on this computer. The hook was still installed and was called for keys typed in other windows, and for injected test keys. The cause is not known yet. One guess is another program's hook that sits in front of TopVNC's for a while and does not pass keys on; SteelSeries GG, Armoury Crate, Logi Options+ and PowerToys were running. Run the viewer with `--input-debug` to see when the hook installs, when capture turns on or off and why, and why any Windows-key press was left to this computer.
+- Live, 2026-11-27, Windows 11 25H2 viewer to a Windows 11 TopVNC host (English and Thai): in failing sessions the focused viewer received `SuperLeft` through window input and Windows handled Win+Space locally. Renewing the hook left the same behavior. The hook received keys when the viewer lost focus.
+- Winit registers raw input for both the mouse and keyboard. SDL reproduced the same failure with raw keyboard input registered. TopVNC now removes the keyboard registration after winit sets up raw input. Normal keyboard events handle typing, the keyboard hook handles Windows-key shortcuts, and raw mouse input handles relative motion. The Windows interactive smoke test checks both registrations. [SDL issue #9409](https://github.com/libsdl-org/SDL/issues/9409)
+- Retested with a physical keyboard after removing the raw keyboard registration. The viewer captured and sent both keys on four attempts after refocusing, and the tester confirmed the host's language switched.
 - Remaining live steps, which need a person at the keyboard because the hook ignores injected keys:
   1. On a Windows viewer computer with two input languages, connect to a Windows host that also has two. Click into the viewer and press Win+Space. The host's language switches, and this computer's does not.
   2. Press and release Win alone. The host's Start menu opens, and this computer's does not.
