@@ -762,6 +762,14 @@ background. Afterwards, read the `/ws` CPU times in Workers analytics.
   **Ctrl + left drag** to the remote app. Browsers that report trackpad pinch as
   Ctrl + wheel follow the same setting. Touchscreen pinch remains available.
   The browser saves this preference.
+- **Windows key**: in fullscreen, Chrome and Edge let the page take the
+  Windows key (Command on a Mac) through Keyboard Lock, so shortcuts such as
+  **Win + Space** reach the host instead of this computer. Outside fullscreen,
+  and in browsers without Keyboard Lock, the operating system keeps those
+  shortcuts. **Win + L** and **Ctrl + Alt + Del** always stay with this
+  computer. Turn off **Settings → Win key in fullscreen** to keep the Windows
+  key on this computer. The browser saves this preference. Live validation is
+  pending; see [spec 025](../specs/025-windows-key-shortcuts/spec.md).
 - **Appearance** follows the accepted [mobile reference](../design/topvnc-mobile-wireframe/): paper surfaces, olive accents, rounded controls and locally bundled DM Sans / IBM Plex Mono fonts. At widths of at least 900 CSS pixels with a fine primary pointer and hover, desktop browsers use a full-width remote view below the header, with physical keyboard/mouse input, Fit, Fullscreen and settings. The entire touch deck, dock and FPS overlay are hidden regardless of saved layout. Coarse-pointer devices retain mobile controls, including landscape phones and wide touch tablets. The [separate desktop design](../design/topvnc-desktop-wireframe/) is a simulated prototype.
 - **Session settings** stays in the header on desktop and mobile. It contains Display, Served size, Picture quality, fullscreen, Debug / Stats, encryption status and Disconnect. Display and served size appear only when advertised by the host; otherwise their unavailable explanations remain visible. While it is open, keys never reach the host; Escape closes it from anywhere on the page and returns focus to where it was, normally the remote screen, so hardware keys reach the host again. The desktop design Site includes clearly simulated equivalents and example diagnostic values.
 - **Mobile thumb dock**: Keys / Type / Pointer / Enter stays in the same order across

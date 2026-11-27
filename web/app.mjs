@@ -13,6 +13,7 @@ import { attachTextInput } from "./text-input.mjs";
 import { View } from "./view.mjs";
 import { createMobileControls } from "./mobile-controls.mjs";
 import { createModals } from "./modal.mjs";
+import { lockSystemKeys } from "./system-keys.mjs";
 
 const $ = (selector) => document.querySelector(selector);
 const home = $("#home");
@@ -36,6 +37,7 @@ const functionKeys = $("#function-keys");
 const menu = $("#menu");
 const keyboard = $("#keyboard");
 const zoomShortcuts = $("#zoom-shortcuts");
+const windowsKey = $("#windows-key");
 
 const BUTTON = { left: 1, middle: 2, right: 4, wheelUp: 8, wheelDown: 16, wheelLeft: 32, wheelRight: 64, back: 128, forward: 256 };
 // KeyboardEvent.buttons bits, in order: left, right, middle, back, forward.
@@ -61,6 +63,7 @@ try {
   storage = undefined;
 }
 zoomShortcuts.checked = preference("zoomShortcuts", "true") === "true";
+windowsKey.checked = preference("windowsKey", "true") === "true";
 
 let pending; // A scanned invite and a new browser key, kept in memory until verified.
 let state = "idle"; // idle | connecting | password | connected
@@ -751,6 +754,13 @@ for (const bar of [toolbar, functionKeys]) {
 
 $("#disconnect").addEventListener("click", () => switchMachine(selected, { disconnect: true }));
 zoomShortcuts.addEventListener("change", () => remember("zoomShortcuts", zoomShortcuts.checked));
+// In fullscreen, shortcuts such as Win+Space go to the host, not this computer.
+const updateSystemKeys = () => lockSystemKeys(navigator.keyboard, { fullscreen: document.fullscreenElement === viewer, enabled: windowsKey.checked });
+document.addEventListener("fullscreenchange", updateSystemKeys);
+windowsKey.addEventListener("change", () => {
+  remember("windowsKey", windowsKey.checked);
+  updateSystemKeys();
+});
 $("#stats-toggle").addEventListener("change", (event) => {
   statsLine.hidden = !event.target.checked;
 });

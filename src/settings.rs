@@ -74,6 +74,11 @@ pub fn load(config: &mut Config) {
     {
         config.zoom_shortcuts = enabled;
     }
+    if let Ok(saved) = fs::read_to_string(dir.join("windows-key"))
+        && let Ok(enabled) = saved.trim().parse()
+    {
+        config.windows_key = enabled;
+    }
     let Ok(contents) = fs::read_to_string(dir.join("last-session")) else {
         return;
     };
@@ -150,11 +155,16 @@ pub fn save(config: &Config) -> io::Result<()> {
     password_result.map(|_| ())
 }
 
-pub fn save_zoom_shortcuts(enabled: bool) -> io::Result<()> {
+fn save_switch(name: &str, enabled: bool) -> io::Result<()> {
     let dir = directory().ok_or_else(|| io::Error::other("settings directory unavailable"))?;
     fs::create_dir_all(&dir)?;
-    fs::write(
-        dir.join("zoom-shortcuts"),
-        if enabled { "true" } else { "false" },
-    )
+    fs::write(dir.join(name), if enabled { "true" } else { "false" })
+}
+
+pub fn save_zoom_shortcuts(enabled: bool) -> io::Result<()> {
+    save_switch("zoom-shortcuts", enabled)
+}
+
+pub fn save_windows_key(enabled: bool) -> io::Result<()> {
+    save_switch("windows-key", enabled)
 }
