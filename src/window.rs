@@ -5,6 +5,8 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use topvnc::presentation::MotionPresentation;
+#[cfg(windows)]
+use windows_sys::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
@@ -126,6 +128,23 @@ impl KeySender {
     }
 }
 
+#[cfg(windows)]
+fn unregister_raw_keyboard() -> std::io::Result<()> {
+    // Winit registers both HID devices together. Raw keyboard input can
+    // bypass WH_KEYBOARD_LL while this process has focus. We only use raw
+    // mouse motion and take ordinary keys through window events.
+    let keyboard = RAWINPUTDEVICE {
+        usUsagePage: 0x01, // Generic Desktop Controls.
+        usUsage: 0x06,     // Keyboard.
+        dwFlags: RIDEV_REMOVE,
+        hwndTarget: std::ptr::null_mut(),
+    };
+    if unsafe { RegisterRawInputDevices(&keyboard, 1, size_of::<RAWINPUTDEVICE>() as u32) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl Ui {
     pub fn new() -> Result<Self, Box<dyn Error>> {
         let mut builder = EventLoop::with_user_event();
@@ -136,6 +155,10 @@ impl Ui {
         }
         let event_loop = builder.build()?;
         event_loop.listen_device_events(DeviceEvents::WhenFocused);
+        #[cfg(windows)]
+        if let Err(error) = unregister_raw_keyboard() {
+            eprintln!("TopVNC: could not disable raw keyboard input: {error}");
+        }
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(event_loop.owned_display_handle()),
         ));
