@@ -25,6 +25,8 @@ mod macos_server;
 #[cfg(windows)]
 mod service_pipe;
 #[cfg(windows)]
+mod system_keys;
+#[cfg(windows)]
 mod windows_server;
 #[cfg(windows)]
 mod windows_service;
@@ -2103,6 +2105,17 @@ fn send_buttons(
     }
 }
 
+/// Send the whole units of relative motion gathered so far, keeping the
+/// fraction for the next event.
+fn send_motion(writer: &InputWriter, buttons: u16, motion: &mut (f64, f64)) -> std::io::Result<()> {
+    if motion.0.abs() >= 1.0 || motion.1.abs() >= 1.0 {
+        let (x, y) = (motion.0.trunc(), motion.1.trunc());
+        writer.pointer_motion(buttons, x as i32, y as i32)?;
+        *motion = (motion.0 - x, motion.1 - y);
+    }
+    Ok(())
+}
+
 fn run_session(
     ui: &mut Ui,
     session: Session,
@@ -2235,6 +2248,14 @@ fn run_session_inner(
             })?;
     }
 
+    // Windows acts on shortcuts such as Win+Space before the window sees
+    // them; while the viewer has focus, take them for the remote computer.
+    #[cfg(windows)]
+    let system_keys = system_keys::SystemKeyCapture::start(&window, ui.key_sender())
+        .inspect_err(|error| {
+            eprintln!("Windows-key shortcuts will act on this computer: {error}");
+        })
+        .ok();
     let mut overlay_changed = true;
     let mut pressed_keys = HashMap::new();
     let mut buttons = 0u16;
@@ -2286,6 +2307,10 @@ fn run_session_inner(
             overlay_changed = true;
             redraw = true;
         }
+        #[cfg(windows)]
+        if let Some(capture) = &system_keys {
+            capture.set_active(config.windows_key && focused && !settings_open);
+        }
         // Presentation waits never run on the input event thread.
         let timeout = (last_stats.0 + STATS_INTERVAL).saturating_duration_since(Instant::now());
         for event in ui.pump(timeout) {
@@ -2296,14 +2321,29 @@ fn run_session_inner(
                     continue;
                 }
                 UiEvent::Window(id, _) if id != window.id() => continue,
+                UiEvent::SystemKey { code, down } => {
+                    // The hook stops taking presses once focus or the
+                    // settings change; releases always come through.
+                    if down && (settings_open || !focused) {
+                        continue;
+                    }
+                    send_motion(&writer, buttons, &mut motion)?;
+                    if let Some((symbol, down)) =
+                        translated_key_event(&mut pressed_keys, code, down)
+                    {
+                        if input_debug {
+                            eprintln!(
+                                "system key {}: {code:?} -> {symbol:#x}",
+                                if down { "down" } else { "up" }
+                            );
+                        }
+                        writer.key(symbol, down)?;
+                    }
+                }
                 UiEvent::Window(_, event) => {
                     // Motion goes out before the event that follows it, so a
                     // flick and a click arrive in the order they happened.
-                    if motion.0.abs() >= 1.0 || motion.1.abs() >= 1.0 {
-                        let (x, y) = (motion.0.trunc(), motion.1.trunc());
-                        writer.pointer_motion(buttons, x as i32, y as i32)?;
-                        motion = (motion.0 - x, motion.1 - y);
-                    }
+                    send_motion(&writer, buttons, &mut motion)?;
                     match event {
                         WindowEvent::CloseRequested => return Ok(None),
                         WindowEvent::Resized(_)
@@ -2537,6 +2577,17 @@ fn run_session_inner(
                                                 "Could not remember the zoom shortcuts setting: {error}"
                                             );
                                         }
+                                    } else if ui::LIVE_WINDOWS_KEY
+                                        .is_some_and(|area| area.contains(x, y))
+                                    {
+                                        config.windows_key = !config.windows_key;
+                                        if let Err(error) =
+                                            settings::save_windows_key(config.windows_key)
+                                        {
+                                            eprintln!(
+                                                "Could not remember the Windows key setting: {error}"
+                                            );
+                                        }
                                     } else if ui::LIVE_WHOLE_UPDATE.contains(x, y) {
                                         config.progressive = false;
                                         config.performance = PerformanceMode::Standard;
@@ -2658,11 +2709,7 @@ fn run_session_inner(
                 UiEvent::Device(_) | UiEvent::Wake => {}
             }
         }
-        if motion.0.abs() >= 1.0 || motion.1.abs() >= 1.0 {
-            let (x, y) = (motion.0.trunc(), motion.1.trunc());
-            writer.pointer_motion(buttons, x as i32, y as i32)?;
-            motion = (motion.0 - x, motion.1 - y);
-        }
+        send_motion(&writer, buttons, &mut motion)?;
         if let Ok(result) = error_rx.try_recv() {
             return Ok(result.err().map(|error| error.to_string()));
         }

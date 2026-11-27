@@ -23,6 +23,7 @@ pub struct RenderOptions {
     pub progressive: bool,
     pub relative_mouse: bool,
     zoom_shortcuts: bool,
+    windows_key: bool,
     pub ui_scale: f32,
     pub debug: bool,
     pub open: bool,
@@ -47,6 +48,7 @@ impl RenderOptions {
             progressive: config.progressive,
             relative_mouse: config.relative_mouse,
             zoom_shortcuts: config.zoom_shortcuts,
+            windows_key: config.windows_key,
             ui_scale: config.ui_scale,
             debug: config.debug,
             open: false,
@@ -70,6 +72,7 @@ impl RenderOptions {
             progressive: self.progressive,
             relative_mouse: self.relative_mouse,
             zoom_shortcuts: self.zoom_shortcuts,
+            windows_key: self.windows_key,
             ui_scale: self.ui_scale,
             debug: self.debug,
             ..Config::default()
@@ -401,6 +404,19 @@ mod tests {
         config.zoom_shortcuts = false;
         let disabled = RenderOptions::new(&config, size, 1.0);
         assert!(!disabled.config().zoom_shortcuts);
+        assert!(enabled != disabled);
+    }
+
+    #[test]
+    fn session_overlay_reflects_windows_key_changes() {
+        let mut config = Config::default();
+        let size = PhysicalSize::new(800, 600);
+        let enabled = RenderOptions::new(&config, size, 1.0);
+        assert!(enabled.config().windows_key);
+
+        config.windows_key = false;
+        let disabled = RenderOptions::new(&config, size, 1.0);
+        assert!(!disabled.config().windows_key);
         assert!(enabled != disabled);
     }
 }
