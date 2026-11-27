@@ -25,7 +25,7 @@ The failing component could not be reproduced here, since that needs a cable to 
 - Capture candidates must match the current GDI monitor name and desktop area, with the primary flag taken from GDI. A stale DXGI output must not override the current main display during reconfiguration.
 - An incomplete capture snapshot serves only a confirmed current primary instead of silently renumbering a selected display or representing a partial image as ALL. Refresh that snapshot on each layout check, even when GDI no longer changes, and restore the requested selection once DXGI catches up. A missing secondary or a failed refresh must not interrupt a healthy primary capture. If the current primary is unavailable too, retry capture with the existing backoff.
 - If a selected output or ALL cannot start capture while another display is the current primary, try that primary in the same attempt. Keep the requested selection so a later layout change can restore it. Do not retry the same output twice or try other outputs after access to the desktop is denied. Report both failures if the fallback also fails.
-- Capture startup succeeds only once each selected output has copied its first desktop image. An error or a one-second timeout before that counts as a failed capture attempt and follows the same primary fallback path. Cursor-only changes and frames from only some selected outputs do not establish a live capture.
+- Capture startup succeeds only once each selected output has delivered its first frame. Windows reports that frame as pointer-only, so its image is not copied; see the follow-up of 2026-11-27. An error or a one-second timeout before that counts as a failed capture attempt and follows the same primary fallback path. Later cursor changes and frames from only some selected outputs do not establish a live capture.
 
 ### Telling viewers
 
@@ -56,3 +56,24 @@ The failing component could not be reproduced here, since that needs a cable to 
 - `cargo fmt --all --check`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo build --bin topvnc` pass.
 - Live Windows checks pass: `gdi_and_dxgi_agree_on_attached_displays`, `every_attached_display_has_a_connected_monitor`, `captures_each_and_all_live_displays`, and `viewers_switch_between_live_displays`. Desktop-capture checks ran outside the sandbox, which denies Desktop Duplication access.
 - A physical cable unplug with a browser connected remains unvalidated; use the manual test above. No macOS or Linux hardware testing was performed for this follow-up.
+
+## Follow-up: black flashes on an idle desktop (Windows 11, 2026-11-27)
+
+Reported: the native viewer, connected to a TopVNC host on another PC, often went black for a moment and came back while the host's desktop was idle. That host ran the branch of PR #28, not yet merged, whose silence check restarts capture every 3 seconds while a viewer watches a desktop at rest. Without it, capture restarts after capture errors, layout changes, and display switches. The host's log showed capture errors (`0x887A0026`, `0x887A0001`) restarting capture every few minutes.
+
+### Findings
+
+- On a 3440x1440 desktop, the first frame of every new duplication reported `LastPresentTime` 0 and `AccumulatedFrames` 0: only the pointer changed. When no duplication had run for a while, as after the 250 ms retry delay, its image was black. Capture still copied that frame in full as the first image. A restarted capture also started from a black image, which it presented as a whole on the first frame.
+- Viewers got the black picture whenever the serving loop presented before Windows presented the desktop. That was usually about 2 ms later: 10 of 20 restarts in one run served a fully black image. Once, the desktop was not presented for more than 3 seconds. Each restart also sent the whole screen twice, first black and then the desktop.
+
+### Acceptance criteria
+
+- Desktop pixels are copied only from frames in which Windows presented the desktop (`LastPresentTime` nonzero). Each output's first such frame is copied in full. For startup, an output counts once it delivers any frame, since Windows may not present an idle desktop for seconds.
+- A capture restarted on the same desktop area starts from the picture the stopped capture served, including regions it had captured but not yet presented. This applies after capture errors and layout changes. Viewers keep that picture until a display presents, then receive only tiles that changed. The new capture draws the cursor its displays report; a cursor they do not report is erased. A capture of another area, as after switching displays, still starts from black.
+
+### Validation
+
+- `a_restarted_capture_keeps_the_last_picture_until_it_copies_one` (image, cursor erase, other sizes) and `a_restarted_capture_serves_the_last_picture_until_its_display_presents` (pointer-only first frame, regions not yet presented, other areas) run headlessly.
+- Live, `restarted_captures_never_serve_a_black_desktop` restarts capture 20 times, alternately at once and after the 250 ms retry delay. It fails if a present blanks half the screen. It passed four times with the fix. Mutation checks: without the carried picture, the first restart blanked 4,953,457 of 4,953,600 pixels. Copying pointer-only frames again blanked 4,953,443 pixels at the first restart.
+- `cargo fmt --all`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` pass. The live `captures_each_and_all_live_displays`, `gdi_and_dxgi_agree_on_attached_displays`, `every_attached_display_has_a_connected_monitor`, and `viewers_switch_between_live_displays` checks pass.
+- Not validated: the reporting host itself, with a viewer watching its idle desktop, and this change together with PR #28's silence check. The same change, applied on PR #28's branch, passed the live restart test there.
