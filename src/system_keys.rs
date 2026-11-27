@@ -19,10 +19,10 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC_EX, MapVirtualKeyW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
-    LLKHF_INJECTED, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_USER,
+    CallNextHookEx, GetForegroundWindow, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
+    LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
 };
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::scancode::PhysicalKeyExtScancode;
@@ -34,6 +34,7 @@ use crate::window::KeySender;
 /// Virtual-key codes of the left and right Windows keys.
 const VK_LWIN: u8 = 0x5b;
 const VK_RWIN: u8 = 0x5c;
+const WM_REFRESH_HOOK: u32 = WM_USER + 1;
 
 /// Decides which key events the hook takes from Windows.
 ///
@@ -43,14 +44,12 @@ const VK_RWIN: u8 = 0x5c;
 /// press was, so Windows sees every key it saw go down come back up, and no
 /// key stays down on this computer.
 pub struct Router {
-    taken: [bool; 256],
+    held: [Option<bool>; 256],
 }
 
 impl Default for Router {
     fn default() -> Self {
-        Self {
-            taken: [false; 256],
-        }
+        Self { held: [None; 256] }
     }
 }
 
@@ -60,15 +59,15 @@ impl Router {
     pub fn take(&mut self, vk: u8, down: bool, capturing: bool) -> bool {
         let index = usize::from(vk);
         if !down {
-            return std::mem::take(&mut self.taken[index]);
+            return self.held[index].take() == Some(true);
         }
-        if self.taken[index] {
-            // Auto-repeat of a key already taken.
-            return true;
+        if let Some(taken) = self.held[index] {
+            return taken;
         }
-        let chord = self.taken[usize::from(VK_LWIN)] || self.taken[usize::from(VK_RWIN)];
+        let chord = self.held[usize::from(VK_LWIN)] == Some(true)
+            || self.held[usize::from(VK_RWIN)] == Some(true);
         let take = capturing && (vk == VK_LWIN || vk == VK_RWIN || chord);
-        self.taken[index] = take;
+        self.held[index] = Some(take);
         take
     }
 }
@@ -99,8 +98,6 @@ struct HookState {
     active: Arc<AtomicBool>,
     router: Router,
     keys: KeySink,
-    /// Print why a Windows-key press was left to this computer.
-    debug: bool,
 }
 
 fn foreground_window() -> isize {
@@ -121,24 +118,11 @@ impl HookState {
         // Keys that programs inject pass through. A TopVNC server on this
         // computer injects the keys its viewers send, and taking them here
         // would loop them back to it.
-        let injected = event.flags & LLKHF_INJECTED != 0;
-        let active = self.active.load(Ordering::Relaxed);
-        let foreground = (self.foreground)();
-        let capturing = active && foreground == self.window;
-        if injected || !self.router.take(vk, down, capturing) {
-            if self.debug && down && (vk == VK_LWIN || vk == VK_RWIN) {
-                let reason = if injected {
-                    "another program injected it".to_string()
-                } else if !active {
-                    "capture is off (WIN KEY off, window unfocused, or F8 open)".to_string()
-                } else {
-                    format!(
-                        "the viewer window {:#x} is not in front ({foreground:#x} is)",
-                        self.window
-                    )
-                };
-                eprintln!("system keys: Windows key {vk:#x} left to this computer: {reason}");
-            }
+        if event.flags & LLKHF_INJECTED != 0 {
+            return false;
+        }
+        let capturing = self.active.load(Ordering::Relaxed) && (self.foreground)() == self.window;
+        if !self.router.take(vk, down, capturing) {
             return false;
         }
         // A key the viewer cannot name is still taken, so Windows never sees
@@ -184,21 +168,16 @@ pub struct SystemKeyCapture {
 
 impl SystemKeyCapture {
     /// Install the hook for `window`. It takes nothing until
-    /// [`SystemKeyCapture::set_active`] turns it on. With `debug`, it prints
-    /// why a Windows-key press was left to this computer.
-    pub fn start(window: &Window, keys: KeySender, debug: bool) -> io::Result<Self> {
+    /// [`SystemKeyCapture::set_active`] turns it on.
+    pub fn start(window: &Window, keys: KeySender) -> io::Result<Self> {
         let window = match window.window_handle().map_err(io::Error::other)?.as_raw() {
             RawWindowHandle::Win32(handle) => handle.hwnd.get(),
             _ => return Err(io::Error::other("the viewer window is not a Win32 window")),
         };
-        Self::spawn(
-            window,
-            Box::new(move |code, down| keys.send(code, down)),
-            debug,
-        )
+        Self::spawn(window, Box::new(move |code, down| keys.send(code, down)))
     }
 
-    fn spawn(window: isize, keys: KeySink, debug: bool) -> io::Result<Self> {
+    fn spawn(window: isize, keys: KeySink) -> io::Result<Self> {
         let active = Arc::new(AtomicBool::new(false));
         let state = HookState {
             window,
@@ -206,7 +185,6 @@ impl SystemKeyCapture {
             active: Arc::clone(&active),
             router: Router::default(),
             keys,
-            debug,
         };
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         // The hook gets its own thread. Windows waits for the hook on every
@@ -235,7 +213,17 @@ impl SystemKeyCapture {
     /// shortcuts and the viewer has focus. Keys already taken are released
     /// through the viewer either way. Returns whether this changed it.
     pub fn set_active(&self, active: bool) -> bool {
-        self.active.swap(active, Ordering::Relaxed) != active
+        let changed = self.active.swap(active, Ordering::Relaxed) != active;
+        if changed && active {
+            self.refresh();
+        }
+        changed
+    }
+
+    /// Put the hook at the front of the chain again. Windows may have removed
+    /// it after a timeout, or another hook may have registered ahead of it.
+    pub fn refresh(&self) {
+        unsafe { PostThreadMessageW(self.thread_id, WM_REFRESH_HOOK, 0, 0) };
     }
 }
 
@@ -262,24 +250,44 @@ fn run_hook(state: HookState, ready: mpsc::SyncSender<io::Result<u32>>) {
         )
     };
     STATE.set(Some(state));
-    let hook = unsafe {
-        SetWindowsHookExW(
-            WH_KEYBOARD_LL,
-            Some(keyboard_hook),
-            GetModuleHandleW(std::ptr::null()),
-            0,
-        )
-    };
+    let mut hook = install_hook();
     if hook.is_null() {
         let _ = ready.send(Err(io::Error::last_os_error()));
         STATE.set(None);
         return;
     }
     let _ = ready.send(Ok(unsafe { GetCurrentThreadId() }));
-    // Windows calls the hook from inside this loop.
-    while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {}
+    // Windows calls the hook from inside this loop. Replace the old hook
+    // only once the new one is installed and preserve held-key routing.
+    while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {
+        if message.message == WM_REFRESH_HOOK {
+            hook = refresh_hook(hook);
+        }
+    }
     unsafe { UnhookWindowsHookEx(hook) };
     STATE.set(None);
+}
+
+fn install_hook() -> HHOOK {
+    unsafe {
+        SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(keyboard_hook),
+            GetModuleHandleW(std::ptr::null()),
+            0,
+        )
+    }
+}
+
+fn refresh_hook(current: HHOOK) -> HHOOK {
+    let replacement = install_hook();
+    if replacement.is_null() {
+        return current;
+    }
+    if current != replacement {
+        unsafe { UnhookWindowsHookEx(current) };
+    }
+    replacement
 }
 
 #[cfg(test)]
@@ -318,6 +326,7 @@ mod tests {
         assert!(!router.take(VK_SHIFT, true, true));
         assert!(router.take(VK_LWIN, true, true));
         assert!(router.take(VK_R, true, true));
+        assert!(!router.take(VK_SHIFT, true, true), "local auto-repeat");
         // Windows saw Shift go down, so it must see it come up.
         assert!(!router.take(VK_SHIFT, false, true));
         assert!(router.take(VK_R, false, true));
@@ -340,6 +349,18 @@ mod tests {
         assert!(router.take(VK_LWIN, false, false));
         // A release Windows already saw go down is never taken.
         assert!(!router.take(VK_LWIN, false, true));
+    }
+
+    #[test]
+    fn a_windows_key_held_when_capture_starts_stays_local_until_released() {
+        let mut router = Router::default();
+        assert!(!router.take(VK_LWIN, true, false));
+        assert!(!router.take(VK_LWIN, true, true));
+        assert!(!router.take(VK_SPACE, true, true));
+        assert!(!router.take(VK_SPACE, false, true));
+        assert!(!router.take(VK_LWIN, false, true));
+        assert!(router.take(VK_LWIN, true, true));
+        assert!(router.take(VK_SPACE, true, true));
     }
 
     #[test]
@@ -393,7 +414,6 @@ mod tests {
             active: Arc::clone(&active),
             router: Router::default(),
             keys: Box::new(move |code, down| record.lock().unwrap().push((code, down))),
-            debug: false,
         };
         (state, active, sent)
     }
@@ -444,9 +464,21 @@ mod tests {
     #[ignore = "installs a system-wide keyboard hook; needs an interactive desktop"]
     fn the_hook_installs_and_stops_with_its_capture() {
         let started = std::time::Instant::now();
-        let capture = SystemKeyCapture::spawn(0, Box::new(|_, _| {}), false).unwrap();
+        let capture = SystemKeyCapture::spawn(0, Box::new(|_, _| {})).unwrap();
         assert!(!capture.set_active(false), "starts inactive");
+        capture.refresh();
         drop(capture);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    #[ignore = "installs a system-wide keyboard hook; needs an interactive desktop"]
+    fn a_refresh_restores_a_hook_that_windows_removed() {
+        let hook = install_hook();
+        assert!(!hook.is_null());
+        // Simulate Windows removing the hook while we still have its handle.
+        assert_ne!(unsafe { UnhookWindowsHookEx(hook) }, 0);
+        let replacement = refresh_hook(hook);
+        assert_ne!(unsafe { UnhookWindowsHookEx(replacement) }, 0);
     }
 }

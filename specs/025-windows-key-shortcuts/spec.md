@@ -30,11 +30,12 @@ Read from the code, not reproduced live:
 ### Native viewer (Windows)
 
 - `src/system_keys.rs` installs a low-level keyboard hook (`WH_KEYBOARD_LL`) for the length of a viewer session. The hook runs on its own thread, which does nothing but run a message loop. Windows waits for low-level hooks on every key pressed anywhere, so the hook never waits behind viewer work such as a network write.
-- New presses are taken only while the session is active: **Win key** on, the window focused, and the F8 panel closed. The window must also be the foreground window when the key is pressed.
+- New presses are taken only while the session is active: **Win key** on, the window focused, and the F8 panel closed. The hook checks the foreground window when the key is pressed. Each activation refreshes the hook registration so it returns to the front of the Windows hook chain.
 - A Windows key pressed while capturing starts a chord. Until the Windows keys are released, every new press is taken too. So Windows never sees a shortcut with a Windows key in it, and Space, R, D, and so on reach the remote computer together with the Windows key.
-- A key's release is taken exactly when its press was. Windows therefore sees every key it saw go down come back up. Keys held before the Windows key, such as Shift, stay with Windows, and no key stays down on this computer. A taken key's repeat and release are still taken after focus moves away.
+- Repeats and releases follow the original press, even if focus changes or the hook is refreshed. Keys held before the Windows key, such as Shift, stay with Windows.
 - Injected keys always pass through. Otherwise a TopVNC server on the same computer, which injects the keys its viewers send, would loop them back.
 - Taken keys are named from their scan code the same way winit names window keys. They reach the event loop as `UiEvent::SystemKey` through the same queue as other wake-ups, so a chord arrives in the order it was typed. The session sends them like other keys, with the same pressed-key tracking. So a focus loss or opening F8 still releases them on the remote computer.
+- When capture is enabled and a Windows key reaches the regular window input handler, Windows may have kept the rest of the shortcut. The viewer leaves that press local to avoid opening Start on the host. A release reaching the window requests a hook refresh for the next attempt. The hook itself performs no debug logging because a blocked callback can cause Windows to remove it.
 - If the hook cannot be installed, the viewer prints `Windows-key shortcuts will act on this computer: …` and works as before.
 
 ### Web client
@@ -51,18 +52,20 @@ Read from the code, not reproduced live:
 - [x] Injected keys pass through the hook.
 - [x] The F8 switch and the web setting are saved and default to on.
 - [x] In Chromium fullscreen with the setting on, the web client locks only `MetaLeft` and `MetaRight`. Otherwise it unlocks them.
-- [ ] Validated live on Windows 11 (below). Win+Space worked, but not reliably in the first minutes of a session.
+- [ ] With the updated Windows viewer, Win+Space switches the host's input language on the first attempt after connecting and after refocusing the viewer. If Windows takes a chord and delivers the Windows key release to the viewer, the next attempt works after the hook refresh and the host Start menu stays closed.
 
 ## Validation (Windows 11, 2026-11-27)
 
 - Unit tests (`cargo test -p topvnc --bin topvnc -- system_keys`):
   - `a_windows_key_shortcut_is_taken_whole_and_released_whole`, `keys_pressed_before_the_windows_key_stay_with_windows`, `nothing_new_is_taken_without_focus_but_taken_keys_still_come_back`: the chord rules.
+  - `a_windows_key_held_when_capture_starts_stays_local_until_released`: local presses stay local when capture activates mid-press.
   - `the_hook_sends_win_space_to_the_viewer_in_order` and `the_hook_leaves_injected_keys_and_other_windows_alone`: the hook's decisions, the keys it sends, and their order.
   - `hook_keys_are_named_like_window_keys`: scan codes map to the same winit keys as window events.
-  - `the_hook_installs_and_stops_with_its_capture` (ignored; run with `--include-ignored` on a desktop): the real hook installs, and dropping the capture removes it and stops its thread. Passed here.
+  - `the_hook_installs_and_stops_with_its_capture` (ignored; run with `--include-ignored` on a desktop): the real hook installs, accepts a refresh request, and stops with its thread when dropped.
+  - `a_refresh_restores_a_hook_that_windows_removed` (ignored by default): removes the real Windows hook, then verifies that refreshing installs a usable replacement.
   - `session_overlay_reflects_windows_key_changes`: the F8 panel redraws when the switch changes.
 - Web unit tests (`npm test` in `web/`): `tests/system-keys.test.mjs` covers locking, unlocking, browsers without the API, and refused locks.
-- Live, 2026-11-27, Windows 11 25H2 viewer to a Windows 11 TopVNC host (English and Thai): Win+Space reached the host whole, as `system key` events in order. But in the first minute or two of fresh sessions, Windows did not call the hook at all while the viewer was in front, so the shortcut acted on this computer. The hook was still installed and was called for keys typed in other windows, and for injected test keys. The cause is not known yet. One guess is another program's hook that sits in front of TopVNC's for a while and does not pass keys on; SteelSeries GG, Armoury Crate, Logi Options+ and PowerToys were running. Run the viewer with `--input-debug` to see when the hook installs, when capture turns on or off and why, and why any Windows-key press was left to this computer.
+- PR #32 live test on 2026-11-27, Windows 11 25H2 viewer to a Windows 11 TopVNC host (English and Thai): Win+Space reached the host as `system key` events in order. In the first minute or two of fresh sessions, Windows sometimes skipped the hook while the viewer was in front and handled the shortcut locally. The hook still received keys typed in other windows and injected test keys. The cause remains unconfirmed. Run the updated viewer with `--input-debug` to see hook installation, capture changes, and refresh requests when Windows delivers a Windows key to the viewer window.
 - Remaining live steps, which need a person at the keyboard because the hook ignores injected keys:
   1. On a Windows viewer computer with two input languages, connect to a Windows host that also has two. Click into the viewer and press Win+Space. The host's language switches, and this computer's does not.
   2. Press and release Win alone. The host's Start menu opens, and this computer's does not.

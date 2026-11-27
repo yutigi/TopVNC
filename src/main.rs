@@ -2251,7 +2251,7 @@ fn run_session_inner(
     // Windows acts on shortcuts such as Win+Space before the window sees
     // them; while the viewer has focus, take them for the remote computer.
     #[cfg(windows)]
-    let system_keys = system_keys::SystemKeyCapture::start(&window, ui.key_sender(), input_debug)
+    let system_keys = system_keys::SystemKeyCapture::start(&window, ui.key_sender())
         .inspect(|_| {
             if input_debug {
                 eprintln!("system keys: hook installed");
@@ -2294,6 +2294,21 @@ fn run_session_inner(
     let mut ctrl_held = false;
     // The last logical point of a Ctrl+drag that pans the zoomed view.
     let mut panning: Option<(f64, f64)> = None;
+    #[cfg(windows)]
+    let update_system_keys = |enabled: bool, focused: bool, settings_open: bool| {
+        if let Some(capture) = &system_keys {
+            let active = enabled && focused && !settings_open;
+            if capture.set_active(active) && input_debug {
+                eprintln!(
+                    "system keys: capture {} (WIN KEY {}, focused {focused}, F8 open {settings_open})",
+                    if active { "on" } else { "off" },
+                    if enabled { "on" } else { "off" },
+                );
+            }
+        }
+    };
+    #[cfg(windows)]
+    update_system_keys(config.windows_key, focused, settings_open);
     loop {
         let mut title_changed = false;
         remote = frames.dimensions();
@@ -2311,17 +2326,6 @@ fn run_session_inner(
             (known_serve_scale, known_serve_display) = (serve_scale, serve_display);
             overlay_changed = true;
             redraw = true;
-        }
-        #[cfg(windows)]
-        if let Some(capture) = &system_keys {
-            let active = config.windows_key && focused && !settings_open;
-            if capture.set_active(active) && input_debug {
-                eprintln!(
-                    "system keys: capture {} (WIN KEY {}, focused {focused}, F8 open {settings_open})",
-                    if active { "on" } else { "off" },
-                    if config.windows_key { "on" } else { "off" },
-                );
-            }
         }
         // Presentation waits never run on the input event thread.
         let timeout = (last_stats.0 + STATS_INTERVAL).saturating_duration_since(Instant::now());
@@ -2371,6 +2375,8 @@ fn run_session_inner(
                         }
                         WindowEvent::Focused(now_focused) => {
                             focused = now_focused;
+                            #[cfg(windows)]
+                            update_system_keys(config.windows_key, focused, settings_open);
                             if !focused {
                                 // Keys and buttons held when focus leaves would
                                 // otherwise stay down on the remote desktop.
@@ -2412,6 +2418,8 @@ fn run_session_inner(
                             if code == KeyCode::F8 {
                                 if down && !event.repeat {
                                     settings_open = !settings_open;
+                                    #[cfg(windows)]
+                                    update_system_keys(config.windows_key, focused, settings_open);
                                     overlay_changed = true;
                                     redraw = true;
                                     dragging_ui_scale = false;
@@ -2425,6 +2433,29 @@ fn run_session_inner(
                                 continue;
                             }
                             if settings_open || event.repeat {
+                                continue;
+                            }
+                            #[cfg(windows)]
+                            if config.windows_key
+                                && matches!(code, KeyCode::SuperLeft | KeyCode::SuperRight)
+                            {
+                                // Windows saw this key. Forwarding its press alone
+                                // can open Start on the host if Windows took Space.
+                                if !down {
+                                    if let Some((symbol, down)) =
+                                        translated_key_event(&mut pressed_keys, code, false)
+                                    {
+                                        writer.key(symbol, down)?;
+                                    }
+                                    if let Some(capture) = &system_keys {
+                                        capture.refresh();
+                                        if input_debug {
+                                            eprintln!(
+                                                "system keys: {code:?} reached the window; refreshing the hook"
+                                            );
+                                        }
+                                    }
+                                }
                                 continue;
                             }
                             if let Some((symbol, down)) =
@@ -2532,6 +2563,12 @@ fn run_session_inner(
                                     };
                                     if ui::CLOSE_SETTINGS.contains(x, y) {
                                         settings_open = false;
+                                        #[cfg(windows)]
+                                        update_system_keys(
+                                            config.windows_key,
+                                            focused,
+                                            settings_open,
+                                        );
                                     } else if ui::LIVE_FIT.contains(x, y) {
                                         config.window_mode = WindowMode::Fit;
                                         zoom.reset();
@@ -2633,6 +2670,8 @@ fn run_session_inner(
                                     && ui::open_settings_box(config.ui_scale).contains(x, y)
                                 {
                                     settings_open = true;
+                                    #[cfg(windows)]
+                                    update_system_keys(config.windows_key, focused, settings_open);
                                     ui_captured_mouse = true;
                                     overlay_changed = true;
                                     redraw = true;
