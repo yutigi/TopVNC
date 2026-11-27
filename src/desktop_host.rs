@@ -505,6 +505,87 @@ impl CaptureOutage {
     }
 }
 
+/// How long capture may receive no frame, not even a pointer move, before
+/// it is restarted to check that its displays still show the desktop.
+pub const CAPTURE_SILENCE_CHECK: Duration = Duration::from_secs(3);
+
+/// Notices displays that stopped delivering images without an error.
+///
+/// Windows can keep an unplugged monitor on the desktop, listed and
+/// reported available, as when a laptop's lid is closed and no other
+/// display is left; capture then simply receives nothing. A desktop at rest
+/// is silent too, so while viewers watch, a silent capture is restarted: a
+/// new capture delivers its first image at once unless its display is gone.
+/// Restarts that serve the same displays again are not announced. A display
+/// that went to sleep delivers nothing either, so the first failed start of
+/// an outage asks for the displays to be turned on.
+///
+/// `P` is what a capture serves, compared to tell a quiet check from a
+/// change worth announcing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureWatchdog<P> {
+    /// What a silence check restarted.
+    probed: Option<P>,
+    woke: bool,
+}
+
+impl<P> Default for CaptureWatchdog<P> {
+    fn default() -> Self {
+        Self {
+            probed: None,
+            woke: false,
+        }
+    }
+}
+
+impl<P: PartialEq + Clone> CaptureWatchdog<P> {
+    /// The running capture serving `serving` has received nothing for
+    /// `silent_for`, with `viewers` connected. Returns whether to restart it.
+    pub fn check_silence(
+        &mut self,
+        viewers: usize,
+        silent_for: Duration,
+        serving: Option<&P>,
+    ) -> bool {
+        // Without viewers nobody sees a frozen picture; check once one joins.
+        if viewers == 0 || silent_for < CAPTURE_SILENCE_CHECK {
+            return false;
+        }
+        self.probed = serving.cloned();
+        true
+    }
+
+    /// Capture started serving `plan`. Returns whether to announce it: not
+    /// after a silence check that serves the same displays again.
+    pub fn started(&mut self, plan: &P) -> bool {
+        self.woke = false;
+        self.probed.take().as_ref() != Some(plan)
+    }
+
+    /// Starting capture failed for `status`, with `viewers` connected.
+    /// Returns whether to turn the displays on now.
+    pub fn failed(
+        &mut self,
+        status: topvnc::CaptureStatus,
+        viewers: usize,
+        input_desktop_allows_wake: impl FnOnce() -> bool,
+    ) -> bool {
+        // The next start is a recovery, which is announced.
+        self.probed = None;
+        // Nobody needs the picture, and a locked or secure desktop cannot be
+        // captured however the displays are powered.
+        if viewers == 0
+            || self.woke
+            || status == topvnc::CaptureStatus::SecureDesktop
+            || !input_desktop_allows_wake()
+        {
+            return false;
+        }
+        self.woke = true;
+        true
+    }
+}
+
 /// Decides which output's pointer reports move the cursor when several
 /// outputs are captured at once. Each output reports the pointer only while
 /// it is on that output, so a report from another output hides it only
@@ -1959,6 +2040,16 @@ pub struct DesktopImage {
     cursor_visible: bool,
     drawn_cursor: Option<Rect>,
     cursor_changed: bool,
+    cursor_shape_reported: bool,
+    cursor_position_reported: bool,
+}
+
+/// The cursor a [`DesktopImage`] draws, carried over when capture restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawnCursor {
+    shape: Option<CursorShape>,
+    position: (i32, i32),
+    visible: bool,
 }
 
 impl DesktopImage {
@@ -1973,6 +2064,8 @@ impl DesktopImage {
             cursor_visible: false,
             drawn_cursor: None,
             cursor_changed: false,
+            cursor_shape_reported: false,
+            cursor_position_reported: false,
         }
     }
 
@@ -2009,6 +2102,7 @@ impl DesktopImage {
     }
 
     pub fn set_cursor_position(&mut self, x: i32, y: i32, visible: bool) {
+        self.cursor_position_reported = true;
         if (x, y) != self.cursor_position || visible != self.cursor_visible {
             self.cursor_position = (x, y);
             self.cursor_visible = visible;
@@ -2017,8 +2111,37 @@ impl DesktopImage {
     }
 
     pub fn set_cursor_shape(&mut self, shape: Option<CursorShape>) {
+        self.cursor_shape_reported = true;
         if shape != self.cursor {
             self.cursor = shape;
+            self.cursor_changed = true;
+        }
+    }
+
+    /// The cursor this image draws.
+    pub fn cursor(&self) -> DrawnCursor {
+        DrawnCursor {
+            shape: self.cursor.clone(),
+            position: self.cursor_position,
+            visible: self.cursor_visible,
+        }
+    }
+
+    /// A restarted capture can take a while to report a cursor that does
+    /// not move. Draw `previous`, the cursor the last capture of the same
+    /// area drew, until this capture reports the cursor itself, so the
+    /// cursor does not vanish from viewers' picture meanwhile.
+    pub fn restore_cursor(&mut self, previous: DrawnCursor) {
+        if !self.cursor_shape_reported && self.cursor != previous.shape {
+            self.cursor = previous.shape;
+            self.cursor_changed = true;
+        }
+        if !self.cursor_position_reported
+            && (self.cursor_position != previous.position
+                || self.cursor_visible != previous.visible)
+        {
+            self.cursor_position = previous.position;
+            self.cursor_visible = previous.visible;
             self.cursor_changed = true;
         }
     }
@@ -3020,6 +3143,41 @@ mod tests {
     }
 
     #[test]
+    fn silent_captures_are_checked_only_while_viewers_watch() {
+        let mut watchdog = CaptureWatchdog::<&str>::default();
+        let due = CAPTURE_SILENCE_CHECK;
+        assert!(!watchdog.check_silence(0, due * 10, Some(&"main")));
+        assert!(!watchdog.check_silence(1, due - Duration::from_millis(1), Some(&"main")));
+        assert!(watchdog.check_silence(1, due, Some(&"main")));
+        // A healthy desktop at rest restarts quietly.
+        assert!(!watchdog.started(&"main"));
+        // Starting on other displays is always announced, as is a start
+        // without a check.
+        assert!(watchdog.check_silence(2, due, Some(&"main")));
+        assert!(watchdog.started(&"other"));
+        assert!(watchdog.started(&"other"));
+    }
+
+    #[test]
+    fn displays_are_asked_to_turn_on_once_per_outage_while_viewers_watch() {
+        use topvnc::CaptureStatus;
+        let mut watchdog = CaptureWatchdog::<&str>::default();
+        // Nobody watching, or a desktop that display power cannot help with.
+        assert!(!watchdog.failed(CaptureStatus::Unavailable, 0, || true));
+        assert!(!watchdog.failed(CaptureStatus::SecureDesktop, 1, || true));
+        assert!(!watchdog.failed(CaptureStatus::Unavailable, 1, || false));
+        assert!(watchdog.failed(CaptureStatus::Unavailable, 1, || true));
+        // Not on every retry of the same outage.
+        assert!(!watchdog.failed(CaptureStatus::NoDisplay, 2, || true));
+        // Recovering from a failed check is announced even on the same
+        // displays, and a later outage asks again.
+        assert!(watchdog.check_silence(1, CAPTURE_SILENCE_CHECK, Some(&"main")));
+        assert!(!watchdog.failed(CaptureStatus::Unavailable, 1, || true));
+        assert!(watchdog.started(&"main"));
+        assert!(watchdog.failed(CaptureStatus::NoDisplay, 1, || true));
+    }
+
+    #[test]
     fn viewers_learn_of_a_capture_outage_only_after_the_grace_period() {
         use topvnc::CaptureStatus;
         let start = Instant::now();
@@ -3559,6 +3717,50 @@ mod tests {
         assert!(CursorShape::new(CursorKind::Color, 1, 2, 4, vec![0; 4]).is_err());
         assert!(CursorShape::new(CursorKind::MaskedColor, 1, 1, 4, vec![0, 0, 0, 7]).is_err());
         assert!(CursorShape::new(CursorKind::Color, 0, 1, 4, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_restarted_capture_keeps_drawing_the_cursor_until_it_reports_one() {
+        let shape = CursorShape::new(CursorKind::Color, 1, 1, 4, [0xff; 4].to_vec()).unwrap();
+        let mut old = DesktopImage::new(4, 1);
+        old.set_cursor_shape(Some(shape.clone()));
+        old.set_cursor_position(2, 0, true);
+
+        // The restarted image's first picture already has the cursor, so
+        // viewers see no change at all.
+        let mut image = DesktopImage::new(4, 1);
+        image.restore_cursor(old.cursor());
+        let (mut output, mut damage) = (vec![0; 4], Vec::new());
+        image.present(&[image.bounds()], &mut output, &mut damage);
+        assert_eq!(output, [0, 0, 0x00ff_ffff, 0]);
+
+        // What the new capture reports wins, and is not undone by a late
+        // restore.
+        image.set_cursor_position(0, 0, false);
+        image.restore_cursor(old.cursor());
+        damage.clear();
+        image.present(&[], &mut output, &mut damage);
+        assert_eq!(output, [0; 4]);
+        let mut reported = DesktopImage::new(4, 1);
+        reported.set_cursor_shape(None);
+        reported.restore_cursor(old.cursor());
+        assert_eq!(reported.cursor().shape, None);
+
+        let mut position_only = DesktopImage::new(4, 1);
+        position_only.set_cursor_position(1, 0, true);
+        position_only.restore_cursor(old.cursor());
+        damage.clear();
+        position_only.present(&[position_only.bounds()], &mut output, &mut damage);
+        assert_eq!(output, [0, 0x00ff_ffff, 0, 0]);
+
+        let mut shape_only = DesktopImage::new(4, 1);
+        let replacement =
+            CursorShape::new(CursorKind::Color, 1, 1, 4, vec![0xff, 0, 0, 0xff]).unwrap();
+        shape_only.set_cursor_shape(Some(replacement));
+        shape_only.restore_cursor(old.cursor());
+        damage.clear();
+        shape_only.present(&[shape_only.bounds()], &mut output, &mut damage);
+        assert_eq!(output, [0, 0, 0x0000_00ff, 0]);
     }
 
     #[test]
