@@ -1980,6 +1980,21 @@ impl DesktopImage {
         Rect::new(0, 0, self.width as i32, self.height as i32)
     }
 
+    /// Start from the desktop that `previous`, a stopped capture of the same
+    /// area, served instead of from black, so areas this capture has not
+    /// copied yet keep their last picture. Its drawn cursor area is taken
+    /// too, so the next present erases that cursor or redraws the one this
+    /// capture reports. Returns false, changing nothing, when the sizes
+    /// differ.
+    pub fn continue_from(&mut self, previous: &DesktopImage) -> bool {
+        if (previous.width, previous.height) != (self.width, self.height) {
+            return false;
+        }
+        self.clean.copy_from_slice(&previous.clean);
+        self.drawn_cursor = previous.drawn_cursor;
+        true
+    }
+
     pub fn copy_from(&mut self, surface: &CaptureSurface<'_>, rect: Rect) {
         if let Some(rect) = rect.intersect(self.bounds()) {
             surface.copy_rect(rect, &mut self.clean, self.width);
@@ -3559,6 +3574,44 @@ mod tests {
         assert!(CursorShape::new(CursorKind::Color, 1, 2, 4, vec![0; 4]).is_err());
         assert!(CursorShape::new(CursorKind::MaskedColor, 1, 1, 4, vec![0, 0, 0, 7]).is_err());
         assert!(CursorShape::new(CursorKind::Color, 0, 1, 4, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_restarted_capture_keeps_the_last_picture_until_it_copies_one() {
+        let shape = CursorShape::new(CursorKind::Color, 1, 1, 4, [0xff; 4].to_vec()).unwrap();
+        let mut old = DesktopImage::new(4, 1);
+        old.clean.fill(0x11);
+        old.set_cursor_shape(Some(shape.clone()));
+        old.set_cursor_position(2, 0, true);
+        let (mut output, mut damage) = (vec![0; 4], Vec::new());
+        old.present(&[old.bounds()], &mut output, &mut damage);
+        let served = [0x11, 0x11, 0x00ff_ffff, 0x11];
+        assert_eq!(output, served);
+
+        // Nothing copied yet: even presenting the whole area shows the last
+        // picture, not black, with the cursor the new capture reports.
+        let mut image = DesktopImage::new(4, 1);
+        assert!(image.continue_from(&old));
+        image.set_cursor_shape(Some(shape));
+        image.set_cursor_position(2, 0, true);
+        damage.clear();
+        image.present(&[image.bounds()], &mut output, &mut damage);
+        assert_eq!(output, served);
+
+        // A cursor the new capture does not report is erased, not left
+        // behind.
+        let mut image = DesktopImage::new(4, 1);
+        assert!(image.continue_from(&old));
+        damage.clear();
+        image.present(&[], &mut output, &mut damage);
+        assert_eq!(damage, [Rect::new(2, 0, 3, 1)]);
+        assert_eq!(output, [0x11; 4]);
+
+        // A capture of another size starts from black.
+        let mut other = DesktopImage::new(2, 2);
+        assert!(!other.continue_from(&old));
+        assert!(other.clean.iter().all(|pixel| *pixel == 0));
+        assert_eq!(other.drawn_cursor, None);
     }
 
     #[test]
