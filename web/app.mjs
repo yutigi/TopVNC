@@ -13,6 +13,7 @@ import { attachTextInput } from "./text-input.mjs";
 import { View } from "./view.mjs";
 import { createMobileControls } from "./mobile-controls.mjs";
 import { createModals } from "./modal.mjs";
+import { lockSystemKeys } from "./system-keys.mjs";
 
 const $ = (selector) => document.querySelector(selector);
 const home = $("#home");
@@ -35,6 +36,8 @@ const toolbar = $("#toolbar");
 const functionKeys = $("#function-keys");
 const menu = $("#menu");
 const keyboard = $("#keyboard");
+const zoomShortcuts = $("#zoom-shortcuts");
+const windowsKey = $("#windows-key");
 
 const BUTTON = { left: 1, middle: 2, right: 4, wheelUp: 8, wheelDown: 16, wheelLeft: 32, wheelRight: 64, back: 128, forward: 256 };
 // KeyboardEvent.buttons bits, in order: left, right, middle, back, forward.
@@ -59,6 +62,8 @@ try {
 } catch {
   storage = undefined;
 }
+zoomShortcuts.checked = preference("zoomShortcuts", "true") === "true";
+windowsKey.checked = preference("windowsKey", "true") === "true";
 
 let pending; // A scanned invite and a new browser key, kept in memory until verified.
 let state = "idle"; // idle | connecting | password | connected
@@ -69,6 +74,8 @@ let relativePointer = false;
 const mode = preference("mode", "trackpad");
 let buttons = 0;
 let pointerPosition = { x: 0, y: 0 };
+// A Ctrl-drag panning the zoomed view: its pointer and last screen point.
+let panning = null;
 // Mouse users see their own cursor; touch input aims a drawn one.
 let touchInput = matchMedia("(pointer: coarse)").matches;
 let mobile;
@@ -236,6 +243,7 @@ function clearViewer() {
   frame = { width: 0, height: 0 };
   oversized = relativePointer = false;
   wheelX = wheelY = 0;
+  panning = null;
   view.reset();
   passwordInput.value = "";
   passwordForm.hidden = true;
@@ -439,7 +447,17 @@ function layout() {
   const box = screen.getBoundingClientRect();
   view.layout(box.width, box.height, frame.width, frame.height);
   Object.assign(canvas.style, view.style());
+  showZoom();
   updateCursor();
+}
+
+// The Fit button says how far the local view is zoomed in.
+function showZoom() {
+  const fitButton = $("#fit");
+  const zoomed = view.zoom > 1;
+  const factor = view.zoom < 10 ? view.zoom.toFixed(1).replace(/\.0$/, "") : String(Math.round(view.zoom));
+  fitButton.textContent = zoomed ? `Fit · ${factor}×` : "Fit";
+  fitButton.title = zoomed ? `Zoomed ${factor}× — click to fit the whole screen` : "Fit the whole screen";
 }
 
 function updateCursor() {
@@ -500,9 +518,13 @@ function sendPointer(motion) {
   else input({ kind: "pointer", buttons, x: pointerPosition.x, y: pointerPosition.y, motion });
 }
 
-function moveTo(point) {
+function aimAt(point) {
   pointerPosition = view.toFrame(point.x, point.y, frame.width, frame.height);
   updateCursor();
+}
+
+function moveTo(point) {
+  aimAt(point);
   sendPointer(true);
 }
 
@@ -572,6 +594,11 @@ screen.addEventListener("pointerdown", (event) => {
     return;
   }
   screen.setPointerCapture(event.pointerId);
+  // Ctrl-left-drag pans a zoomed view; the click stays local.
+  if (zoomShortcuts.checked && event.ctrlKey && event.button === 0 && view.zoom > 1 && !document.pointerLockElement) {
+    panning = { id: event.pointerId, ...screenPoint(event) };
+    return;
+  }
   if (relativePointer && !document.pointerLockElement) {
     canvas.requestPointerLock?.();
     return;
@@ -585,6 +612,13 @@ screen.addEventListener("pointermove", (event) => {
   if (event.pointerType === "touch") {
     const point = screenPoint(event);
     gestures.move(event.pointerId, point.x, point.y, event.timeStamp);
+    return;
+  }
+  if (panning?.id === event.pointerId) {
+    const point = screenPoint(event);
+    view.pan(point.x - panning.x, point.y - panning.y);
+    panning = { id: event.pointerId, ...point };
+    layout();
     return;
   }
   if (document.pointerLockElement === canvas) {
@@ -604,6 +638,10 @@ for (const type of ["pointerup", "pointercancel"]) {
       else gestures.up(event.pointerId, point.x, point.y, event.timeStamp);
       return;
     }
+    if (panning?.id === event.pointerId) {
+      panning = null;
+      return;
+    }
     domButtons(type === "pointercancel" ? 0 : event.buttons);
   });
 }
@@ -617,8 +655,8 @@ let wheelY = 0;
 screen.addEventListener("wheel", (event) => {
   if (state !== "connected") return;
   event.preventDefault();
-  if (event.ctrlKey) {
-    // Trackpad pinch on desktop browsers zooms the local view.
+  if (zoomShortcuts.checked && event.ctrlKey) {
+    // Trackpad pinch and Ctrl+wheel on desktop browsers zoom the local view.
     view.zoomAt(Math.exp(-event.deltaY / 100), ...Object.values(screenPoint(event)));
     layout();
     return;
@@ -630,6 +668,7 @@ screen.addEventListener("wheel", (event) => {
   const stepsY = Math.trunc(wheelY);
   wheelX -= stepsX;
   wheelY -= stepsY;
+  if (!relativePointer && (stepsX !== 0 || stepsY !== 0)) aimAt(screenPoint(event));
   wheel(stepsX, stepsY);
 }, { passive: false });
 
@@ -714,6 +753,14 @@ for (const bar of [toolbar, functionKeys]) {
 }
 
 $("#disconnect").addEventListener("click", () => switchMachine(selected, { disconnect: true }));
+zoomShortcuts.addEventListener("change", () => remember("zoomShortcuts", zoomShortcuts.checked));
+// In fullscreen, shortcuts such as Win+Space go to the host, not this computer.
+const updateSystemKeys = () => lockSystemKeys(navigator.keyboard, { fullscreen: document.fullscreenElement === viewer, enabled: windowsKey.checked });
+document.addEventListener("fullscreenchange", updateSystemKeys);
+windowsKey.addEventListener("change", () => {
+  remember("windowsKey", windowsKey.checked);
+  updateSystemKeys();
+});
 $("#stats-toggle").addEventListener("change", (event) => {
   statsLine.hidden = !event.target.checked;
 });

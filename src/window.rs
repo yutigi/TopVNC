@@ -5,9 +5,12 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use topvnc::presentation::MotionPresentation;
+#[cfg(windows)]
+use windows_sys::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
+use winit::keyboard::KeyCode;
 use winit::platform::pump_events::EventLoopExtPumpEvents;
 use winit::window::{Window, WindowAttributes, WindowId};
 
@@ -19,12 +22,31 @@ pub enum UiEvent {
     Device(DeviceEvent),
     /// Another thread woke the loop, as when a frame has arrived.
     Wake,
+    /// A key taken from the system before it could act on a shortcut, such
+    /// as Win+Space, so it reaches the remote computer instead. These keys
+    /// never arrive as window events.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    SystemKey {
+        code: KeyCode,
+        down: bool,
+    },
+}
+
+/// What other threads send the event loop. One queue keeps taken keys in
+/// the order they were pressed.
+enum UserEvent {
+    Wake,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    SystemKey {
+        code: KeyCode,
+        down: bool,
+    },
 }
 
 /// The event loop every window shares. It runs inside the caller's loop:
 /// [`Ui::pump`] returns as soon as events arrive.
 pub struct Ui {
-    event_loop: EventLoop<()>,
+    event_loop: EventLoop<UserEvent>,
     collector: Collector,
     /// Every surface and the device come from this one instance.
     instance: wgpu::Instance,
@@ -47,7 +69,7 @@ impl Collector {
     }
 }
 
-impl ApplicationHandler for Collector {
+impl ApplicationHandler<UserEvent> for Collector {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: StartCause) {
         self.create_pending(event_loop);
     }
@@ -56,8 +78,11 @@ impl ApplicationHandler for Collector {
         self.create_pending(event_loop);
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, (): ()) {
-        self.events.push(UiEvent::Wake);
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        self.events.push(match event {
+            UserEvent::Wake => UiEvent::Wake,
+            UserEvent::SystemKey { code, down } => UiEvent::SystemKey { code, down },
+        });
     }
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -80,13 +105,44 @@ impl ApplicationHandler for Collector {
 
 /// Wakes [`Ui::pump`] from another thread.
 #[derive(Clone)]
-pub struct Waker(EventLoopProxy<()>);
+pub struct Waker(EventLoopProxy<UserEvent>);
 
 impl Waker {
     pub fn wake(&self) {
         // Fails only once the event loop is gone.
-        let _ = self.0.send_event(());
+        let _ = self.0.send_event(UserEvent::Wake);
     }
+}
+
+/// Hands keys taken from the system to [`Ui::pump`] from another thread, as
+/// [`UiEvent::SystemKey`].
+#[derive(Clone)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct KeySender(EventLoopProxy<UserEvent>);
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl KeySender {
+    pub fn send(&self, code: KeyCode, down: bool) {
+        // Fails only once the event loop is gone.
+        let _ = self.0.send_event(UserEvent::SystemKey { code, down });
+    }
+}
+
+#[cfg(windows)]
+fn unregister_raw_keyboard() -> std::io::Result<()> {
+    // Winit registers both HID devices together. Raw keyboard input can
+    // bypass WH_KEYBOARD_LL while this process has focus. We only use raw
+    // mouse motion and take ordinary keys through window events.
+    let keyboard = RAWINPUTDEVICE {
+        usUsagePage: 0x01, // Generic Desktop Controls.
+        usUsage: 0x06,     // Keyboard.
+        dwFlags: RIDEV_REMOVE,
+        hwndTarget: std::ptr::null_mut(),
+    };
+    if unsafe { RegisterRawInputDevices(&keyboard, 1, size_of::<RAWINPUTDEVICE>() as u32) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl Ui {
@@ -99,6 +155,10 @@ impl Ui {
         }
         let event_loop = builder.build()?;
         event_loop.listen_device_events(DeviceEvents::WhenFocused);
+        #[cfg(windows)]
+        if let Err(error) = unregister_raw_keyboard() {
+            eprintln!("TopVNC: could not disable raw keyboard input: {error}");
+        }
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(event_loop.owned_display_handle()),
         ));
@@ -112,6 +172,11 @@ impl Ui {
 
     pub fn waker(&self) -> Waker {
         Waker(self.event_loop.create_proxy())
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn key_sender(&self) -> KeySender {
+        KeySender(self.event_loop.create_proxy())
     }
 
     /// Dispatch pending window and device events, first waiting up to

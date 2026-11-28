@@ -139,7 +139,9 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
   await command("Page.addScriptToEvaluateOnNewDocument", { source: `
     window.fixture = { workers: [], messages: [] };
     const keys = ${JSON.stringify(keys)};
-    localStorage.clear();
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith('topvnc.e2e.pairing.')) localStorage.removeItem(key);
+    }
     if (location.search.includes('legacy')) {
       localStorage.setItem('topvnc.e2e.pairing.v1', JSON.stringify({ version: 1, ...keys[0] }));
     } else {
@@ -164,6 +166,80 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
   await waitFor("!document.querySelector('#password-form').hidden");
   await evaluate("document.querySelector('#password').value = 'ephemeral'; document.querySelector('#password-form').requestSubmit()");
   await waitFor("!document.querySelector('#viewer').hidden");
+  const ctrlScroll = (deltaY = -100) => evaluate(`(() => {
+    const screen = document.querySelector('#screen');
+    const box = screen.getBoundingClientRect();
+    const start = fixture.messages.length;
+    const ctrl = { code: 'ControlLeft', bubbles: true, cancelable: true };
+    screen.dispatchEvent(new KeyboardEvent('keydown', ctrl));
+    const wheel = new WheelEvent('wheel', {
+      ctrlKey: true, deltaY: ${deltaY}, clientX: box.left + box.width / 2,
+      clientY: box.top + box.height / 2, cancelable: true,
+    });
+    screen.dispatchEvent(wheel);
+    screen.dispatchEvent(new KeyboardEvent('keyup', ctrl));
+    return {
+      prevented: wheel.defaultPrevented,
+      inputs: fixture.messages.slice(start).filter(m => m.type === 'input').map(m =>
+        m.kind === 'code' ? [m.code, m.down] : [m.kind, m.buttons]),
+    };
+  })()`);
+  assert.deepEqual(await ctrlScroll(-100 * Math.log(1.25)), { prevented: true, inputs: [["ControlLeft", true], ["ControlLeft", false]] });
+  const zoomed = await evaluate("document.querySelector('#fit').textContent");
+  assert.match(zoomed, /×/);
+
+  const { start, end } = await evaluate(`(() => {
+    const screen = document.querySelector('#screen').getBoundingClientRect();
+    const canvas = document.querySelector('#canvas').getBoundingClientRect();
+    const horizontal = canvas.width > screen.width;
+    const point = fraction => ({
+      x: Math.round(screen.left + screen.width * (horizontal ? fraction : 0.5)),
+      y: Math.round(screen.top + screen.height * (horizontal ? 0.5 : fraction)),
+    });
+    return { start: point(0.25), end: point(0.75) };
+  })()`);
+  const mouse = (type, point, options = {}) => command("Input.dispatchMouseEvent", { type, ...point, ...options });
+  const messageCount = () => evaluate("fixture.messages.length");
+  const pointerInputs = (since) => evaluate(`fixture.messages.slice(${since}).filter(m => m.type === 'input' && m.kind === 'pointer')`);
+  const control = 2;
+  await mouse("mouseMoved", start);
+  for (const [button, mask, remoteBit] of [["right", 2, 4], ["middle", 4, 2]]) {
+    const since = await messageCount();
+    await mouse("mousePressed", start, { button, buttons: mask, modifiers: control, clickCount: 1 });
+    await mouse("mouseReleased", start, { button, buttons: 0, modifiers: control, clickCount: 1 });
+    assert.deepEqual((await pointerInputs(since)).filter(m => !m.motion).map(m => m.buttons), [remoteBit, 0], `Ctrl+${button} reaches the host`);
+  }
+
+  const panStart = await messageCount();
+  await mouse("mousePressed", start, { button: "left", buttons: 1, modifiers: control, clickCount: 1 });
+  await mouse("mouseMoved", end, { button: "left", buttons: 1, modifiers: control });
+  await mouse("mouseReleased", end, { button: "left", buttons: 0, modifiers: control, clickCount: 1 });
+  assert.deepEqual(await pointerInputs(panStart), [], "Ctrl+left drag stays local");
+  const expected = await evaluate(`(() => {
+    const canvas = document.querySelector('#canvas').getBoundingClientRect();
+    return {
+      x: Math.floor(800 * (${end.x} - canvas.left) / canvas.width),
+      y: Math.floor(600 * (${end.y} - canvas.top) / canvas.height),
+    };
+  })()`);
+  const wheelStart = await messageCount();
+  await mouse("mouseWheel", end, { deltaX: 0, deltaY: 100 });
+  const scrolled = await pointerInputs(wheelStart);
+  assert.deepEqual(scrolled.map(m => m.buttons), [16, 0]);
+  for (const { x, y } of scrolled) {
+    assert.ok(Math.abs(x - expected.x) <= 1 && Math.abs(y - expected.y) <= 1,
+      `wheel used (${x}, ${y}) with the cursor over (${expected.x}, ${expected.y})`);
+  }
+
+  await evaluate(`
+    document.querySelector('#show-menu').click();
+    document.querySelector('#zoom-shortcuts').click();
+    document.querySelector('#close-menu').click();
+  `);
+  assert.deepEqual(await ctrlScroll(), { prevented: true, inputs: [
+    ["ControlLeft", true], ["pointer", 8], ["pointer", 0], ["ControlLeft", false],
+  ] });
+  assert.equal(await evaluate("document.querySelector('#fit').textContent"), zoomed);
   await evaluate("fixture.workers[0].emit({ type: 'captureStatus', status: 2 })");
   assert.equal(await evaluate("!document.querySelector('#host-status').hidden && document.querySelector('#host-status').textContent.includes('lock screen')"), true);
   await evaluate(`
@@ -219,6 +295,7 @@ test("built page switches machines, isolates pairing, clears secrets and fences 
   // `?legacy` stores only a v1 pairing. With no migration target, no machine
   // uses it and Forget pairing cannot reach it, so the page offers to drop it.
   await navigate(`${origin}/?legacy`);
+  assert.equal(await evaluate("document.querySelector('#zoom-shortcuts').checked"), false, "the zoom preference survives a reload");
   assert.equal(await evaluate("document.querySelector('#legacy-pairing').hidden"), false);
   assert.equal(await evaluate("document.querySelector('#connect').disabled"), true);
   await evaluate("document.querySelector('#forget-legacy').click()");

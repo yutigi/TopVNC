@@ -1,5 +1,6 @@
 //! Session GPU work is isolated from the window/input event thread.
 use crate::ui::{self, Canvas, Config, Quality, ViewerSecurity, WindowMode};
+use crate::view_zoom::ViewZoom;
 use crate::window::{Draw, Presenter, Waker};
 use crate::{Overlay, RETRY_INTERVAL, clip, placement};
 use std::error::Error;
@@ -9,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use topvnc::presentation::{FrameMailbox, FramePacing, MotionPresentation};
 use topvnc::{PerformanceMode, ServedDisplays};
-use winit::window::Window;
+use winit::dpi::PhysicalSize;
 
 /// Only display settings cross the thread boundary; credentials stay on the UI.
 #[derive(Clone, PartialEq)]
@@ -21,6 +22,8 @@ pub struct RenderOptions {
     pub fps: usize,
     pub progressive: bool,
     pub relative_mouse: bool,
+    zoom_shortcuts: bool,
+    windows_key: bool,
     pub ui_scale: f32,
     pub debug: bool,
     pub open: bool,
@@ -30,12 +33,12 @@ pub struct RenderOptions {
     pub serve_display: Option<ServedDisplays>,
     pub viewport: (u32, u32),
     pub scale: f64,
+    pub zoom: ViewZoom,
 }
 
 impl RenderOptions {
     /// Call on the window event thread, where native geometry is available.
-    pub fn new(config: &Config, window: &Window) -> Self {
-        let size = window.inner_size();
+    pub fn new(config: &Config, size: PhysicalSize<u32>, scale: f64) -> Self {
         Self {
             window_mode: config.window_mode,
             quality: config.quality,
@@ -44,6 +47,8 @@ impl RenderOptions {
             fps: config.fps,
             progressive: config.progressive,
             relative_mouse: config.relative_mouse,
+            zoom_shortcuts: config.zoom_shortcuts,
+            windows_key: config.windows_key,
             ui_scale: config.ui_scale,
             debug: config.debug,
             open: false,
@@ -52,7 +57,8 @@ impl RenderOptions {
             serve_scale: None,
             serve_display: None,
             viewport: (size.width, size.height),
-            scale: window.scale_factor(),
+            scale,
+            zoom: ViewZoom::default(),
         }
     }
 
@@ -65,6 +71,8 @@ impl RenderOptions {
             fps: self.fps,
             progressive: self.progressive,
             relative_mouse: self.relative_mouse,
+            zoom_shortcuts: self.zoom_shortcuts,
+            windows_key: self.windows_key,
             ui_scale: self.ui_scale,
             debug: self.debug,
             ..Config::default()
@@ -334,7 +342,17 @@ fn render_loop(
             ]
         };
         let mut draws = Vec::with_capacity(2);
-        if let Some((target, source)) = placement(options.window_mode, remote, logical) {
+        if let Some((target, source)) = options.zoom.draw(options.window_mode, remote, logical) {
+            let [x, y, width, height] = target;
+            draws.push(Draw {
+                layer: &image,
+                target: [x * scale, y * scale, width * scale, height * scale],
+                source,
+                // Deep zoom shows remote pixels as sharp squares.
+                smooth: options.quality == Quality::Smooth
+                    && !options.zoom.pixelated(options.window_mode, remote, logical),
+            });
+        } else if let Some((target, source)) = placement(options.window_mode, remote, logical) {
             draws.push(Draw {
                 layer: &image,
                 target: physical(target.x0, target.y0, target.width(), target.height()),
@@ -372,5 +390,36 @@ fn render_loop(
             };
         }
         redraw = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_overlay_reflects_zoom_shortcut_changes() {
+        let mut config = Config::default();
+        let size = PhysicalSize::new(800, 600);
+        let enabled = RenderOptions::new(&config, size, 1.0);
+        assert!(enabled.config().zoom_shortcuts);
+
+        config.zoom_shortcuts = false;
+        let disabled = RenderOptions::new(&config, size, 1.0);
+        assert!(!disabled.config().zoom_shortcuts);
+        assert!(enabled != disabled);
+    }
+
+    #[test]
+    fn session_overlay_reflects_windows_key_changes() {
+        let mut config = Config::default();
+        let size = PhysicalSize::new(800, 600);
+        let enabled = RenderOptions::new(&config, size, 1.0);
+        assert!(enabled.config().windows_key);
+
+        config.windows_key = false;
+        let disabled = RenderOptions::new(&config, size, 1.0);
+        assert!(!disabled.config().windows_key);
+        assert!(enabled != disabled);
     }
 }

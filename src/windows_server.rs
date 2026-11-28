@@ -376,7 +376,7 @@ pub fn serve(
         report(ServerNotice::Message(error));
     }
     let mut follower = DisplayFollower::new(display);
-    let (capture, plan) = start_capture(&mut follower).map_err(|error| {
+    let (capture, plan) = start_capture(&mut follower, None).map_err(|error| {
         format!(
             "{error}. Run the server in an interactive, unlocked desktop session; \
              services, disconnected Remote Desktop sessions, and the secure desktop cannot be captured"
@@ -516,6 +516,8 @@ fn serve_desktop(
     let mut connections = 0;
     let mut pointer_mode = PointerModeHint::default();
     let mut outage = CaptureOutage::default();
+    // The picture the stopped capture served, which viewers still see.
+    let mut previous_picture: Option<CapturePicture> = None;
     while !shutdown.load(Ordering::Acquire) {
         if capture.is_none() {
             outage.stopped(Instant::now());
@@ -599,7 +601,9 @@ fn serve_desktop(
             DisplayChange::Restart => {
                 // A display can be duplicated once per process; stop first.
                 outage.stopped(Instant::now());
-                capture = None;
+                if let Some(picture) = capture.take().and_then(DesktopCapture::into_picture) {
+                    previous_picture = Some(picture);
+                }
                 follower.stopped();
                 next_retry = Instant::now();
                 retry_delay = CAPTURE_RETRY_MIN;
@@ -619,8 +623,9 @@ fn serve_desktop(
                 report(ServerNotice::Message(error.clone()));
                 last_capture_error = error;
             }
-            match start_capture(&mut follower) {
+            match start_capture(&mut follower, previous_picture.as_ref()) {
                 Ok((recreated, plan)) => {
+                    previous_picture = None;
                     let size = (recreated.placement.width, recreated.placement.height);
                     if size != (framebuffer.width() as u16, framebuffer.height() as u16) {
                         framebuffer = Framebuffer::new(size.0, size.1)?;
@@ -672,7 +677,9 @@ fn serve_desktop(
                 "Desktop capture paused: {error}"
             )));
             last_capture_error = error.to_string();
-            capture = None;
+            if let Some(picture) = capture.take().and_then(DesktopCapture::into_picture) {
+                previous_picture = Some(picture);
+            }
             follower.stopped();
             next_retry = Instant::now() + retry_delay;
             continue;
@@ -1552,6 +1559,15 @@ struct DesktopCapture {
     gpu_priority_raised: bool,
 }
 
+/// The picture a stopped capture served, for a new capture of the same area.
+struct CapturePicture {
+    /// The desktop area it covers.
+    area: Rect,
+    image: DesktopImage,
+    /// Regions copied into `image` that were not presented yet.
+    pending: Vec<Rect>,
+}
+
 /// What capture threads hand to the serving loop.
 struct CaptureShared {
     state: Mutex<CaptureState>,
@@ -1574,8 +1590,23 @@ impl CaptureShared {
         }
     }
 
+    /// Before capture threads start: show `previous`, the picture a stopped
+    /// capture of the same area served, until the displays present an
+    /// image. Windows does not present an idle desktop, and a restart would
+    /// otherwise serve black meanwhile.
+    fn continue_from(&self, previous: &CapturePicture) {
+        if let Ok(mut state) = self.state.lock()
+            && state.image.continue_from(&previous.image)
+        {
+            // Viewers already have that picture, except what it had not yet
+            // presented.
+            state.captured.clone_from(&previous.pending);
+            state.changed = !state.captured.is_empty();
+        }
+    }
+
     /// Duplication can start successfully on an output that never delivers
-    /// an image. Establish a complete first image before declaring it live.
+    /// a frame. Wait for a frame from every output before declaring it live.
     fn wait_for_first_frames(&self, timeout: Duration) -> Result<(), Box<dyn Error>> {
         let state = self
             .state
@@ -1607,7 +1638,7 @@ struct CaptureState {
     captured: Vec<Rect>,
     /// The image or cursor changed since the serving loop last presented.
     changed: bool,
-    /// Decremented once per output, after its first full image is copied.
+    /// Decremented once per output, when its first frame arrives.
     first_frames_pending: usize,
     pointer: PointerOwner,
     /// Why a display's capture stopped; the whole capture is then recreated.
@@ -1637,9 +1668,12 @@ fn capture_failure_status(error: &(dyn Error + 'static)) -> CaptureStatus {
 }
 
 /// Start capturing what `follower` selects, among the displays attached
-/// now, and tell it what is served.
+/// now, and tell it what is served. `previous` is the picture the last
+/// capture served; a capture of the same area shows it until its displays
+/// present an image.
 fn start_capture(
     follower: &mut DisplayFollower,
+    previous: Option<&CapturePicture>,
 ) -> Result<(DesktopCapture, DisplayPlan), Box<dyn Error>> {
     // Read the layout first: a change while starting is then noticed.
     let layout = monitor_layout();
@@ -1657,7 +1691,7 @@ fn start_capture(
     let (capture, plan) = capture_selected_or_primary(
         DisplayPlan::for_layout(follower.selection(), &areas, &layout)?,
         &areas,
-        |plan| DesktopCapture::new(plan, &attached),
+        |plan| DesktopCapture::new(plan, &attached, previous),
         |capture| capture.shared.wait_for_first_frames(FIRST_FRAME_TIMEOUT),
     )?;
     follower.started(plan.clone(), layout);
@@ -1715,8 +1749,13 @@ fn attached_areas() -> Result<Vec<DisplayArea>, String> {
 }
 
 impl DesktopCapture {
-    /// Capture the displays `plan` chose from `attached`.
-    fn new(plan: &DisplayPlan, attached: &[AttachedOutput]) -> Result<Self, Box<dyn Error>> {
+    /// Capture the displays `plan` chose from `attached`. If `previous`
+    /// covers the same area, show its picture until they present an image.
+    fn new(
+        plan: &DisplayPlan,
+        attached: &[AttachedOutput],
+        previous: Option<&CapturePicture>,
+    ) -> Result<Self, Box<dyn Error>> {
         let bounds = plan.chosen.bounds;
         let width = u16::try_from(bounds.right - bounds.left)
             .map_err(|_| "display width is outside VNC limits")?;
@@ -1749,6 +1788,7 @@ impl DesktopCapture {
             },
             gpu_priority_raised: captures.iter().all(|output| output.gpu_priority_raised),
         };
+        capture.continue_from(previous);
         for output in captures {
             let shared = Arc::clone(&capture.shared);
             let stop = Arc::clone(&capture.stop);
@@ -1789,14 +1829,53 @@ impl DesktopCapture {
         }
         Ok(())
     }
-}
 
-impl Drop for DesktopCapture {
-    fn drop(&mut self) {
+    /// The desktop area this capture covers.
+    fn area(&self) -> Rect {
+        let placement = &self.placement;
+        Rect::new(
+            placement.left,
+            placement.top,
+            placement.left + i32::from(placement.width),
+            placement.top + i32::from(placement.height),
+        )
+    }
+
+    /// Before its threads start: if `previous` covers the same area, show
+    /// its picture until the displays present an image.
+    fn continue_from(&self, previous: Option<&CapturePicture>) {
+        if let Some(previous) = previous
+            && previous.area == self.area()
+        {
+            self.shared.continue_from(previous);
+        }
+    }
+
+    fn stop_threads(&mut self) {
         self.stop.store(true, Ordering::Release);
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
+    }
+
+    /// Stop capturing and return the picture served, for a new capture of
+    /// the same area; see [`CaptureShared::continue_from`].
+    fn into_picture(mut self) -> Option<CapturePicture> {
+        self.stop_threads();
+        let area = self.area();
+        let mut state = self.shared.state.lock().ok()?;
+        let state = &mut *state;
+        Some(CapturePicture {
+            area,
+            image: std::mem::replace(&mut state.image, DesktopImage::new(0, 0)),
+            pending: std::mem::take(&mut state.captured),
+        })
+    }
+}
+
+impl Drop for DesktopCapture {
+    fn drop(&mut self) {
+        self.stop_threads();
     }
 }
 
@@ -1838,8 +1917,10 @@ struct OutputCapture {
     rotation: Rotation,
     source_width: u16,
     source_height: u16,
-    /// The next frame must be copied in full.
+    /// The next frame with a desktop image must be copied in full.
     full_frame_pending: bool,
+    /// No frame has arrived yet. Startup waits for one from each display.
+    first_frame_pending: bool,
     pointer_shape: Vec<u8>,
     move_rects: Vec<DXGI_OUTDUPL_MOVE_RECT>,
     dirty_rects: Vec<RECT>,
@@ -1913,6 +1994,7 @@ impl OutputCapture {
             source_width,
             source_height,
             full_frame_pending: true,
+            first_frame_pending: true,
             pointer_shape: Vec::new(),
             move_rects: Vec::new(),
             dirty_rects: Vec::new(),
@@ -1939,8 +2021,11 @@ impl OutputCapture {
             0 => None,
             size => Some(self.read_pointer_shape(size)?),
         };
-        // Only the pointer changed when nothing was presented.
-        let texture = if frame_info.LastPresentTime != 0 || self.full_frame_pending {
+        // Only the pointer changed when nothing was presented, and then the
+        // frame's image is not the desktop. A new duplication's first frame
+        // is such a frame, and its image is black: copy nothing until the
+        // desktop is presented.
+        let texture = if frame_info.LastPresentTime != 0 {
             let resource = resource.ok_or("Desktop Duplication returned no frame resource")?;
             let texture: ID3D11Texture2D = resource.cast()?;
             let mut texture_desc = D3D11_TEXTURE2D_DESC::default();
@@ -2024,10 +2109,14 @@ impl OutputCapture {
                 state.captured.clear();
                 state.captured.push(state.image.bounds());
             }
-            if self.full_frame_pending {
-                state.first_frames_pending -= 1;
-            }
             self.full_frame_pending = false;
+        }
+        // An idle desktop may not be presented for seconds, so a display is
+        // live once it delivers any frame. Until it presents an image, the
+        // picture a previous capture of this area served stays in place.
+        if self.first_frame_pending {
+            self.first_frame_pending = false;
+            state.first_frames_pending -= 1;
         }
         state.changed = true;
         shared.changed.notify_all();
@@ -2515,13 +2604,13 @@ mod tests {
     }
 
     #[test]
-    fn startup_requires_a_first_image_from_every_selected_output() {
+    fn startup_requires_a_first_frame_from_every_selected_output() {
         let shared = CaptureShared::new(4, 2, 2);
         assert!(shared.wait_for_first_frames(Duration::ZERO).is_err());
         {
             let mut state = shared.state.lock().unwrap();
-            // A cursor change or an image from only one output cannot make
-            // a combined capture live.
+            // Frames from only one output cannot make a combined capture
+            // live, whatever they changed.
             state.changed = true;
             state.first_frames_pending = 1;
         }
@@ -2533,6 +2622,102 @@ mod tests {
         let state = shared.state.lock().unwrap();
         assert!(state.changed);
         assert_eq!(state.captured, [Rect::new(0, 0, 4, 2)]);
+    }
+
+    /// A capture of `area` without threads; the test delivers its frames.
+    fn headless_capture(area: Rect, previous: Option<&CapturePicture>) -> DesktopCapture {
+        let width = (area.right - area.left) as u16;
+        let height = (area.bottom - area.top) as u16;
+        let capture = DesktopCapture {
+            shared: Arc::new(CaptureShared::new(width, height, 1)),
+            stop: Arc::new(AtomicBool::new(false)),
+            threads: Vec::new(),
+            placement: DisplayPlacement {
+                left: area.left,
+                top: area.top,
+                width,
+                height,
+                served_width: width,
+                served_height: height,
+            },
+            gpu_priority_raised: true,
+        };
+        capture.continue_from(previous);
+        capture
+    }
+
+    /// Deliver a frame as a capture thread does: with the desktop image, or
+    /// pointer-only, as Windows reports a new duplication's first frame.
+    fn deliver(capture: &DesktopCapture, image: Option<&CaptureSurface<'_>>) {
+        let mut state = capture.shared.state.lock().unwrap();
+        let state = &mut *state;
+        if let Some(image) = image {
+            let bounds = state.image.bounds();
+            if let Some(changed) = state.image.copy_from_at(image, bounds, (0, 0)) {
+                state.captured.push(changed);
+            }
+        }
+        state.changed = true;
+    }
+
+    #[test]
+    fn a_restarted_capture_serves_the_last_picture_until_its_display_presents() {
+        let area = Rect::new(0, 0, 4, 2);
+        // BGRA bytes of a desktop that is 0x112233 everywhere.
+        let bytes = [0x33, 0x22, 0x11, 0xff].repeat(8);
+        let desktop = CaptureSurface {
+            bytes: &bytes,
+            row_pitch: 16,
+            width: 4,
+            height: 2,
+            rotation: Rotation::Identity,
+        };
+        let first = headless_capture(area, None);
+        deliver(&first, Some(&desktop));
+        let mut served = vec![0; 8];
+        first.next_frame(&mut served, &mut Vec::new()).unwrap();
+        assert_eq!(served, [0x11_2233; 8]);
+
+        // The restart's first frame only moves the pointer. Viewers keep
+        // their picture and are sent nothing.
+        let picture = first.into_picture().unwrap();
+        let restarted = headless_capture(area, Some(&picture));
+        deliver(&restarted, None);
+        let mut damage = Vec::new();
+        restarted.next_frame(&mut served, &mut damage).unwrap();
+        assert_eq!(served, [0x11_2233; 8]);
+        assert!(damage.is_empty());
+        // The presented desktop replaces it.
+        deliver(&restarted, Some(&desktop));
+        restarted.next_frame(&mut served, &mut damage).unwrap();
+        assert_eq!(damage, [area]);
+        assert_eq!(served, [0x11_2233; 8]);
+
+        // Regions captured but not yet presented when capture stopped are
+        // still sent.
+        let changed = Rect::new(1, 0, 2, 1);
+        restarted
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .captured
+            .push(changed);
+        let picture = restarted.into_picture().unwrap();
+        let resumed = headless_capture(area, Some(&picture));
+        damage.clear();
+        resumed.next_frame(&mut served, &mut damage).unwrap();
+        assert_eq!(damage, [changed]);
+
+        // Without that picture, the same pointer-only frame serves black,
+        // as a capture of another area does.
+        for other in [area, Rect::new(4, 0, 8, 2)] {
+            let fresh = headless_capture(other, (other != area).then_some(&picture));
+            deliver(&fresh, None);
+            let mut served = vec![0x11_2233; 8];
+            fresh.next_frame(&mut served, &mut Vec::new()).unwrap();
+            assert_eq!(served, [0; 8], "{other:?}");
+        }
     }
 
     #[test]
@@ -3087,6 +3272,56 @@ mod tests {
         }
     }
 
+    /// Restarts capture as a capture error or layout change does, at once
+    /// and after the retry delay, and checks that viewers never get a black
+    /// picture in between. A new duplication's first frame is pointer-only;
+    /// its image is black when no duplication ran for a while. Windows may
+    /// not present an idle desktop for seconds.
+    #[test]
+    #[ignore = "captures the live Windows desktop; run with --test-threads=1"]
+    fn restarted_captures_never_serve_a_black_desktop() {
+        enable_thread_dpi_awareness();
+        let mut follower = DisplayFollower::new(DisplaySelection::Primary);
+        let (mut capture, _) = start_capture(&mut follower, None).unwrap();
+        let size = usize::from(capture.placement.width) * usize::from(capture.placement.height);
+        let mut served = vec![0; size];
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(500)
+            || served.iter().all(|pixel| *pixel == 0)
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the desktop was never presented"
+            );
+            capture.next_frame(&mut served, &mut Vec::new()).unwrap();
+        }
+        for restart in 0..20 {
+            let before = served.clone();
+            let picture = capture.into_picture();
+            follower.stopped();
+            if restart % 2 == 1 {
+                thread::sleep(CAPTURE_RETRY_MIN);
+            }
+            (capture, _) = start_capture(&mut follower, picture.as_ref()).unwrap();
+            // Present at once and for a while, as the serving loop does.
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(300) {
+                capture.next_frame(&mut served, &mut Vec::new()).unwrap();
+                let blackened = before
+                    .iter()
+                    .zip(&served)
+                    .filter(|&(before, now)| *before != 0 && *now == 0)
+                    .count();
+                // A black flash blanks nearly every pixel; ordinary desktop
+                // changes, such as scrolling text, blank far fewer.
+                assert!(
+                    blackened < size / 2,
+                    "restart {restart}: {blackened} of {size} pixels turned black"
+                );
+            }
+        }
+    }
+
     /// Captures every display alone and all together, and checks that each
     /// display's area of the combined image received pixels.
     #[test]
@@ -3097,7 +3332,8 @@ mod tests {
         let mut selections = vec![DisplaySelection::Primary, DisplaySelection::All];
         selections.extend((1..=displays.len()).map(DisplaySelection::Number));
         for selection in selections {
-            let (capture, plan) = start_capture(&mut DisplayFollower::new(selection)).unwrap();
+            let (capture, plan) =
+                start_capture(&mut DisplayFollower::new(selection), None).unwrap();
             let chosen = choose_displays(selection, &displays).unwrap();
             assert_eq!(plan.chosen, chosen);
             assert_eq!(
@@ -3142,7 +3378,7 @@ mod tests {
         // differently keeps the capture; another display needs a new one.
         let primary = displays.iter().position(|display| display.primary).unwrap();
         let mut follower = DisplayFollower::new(DisplaySelection::Primary);
-        let (_capture, _) = start_capture(&mut follower).unwrap();
+        let (_capture, _) = start_capture(&mut follower, None).unwrap();
         assert_eq!(
             follower.request(primary as u8 + 1, attached_areas),
             DisplayChange::None

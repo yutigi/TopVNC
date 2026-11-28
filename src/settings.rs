@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 use crate::ui::Config;
 
-fn config_dir() -> Option<PathBuf> {
+fn directory() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(not(target_os = "windows"))]
@@ -20,12 +20,8 @@ fn config_dir() -> Option<PathBuf> {
         .map(|base| base.join("TopVNC"))
 }
 
-fn path() -> Option<PathBuf> {
-    config_dir().map(|dir| dir.join("last-session"))
-}
-
 pub fn viewer_cert_dir() -> Option<PathBuf> {
-    config_dir().map(|dir| dir.join(topvnc::transport::LOCAL_CERT_DIR))
+    directory().map(|dir| dir.join(topvnc::transport::LOCAL_CERT_DIR))
 }
 
 #[cfg(target_os = "windows")]
@@ -78,8 +74,18 @@ fn saved_password(host: &str, port: &str, password: Option<&str>) -> io::Result<
 }
 
 pub fn load(config: &mut Config) {
-    let Some(path) = path() else { return };
-    let Ok(contents) = fs::read_to_string(path) else {
+    let Some(dir) = directory() else { return };
+    if let Ok(saved) = fs::read_to_string(dir.join("zoom-shortcuts"))
+        && let Ok(enabled) = saved.trim().parse()
+    {
+        config.zoom_shortcuts = enabled;
+    }
+    if let Ok(saved) = fs::read_to_string(dir.join("windows-key"))
+        && let Ok(enabled) = saved.trim().parse()
+    {
+        config.windows_key = enabled;
+    }
+    let Ok(contents) = fs::read_to_string(dir.join("last-session")) else {
         return;
     };
     let mut lines = contents.lines();
@@ -130,8 +136,8 @@ mod tests {
 }
 
 pub fn save(config: &Config) -> io::Result<()> {
-    let path = path().ok_or_else(|| io::Error::other("settings directory unavailable"))?;
-    fs::create_dir_all(path.parent().unwrap())?;
+    let dir = directory().ok_or_else(|| io::Error::other("settings directory unavailable"))?;
+    fs::create_dir_all(&dir)?;
     #[cfg(target_os = "windows")]
     let password_result = protected_password(&config.password, true);
     #[cfg(target_os = "linux")]
@@ -144,7 +150,7 @@ pub fn save(config: &Config) -> io::Result<()> {
         ""
     };
     fs::write(
-        path,
+        dir.join("last-session"),
         format!(
             "topvnc-session-1\n{}\n{}\n{}\n",
             config.host.trim(),
@@ -153,4 +159,18 @@ pub fn save(config: &Config) -> io::Result<()> {
         ),
     )?;
     password_result.map(|_| ())
+}
+
+fn save_switch(name: &str, enabled: bool) -> io::Result<()> {
+    let dir = directory().ok_or_else(|| io::Error::other("settings directory unavailable"))?;
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(name), if enabled { "true" } else { "false" })
+}
+
+pub fn save_zoom_shortcuts(enabled: bool) -> io::Result<()> {
+    save_switch("zoom-shortcuts", enabled)
+}
+
+pub fn save_windows_key(enabled: bool) -> io::Result<()> {
+    save_switch("windows-key", enabled)
 }

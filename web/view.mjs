@@ -2,7 +2,11 @@
 // zoomed and panned on this device only. Nothing here changes what the host
 // sends.
 
-export const MAX_ZOOM = 5;
+export const MAX_ZOOM = 800;
+
+// From this many screen pixels per remote pixel up, draw remote pixels as
+// sharp squares instead of blurring them together.
+export const PIXELATED_FROM = 2;
 
 // The CSS size of the framebuffer fitted inside the viewer, keeping its
 // aspect ratio.
@@ -24,12 +28,14 @@ export class View {
     this.base = fit(0, 0, 0, 0);
     this.viewWidth = 0;
     this.viewHeight = 0;
+    this.frameWidth = 0;
   }
 
   // The viewer or framebuffer size changed: refit and keep the view valid.
   layout(viewWidth, viewHeight, frameWidth, frameHeight) {
     this.viewWidth = viewWidth;
     this.viewHeight = viewHeight;
+    this.frameWidth = frameWidth;
     this.base = fit(viewWidth, viewHeight, frameWidth, frameHeight);
     this.clamp();
   }
@@ -91,7 +97,13 @@ export class View {
       left: `${left}px`,
       top: `${top}px`,
       transform: `translate(${this.x}px, ${this.y}px) scale(${this.zoom})`,
+      imageRendering: this.pixelScale() >= PIXELATED_FROM ? "pixelated" : "auto",
     };
+  }
+
+  // Screen pixels per remote pixel as shown.
+  pixelScale() {
+    return this.frameWidth > 0 ? (this.base.width * this.zoom) / this.frameWidth : 0;
   }
 
   // Framebuffer coordinates of a viewer point, clamped to the framebuffer.

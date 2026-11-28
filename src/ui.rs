@@ -53,6 +53,10 @@ pub struct Config {
     pub allow_insecure: bool,
     pub window_mode: WindowMode,
     pub window_size: String,
+    pub zoom_shortcuts: bool,
+    /// On Windows viewers, send shortcuts with the Windows key, such as
+    /// Win+Space, to the remote computer while the viewer has focus.
+    pub windows_key: bool,
     /// Presentation limit in frames per second; 0 presents every frame as
     /// it arrives.
     pub fps: usize,
@@ -84,6 +88,8 @@ impl Default for Config {
             allow_insecure: false,
             window_mode: WindowMode::Fit,
             window_size: "1280x720".into(),
+            zoom_shortcuts: true,
+            windows_key: true,
             fps: 0,
             quality: Quality::Smooth,
             compression: Compression::Tight,
@@ -2528,14 +2534,32 @@ pub const LIVE_SHARP: Box2 = Box2 {
 pub const LIVE_MOUSE_AUTO: Box2 = Box2 {
     x: 24,
     y: 410,
-    w: 190,
+    w: 120,
     h: 38,
 };
 pub const LIVE_MOUSE_OFF: Box2 = Box2 {
+    x: 152,
+    y: 410,
+    w: 62,
+    h: 38,
+};
+/// Windows viewers share this row between the zoom and Windows-key switches.
+pub const LIVE_ZOOM_SHORTCUTS: Box2 = Box2 {
     x: 226,
     y: 410,
-    w: 190,
+    w: if cfg!(windows) { 84 } else { 190 },
     h: 38,
+};
+/// Only Windows viewers take Windows-key shortcuts from the system.
+pub const LIVE_WINDOWS_KEY: Option<Box2> = if cfg!(windows) {
+    Some(Box2 {
+        x: 318,
+        y: 410,
+        w: 98,
+        h: 38,
+    })
+} else {
+    None
 };
 pub const LIVE_WHOLE_UPDATE: Box2 = Box2 {
     x: 24,
@@ -2767,6 +2791,19 @@ pub fn overlay(
     canvas.text(24, 386, "GAME MOUSE", ACCENT, 2);
     canvas.button(LIVE_MOUSE_AUTO, "AUTO LOCK", config.relative_mouse);
     canvas.button(LIVE_MOUSE_OFF, "OFF", !config.relative_mouse);
+    if let Some(windows_key) = LIVE_WINDOWS_KEY {
+        // Each switch is lit while its shortcuts are on.
+        canvas.text(LIVE_ZOOM_SHORTCUTS.x, 386, "SHORTCUTS", ACCENT, 2);
+        canvas.button(LIVE_ZOOM_SHORTCUTS, "ZOOM", config.zoom_shortcuts);
+        canvas.button(windows_key, "WIN KEY", config.windows_key);
+    } else {
+        canvas.text(LIVE_ZOOM_SHORTCUTS.x, 386, "ZOOM SHORTCUTS", ACCENT, 2);
+        canvas.button(
+            LIVE_ZOOM_SHORTCUTS,
+            if config.zoom_shortcuts { "ON" } else { "OFF" },
+            config.zoom_shortcuts,
+        );
+    }
     canvas.text(24, 456, "PRESENT UPDATES", ACCENT, 2);
     canvas.button(LIVE_WHOLE_UPDATE, "WHOLE", config.upload_policy() == 0);
     canvas.button(LIVE_PROGRESSIVE, "PROGRESSIVE", config.upload_policy() == 1);
