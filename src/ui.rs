@@ -1588,6 +1588,13 @@ fn connect_tab(canvas: &mut Canvas<'_>, config: &Config, state: &UiState, connec
         if config.tls.unencrypted { ERROR } else { MUTED },
         1,
     );
+    if !config.tls.unencrypted {
+        let trust = match &config.tls.ca {
+            Some(path) => trust_path_label("TRUST: ", path, canvas.width.saturating_sub(400) / 6),
+            None => "TRUST: AUTO USER CONFIG / PUBLIC ROOTS".into(),
+        };
+        canvas.text(400, 345, &trust, MUTED, 1);
+    }
     canvas.label(40, 362, "WINDOW SIZE");
     canvas.button(FIT, "FIT", config.window_mode == WindowMode::Fit);
     canvas.button(NATIVE, "NATIVE", config.window_mode == WindowMode::Native);
@@ -2628,12 +2635,34 @@ fn ultra_button(canvas: &mut Canvas<'_>, area: Box2, performance: PerformanceMod
     canvas.button(area, if ultra { "ULTRA: ON" } else { "ULTRA: OFF" }, ultra);
 }
 
+fn trust_path_label(prefix: &str, path: &std::path::Path, max_chars: usize) -> String {
+    let path = path.to_string_lossy();
+    let budget = max_chars.saturating_sub(prefix.len());
+    if path.chars().count() <= budget {
+        return format!("{prefix}{path}");
+    }
+    let start = path
+        .char_indices()
+        .rev()
+        .take(budget.saturating_sub(3))
+        .last()
+        .map_or(path.len(), |(index, _)| index);
+    format!("{prefix}...{}", &path[start..])
+}
+
+pub enum ViewerSecurity {
+    Unencrypted,
+    PublicRoots,
+    Certificate(std::path::PathBuf),
+}
+
 pub fn overlay(
     canvas: &mut Canvas<'_>,
     config: &Config,
     open: bool,
     serve_scale: Option<u8>,
     serve_display: Option<ServedDisplays>,
+    security: &ViewerSecurity,
 ) {
     if !open {
         let area = open_settings_box(config.ui_scale);
@@ -2654,6 +2683,20 @@ pub fn overlay(
     canvas.frame(SETTINGS_PANEL, ACCENT);
     canvas.text(24, 28, "SESSION SETTINGS", TEXT, 3);
     canvas.button(CLOSE_SETTINGS, "CLOSE", false);
+    let label_right = (SETTINGS_PANEL.x + SETTINGS_PANEL.w - 16).min(canvas.width);
+    let (label, color) = match security {
+        ViewerSecurity::Unencrypted => ("TCP / UNENCRYPTED".into(), ERROR),
+        ViewerSecurity::PublicRoots => ("TLS 1.3 / PUBLIC ROOTS".into(), MUTED),
+        ViewerSecurity::Certificate(path) => (
+            trust_path_label(
+                "TLS 1.3 / TRUST: ",
+                path,
+                label_right.saturating_sub(24) / 6,
+            ),
+            MUTED,
+        ),
+    };
+    canvas.text(24, 52, &label, color, 1);
     canvas.text(24, 62, "WINDOW", ACCENT, 2);
     canvas.button(LIVE_FIT, "FIT", config.window_mode != WindowMode::Native);
     canvas.button(
@@ -2808,7 +2851,6 @@ pub fn overlay(
     );
     canvas.text(24, track_y + 26, "0.5X", MUTED, 1);
     canvas.text(384, track_y + 26, "2X", MUTED, 1);
-    canvas.text(24, 634, "RFB TRAFFIC IS UNENCRYPTED", ERROR, 2);
     canvas.button(
         LIVE_DEBUG,
         if config.debug {
@@ -2889,6 +2931,16 @@ fn glyph(c: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_label_keeps_the_certificate_filename_visible() {
+        let path =
+            std::path::Path::new("profiles/vnc-consulting/สำนักงาน/certs.local/office-pc.pem");
+        let label = trust_path_label("TRUST: ", path, 36);
+        assert!(label.starts_with("TRUST: ..."));
+        assert!(label.ends_with("office-pc.pem"));
+        assert_eq!(label.chars().count(), 36);
+    }
 
     #[test]
     fn ultra_overrides_pacing_and_preserves_user_settings_and_security() {

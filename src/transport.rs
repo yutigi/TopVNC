@@ -3,7 +3,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObjec
 use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore, ServerConnection};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,18 +17,29 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 
 /// TLS 1.3 only. An explicit CA file replaces the public trust roots.
 pub fn client_config(ca_file: Option<&Path>) -> io::Result<Arc<ClientConfig>> {
-    let mut roots = RootCertStore::empty();
     if let Some(path) = ca_file {
         let certs = CertificateDer::pem_file_iter(path).map_err(invalid)?;
-        for cert in certs {
-            roots.add(cert.map_err(invalid)?).map_err(invalid)?;
-        }
-        if roots.is_empty() {
-            return Err(invalid("TLS CA file contains no certificates"));
-        }
-    } else {
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        return custom_client_config(certs.map(|cert| cert.map_err(invalid)));
     }
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    client_config_with_roots(roots)
+}
+
+fn custom_client_config(
+    certs: impl IntoIterator<Item = io::Result<CertificateDer<'static>>>,
+) -> io::Result<Arc<ClientConfig>> {
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert?).map_err(invalid)?;
+    }
+    if roots.is_empty() {
+        return Err(invalid("TLS CA file contains no certificates"));
+    }
+    client_config_with_roots(roots)
+}
+
+fn client_config_with_roots(roots: RootCertStore) -> io::Result<Arc<ClientConfig>> {
     let config = ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(invalid)?
@@ -53,12 +64,136 @@ pub fn server_config(cert: &Path, key: &Path) -> io::Result<Arc<rustls::ServerCo
     Ok(Arc::new(config))
 }
 
-/// Folder, relative to the working directory, searched for host PEM files
-/// when neither `--tls-cert` nor `--tls-key` is given. Ignored by git.
+/// PEM directory name. Host credentials use the working directory, while
+/// viewer trust uses the per-user configuration directory.
 pub const LOCAL_CERT_DIR: &str = "certs.local";
 
 /// Largest file inspected while detecting PEM files.
 const MAX_DETECTED_PEM_BYTES: u64 = 1024 * 1024;
+const MAX_VIEWER_PEM_FILES: usize = 128;
+
+struct DiscoveredCa {
+    path: PathBuf,
+    chain: Vec<CertificateDer<'static>>,
+}
+
+impl DiscoveredCa {
+    fn into_client(self, server_name: String) -> io::Result<(ClientTransport, PathBuf)> {
+        let config = custom_client_config(self.chain.into_iter().map(Ok))
+            .map_err(|error| discovery_error(&self.path, "load certificates from", error))?;
+        Ok((
+            ClientTransport::Tls {
+                config,
+                server_name,
+            },
+            self.path,
+        ))
+    }
+}
+
+fn discovery_error(path: &Path, action: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "Viewer TLS trust: cannot {action} {}: {error}. Fix access or use --tls-ca FILE",
+            path.display()
+        ),
+    )
+}
+
+fn read_viewer_pem(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(discovery_error(path, "open", error)),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| discovery_error(path, "inspect", error))?;
+    if !metadata.is_file() || metadata.len() > MAX_DETECTED_PEM_BYTES {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_DETECTED_PEM_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| discovery_error(path, "read", error))?;
+    Ok((bytes.len() as u64 <= MAX_DETECTED_PEM_BYTES).then_some(bytes))
+}
+
+/// Select a locally distributed host certificate by its DNS/IP identity.
+/// Selection is not verification: the live TLS handshake must still validate
+/// the chain, validity period, name, and proof of possession of the private key.
+fn detect_client_ca(dir: &Path, name: &str) -> io::Result<Option<DiscoveredCa>> {
+    let name = ServerName::try_from(name).map_err(invalid)?;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(discovery_error(dir, "list", error)),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| discovery_error(dir, "list", error))?;
+        let path = entry.path();
+        if !path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pem"))
+        {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(discovery_error(&path, "inspect", error)),
+        }
+        if paths.len() == MAX_VIEWER_PEM_FILES {
+            return Err(invalid(format!(
+                "Too many .pem files in {} (limit {MAX_VIEWER_PEM_FILES}). Remove some or use --tls-ca FILE",
+                dir.display()
+            )));
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    let mut selected: Option<DiscoveredCa> = None;
+    for path in paths {
+        let Some(bytes) = read_viewer_pem(&path)? else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        // Never use a combined certificate/key file as viewer trust.
+        if text.contains("PRIVATE KEY-----") {
+            continue;
+        }
+        let Ok(chain) = CertificateDer::pem_slice_iter(&bytes).collect::<Result<Vec<_>, _>>()
+        else {
+            continue;
+        };
+        let Some(leaf) = chain.first() else {
+            continue;
+        };
+        let Ok(parsed) = rustls::server::ParsedCertificate::try_from(leaf) else {
+            continue;
+        };
+        if rustls::client::verify_server_name(&parsed, &name).is_err() {
+            continue;
+        }
+        if let Some(previous) = &selected {
+            if previous.chain != chain {
+                return Err(invalid(format!(
+                    "Multiple certificates in {} match {}. Use --tls-ca FILE to choose one",
+                    dir.display(),
+                    name.to_str()
+                )));
+            }
+        } else {
+            selected = Some(DiscoveredCa { path, chain });
+        }
+    }
+    Ok(selected)
+}
 
 /// Finds one host certificate and private key among the `.pem` files in
 /// `dir` by their PEM labels, not their names. Returns `None` when there is no
@@ -134,6 +269,35 @@ pub struct TlsOptions {
 }
 
 impl TlsOptions {
+    /// Prepare the transport for one connection and report the discovered PEM,
+    /// if any. Explicit trust and plaintext choices bypass discovery.
+    pub fn client_with_local_ca(
+        &self,
+        host: &str,
+        dir: Option<&Path>,
+    ) -> io::Result<(ClientTransport, Option<PathBuf>)> {
+        if let Some(dir) = dir
+            && !self.unencrypted
+            && self.ca.is_none()
+        {
+            let server_name = self.client_server_name(host);
+            if let Some(ca) = detect_client_ca(dir, &server_name)? {
+                let (transport, path) = ca.into_client(server_name)?;
+                return Ok((transport, Some(path)));
+            }
+        }
+        Ok((self.client(host)?, None))
+    }
+
+    fn client_server_name(&self, host: &str) -> String {
+        self.server_name.clone().unwrap_or_else(|| {
+            host.trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_owned()
+        })
+    }
+
     pub fn label(&self) -> &'static str {
         if self.unencrypted {
             "TCP / UNENCRYPTED (EXPLICIT)"
@@ -153,12 +317,7 @@ impl TlsOptions {
         }
         Ok(ClientTransport::Tls {
             config: client_config(self.ca.as_deref())?,
-            server_name: self.server_name.clone().unwrap_or_else(|| {
-                host.trim()
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_owned()
-            }),
+            server_name: self.client_server_name(host),
         })
     }
 

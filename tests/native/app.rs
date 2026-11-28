@@ -40,13 +40,17 @@ fn encrypted_native_app_connection_uses_form_trust_and_keeps_password_auth() {
         password: "native-test-password".into(),
         compression: Compression::Raw,
         tls: topvnc::transport::TlsOptions {
-            ca: Some(ca),
+            ca: Some(ca.clone()),
             server_name: Some("localhost".into()),
             ..Default::default()
         },
         ..Default::default()
     };
-    let mut session = connect_native(&config).unwrap();
+    let NativeConnection {
+        mut session,
+        security,
+    } = connect_native_in(&config, Some(&directory)).unwrap();
+    assert!(matches!(security, ui::ViewerSecurity::Certificate(path) if path == ca));
     assert_eq!(session.info.security, topvnc::Security::VncPassword);
     let writer = session.writer();
     writer.request_update(false, 4, 3).unwrap();
@@ -72,8 +76,29 @@ fn encrypted_native_app_connection_uses_form_trust_and_keeps_password_auth() {
     ));
     writer.shutdown().unwrap();
     config.tls.server_name = Some("wrong.invalid".into());
-    assert!(connect_native(&config).is_err());
+    assert!(connect_native_in(&config, Some(&directory)).is_err());
     config.tls.server_name = Some("localhost".into());
+    // No launch flag is needed when the target certificate is present.
     config.tls.ca = None;
-    assert!(connect_native(&config).is_err());
+    let NativeConnection { session, security } =
+        connect_native_in(&config, Some(&directory)).unwrap();
+    assert!(matches!(security, ui::ViewerSecurity::Certificate(path) if path == ca));
+    assert_eq!(session.info.security, topvnc::Security::VncPassword);
+    session.writer().shutdown().unwrap();
+    // Editing the identity must select trust again, never reuse the last CA.
+    config.tls.server_name = Some("wrong.invalid".into());
+    assert!(connect_native_in(&config, Some(&directory)).is_err());
+    config.tls.server_name = None;
+    let session = connect_native_in(&config, Some(&directory))
+        .unwrap()
+        .session;
+    session.writer().shutdown().unwrap();
+    // A different local certificate for the same name cannot authenticate this
+    // server, and a failing attempt cannot fall back to public roots or TCP.
+    let stranger = Identity::new();
+    std::fs::remove_file(directory.join("ca.pem")).unwrap();
+    std::fs::write(directory.join("server.pem"), stranger.cert.pem()).unwrap();
+    assert!(connect_native_in(&config, Some(&directory)).is_err());
+    std::fs::remove_file(directory.join("server.pem")).unwrap();
+    assert!(connect_native_in(&config, Some(&directory)).is_err());
 }

@@ -1,5 +1,5 @@
 //! Session GPU work is isolated from the window/input event thread.
-use crate::ui::{self, Canvas, Config, Quality, WindowMode};
+use crate::ui::{self, Canvas, Config, Quality, ViewerSecurity, WindowMode};
 use crate::view_zoom::ViewZoom;
 use crate::window::{Draw, Presenter, Waker};
 use crate::{Overlay, RETRY_INTERVAL, clip, placement};
@@ -132,6 +132,7 @@ impl RenderWorker {
         frames: Arc<FrameMailbox>,
         options: RenderOptions,
         initial: (usize, usize),
+        security: ViewerSecurity,
         errors: std::sync::mpsc::Sender<io::Result<()>>,
         ui_waker: Waker,
     ) -> io::Result<Self> {
@@ -148,7 +149,7 @@ impl RenderWorker {
         let worker = thread::Builder::new()
             .name("topvnc-present".into())
             .spawn(move || {
-                if let Err(error) = render_loop(presenter, frames, initial, &shared) {
+                if let Err(error) = render_loop(presenter, frames, initial, &security, &shared) {
                     let _ = errors.send(Err(io::Error::other(error.to_string())));
                     ui_waker.wake();
                 }
@@ -204,6 +205,7 @@ fn render_loop(
     mut presenter: Presenter,
     frames: Arc<FrameMailbox>,
     mut remote: (usize, usize),
+    security: &ViewerSecurity,
     shared: &Shared,
 ) -> Result<(), Box<dyn Error>> {
     let mut image = presenter.layer(remote.0 as u32, remote.1 as u32);
@@ -325,6 +327,7 @@ fn render_loop(
                 options.open,
                 options.serve_scale,
                 options.serve_display,
+                security,
             );
             overlay
                 .layer

@@ -60,15 +60,37 @@ fn encoding(config: &Config) -> Encoding {
     }
 }
 
-fn connect_native(config: &Config) -> std::io::Result<Session> {
+struct NativeConnection {
+    session: Session,
+    security: ui::ViewerSecurity,
+}
+
+fn connect_native_in(
+    config: &Config,
+    cert_dir: Option<&std::path::Path>,
+) -> std::io::Result<NativeConnection> {
     let address = config.address().map_err(std::io::Error::other)?;
-    Session::connect_with_transport(
+    let (transport, discovered) = config.tls.client_with_local_ca(&config.host, cert_dir)?;
+    let security = if config.tls.unencrypted {
+        ui::ViewerSecurity::Unencrypted
+    } else if let Some(ca) = discovered.or_else(|| config.tls.ca.clone()) {
+        eprintln!(
+            "TopVNC: using viewer TLS trust from {} for {}",
+            ca.display(),
+            config.host
+        );
+        ui::ViewerSecurity::Certificate(ca)
+    } else {
+        ui::ViewerSecurity::PublicRoots
+    };
+    let session = Session::connect_with_transport(
         &address,
-        config.tls.client(&config.host)?,
+        transport,
         config.allow_insecure,
         encoding(config),
         || Ok(config.password.clone()),
-    )
+    )?;
+    Ok(NativeConnection { session, security })
 }
 
 const USAGE: &str = "usage: topvnc [HOST:PORT] [--tls-ca CA.pem] [--tls-server-name NAME] [--tls-cert CERT.pem --tls-key KEY.pem] [--unencrypted] [--allow-insecure] [--fit | --native-size | --window WIDTHxHEIGHT] [--quality 0-9] [--progressive] [--ultra] [--smooth-motion | --immediate] [--input-debug]";
@@ -660,7 +682,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Keeps an installer's report while a viewer session runs.
     let mut service = host_service::ServiceRuntime::default();
     loop {
-        let Some((next_config, session)) = show_landing(
+        let Some((next_config, connection)) = show_landing(
             &mut ui,
             config,
             connection_error.take(),
@@ -673,7 +695,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Ok(());
         };
         config = next_config;
-        connection_error = match run_session(&mut ui, session, &mut config, input_debug) {
+        connection_error = match run_session(&mut ui, connection, &mut config, input_debug) {
             Ok(error) => error,
             Err(error) => Some(error.to_string()),
         };
@@ -1355,7 +1377,7 @@ fn show_landing(
     web: &mut WebRuntime,
     service: &mut host_service::ServiceRuntime,
     mut pending_start: Option<StartAction>,
-) -> Result<Option<(Config, Session)>, Box<dyn Error>> {
+) -> Result<Option<(Config, NativeConnection)>, Box<dyn Error>> {
     const WIDTH: usize = 800;
     const HEIGHT: usize = 640;
     let window = ui.create_window(
@@ -1374,7 +1396,7 @@ fn show_landing(
         error,
         ..UiState::default()
     };
-    let (result_tx, result_rx) = mpsc::channel::<Result<Session, String>>();
+    let (result_tx, result_rx) = mpsc::channel::<Result<NativeConnection, String>>();
     let mut connecting = false;
     let mut helpers = helpers::HelperRuntime::default();
     let mut permissions_checked: Option<Instant> = None;
@@ -1478,11 +1500,11 @@ fn show_landing(
         if let Ok(result) = result_rx.try_recv() {
             connecting = false;
             match result {
-                Ok(session) => {
+                Ok(connection) => {
                     if let Err(error) = settings::save(&config) {
                         eprintln!("Could not remember the last session: {error}");
                     }
-                    return Ok(Some((config, session)));
+                    return Ok(Some((config, connection)));
                 }
                 Err(error) => state.error = Some(error),
             }
@@ -1955,8 +1977,9 @@ fn show_landing(
                     let sender = result_tx.clone();
                     let connection_config = config.clone();
                     thread::spawn(move || {
-                        let result =
-                            connect_native(&connection_config).map_err(|error| error.to_string());
+                        let directory = settings::viewer_cert_dir();
+                        let result = connect_native_in(&connection_config, directory.as_deref())
+                            .map_err(|error| error.to_string());
                         let _ = sender.send(result);
                     });
                 }
@@ -2118,26 +2141,31 @@ fn send_motion(writer: &InputWriter, buttons: u16, motion: &mut (f64, f64)) -> s
 
 fn run_session(
     ui: &mut Ui,
-    session: Session,
+    connection: NativeConnection,
     config: &mut Config,
     input_debug: bool,
 ) -> Result<Option<String>, Box<dyn Error>> {
-    let writer = session.writer();
-    let result = run_session_inner(ui, session, config, input_debug);
+    let writer = connection.session.writer();
+    let result = run_session_inner(ui, connection, config, input_debug);
     let _ = writer.shutdown();
     result
 }
 
 fn run_session_inner(
     ui: &mut Ui,
-    mut session: Session,
+    connection: NativeConnection,
     config: &mut Config,
     input_debug: bool,
 ) -> Result<Option<String>, Box<dyn Error>> {
+    let NativeConnection {
+        mut session,
+        security,
+    } = connection;
     let info = session.info.clone();
     eprintln!(
-        "Connected using {:?} security. RFB traffic is not encrypted.",
-        info.security
+        "Connected using {:?} authentication. {}.",
+        info.security,
+        config.tls.label()
     );
     let writer = session.writer();
     if !config.relative_mouse {
@@ -2175,6 +2203,7 @@ fn run_session_inner(
         Arc::clone(&frames),
         RenderOptions::new(config, window.inner_size(), window.scale_factor()),
         remote,
+        security,
         error_tx.clone(),
         ui.waker(),
     )?;
@@ -2889,6 +2918,7 @@ mod tests {
             Arc::clone(&frames),
             RenderOptions::new(&config, window.inner_size(), window.scale_factor()),
             (1920, 1080),
+            ui::ViewerSecurity::PublicRoots,
             errors,
             ui.waker(),
         )

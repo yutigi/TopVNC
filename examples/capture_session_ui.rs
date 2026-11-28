@@ -37,6 +37,7 @@ fn main() -> io::Result<()> {
                 count: 2,
             })
         },
+        &ui::ViewerSecurity::PublicRoots,
     );
     let mut output = io::BufWriter::new(io::stdout().lock());
     write!(output, "P6\n{width} {height}\n255\n")?;
